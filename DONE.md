@@ -7,19 +7,26 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
 
 ## Unreleased Commit
 
-### WP-01 — Domain types and executable reference model
-- Validated ID newtypes, external aliases, revisions, store generation, channel/session identities (`src/domain/id.rs`).
-- Canonical record types preserving optional quality, lifecycle, evidence, archives, guide deps, attempts, suggestions (`src/domain/{memory,relation,guide,session,project,export}.rs`).
-- Native DTOs separate from exact legacy wire DTOs; missing/null distinctions preserved (`src/domain/{wire,legacy}.rs`).
-- `DomainCommand`, `CommandContext`, `CommandReceipt`, `DomainError`, `Scope`, `SnapshotToken` without Arrow/database types (`src/domain/command.rs`).
-- In-memory sequential reference interpreter with deterministic IDs/clock as the concurrency-history oracle (`src/domain/interpreter.rs`).
-- Graph endpoint, edge uniqueness, symmetry/direction, supersession-cycle and lifecycle predicates (`src/domain/graph.rs`).
-- Canonical normalized export and digest ordering for round-trip/property tests (`src/domain/export.rs`).
-- Legacy field map into canonical/envelope/derived/rejected categories (`src/domain/legacy.rs`).
+### WP-03 — Harden the canonical repository (core)
+- `CanonicalRepository` over Fjall (`src/canonical/`): single `apply(ctx, cmd)`
+  gateway centralizing command application, precondition validation and atomic
+  receipt storage — the receipt commits in the same transaction as the command.
+- Idempotency: durable `(store_generation, operation_id)` key + request digest;
+  same key+digest replays the recorded receipt; key reuse with different input
+  is rejected.
+- Conflict separation: storage conflicts retry from a fresh snapshot (bounded);
+  stale `expected_revision` surfaces a domain conflict (not rebased); unknown
+  commit outcomes resolve via the receipt and the same operation key.
+- Uniqueness + referential/lifecycle invariants enforced in-transaction
+  (memory, alias, edge); concurrency-safe supersession-cycle check.
+- Deletion effects: hard delete severs adjacency; invalidation/archival preserve edges.
+- Snapshot-consistent reads: multi-get, graph-neighbor, export traversal.
+- Schema version check on open; refuses unknown/newer incompatible schemas.
+- Tests (8): atomic receipt, idempotent replay, key-reuse rejection, stale
+  revision, supersession cycle, lifecycle transition, hard-delete adjacency,
+  one-winner concurrent absent-key create.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --lib` (45 passed, 0 failed).
 
-### WP-02 — Backend capability and correctness gate
-- Lance-only probe: create, conditional update, receipts, concurrency, snapshot, scalar query, kill/reopen durability, unenforced-PK metadata check (`src/storage/lance_backend.rs`).
-- Fjall + Lance probe: optimistic cross-keyspace transactions, SSI write-write conflict detection, atomic merge, kill/reopen SyncAll durability, bounded retry under contention, one-winner absent-key create (`src/storage/fjall_backend.rs`).
-- Arrow schemas for memories/relations/receipts (`src/storage/schema.rs`).
-- **AD-01 DECIDED: Option B (Fjall + Lance)** — canonical state in Fjall keyspaces, Lance as search/projection store. Counterexample: Lance alone is not one-winner for concurrent absent-key creates. See `plans/AD-01_canonical_backend.md`.
-- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (37 passed, 0 failed).
+> Remaining WP-03 (not yet done): full migration runner, fixed-expiry retry
+> namespaces + receipt GC, feedback/access telemetry separation, fault injection.

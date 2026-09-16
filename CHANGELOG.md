@@ -5,6 +5,22 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 7cbc1b6 (2026-09-16) — domain model, reference interpreter, backend gate probes (WP-01, WP-02)
+
+- WP-01: validated ID/alias/revision/generation identities; canonical record
+  types; native + legacy wire DTOs; `DomainCommand`/`CommandContext`/
+  `CommandReceipt`/`DomainError`/`Scope`/`SnapshotToken`; in-memory sequential
+  reference interpreter (concurrency oracle); graph predicates; canonical export
+  + digest; legacy field map (`src/domain/`).
+- WP-02: Lance-only probe and Fjall+Lance probe (optimistic transactions, SSI
+  conflict detection, atomic merge, SyncAll durability, bounded retry,
+  one-winner create); Arrow schemas (`src/storage/`).
+- **AD-01 DECIDED: Option B (Fjall + Lance)** — canonical state in Fjall
+  keyspaces, Lance as search/projection store. See
+  `plans/AD-01_canonical_backend.md`.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --lib` (37 passed, 0 failed).
+
 ## dd0be90 (2026-09-16) — close WP-00 gaps from plan review
 
 - Added static tool-definition snapshot (`static/tools_static.json`), kept

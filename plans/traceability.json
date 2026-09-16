@@ -275,7 +275,8 @@
         "T-CONC-02",
         "T-GRAPH-01"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "CanonicalRepository: one_winner_for_concurrent_absent_key (T-CONC-02), stale_revision_conflict_is_not_blindly_rebased, supersession_cycle_rejected_concurrency_safely, uniqueness invariants. T-CONC-01 disjoint-field races and full T-GRAPH-01 race matrix deferred."
     },
     {
       "id": "RQ-05",
@@ -297,7 +298,8 @@
         "T-CONC-03",
         "T-REC-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "CanonicalRepository: idempotent_replay_returns_recorded_receipt, key_reuse_with_different_input_is_error, unknown-outcome resolution via receipt. Fixed-expiry retry namespaces and GC deferred."
     },
     {
       "id": "RQ-07",
@@ -363,7 +365,8 @@
         "T-GRAPH-02",
         "T-RANK-03"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "CanonicalRepository + graph predicates: endpoint existence, edge uniqueness, self-supersession and cycle rejection enforced in-transaction. T-GRAPH-02 retrieval preservation and T-RANK-03 (WP-07) deferred."
     },
     {
       "id": "RQ-13",

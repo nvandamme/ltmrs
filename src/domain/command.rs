@@ -179,6 +179,40 @@ pub enum DomainErrorCode {
     Validation,
 }
 
+impl DomainErrorCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DomainErrorCode::NotFound => "not_found",
+            DomainErrorCode::RevisionConflict => "revision_conflict",
+            DomainErrorCode::DuplicateAlias => "duplicate_alias",
+            DomainErrorCode::DuplicateEdge => "duplicate_edge",
+            DomainErrorCode::SelfSupersession => "self_supersession",
+            DomainErrorCode::SupersessionCycle => "supersession_cycle",
+            DomainErrorCode::InvalidLifecycleTransition => "invalid_lifecycle_transition",
+            DomainErrorCode::StaleReplay => "stale_replay",
+            DomainErrorCode::KeyReuseDifferentInput => "key_reuse_different_input",
+            DomainErrorCode::OutOfScope => "out_of_scope",
+            DomainErrorCode::Validation => "validation",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "not_found" => DomainErrorCode::NotFound,
+            "revision_conflict" => DomainErrorCode::RevisionConflict,
+            "duplicate_alias" => DomainErrorCode::DuplicateAlias,
+            "duplicate_edge" => DomainErrorCode::DuplicateEdge,
+            "self_supersession" => DomainErrorCode::SelfSupersession,
+            "supersession_cycle" => DomainErrorCode::SupersessionCycle,
+            "invalid_lifecycle_transition" => DomainErrorCode::InvalidLifecycleTransition,
+            "stale_replay" => DomainErrorCode::StaleReplay,
+            "key_reuse_different_input" => DomainErrorCode::KeyReuseDifferentInput,
+            "out_of_scope" => DomainErrorCode::OutOfScope,
+            _ => DomainErrorCode::Validation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainError {
     pub code: DomainErrorCode,

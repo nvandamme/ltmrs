@@ -204,19 +204,24 @@ Rust snippets and commands in this document are design-level examples or planned
 ### Tasks
 
 - [ ] Implement migrations with version checks, staging/safety rules and refusal of unknown/newer incompatible schemas.
-- [ ] Centralize command application, precondition validation and atomic receipt storage.
+- [x] Centralize command application, precondition validation and atomic receipt storage.
 - [ ] Add scoped operation IDs and request digests; implement fixed-expiry daemon-issued retry namespaces, receipt retention, and stale replay rejection across reconnect/restart.
-- [ ] Separate storage conflict retries from stale edit conflicts and unknown commit outcomes.
-- [ ] Enforce memory/alias/edge uniqueness and referential/lifecycle invariants.
-- [ ] Make supersession checks safe against simultaneous cycle-forming insertions, including predicate dependencies or a scope-wide graph-mutation lock held through publication; merging components must not defeat lock coverage.
+- [x] Separate storage conflict retries from stale edit conflicts and unknown commit outcomes.
+- [x] Enforce memory/alias/edge uniqueness and referential/lifecycle invariants.
+- [x] Make supersession checks safe against simultaneous cycle-forming insertions, including predicate dependencies or a scope-wide graph-mutation lock held through publication; merging components must not defeat lock coverage.
 - [ ] Specify deletion effects on adjacency, evidence, guide links, receipt history and pending projections.
-- [ ] Provide snapshot-consistent multi-get, graph-neighbor and export traversal APIs.
+- [x] Provide snapshot-consistent multi-get, graph-neighbor and export traversal APIs.
 - [ ] Persist compatibility-visible feedback/access effects correctly; separate diagnostic telemetry from domain state.
 - [ ] Add fault injection around commit, receipt publication and migration steps.
 
 **Outputs:** selected repository, migration runner, durable command gateway, crash-stable receipt lookup, domain inspector.
 
 **Acceptance:** all storage/concurrency/graph cases pass against the reference interpreter; RQ-18 ACK timing includes its actual durability barrier. The inspector reports corruption/unresolved import references rather than silently repairing semantic knowledge.
+
+> **Warning:** any temporary/test Fjall database must open at a unique OS-temp
+> directory, never a real or CWD path — Fjall's `temporary(true)` deletes that
+> directory on drop. See the "Critical pitfall" section in
+> `plans/AD-01_canonical_backend.md`.
 
 ## 9. WP-04 - Singleton daemon, IPC and session routing
 
