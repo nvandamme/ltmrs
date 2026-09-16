@@ -1,7 +1,7 @@
 {
   "plan_version": "2.0-review",
-  "date": "2026-09-15",
-  "status": "specification_not_implementation",
+  "date": "2026-09-16",
+  "status": "implementation_in_progress",
   "review_findings": [
     {
       "id": "RV-01",
@@ -239,7 +239,8 @@
         "T-STORE-02",
         "T-REC-01"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_passed",
+      "evidence": "fjall_backend: fjall_atomic_merge_no_partial_state, fjall_kill_reopen_durability_syncall; lance_backend: stepwise_merge_exposes_partial_publication_boundary, test_kill_and_reopen_durability; domain interpreter serial-history oracle"
     },
     {
       "id": "RQ-02",
@@ -249,7 +250,8 @@
       "tests": [
         "T-GATE-01"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_passed",
+      "evidence": "AD-01 decided Option B (Fjall + Lance) from WP-02 hard gates; see plans/AD-01_canonical_backend.md"
     },
     {
       "id": "RQ-03",
@@ -260,7 +262,8 @@
         "T-BUILD-01",
         "T-STORE-03"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_passed",
+      "evidence": "WP-00 baseline: pinned manifest, resolved dependency set (cargo check OK), local Rust API exercised in storage probes"
     },
     {
       "id": "RQ-04",
@@ -406,7 +409,8 @@
         "T-DATA-01",
         "T-IMPORT-01"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "T-DATA-01: domain model + serialization round-trip (domain tests pass). T-IMPORT-01 deferred to WP-11 importer."
     },
     {
       "id": "RQ-17",
@@ -428,7 +432,8 @@
         "T-REC-03",
         "T-BENCH-01"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "T-REC-01: kill/reopen durability probes pass (fjall SyncAll + lance). T-REC-03 I/O fault injection and T-BENCH-01 benchmark deferred."
     },
     {
       "id": "RQ-19",

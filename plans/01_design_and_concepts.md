@@ -467,7 +467,7 @@ Import into staging. Preserve all supported fields/IDs, record every unsupported
 
 | Decision | Current state | Evidence that closes it |
 |---|---|---|
-| AD-01 Canonical backend A or B | OPEN, A tested first | WP-02 hard gates and Part III traces |
+| AD-01 Canonical backend A or B | DECIDED: Option B (Fjall + Lance) — see plans/AD-01_canonical_backend.md | WP-02 hard gates and Part III traces |
 | AD-02 Exact crate/feature/toolchain lock | OPEN | Reproducible local CPU build and dependency report |
 | AD-03 Legacy contract baseline | Version/commit identified; wire capture OPEN | WP-00 generated snapshot and upstream transcripts |
 | AD-04 Default Candle recipe | E5-small candidate | Reference equivalence and retrieval quality suite |

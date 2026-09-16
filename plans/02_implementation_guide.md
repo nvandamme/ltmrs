@@ -144,15 +144,15 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### Tasks
 
-- [ ] Define validated ID newtypes, external aliases, revisions, store generation and channel/session identities.
-- [ ] Define all canonical record types, preserving optional quality, lifecycle distinctions, evidence, archives, guide dependencies, attempts and suggestions.
-- [ ] Define native DTOs separately from exact legacy wire DTOs; preserve missing/null distinctions where upstream observes them.
-- [ ] Define `DomainCommand`, `CommandContext`, `CommandReceipt`, `DomainError`, `Scope` and `SnapshotToken` without Arrow/database types.
-- [ ] Specify before/after state transitions for every critical command in Part I's atomic operation table.
-- [ ] Implement an in-memory sequential reference interpreter using deterministic IDs/clock. It is the oracle for concurrency histories, not a production backend candidate.
-- [ ] Implement graph endpoint, edge uniqueness, symmetry/direction, supersession-cycle and lifecycle predicates.
-- [ ] Define canonical normalized export and digest ordering for round-trip/property tests.
-- [ ] Map every legacy field into a known canonical field, legacy envelope, explicit derived field or rejected/loss-report category.
+- [x] Define validated ID newtypes, external aliases, revisions, store generation and channel/session identities.
+- [x] Define all canonical record types, preserving optional quality, lifecycle distinctions, evidence, archives, guide dependencies, attempts and suggestions.
+- [x] Define native DTOs separately from exact legacy wire DTOs; preserve missing/null distinctions where upstream observes them.
+- [x] Define `DomainCommand`, `CommandContext`, `CommandReceipt`, `DomainError`, `Scope` and `SnapshotToken` without Arrow/database types.
+- [x] Specify before/after state transitions for every critical command in Part I's atomic operation table.
+- [x] Implement an in-memory sequential reference interpreter using deterministic IDs/clock. It is the oracle for concurrency histories, not a production backend candidate.
+- [x] Implement graph endpoint, edge uniqueness, symmetry/direction, supersession-cycle and lifecycle predicates.
+- [x] Define canonical normalized export and digest ordering for round-trip/property tests.
+- [x] Map every legacy field into a known canonical field, legacy envelope, explicit derived field or rejected/loss-report category.
 
 **Outputs:** validated domain model, sequential interpreter, generated schema/property fixtures, migration field map.
 
@@ -166,30 +166,30 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### A. Lance-only probe
 
-- [ ] List exact public local Rust operations for conditional update, insert-if-absent, affected-row reporting, snapshot reads and multi-record publication.
-- [ ] Probe local normalized tables first; distinguish a local transaction implementation from remote namespace API availability.
-- [ ] Test `set_unenforced_primary_key`/index assumptions explicitly: metadata must not be mistaken for a uniqueness constraint.
-- [ ] Implement create, conditional edit, feedback, relation creation, merge and operation receipts through one proven atomic command path.
-- [ ] Run two concurrent absent-key creates and two stale-revision updates with deterministic barriers.
-- [ ] Run merge plus concurrent reads/updates/deletes and kill/reopen at each publication boundary.
-- [ ] Prove a coherent snapshot for graph traversal and export.
-- [ ] Test FTS/vector queries on empty stores, absent/null vectors, fresh append/update/delete, and after reopening.
-- [ ] If needed, conduct only one single-table alternate probe. Document how a command and its receipt become atomic through a supported API. Do not implement an ad hoc transaction framework.
+- [x] List exact public local Rust operations for conditional update, insert-if-absent, affected-row reporting, snapshot reads and multi-record publication.
+- [x] Probe local normalized tables first; distinguish a local transaction implementation from remote namespace API availability.
+- [x] Test `set_unenforced_primary_key`/index assumptions explicitly: metadata must not be mistaken for a uniqueness constraint.
+- [x] Implement create, conditional edit, feedback, relation creation, merge and operation receipts through one proven atomic command path.
+- [x] Run two concurrent absent-key creates and two stale-revision updates with deterministic barriers.
+- [x] Run merge plus concurrent reads/updates/deletes and kill/reopen at each publication boundary.
+- [x] Prove a coherent snapshot for graph traversal and export.
+- [x] Test FTS/vector queries on empty stores, absent/null vectors, fresh append/update/delete, and after reopening.
+- [x] If needed, conduct only one single-table alternate probe. Document how a command and its receipt become atomic through a supported API. Do not implement an ad hoc transaction framework.
 
 ### B. Fjall plus Lance probe
 
-- [ ] Implement the same commands with optimistic cross-keyspace transactions and explicit durable ACK behavior.
-- [ ] Read revision/uniqueness predicates inside the transaction; verify both the outer storage result and inner conflict result.
-- [ ] Demonstrate bounded retries with no external side effects inside the retry closure.
-- [ ] Commit pending projection work with canonical state; kill between canonical and Lance commits.
-- [ ] Use the same fixtures, durability promise, request trace and workload as A.
+- [x] Implement the same commands with optimistic cross-keyspace transactions and explicit durable ACK behavior.
+- [x] Read revision/uniqueness predicates inside the transaction; verify both the outer storage result and inner conflict result.
+- [x] Demonstrate bounded retries with no external side effects inside the retry closure.
+- [x] Commit pending projection work with canonical state; kill between canonical and Lance commits.
+- [x] Use the same fixtures, durability promise, request trace and workload as A.
 
 ### Decision
 
-- [ ] Execute all hard gate tests before throughput scoring.
-- [ ] Compare the minimum necessary recovery states, mutation code, maintenance, direct-read/graph latency and resource use.
-- [ ] Record AD-01 with selected release/feature configuration, counterexamples and evidence links.
-- [ ] Remove the losing production path; retain the backend-independent tests.
+- [x] Execute all hard gate tests before throughput scoring.
+- [x] Compare the minimum necessary recovery states, mutation code, maintenance, direct-read/graph latency and resource use.
+- [x] Record AD-01 with selected release/feature configuration, counterexamples and evidence links.
+- [x] Remove the losing production path; retain the backend-independent tests.
 
 **Outputs:** capability matrix, command implementation probes, raw histories, crash artifacts, AD-01.
 

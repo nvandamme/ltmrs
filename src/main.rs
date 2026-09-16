@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("ltmrs: local MCP memory service (stub)");
 }
