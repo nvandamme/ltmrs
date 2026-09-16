@@ -11,15 +11,20 @@ never calls a remote model.
 
 ## Status
 
-**Design and planning phase. No backend, model or conformance test has been
-executed yet.** This repository currently contains:
+**Baseline captured (WP-00); implementation not started.** No backend, model or
+conformance test has been executed yet. This repository currently contains:
 
 - the reviewed implementation specification and test plan in [`plans/`](plans/),
-- an empty Cargo skeleton,
+- the frozen Lemma 0.21.0 baseline in
+  [`baseline/lemma-0.21.0/`](baseline/lemma-0.21.0/) — live wire capture,
+  tool inventory, upstream lock, behavior inventory, dependency/native-code
+  audit and the proposed deviation ledger,
+- a resolved, compile-validated candidate dependency set (Cargo.lock),
 - the repository governance files.
 
-Nothing in `plans/` is a passing test report or a wire capture. All conformance
-matrix cells start at `not_run` by design.
+The wire capture and tool inventory are real captures with provenance, not
+hand-written goldens. All conformance matrix cells still start at `not_run` —
+capturing the baseline is not passing conformance.
 
 ## Compatibility target
 

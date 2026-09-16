@@ -1,0 +1,20 @@
+{
+  "result": {
+    "protocolVersion": "2025-11-25",
+    "capabilities": {
+      "tools": {
+        "listChanged": true
+      },
+      "resources": {
+        "listChanged": true
+      }
+    },
+    "serverInfo": {
+      "name": "lemma",
+      "version": "0.21.0"
+    },
+    "instructions": "# Lemma — Persistent Memory\n\nYou start every session blank — knowledge survives only via tool calls. If you\nlearn something and don't save it (memory_add), it's gone permanently.\n\n## Layers\n- Memory fragments (memory_read/add): fact / pattern / lesson / warning / context.\n  Confidence evolves with use.\n- Guides (guide_get/distill/practice): procedural skills distilled from experience.\n  Track usage + success rate.\nPipeline: experience -> memory_add -> pattern/lesson -> guide_distill -> guide_practice.\n\n## How to work\n1. RECALL: memory_read.  2. ACT.  3. PERSIST: insight -> memory_add, guide applied -> guide_practice.\nStore fragments in ENGLISH (required for search). Never ask permission to save.\n\n## Writing a fragment\n## [Title] / ### Context (1-2 sentences) / ### [Content] (bullets).\nOne idea, 30-2000 chars. Types: fact/pattern/lesson/warning/context.\n\n## Relations (memory_relate)\nsupports / contradicts / supersedes / related_to (bidirectional).\n\n## Background intelligence\nConflict detection, suggestions (distill/merge/refine), and auto-linking run\nautomatically — act on signals when sensible.\n\n## Commands\n-lib -> memory_library (full snapshot). -vis -> launch visualizer.\n\n## Your current memory\n- Global: 4 fragments\n  [seed_html_output_strategy] HTML vs Markdown Output Strategy (1.00)\n  [seed_clean_code_modern] Modern Clean Code (Agentic Era) (1.00)\n  [seed_prompt_engineering] Prompt Engineering Principles (1.00)\n  [seed_task_complexity] Task Complexity Assessment (1.00)\n\nUse memory_read to load full details of any fragment.\n\nYou have 4 skill guide(s). Use guide_get to review them.\n"
+  },
+  "jsonrpc": "2.0",
+  "id": 868303625
+}

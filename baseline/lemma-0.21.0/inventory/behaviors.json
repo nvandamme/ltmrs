@@ -1,0 +1,100 @@
+{
+  "schema": "ltmrs.behavior-inventory/1",
+  "source": {
+    "repo": "xenitV1/lemma",
+    "commit": "d30a816632d0bc5d92907cbc51c1dc1010111986",
+    "version": "0.21.0"
+  },
+  "cli": {
+    "bin": "lemma -> dist/index.js",
+    "flags": {
+      "default": "Start MCP server over stdio",
+      "-lib / --library": "Print full knowledge-base snapshot (runLibMode)",
+      "-vis / --visualize": "Start visualizer in background",
+      "-vis --fg": "Visualizer in foreground",
+      "-vis -p PORT / --port": "Custom visualizer port (1-65535)",
+      "--install-skill": "Install/update skill at ~/.agents/skills/lemma/",
+      "--version / -V": "Print version",
+      "--help / -h": "Show help"
+    }
+  },
+  "mcp_server": {
+    "name": "lemma",
+    "version": "0.21.0",
+    "transport": "stdio",
+    "capabilities": {
+      "tools": { "listChanged": true },
+      "resources": { "listChanged": true }
+    },
+    "instructions": "Dynamic: base prompt + injected 'Your current memory' (global fragment count + seed list) + guide count. Rebuilt per detected project. NOT static.",
+    "tool_count": 29
+  },
+  "data_store": {
+    "db_path_default": "~/.lemma/lemma.db",
+    "config_path_default": "~/.lemma/config.json",
+    "engine": "better-sqlite3 (native, C++ addon)",
+    "config_defaults": {
+      "token_budget": { "full_content": 5000, "summary_index": 1000, "guides_detail": 1000, "instructions": 1500, "continuity": 800 },
+      "injection": { "max_full_content_fragments": 15, "max_summary_fragments": 30, "max_guides": 20, "max_guide_detail": 3 },
+      "virtual_session": { "timeout_minutes": 30, "idle_timeout_seconds": 120 },
+      "verification": { "stale_check": false },
+      "eviction": { "enabled": false, "max_fragments": 10000 },
+      "decay": { "model": "linear", "half_life_days": { "pattern": 180, "context": 120, "lesson": 90, "fact": 60, "warning": 30 } }
+    }
+  },
+  "sessions": {
+    "virtual_session_model": "Daemon-global singleton (currentVirtualSession). Idle-finalizes after idle_timeout_seconds; timeout_minutes bounds lifetime.",
+    "ltmrs_note": "RV-05: this global current session is the exact anti-pattern ltmrs must NOT replicate. Legacy adapter preserves observable per-channel semantics; native binds sessions to frontend channels."
+  },
+  "skills": {
+    "install_path": "~/.agents/skills/lemma/SKILL.md",
+    "idempotent": true,
+    "version_aware": true,
+    "purpose": "Reliable recall->act->persist channel for skill-format clients (Codex) that do not inject MCP instructions."
+  },
+  "visualizer": {
+    "http": true,
+    "auth": "startup token (header) required for /api/* except /api/export; CORS allow-list bound to port",
+    "export_endpoint": "GET /api/export -> memory-export.jsonl (attachment)",
+    "asset": "assets/visualizer.html copied to dist/server/visualizer.html at build"
+  },
+  "backup": {
+    "format": "lemma-backup",
+    "format_version": 1,
+    "extension": ".lemma-backup",
+    "file_pattern": "<prefix>-<ISO-timestamp>-<uuid>.lemma-backup",
+    "max_size_bytes": 134217728,
+    "excluded": ["config.json", "diagnostic logs", "raw session/traffic logs", "installed skills and models", "MCP client configuration"],
+    "integrity": "sha256 over normalized application rows + version-history check"
+  },
+  "privacy": {
+    "module": "src/memory/privacy.ts",
+    "note": "memory_add has a confirm flag that stores verbatim despite secret detection (see WP-08 task)."
+  },
+  "behavior_classification": {
+    "note": "Plan WP-00 requires recording which behaviors are schema-documented vs handler-defined vs side effects vs apparent defects. Do not copy a safety defect just to pass exact-output tests.",
+    "schema_documented": [
+      "29 tool names, input schemas, annotations, output schemas (static TOOLS array in src/server/tools.ts)",
+      "initialize capabilities (tools.listChanged, resources.listChanged)",
+      "config.json schema and defaults (src/memory/config.ts)"
+    ],
+    "handler_defined": [
+      "Dynamic instructions injection in initialize (buildInstructions: base prompt + current memory + guide count)",
+      "Dynamic tool-description injection in tools/list (buildInjectedTools embeds memory/guides into descriptions)",
+      "Daemon-global virtual session (currentVirtualSession singleton) — RV-05 anti-pattern",
+      "memory_add secret redaction + confirm=true verbatim override",
+      "Read side effects: memory_read/guide access update lastAccessed, accessed, confidence decay"
+    ],
+    "side_effects": [
+      "postinstall writes ~/.agents/skills/lemma/SKILL.md (never throws)",
+      "config.json auto-created with defaults on first run if absent",
+      "DB schema migrations applied on open (schema_version gated)",
+      "notifications/tools/list_changed sent (debounced) when tools change"
+    ],
+    "apparent_defects_or_risks": [
+      "Daemon-global current session is unsafe for concurrent multi-agent use (RV-05) — ltmrs must not replicate",
+      "lancedb 0.38.0 remote-feature compile coupling is an upstream concern, not Lemma's",
+      "Backup excludes config.json/diagnostics by design — restore must not assume they are present"
+    ]
+  }
+}

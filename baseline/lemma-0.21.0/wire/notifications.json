@@ -1,0 +1,17 @@
+{
+  "schema": "ltmrs.notifications-inventory/1",
+  "source": {
+    "repo": "xenitV1/lemma",
+    "commit": "d30a816632d0bc5d92907cbc51c1dc1010111986",
+    "version": "0.21.0"
+  },
+  "notifications": [
+    {
+      "method": "notifications/tools/list_changed",
+      "trigger": "Sent (debounced 100ms) when the tool set changes; wired via setNotifyChange in src/server/index.ts.",
+      "capture_status": "documented_not_captured",
+      "note": "Event-driven; not deterministically reproducible in a single capture run. Recorded here rather than faked. A conformance test (T-MCP-01) can trigger it by mutating memory between tools/list calls."
+    }
+  ],
+  "note": "The server declares capabilities.tools.listChanged=true and capabilities.resources.listChanged=true, but only tools/list_changed is actually emitted in 0.21.0. resources/list_changed is declared but no resource handlers are registered in the captured build."
+}

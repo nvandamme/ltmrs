@@ -1,0 +1,24 @@
+{
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "## Memory Stats\nTotal: 4 fragments | Avg confidence: 1\nHigh confidence (>0.8): 4 | Low (<0.3): 0\nSources: ai: 4\nProjects: (global): 4\n"
+      }
+    ],
+    "structuredContent": {
+      "total": 4,
+      "avg_confidence": 1,
+      "by_source": {
+        "ai": 4
+      },
+      "by_project": {
+        "(global)": 4
+      },
+      "low_confidence": 0,
+      "high_confidence": 4
+    }
+  },
+  "jsonrpc": "2.0",
+  "id": 873314648
+}

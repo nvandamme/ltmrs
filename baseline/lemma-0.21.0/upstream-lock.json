@@ -1,0 +1,65 @@
+{
+  "schema": "ltmrs.upstream-lock/1",
+  "repository": "xenitV1/lemma",
+  "commit": "d30a816632d0bc5d92907cbc51c1dc1010111986",
+  "branch_head": "HEAD",
+  "package": {
+    "name": "lemma-mcp",
+    "version": "0.21.0",
+    "license": "MIT",
+    "bin": {
+      "lemma": "dist/index.js"
+    },
+    "type": "module",
+    "engines": {
+      "node": ">=20.0.0"
+    }
+  },
+  "runtime": {
+    "node": "v26.8.2",
+    "npm": "12.0.2"
+  },
+  "mcp_sdk": {
+    "range": "^1.0.0",
+    "version": "1.29.0"
+  },
+  "protocol_versions_supported": [
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07"
+  ],
+  "file_hashes": {
+    "package.json": "3c62d770b3898399b534f18738480c3775b13221168cb0870b7f588d13b4edc9",
+    "package-lock.json": "4b45fc30e4fd3422657c87ecde2c3976404fcaf0bbf08d45910d68b3cd8524ce",
+    "LICENSE": "161c6708dab20afb5257a155379f37656f9a0ae1511d40648ea9056dde332e2e",
+    "src/server/tools.ts": "2299be364b807b5ade98d26afcb8bcf1adb545e10f9a6826839b6bd75713cd73",
+    "src/index.ts": "919813bc8cf462b18ae5b0b1d21c7592b1170cd2b6a8f527285772270c358bfa",
+    "src/db/schema.ts": "9793a6cfc8e6d9d79cc35bfabdf80fb43800c5ac49168b1031226e53b7435c96",
+    "assets/visualizer.html": "448326532718653ec906d278d2ea251d8475df6444e36e283ff5514047d6a1b2"
+  },
+  "runtime_dependencies": {
+    "@modelcontextprotocol/sdk": {
+      "range": "^1.0.0",
+      "resolved_version": "1.29.0",
+      "integrity": "sha512-zo37mZA9hJWpULgkRpowewez1y6ML5GsXJPY8FI0tBBCd77HEvza4jDqRKOXgHNn867PVGCyTdzqpz0izu5ZjQ=="
+    },
+    "better-sqlite3": {
+      "range": "^12.9.0",
+      "resolved_version": "12.10.1",
+      "integrity": "sha512-HfFtzCqnSfwB3+HroF6PSKzyh+7RfNMGPCzHFUZXRlvrPCb4P3cvxKZNN43Sr7IrkofqQZM+gIvffGpA8VvqgA=="
+    }
+  },
+  "tool_count_expected": 29,
+  "tool_count_in_source": 29,
+  "tool_names_inventory_match": true,
+  "db_schema_version": 8,
+  "db_migrations_count": 8,
+  "static_tools_snapshot": "static/tools_static.json",
+  "live_tools_snapshot": "wire/tools_list.json",
+  "dynamic_injection": {
+    "confirmed": true,
+    "note": "Live tools/list descriptions embed current memory/guides (memory_read: 376 static chars -> 8269 live chars). Static schema is in static/tools_static.json; live (with injection) is in wire/tools_list.json. Keep separate per plan."
+  }
+}

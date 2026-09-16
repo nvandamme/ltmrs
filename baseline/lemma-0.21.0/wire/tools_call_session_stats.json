@@ -1,0 +1,58 @@
+{
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "## Session Stats\nActive session: 3 tool calls\n\nRecent sessions (1):\n  vs_mu41akkc: 4 calls\n"
+      }
+    ],
+    "structuredContent": {
+      "active_session": {
+        "tool_calls": 3,
+        "technologies": [],
+        "guides_used": []
+      },
+      "recent_sessions": [
+        {
+          "id": "vs_mu41akkc",
+          "started_at": "2026-09-16T11:45:17.724Z",
+          "tool_calls": [
+            {
+              "tool": "memory_read",
+              "timestamp": "2026-09-16T11:45:17.724Z",
+              "args_summary": "list",
+              "result_summary": "## Memory Fragments (ltmrs)\n---\n[seed_html_output_strategy] [global] HTML vs Markdown Output Strateg..."
+            },
+            {
+              "tool": "memory_stats",
+              "timestamp": "2026-09-16T11:45:17.877Z",
+              "args_summary": null,
+              "result_summary": "## Memory Stats\nTotal: 4 fragments | Avg confidence: 1\nHigh confidence (>0.8): 4 | Low (<0.3): 0\nSou..."
+            },
+            {
+              "tool": "guide_get",
+              "timestamp": "2026-09-16T11:45:18.029Z",
+              "args_summary": null,
+              "result_summary": "## Guides\n---\n[dev-tool] error-handling — 0x usage, 4 learnings\n[dev-tool] debugging — 0x usage, 5 l..."
+            },
+            {
+              "tool": "session_stats",
+              "timestamp": "2026-09-16T11:45:18.182Z",
+              "args_summary": null,
+              "result_summary": "## Session Stats\nActive session: 3 tool calls\n\nNo past sessions recorded yet.\n"
+            }
+          ],
+          "project": "ltmrs",
+          "guides_used": [],
+          "memories_accessed": [],
+          "memories_created": [],
+          "ended_at": "2026-09-16T11:45:18.335Z",
+          "duration_tool_calls": 4,
+          "technologies": []
+        }
+      ]
+    }
+  },
+  "jsonrpc": "2.0",
+  "id": 293061457
+}

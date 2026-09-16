@@ -1,0 +1,8 @@
+{
+  "captured_at": "2026-09-16T12:22:22.944Z",
+  "lemma_commit": "d30a816632d0bc5d92907cbc51c1dc1010111986",
+  "lemma_version": "0.21.0",
+  "node_version": "v26.8.2",
+  "mcp_sdk_version": "1.29.0",
+  "sandbox_home": "vendor/lemma-sandbox/home"
+}

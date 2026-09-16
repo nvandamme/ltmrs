@@ -78,8 +78,22 @@ CLI tools: `ccc init`, `ccc index`, `ccc search`. The index lives in `.cocoindex
 - Conventional commit tags on the first line (`feat:`, `fix:`, `refactor:`, `chore:`,
   `docs:`) followed by a short summary; full changelog in the body.
 - ALWAYS use `--no-pager` with git commands (e.g., `git --no-pager diff`, `git --no-pager log`).
-- Never amend or rewrite published history; never force-push.
+- Never amend or rewrite published history; never force-push (unless the user explicitly
+  authorizes a specific history rewrite).
 - Do not commit unless explicitly asked.
+- **NO COMMIT SPREE (STRICT)**: one reviewed, coherent commit per logical unit of work.
+  Review the change against the plan/spec BEFORE committing — never commit first and
+  patch in a follow-up commit. If a review uncovers gaps, fold them into the same
+  commit (amend while unpublished) instead of stacking fix-ups.
+
+## Tracking Rules
+
+- On all markdown tracker files, content before `---` is instructions and should not
+  be modified. Only add content after the `---` line. Do not introduce new `---`
+  separators, sections, or headings unless explicitly instructed.
+- Use `TODO.md` for planned work, implementation plans, and backlog notes.
+- Use `DONE.md` for work completed on the current unreleased commit (after `## Unreleased Commit`).
+- Use `CHANGELOG.md` for work completed on previous commits, grouped by commit.
 
 ## Temporary Files and Scratch Space
 

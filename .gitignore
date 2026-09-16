@@ -3,6 +3,10 @@
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 
+# Upstream checkout + sandbox (external dep; pinned by baseline/upstream-lock.json)
+/vendor/lemma/
+/vendor/lemma-sandbox/
+
 # Scratch space (see AGENTS.md)
 /tmp/
 

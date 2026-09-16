@@ -1,0 +1,48 @@
+{
+  "schema": "ltmrs.deviation-ledger/1",
+  "status": "proposed",
+  "note": "WP-00 proposed ledger. Each entry records an intentional ltmrs deviation from pinned Lemma 0.21.0 behavior. A consumer needing exact upstream behavior uses a reference profile or upstream; these are not silent.",
+  "baseline": {
+    "repository": "xenitV1/lemma",
+    "version": "0.21.0",
+    "commit": "d30a816632d0bc5d92907cbc51c1dc1010111986"
+  },
+  "deviations": [
+    {
+      "id": "DEV-001",
+      "class": "retrieval",
+      "tool": "semantic_search",
+      "upstream_behavior": "TF-IDF lexical ranking only; scores are raw TF-IDF/RRF values.",
+      "ltmrs_behavior": "Dense Candle embeddings + hybrid lexical/dense RRF + graph-aware context + calibrated scoring.",
+      "reason": "Intentional retrieval enhancement (Part I 10.3, 11.2).",
+      "user_visible_impact": "Different result ordering and score interpretation; no byte-identical equivalence.",
+      "test": "T-RANK-01, T-RANK-02, T-QUALITY-01",
+      "release_wording": "Complete supported Lemma API/workflow surface with documented retrieval enhancements.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-002",
+      "class": "security",
+      "tool": "memory_add",
+      "upstream_behavior": "confirm=true stores a fragment verbatim despite secret detection.",
+      "ltmrs_behavior": "Policy-dependent: approved legacy policy preserves the override; a stricter policy rejects it explicitly.",
+      "reason": "Security hardening must be named, never silent redaction (Part I 12.1).",
+      "user_visible_impact": "Under a strict policy, confirm=true may be rejected with a policy error.",
+      "test": "T-MCP-04, T-SEC-04",
+      "release_wording": "Secret detection is best-effort; verbatim override is policy-gated and documented.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-003",
+      "class": "concurrency",
+      "tool": "session_*",
+      "upstream_behavior": "Daemon-global current virtual session (single currentVirtualSession).",
+      "ltmrs_behavior": "Sessions bound to authenticated frontend channels; no daemon-global current session.",
+      "reason": "RV-05: multi-agent correctness requires per-channel session isolation.",
+      "user_visible_impact": "Concurrent independent frontends stay isolated; legacy single-client behavior preserved per channel.",
+      "test": "T-SESS-01, T-SESS-02",
+      "release_wording": "Session isolation across concurrent frontends; per-channel legacy semantics retained.",
+      "approval": "pending"
+    }
+  ]
+}

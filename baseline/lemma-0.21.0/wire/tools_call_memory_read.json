@@ -1,0 +1,52 @@
+{
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "## Memory Fragments (ltmrs)\n---\n[seed_html_output_strategy] [global] HTML vs Markdown Output Strategy — Context-aware format selection: use HTML for complex specs/diagrams/reports, Markdown for quick answers/code edits. Default: Markdown.\n[seed_clean_code_modern] [global] Modern Clean Code (Agentic Era) — Updated clean code for AI-assisted dev. SRP as context isolation, pragmatic DRY, LOB, type safety.\n[seed_prompt_engineering] [global] Prompt Engineering Principles — System prompt structure, XML tag usage, anti-hallucination, parallel agent design, verbosity control.\n[seed_task_complexity] [global] Task Complexity Assessment — Evaluate complexity before acting. Simple: execute directly. Complex: plan → evaluate → execute.\n---\nShowing top 4 fragments (ranked by relevance). Use query parameter to search, or id for a specific fragment.\n\n---\n**[Lemma] Session started** (vs_mu42m9xe). When you finish this task, call session_end with outcome and lessons. Use memory_add to persist insights, guide_practice to track skill usage."
+      }
+    ],
+    "structuredContent": {
+      "count": 4,
+      "total": 4,
+      "fragments": [
+        {
+          "id": "seed_html_output_strategy",
+          "title": "HTML vs Markdown Output Strategy",
+          "description": "Context-aware format selection: use HTML for complex specs/diagrams/reports, Markdown for quick answers/code edits. Default: Markdown.",
+          "type": "pattern",
+          "confidence": 1,
+          "project": null
+        },
+        {
+          "id": "seed_clean_code_modern",
+          "title": "Modern Clean Code (Agentic Era)",
+          "description": "Updated clean code for AI-assisted dev. SRP as context isolation, pragmatic DRY, LOB, type safety.",
+          "type": "fact",
+          "confidence": 1,
+          "project": null
+        },
+        {
+          "id": "seed_prompt_engineering",
+          "title": "Prompt Engineering Principles",
+          "description": "System prompt structure, XML tag usage, anti-hallucination, parallel agent design, verbosity control.",
+          "type": "fact",
+          "confidence": 1,
+          "project": null
+        },
+        {
+          "id": "seed_task_complexity",
+          "title": "Task Complexity Assessment",
+          "description": "Evaluate complexity before acting. Simple: execute directly. Complex: plan → evaluate → execute.",
+          "type": "pattern",
+          "confidence": 1,
+          "project": null
+        }
+      ],
+      "has_more": false,
+      "next_offset": null
+    }
+  },
+  "jsonrpc": "2.0",
+  "id": 915888904
+}

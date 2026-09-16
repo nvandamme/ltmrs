@@ -2,5 +2,42 @@
 name = "ltmrs"
 version = "0.1.0"
 edition = "2024"
+description = "Local MCP memory service for LLM agents (Lemma 0.21.0-compatible)."
+license = "MIT OR Apache-2.0"
 
+# WP-00 candidate dependency set (AD-02). Pinned for the backend comparison
+# (WP-02). CPU-first, offline-capable: no GPU features, no cloud features.
+# See baseline/lemma-0.21.0/dependency-native-audit.md for the native-code audit.
 [dependencies]
+# MCP protocol (frontend stdio boundary + daemon dispatcher).
+# server feature gives the stdio/async-rw transports; avoid auth/reqwest (C code).
+rmcp = { version = "3.4.0", default-features = false, features = ["server", "transport-async-rw"] }
+
+# Candidate A: LanceDB canonical + retrieval (Lance engine).
+# default-features=false: no cloud/object-store/GPU. zstd (C) is unavoidable.
+# NOTE (WP-00 finding): lancedb 0.38.0 does not compile without `remote` —
+# `pub mod job` is unconditional but `Error::Http` is `remote`-gated. Enabling
+# `remote` pulls reqwest/http/urlencoding (unused in local mode). See
+# baseline/lemma-0.21.0/dependency-native-audit.md.
+lancedb = { version = "0.38.0", default-features = false, features = ["remote"] }
+lance = { version = "11.0.0", default-features = false }
+
+# Candidate B: Fjall canonical KV (pure Rust, no native deps).
+fjall = { version = "3.1.10" }
+
+# Candle embeddings (CPU). default features = CPU baseline; onig_sys (C) is a
+# hard transitive dep via tokenizers. Do NOT enable cuda/metal/mkl.
+candle-core = { version = "0.11.0" }
+candle-nn = { version = "0.11.0" }
+candle-transformers = { version = "0.11.0" }
+# Match candle-core 0.11.0's tokenizers to avoid a duplicate version in the graph.
+tokenizers = { version = "0.22.2" }
+
+# Core async runtime + utilities.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v7", "serde"] }
+anyhow = "1"
