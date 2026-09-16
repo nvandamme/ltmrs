@@ -1,0 +1,6 @@
+# Working baseline for development. AD-02 (exact toolchain lock) is closed by
+# WP-00 with the reproducible CPU build; update this file when it lands.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

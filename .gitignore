@@ -1,0 +1,20 @@
+/target
+
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+# Scratch space (see AGENTS.md)
+/tmp/
+
+# Generated reports; release evidence is archived separately
+/reports/
+
+# Experiment artifacts (experiments/ itself is tracked)
+/experiments/**/artifacts/
+/experiments/**/data/
+
+# Local stores, backups and model artifacts never enter version control
+/.ltmrs-stores/
+*.lemma-backup
+*.ltmrs-backup
+/models-cache/

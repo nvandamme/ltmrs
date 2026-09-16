@@ -1,0 +1,451 @@
+{
+  "baseline": {
+    "repository": "xenitV1/lemma",
+    "version": "0.21.0",
+    "commit": "d30a816632d0bc5d92907cbc51c1dc1010111986"
+  },
+  "status": "planned_inventory_not_wire_capture",
+  "expected_tool_count": 29,
+  "tools": [
+    {
+      "name": "memory_read",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_add",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08",
+      "special_cases": [
+        "confirm=false default redaction policy",
+        "confirm=true verbatim-storage override or explicit documented policy rejection",
+        "evidence provenance and snippet privacy policy"
+      ]
+    },
+    {
+      "name": "memory_update",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_feedback",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_forget",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_merge",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_relate",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_stats",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_audit",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "memory_library",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-08"
+    },
+    {
+      "name": "guide_get",
+      "family": "guides",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "guide_practice",
+      "family": "guides",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "guide_create",
+      "family": "guides",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "guide_distill",
+      "family": "guides",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "guide_update",
+      "family": "guides",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "guide_forget",
+      "family": "guides",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "guide_merge",
+      "family": "guides",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "session_start",
+      "family": "sessions",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "session_attempt",
+      "family": "sessions",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "session_end",
+      "family": "sessions",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "session_stats",
+      "family": "sessions",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "suggestion_respond",
+      "family": "sessions",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "conflict_scan",
+      "family": "intelligence",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "proactive_analysis",
+      "family": "intelligence",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "project_analytics",
+      "family": "intelligence",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "semantic_search",
+      "family": "intelligence",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-09"
+    },
+    {
+      "name": "backup_create",
+      "family": "backup",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-11"
+    },
+    {
+      "name": "backup_preview",
+      "family": "backup",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-11"
+    },
+    {
+      "name": "backup_restore",
+      "family": "backup",
+      "checks": {
+        "name_and_schema": "not_run",
+        "defaults_and_validation": "not_run",
+        "output_and_errors": "not_run",
+        "state_transitions": "not_run",
+        "scope_and_concurrency": "not_run",
+        "retry_and_restart": "not_run",
+        "legacy_oracle": "not_run",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-11"
+    }
+  ]
+}

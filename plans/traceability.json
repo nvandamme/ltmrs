@@ -1,0 +1,546 @@
+{
+  "plan_version": "2.0-review",
+  "date": "2026-09-15",
+  "status": "specification_not_implementation",
+  "review_findings": [
+    {
+      "id": "RV-01",
+      "severity": "BLOCKER",
+      "original_sections": "2-4, 14, 37, 42, 54, 57",
+      "finding": "A per-table commit was treated too much like an arbitrary multi-entity transaction.",
+      "resolution": "Require a supported local atomic command path, including its receipt, and snapshot-consistent readers. A crash-repairable partial canonical operation does not pass.",
+      "requirement": "RQ-01"
+    },
+    {
+      "id": "RV-02",
+      "severity": "BLOCKER",
+      "original_sections": "4, 38-42, 54",
+      "finding": "Weighted scores could compensate for a correctness failure.",
+      "resolution": "Use pass/fail correctness gates first. Compare performance and integration complexity only among passing candidates.",
+      "requirement": "RQ-02"
+    },
+    {
+      "id": "RV-03",
+      "severity": "HIGH",
+      "original_sections": "2, 17, 28, 37",
+      "finding": "Main-branch features, stable Rust APIs, and namespace/server APIs were conflated.",
+      "resolution": "Freeze release, feature set, source revision and local capability probes. A REST endpoint or format specification is not proof of embedded Rust support.",
+      "requirement": "RQ-03"
+    },
+    {
+      "id": "RV-04",
+      "severity": "BLOCKER",
+      "original_sections": "12, 29-30",
+      "finding": "A revision field alone does not prevent lost updates; unique IDs are not enforced merely by index metadata.",
+      "resolution": "Atomically compare revisions and absent keys, validate affected rows, and commit all results or none. Test duplicate ID/edge insertion and absent-key races.",
+      "requirement": "RQ-04"
+    },
+    {
+      "id": "RV-05",
+      "severity": "BLOCKER",
+      "original_sections": "5-8, 29, 32",
+      "finding": "Session ownership was not defined across frontends, reconnects and subagents.",
+      "resolution": "Bind implicit legacy sessions to authenticated frontend channels. Never use a daemon-global current session. Shared-channel subagents require explicit native binding or are documented as one legacy session.",
+      "requirement": "RQ-05"
+    },
+    {
+      "id": "RV-06",
+      "severity": "BLOCKER",
+      "original_sections": "29-33, 41",
+      "finding": "Retries, cancellation and lost responses had no durable operation contract.",
+      "resolution": "Store a scoped idempotency receipt with the canonical mutation; distinguish storage conflicts, stale user edits and unknown commit outcomes.",
+      "requirement": "RQ-06"
+    },
+    {
+      "id": "RV-07",
+      "severity": "BLOCKER",
+      "original_sections": "19, 29, 39, 47, 56",
+      "finding": "UUIDv7 IDs were implicitly being used as a safe ordered projection checkpoint.",
+      "resolution": "Use durable per-entity pending work and compare-and-clear acknowledgements. IDs are identities, not commit order.",
+      "requirement": "RQ-07"
+    },
+    {
+      "id": "RV-08",
+      "severity": "HIGH",
+      "original_sections": "3, 19-20, 28, 33, 47",
+      "finding": "Projection lag, stale results and missing embeddings were underspecified.",
+      "resolution": "Separate canonical durability, lexical freshness and semantic freshness; validate generation and document revision; never return an obsolete vector result as current.",
+      "requirement": "RQ-08"
+    },
+    {
+      "id": "RV-09",
+      "severity": "HIGH",
+      "original_sections": "16-19, 46",
+      "finding": "The model loader contract was too generic.",
+      "resolution": "Validate a pinned model recipe: architecture plus tokenizer, attention masks, pooling, prefixes, normalization and artifacts. E5-small declares BertModel but XLMRobertaTokenizer.",
+      "requirement": "RQ-09"
+    },
+    {
+      "id": "RV-10",
+      "severity": "HIGH",
+      "original_sections": "17-19, 46-47",
+      "finding": "One memory was assumed always to fit one embedding input.",
+      "resolution": "Preserve canonical memory identity but permit deterministic derived chunks; detect truncation and test queries whose answer lies beyond the first model window.",
+      "requirement": "RQ-10"
+    },
+    {
+      "id": "RV-11",
+      "severity": "HIGH",
+      "original_sections": "20-27, 44-45",
+      "finding": "Raw RRF/priority values and unit-scale cosine were combined in MMR without calibration.",
+      "resolution": "Keep an upstream-reference scorer for tests, normalize native relevance explicitly, bound graph and priority contributions, and calibrate on a held-out corpus.",
+      "requirement": "RQ-11"
+    },
+    {
+      "id": "RV-12",
+      "severity": "HIGH",
+      "original_sections": "13-15, 23-25",
+      "finding": "Graph integrity and the distinction between authoritative corrections and similarity bonuses were missing.",
+      "resolution": "Specify endpoint constraints, edge direction/symmetry, uniqueness, cycle policy and protected correction/conflict bundles.",
+      "requirement": "RQ-12"
+    },
+    {
+      "id": "RV-13",
+      "severity": "BLOCKER",
+      "original_sections": "20-28, 43-45",
+      "finding": "Filters could be applied only after retrieval or lost during graph expansion.",
+      "resolution": "Apply one effective scope to every retrieval leg and graph step; enforce current eligibility on hydration and backfill filtered candidates without silently claiming completeness.",
+      "requirement": "RQ-13"
+    },
+    {
+      "id": "RV-14",
+      "severity": "HIGH",
+      "original_sections": "20-28, 44-45",
+      "finding": "There was no no-answer policy or exact-identifier retrieval contract.",
+      "resolution": "Test empty/no-match queries, identifier-preserving tokenization and semantic false positives; never interpret nearest-neighbor rank as proof of relevance.",
+      "requirement": "RQ-14"
+    },
+    {
+      "id": "RV-15",
+      "severity": "BLOCKER",
+      "original_sections": "7-11, 48-49",
+      "finding": "Full compatibility was stated before actual wire and behavioral baselines existed.",
+      "resolution": "Freeze Lemma 0.21.0 by commit; capture tools, handlers, instructions, side effects, CLI and skill artifacts; maintain an explicit enhancement/deviation ledger.",
+      "requirement": "RQ-15"
+    },
+    {
+      "id": "RV-16",
+      "severity": "HIGH",
+      "original_sections": "12-15, 36, 50",
+      "finding": "The proposed domain and importer omitted nullable fields, evidence, archives and parts of guide/session history.",
+      "resolution": "Use a complete field inventory and loss-accounted import; preserve unknown legacy fields and external IDs; do not coerce unknown quality to zero.",
+      "requirement": "RQ-16"
+    },
+    {
+      "id": "RV-17",
+      "severity": "HIGH",
+      "original_sections": "31, 33, 48",
+      "finding": "Batching visible access counters/confidence can change Lemma behavior.",
+      "resolution": "Persist contract-visible read side effects before success; batch only semantically equivalent groups or explicitly lossy diagnostic telemetry.",
+      "requirement": "RQ-17"
+    },
+    {
+      "id": "RV-18",
+      "severity": "BLOCKER",
+      "original_sections": "33, 35, 41-42, 51",
+      "finding": "Durable-write latency excluded the cost that defines durability, and SIGKILL was overinterpreted.",
+      "resolution": "Include the durability barrier in ACK latency. Separate process-crash, storage-fault and modeled power-loss evidence.",
+      "requirement": "RQ-18"
+    },
+    {
+      "id": "RV-19",
+      "severity": "BLOCKER",
+      "original_sections": "35-36, 41, 50",
+      "finding": "Backup/restore lacked a complete consistent-cut and publication protocol.",
+      "resolution": "Snapshot all canonical state; bind confirmation to digest, store generation and state; stage, validate and atomically publish a restored generation.",
+      "requirement": "RQ-19"
+    },
+    {
+      "id": "RV-20",
+      "severity": "HIGH",
+      "original_sections": "5-6, 32, 34",
+      "finding": "Local IPC, path safety and query construction lacked a trust model.",
+      "resolution": "Use same-user authenticated IPC, private directories, an OS singleton lock, bounded framing, safe path opens and typed predicates.",
+      "requirement": "RQ-20"
+    },
+    {
+      "id": "RV-21",
+      "severity": "HIGH",
+      "original_sections": "34, 46, 56",
+      "finding": "Secret detection and Rust purity were described as absolutes.",
+      "resolution": "State bounded detection guarantees; audit feature-resolved native dependencies and model licenses; separate release runtime from test/import tooling.",
+      "requirement": "RQ-21"
+    },
+    {
+      "id": "RV-22",
+      "severity": "HIGH",
+      "original_sections": "5, 16, 32, 51",
+      "finding": "Concurrent sessions had no queue, resource or fairness policy.",
+      "resolution": "Bound in-flight work and inference batches; reserve interactive capacity; define overload, cancellation and maintenance behavior.",
+      "requirement": "RQ-22"
+    },
+    {
+      "id": "RV-23",
+      "severity": "HIGH",
+      "original_sections": "38-45, 51, 54",
+      "finding": "Benchmarks lacked fair durability, arrival models, maintenance and confidence intervals.",
+      "resolution": "Use identical traces and durability; separate embeddings; measure queue time, tails, retries, lag and storage growth at steady state.",
+      "requirement": "RQ-23"
+    },
+    {
+      "id": "RV-24",
+      "severity": "HIGH",
+      "original_sections": "44-47, 52",
+      "finding": "GraphRAG was required to beat every baseline without defined labels or statistical criteria.",
+      "resolution": "Require no regression on protected cases and evaluate quality at a fixed context budget on frozen held-out labels. Improvements are empirical, not guaranteed.",
+      "requirement": "RQ-24"
+    },
+    {
+      "id": "RV-25",
+      "severity": "HIGH",
+      "original_sections": "9-11, 48-49, 52",
+      "finding": "Skill installation was confused with client discovery and reliable activation.",
+      "resolution": "Test installer ownership separately from each host client; preserve foreign files and do not claim installation forces an agent workflow.",
+      "requirement": "RQ-25"
+    },
+    {
+      "id": "RV-26",
+      "severity": "HIGH",
+      "original_sections": "36, 41, 50",
+      "finding": "Importing a live SQLite database read-only was treated as sufficient isolation.",
+      "resolution": "Read a supported coherent snapshot, accounting for WAL and sidecar state, and prove the original source is unchanged.",
+      "requirement": "RQ-26"
+    },
+    {
+      "id": "RV-27",
+      "severity": "MEDIUM",
+      "original_sections": "37, 52-55",
+      "finding": "Horizontal phases deferred conformance, recovery and user-visible validation.",
+      "resolution": "Build vertical slices with tests in each slice; freeze the contract first and prove atomicity before implementing the large tool surface.",
+      "requirement": "RQ-27"
+    },
+    {
+      "id": "RV-28",
+      "severity": "HIGH",
+      "original_sections": "1-57",
+      "finding": "The plan did not distinguish design decisions, verified facts, hypotheses and executed evidence.",
+      "resolution": "Every requirement has an owner work package, tests and an evidence status. This pack is a reviewed specification, not a tested implementation.",
+      "requirement": "RQ-28"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "RQ-01",
+      "title": "Atomic domain commands",
+      "contract": "A supported multi-entity mutation and its deduplication receipt publish atomically; canonical readers cannot see a partial operation.",
+      "owner_workpackage": "WP-02",
+      "tests": [
+        "T-STORE-01",
+        "T-STORE-02",
+        "T-REC-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-02",
+      "title": "Hard decision gates",
+      "contract": "A candidate failing correctness, offline packaging or license gates is ineligible regardless of throughput.",
+      "owner_workpackage": "WP-02",
+      "tests": [
+        "T-GATE-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-03",
+      "title": "Pinned capabilities",
+      "contract": "All adopted dependency features are identified by exact release/source and exercised through the selected local Rust API.",
+      "owner_workpackage": "WP-00",
+      "tests": [
+        "T-BUILD-01",
+        "T-STORE-03"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-04",
+      "title": "Revision and uniqueness enforcement",
+      "contract": "Conditional updates, create-if-absent, edge uniqueness and typed alias allocation are atomic under concurrency.",
+      "owner_workpackage": "WP-03",
+      "tests": [
+        "T-CONC-01",
+        "T-CONC-02",
+        "T-GRAPH-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-05",
+      "title": "Session isolation",
+      "contract": "Every call has a stable frontend channel and authorized session context; legacy implicit session state never crosses channels.",
+      "owner_workpackage": "WP-04",
+      "tests": [
+        "T-SESS-01",
+        "T-SESS-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-06",
+      "title": "Retry-safe effects",
+      "contract": "Retried logical commands within the documented replay window have one canonical effect; ambiguous outcomes are not blindly replayed as new work.",
+      "owner_workpackage": "WP-03",
+      "tests": [
+        "T-CONC-03",
+        "T-REC-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-07",
+      "title": "Projection convergence",
+      "contract": "Pending work is durable, versioned and acknowledged only by compare-and-clear after projection publication.",
+      "owner_workpackage": "WP-05",
+      "tests": [
+        "T-PROJ-01",
+        "T-PROJ-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-08",
+      "title": "Freshness contracts",
+      "contract": "Direct reads observe acknowledged writes; search never silently represents stale revisions or unavailable embeddings as complete current semantic results.",
+      "owner_workpackage": "WP-05",
+      "tests": [
+        "T-PROJ-03",
+        "T-SEARCH-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-09",
+      "title": "Model correctness",
+      "contract": "The selected Candle adapter matches a pinned reference recipe within documented numerical and retrieval tolerances.",
+      "owner_workpackage": "WP-06",
+      "tests": [
+        "T-EMB-01",
+        "T-EMB-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-10",
+      "title": "Long-memory handling",
+      "contract": "Long input produces explicit bounded chunking or a visible coverage limitation, never silent semantic loss.",
+      "owner_workpackage": "WP-06",
+      "tests": [
+        "T-EMB-03"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-11",
+      "title": "Calibrated ranking",
+      "contract": "Native score components share a documented scale; legacy scoring and enhanced scoring have separate evidence.",
+      "owner_workpackage": "WP-07",
+      "tests": [
+        "T-RANK-01",
+        "T-RANK-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-12",
+      "title": "Graph semantics",
+      "contract": "Graph mutations enforce endpoint/direction/uniqueness/cycle policy, and retrieval preserves corrections and unresolved conflicts.",
+      "owner_workpackage": "WP-03",
+      "tests": [
+        "T-GRAPH-01",
+        "T-GRAPH-02",
+        "T-RANK-03"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-13",
+      "title": "Scope enforcement",
+      "contract": "Scope, lifecycle, date/type filters and confidence eligibility apply to lexical, dense, graph, direct reads and generated context.",
+      "owner_workpackage": "WP-07",
+      "tests": [
+        "T-SCOPE-01",
+        "T-SCOPE-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-14",
+      "title": "Relevance and abstention",
+      "contract": "Exact identifiers remain retrievable; no-match queries may return no applicable memory; zero scores and NaNs do not enter rank fusion.",
+      "owner_workpackage": "WP-07",
+      "tests": [
+        "T-SEARCH-02",
+        "T-RANK-04"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-15",
+      "title": "Complete compatibility surface",
+      "contract": "Every pinned Lemma tool, schema, behavior, instruction path, command and applicable skill contract is tested or explicitly marked as a named deviation.",
+      "owner_workpackage": "WP-08",
+      "tests": [
+        "T-MCP-01",
+        "T-MCP-02",
+        "T-MCP-03",
+        "T-CLI-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-16",
+      "title": "Loss-accounted data model",
+      "contract": "Known fields, nullability, evidence, archives, guide dependencies and legacy history survive serialization and interchange.",
+      "owner_workpackage": "WP-01",
+      "tests": [
+        "T-DATA-01",
+        "T-IMPORT-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-17",
+      "title": "Observable bookkeeping",
+      "contract": "Read/access/feedback side effects visible in the compatibility contract are not silently made eventually consistent.",
+      "owner_workpackage": "WP-08",
+      "tests": [
+        "T-MCP-04"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-18",
+      "title": "Durability qualification",
+      "contract": "A durable ACK includes required storage barriers; process-crash and power-loss qualifications remain distinct.",
+      "owner_workpackage": "WP-02",
+      "tests": [
+        "T-REC-01",
+        "T-REC-03",
+        "T-BENCH-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-19",
+      "title": "Safe recovery and restore",
+      "contract": "A verified snapshot is restored through a coordinated generation switch; confirmation is digest/state/channel-bound and single use.",
+      "owner_workpackage": "WP-11",
+      "tests": [
+        "T-BACKUP-01",
+        "T-BACKUP-02",
+        "T-BACKUP-03"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-20",
+      "title": "Local security boundary",
+      "contract": "Only approved same-user frontends connect; inputs, paths, resource limits and dynamic context are treated as untrusted data.",
+      "owner_workpackage": "WP-04",
+      "tests": [
+        "T-SEC-01",
+        "T-SEC-02",
+        "T-SEC-03"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-21",
+      "title": "Auditable distribution",
+      "contract": "The CPU release requires no Python/Node/ONNX or C++ database engine; native exceptions and model rights are explicitly audited.",
+      "owner_workpackage": "WP-00",
+      "tests": [
+        "T-BUILD-01",
+        "T-SEC-04"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-22",
+      "title": "Bounded concurrency",
+      "contract": "Queues, snapshots, inference, maintenance and per-client load have bounded resources and documented overload behavior.",
+      "owner_workpackage": "WP-04",
+      "tests": [
+        "T-CONC-04",
+        "T-BENCH-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-23",
+      "title": "Reproducible benchmarks",
+      "contract": "Performance comparisons use equivalent guarantees, realistic traces, declared hardware and reproducible raw measurements.",
+      "owner_workpackage": "WP-12",
+      "tests": [
+        "T-BENCH-01",
+        "T-BENCH-02",
+        "T-BENCH-03"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-24",
+      "title": "Measured retrieval quality",
+      "contract": "Quality is judged at fixed result/context budgets on held-out labels, including multilingual, conflict, stale and no-answer cases.",
+      "owner_workpackage": "WP-12",
+      "tests": [
+        "T-QUALITY-01",
+        "T-QUALITY-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-25",
+      "title": "Skill and host conformance",
+      "contract": "Skill ownership, installation, discovery and workflow activation are distinct tests; foreign assets remain untouched.",
+      "owner_workpackage": "WP-10",
+      "tests": [
+        "T-SKILL-01",
+        "T-HOST-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-26",
+      "title": "Coherent import",
+      "contract": "The importer reads a coherent supported source snapshot, handles references explicitly, reports every loss, and does not modify the original source.",
+      "owner_workpackage": "WP-11",
+      "tests": [
+        "T-IMPORT-01",
+        "T-IMPORT-02"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-27",
+      "title": "Incremental delivery",
+      "contract": "Each slice has an end-to-end demonstration and regression evidence; no placeholder handler counts as implemented compatibility.",
+      "owner_workpackage": "WP-13",
+      "tests": [
+        "T-RELEASE-01"
+      ],
+      "status": "specified_not_executed"
+    },
+    {
+      "id": "RQ-28",
+      "title": "Evidence discipline",
+      "contract": "Planned, inspected, executed, passed, failed and waived statuses are never conflated; unrun benchmarks carry no invented values.",
+      "owner_workpackage": "WP-13",
+      "tests": [
+        "T-GATE-01",
+        "T-RELEASE-01"
+      ],
+      "status": "specified_not_executed"
+    }
+  ]
+}
