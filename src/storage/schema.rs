@@ -59,3 +59,20 @@ pub fn receipts_schema() -> Schema {
         Field::new("affected_ids", DataType::Utf8, false),
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schemas_are_well_formed() {
+        assert!(
+            memories_schema()
+                .fields()
+                .iter()
+                .all(|f| f.data_type() != &DataType::Null)
+        );
+        assert_eq!(relations_schema().fields().len(), 6);
+        assert_eq!(receipts_schema().fields().len(), 7);
+    }
+}

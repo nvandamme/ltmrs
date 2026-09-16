@@ -94,3 +94,43 @@ impl Relation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symmetry_and_direction() {
+        assert!(RelationType::Supports.is_symmetric());
+        assert!(RelationType::Contradicts.is_symmetric());
+        assert!(RelationType::RelatedTo.is_symmetric());
+        assert!(!RelationType::Supersedes.is_symmetric());
+        assert!(!RelationType::SupersededBy.is_symmetric());
+
+        // Supersession is directed; inverse is derived.
+        assert_eq!(
+            RelationType::Supersedes.inverse(),
+            RelationType::SupersededBy
+        );
+        assert_eq!(
+            RelationType::SupersededBy.inverse(),
+            RelationType::Supersedes
+        );
+        // Symmetric types invert to themselves.
+        assert_eq!(RelationType::Supports.inverse(), RelationType::Supports);
+    }
+
+    #[test]
+    fn roundtrip_string_forms() {
+        for t in [
+            RelationType::Supports,
+            RelationType::Contradicts,
+            RelationType::Supersedes,
+            RelationType::SupersededBy,
+            RelationType::RelatedTo,
+        ] {
+            assert_eq!(RelationType::parse(t.as_str()), Some(t));
+        }
+        assert_eq!(RelationType::parse("bogus"), None);
+    }
+}

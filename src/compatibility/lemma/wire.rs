@@ -85,3 +85,29 @@ pub struct LegacyImprovementSuggestion {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_memory_id: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_wire_preserves_null_and_absent() {
+        // quality_score null, project null, description absent => all stay None,
+        // never silently converted to a default (RQ-16 / T-DATA-01).
+        let json = r#"{
+            "id": "m1",
+            "title": "T",
+            "fragment": "F",
+            "project": null,
+            "confidence": 0.5,
+            "quality_score": null
+        }"#;
+        let f: LegacyMemoryFragment = serde_json::from_str(json).expect("parses");
+        assert_eq!(f.quality_score, None, "null quality stays None, not 0.0");
+        assert_eq!(f.project, None);
+        // description is absent in the input and must stay None.
+        assert_eq!(f.description, None);
+        assert_eq!(f.evidence, None);
+        assert_eq!(f.related_relations, None);
+    }
+}

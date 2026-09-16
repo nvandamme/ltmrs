@@ -137,6 +137,7 @@ impl ReferenceInterpreter {
             channel_id: ctx.channel_id,
             request_digest: ctx.request_digest.clone(),
             outcome,
+            retry_epoch: ctx.retry_epoch,
         })
     }
 
@@ -463,6 +464,9 @@ impl ReferenceInterpreter {
             ));
         }
 
+        for name in source_names {
+            self.guides.remove(name);
+        }
         self.guides.insert(result.name.clone(), result.clone());
         Ok(ReceiptOutcome::Success { affected: vec![] })
     }
@@ -543,6 +547,64 @@ mod tests {
     use crate::domain::memory::{FragmentType, MemorySource};
     use uuid::Uuid;
 
+    fn eid(n: u64) -> EntityId {
+        EntityId::new(Uuid::from_u128(n as u128))
+    }
+    fn opid(n: u64) -> OperationId {
+        OperationId::new(Uuid::from_u128((10_000 + n) as u128))
+    }
+    fn ctx(op: OperationId, digest: &str) -> CommandContext {
+        CommandContext {
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: FrontendId::new(Uuid::from_u128(1)),
+            channel_id: ChannelId::new(Uuid::from_u128(2)),
+            session: None,
+            operation_id: op,
+            request_digest: digest.to_string(),
+            deadline_millis: None,
+            scope: Scope::default(),
+            retry_epoch: 1,
+        }
+    }
+    fn mem(id: u64, alias: Option<&str>) -> Memory {
+        Memory {
+            id: eid(id),
+            external_alias: alias.map(ExternalAlias::new),
+            title: format!("t{id}"),
+            fragment: format!("f{id}"),
+            description: String::new(),
+            fragment_type: FragmentType::Fact,
+            project: None,
+            source: MemorySource::Ai,
+            confidence: 0.5,
+            quality_score: None,
+            lifecycle: MemoryLifecycle::Live,
+            tags: Vec::new(),
+            associated_with: Vec::new(),
+            relations: Vec::new(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            session_id: None,
+            task_type: None,
+            related_guides: Vec::new(),
+            evidence: Vec::new(),
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: EntityRevision::new(0),
+            document_revision: crate::domain::id::DocumentRevision::new(0),
+            eligibility_revision: crate::domain::id::EligibilityRevision::new(0),
+            created_at: Instant(0),
+            updated_at: Instant(0),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        }
+    }
+
     fn test_memory(id_num: u64) -> Memory {
         Memory {
             id: EntityId::new(Uuid::from_u128(id_num as u128)),
@@ -592,6 +654,7 @@ mod tests {
             request_digest: format!("digest-{op_num}"),
             deadline_millis: None,
             scope: Scope::default(),
+            retry_epoch: 1,
         }
     }
 
@@ -928,5 +991,163 @@ mod tests {
 
         let alias = interp.allocate_alias("abc123");
         assert_ne!(alias.as_str(), "abc123");
+    }
+
+    /// T-CONC-01 fixture: two writers at the same expected revision. Exactly
+    /// the permitted writer succeeds; the stale writer is rejected and its
+    /// intent is not silently reapplied.
+    #[test]
+    fn t_conc_01_single_writer_wins_at_same_revision() {
+        let mut it = ReferenceInterpreter::new(1, 0);
+        it.apply(
+            &ctx(opid(1), "d1"),
+            &DomainCommand::AddMemory {
+                memory: mem(1, None),
+                session: None,
+            },
+        )
+        .unwrap();
+        let id = eid(1);
+        let rev = it.memories.get(&id).unwrap().entity_revision;
+
+        // Writer A changes content at the current revision => revision advances.
+        let patch_a = MemoryPatch {
+            title: Some("updated-a".into()),
+            ..Default::default()
+        };
+        let a = it
+            .apply(
+                &ctx(opid(2), "da"),
+                &DomainCommand::UpdateMemory {
+                    id,
+                    expected_revision: Some(rev),
+                    patch: patch_a,
+                },
+            )
+            .unwrap();
+        assert!(matches!(a.outcome, ReceiptOutcome::Success { .. }));
+
+        // Writer B still holds the SAME (now stale) revision => must be rejected.
+        let patch_b = MemoryPatch {
+            title: Some("updated-b".into()),
+            ..Default::default()
+        };
+        let b = it
+            .apply(
+                &ctx(opid(3), "db"),
+                &DomainCommand::UpdateMemory {
+                    id,
+                    expected_revision: Some(rev),
+                    patch: patch_b,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(b.code, DomainErrorCode::RevisionConflict);
+
+        // The stale intent was NOT silently reapplied: revision advanced exactly once.
+        assert_eq!(it.memories.get(&id).unwrap().entity_revision, rev.next());
+    }
+
+    /// T-CONC-02 fixture: N independent sessions are all retained; a contested
+    /// create-if-absent for the same alias has exactly one winner.
+    #[test]
+    fn t_conc_02_independent_sessions_contested_alias_one_winner() {
+        let mut it = ReferenceInterpreter::new(1, 0);
+        for i in 0..32u64 {
+            let h = crate::domain::id::SessionHandle::new(Uuid::from_u128(1000 + i as u128));
+            let ch = crate::domain::id::ChannelId::new(Uuid::from_u128(2000 + i as u128));
+            it.register_session(h, ch, Some("task".into()), None);
+        }
+        assert_eq!(it.sessions.len(), 32);
+
+        let winner = it
+            .apply(
+                &ctx(opid(100), "w"),
+                &DomainCommand::AddMemory {
+                    memory: mem(1, Some("contested")),
+                    session: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(winner.outcome, ReceiptOutcome::Success { .. }));
+
+        let loser = it
+            .apply(
+                &ctx(opid(101), "l"),
+                &DomainCommand::AddMemory {
+                    memory: mem(2, Some("contested")),
+                    session: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(loser.code, DomainErrorCode::DuplicateAlias);
+    }
+
+    #[test]
+    fn guide_merge_removes_sources_and_forget_removes() {
+        use crate::domain::guide::Guide;
+        use crate::domain::memory::Instant;
+
+        let mut it = ReferenceInterpreter::new(1, 0);
+        for (i, g) in ["react", "hooks"].iter().enumerate() {
+            it.apply(
+                &ctx(opid(i as u64 + 1), &format!("g{}", i)),
+                &DomainCommand::GuidePractice {
+                    guide: g.to_string(),
+                    category: "web".into(),
+                    contexts: vec![],
+                    learnings: vec![],
+                    outcome: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // Merge react + hooks into "react-complete".
+        let now = it.clock.now_millis();
+        let result = Guide {
+            name: "react-complete".into(),
+            category: "web-frontend".into(),
+            description: String::new(),
+            contexts: vec![],
+            learnings: vec![],
+            usage_count: 0,
+            last_used: None,
+            success_count: 0,
+            failure_count: 0,
+            anti_patterns: vec![],
+            pitfalls: vec![],
+            depends_on: vec![],
+            enables: vec![],
+            source_memories: vec![],
+            validated_by: vec![],
+            superseded_by: None,
+            deprecated: false,
+            entity_revision: EntityRevision::new(1),
+            created_at: Instant::new(now),
+            updated_at: Instant::new(now),
+        };
+        it.apply(
+            &ctx(opid(10), "gm"),
+            &DomainCommand::GuideMerge {
+                source_names: vec!["react".into(), "hooks".into()],
+                result,
+            },
+        )
+        .unwrap();
+        // Sources removed, merged guide present.
+        assert!(!it.guides.contains_key("react"));
+        assert!(!it.guides.contains_key("hooks"));
+        assert!(it.guides.contains_key("react-complete"));
+
+        // Forget the merged guide.
+        it.apply(
+            &ctx(opid(11), "gf"),
+            &DomainCommand::GuideForget {
+                name: "react-complete".into(),
+            },
+        )
+        .unwrap();
+        assert!(!it.guides.contains_key("react-complete"));
     }
 }

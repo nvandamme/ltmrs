@@ -121,16 +121,16 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### Tasks
 
-- [ ] Check out Lemma commit `d30a816632d0bc5d92907cbc51c1dc1010111986`; verify package version 0.21.0 and license.
-- [ ] Capture package lock, Node/runtime version, upstream config defaults, source schema versions and asset hashes.
-- [ ] Build the pinned upstream in an isolated development environment; do not point it at the user's home or production store.
-- [ ] Generate the static tool definitions from the built module; compare against the expected 29-name inventory.
-- [ ] Capture real `initialize`, `tools/list`, `tools/call` and relevant notifications, including text plus structured results and errors.
-- [ ] Inventory instructions, tool-description injection, virtual sessions, skill content/installer, CLI options, visualizer routes and backup formats.
-- [ ] Record which observed behaviors are schema-documented, handler-defined, side effects, or apparent upstream defects. Do not copy a safety defect merely to make an exact-output test pass.
-- [ ] Resolve a local published LanceDB/Fjall/Candle/rmcp dependency set; pin Cargo.lock and the actual toolchain. Use no `latest`, mutable Git branch or prerelease-only API in a release claim.
-- [ ] Audit features, `links` crates, build scripts, C/C++/assembly dependencies and model licenses; distinguish build tools, optional import helper, CPU runtime and GPU runtime.
-- [ ] Establish sandbox home, deterministic clock/IDs where possible, fixtures and documentation conventions.
+- [x] Check out Lemma commit `d30a816632d0bc5d92907cbc51c1dc1010111986`; verify package version 0.21.0 and license.
+- [x] Capture package lock, Node/runtime version, upstream config defaults, source schema versions and asset hashes.
+- [x] Build the pinned upstream in an isolated development environment; do not point it at the user's home or production store.
+- [x] Generate the static tool definitions from the built module; compare against the expected 29-name inventory.
+- [x] Capture real `initialize`, `tools/list`, `tools/call` and relevant notifications, including text plus structured results and errors.
+- [x] Inventory instructions, tool-description injection, virtual sessions, skill content/installer, CLI options, visualizer routes and backup formats.
+- [x] Record which observed behaviors are schema-documented, handler-defined, side effects, or apparent upstream defects. Do not copy a safety defect merely to make an exact-output test pass.
+- [x] Resolve a local published LanceDB/Fjall/Candle/rmcp dependency set; pin Cargo.lock and the actual toolchain. Use no `latest`, mutable Git branch or prerelease-only API in a release claim.
+- [x] Audit features, `links` crates, build scripts, C/C++/assembly dependencies and model licenses; distinguish build tools, optional import helper, CPU runtime and GPU runtime.
+- [x] Establish sandbox home, deterministic clock/IDs where possible, fixtures and documentation conventions.
 
 **Outputs:** `upstream-lock.json`, static and live tool snapshots, default-config inventory, dependency/native-code report, proposed `deviations.json`.
 
@@ -203,16 +203,16 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### Tasks
 
-- [ ] Implement migrations with version checks, staging/safety rules and refusal of unknown/newer incompatible schemas.
+- [x] Implement migrations with version checks, staging/safety rules and refusal of unknown/newer incompatible schemas.
 - [x] Centralize command application, precondition validation and atomic receipt storage.
-- [ ] Add scoped operation IDs and request digests; implement fixed-expiry daemon-issued retry namespaces, receipt retention, and stale replay rejection across reconnect/restart.
+- [x] Add scoped operation IDs and request digests; implement fixed-expiry daemon-issued retry namespaces, receipt retention, and stale replay rejection across reconnect/restart.
 - [x] Separate storage conflict retries from stale edit conflicts and unknown commit outcomes.
 - [x] Enforce memory/alias/edge uniqueness and referential/lifecycle invariants.
 - [x] Make supersession checks safe against simultaneous cycle-forming insertions, including predicate dependencies or a scope-wide graph-mutation lock held through publication; merging components must not defeat lock coverage.
-- [ ] Specify deletion effects on adjacency, evidence, guide links, receipt history and pending projections.
+- [x] Specify deletion effects on adjacency, evidence, guide links, receipt history and pending projections.
 - [x] Provide snapshot-consistent multi-get, graph-neighbor and export traversal APIs.
-- [ ] Persist compatibility-visible feedback/access effects correctly; separate diagnostic telemetry from domain state.
-- [ ] Add fault injection around commit, receipt publication and migration steps.
+- [x] Persist compatibility-visible feedback/access effects correctly; separate diagnostic telemetry from domain state.
+- [x] Add fault injection around commit, receipt publication and migration steps.
 
 **Outputs:** selected repository, migration runner, durable command gateway, crash-stable receipt lookup, domain inspector.
 

@@ -17,4 +17,3 @@ pub mod memory;
 pub mod project;
 pub mod relation;
 pub mod session;
-pub mod wire;

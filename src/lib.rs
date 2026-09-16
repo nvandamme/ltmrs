@@ -1,3 +1,15 @@
-pub mod canonical;
+pub mod compatibility;
+pub mod config;
+pub mod daemon;
 pub mod domain;
+pub mod embeddings;
+pub mod error;
+pub mod frontend;
+pub mod interchange;
+pub mod projection;
+pub mod retrieval;
+pub mod search;
+pub mod service;
+pub mod skills;
 pub mod storage;
+pub mod visualizer;

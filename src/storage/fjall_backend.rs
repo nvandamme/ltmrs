@@ -407,6 +407,7 @@ fn receipt_from_record(record: &ReceiptRecord) -> DomainResult<CommandReceipt> {
         channel_id: crate::domain::id::ChannelId::new(uuid::Uuid::nil()),
         request_digest: record.request_digest.clone(),
         outcome,
+        retry_epoch: 0,
     })
 }
 
@@ -586,5 +587,113 @@ mod tests {
         let updated = results.iter().filter(|r| **r == 1).count();
         eprintln!("Fjall bounded retry: {updated}/8 writers updated (contention resolved)");
         assert!(updated >= 1, "at least one writer must succeed");
+    }
+
+    #[test]
+    fn insert_if_absent_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FjallBackend::open(dir.path().to_str().unwrap()).unwrap();
+
+        assert!(
+            be.create_memory_if_absent(eid(1), "t1", "f1", 0.5, 1)
+                .unwrap()
+        );
+        assert!(
+            !be.create_memory_if_absent(eid(1), "t1-dup", "f1", 0.5, 1)
+                .unwrap()
+        );
+
+        let rec = be.read_memory(eid(1)).unwrap().unwrap();
+        assert_eq!(rec.title, "t1", "the original value is retained");
+    }
+
+    #[test]
+    fn conditional_edit_stale_revision_updates_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = FjallBackend::open(dir.path().to_str().unwrap()).unwrap();
+        be.create_memory_if_absent(eid(1), "t1", "f1", 0.5, 1)
+            .unwrap();
+
+        assert_eq!(
+            be.update_memory_conditional(eid(1), 1, "t1-new", 2)
+                .unwrap(),
+            1
+        );
+        // Stale revision (still 1, but it's now 2) => 0 rows updated.
+        assert_eq!(
+            be.update_memory_conditional(eid(1), 1, "t1-stale", 3)
+                .unwrap(),
+            0,
+            "stale revision must not update"
+        );
+    }
+
+    #[test]
+    fn concurrent_stale_revision_updates_one_winner() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let be = Arc::new(FjallBackend::open(dir.path().to_str().unwrap()).unwrap());
+        be.create_memory_if_absent(eid(1), "t1", "f1", 0.5, 1)
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for winner in 0..4 {
+            let be = Arc::clone(&be);
+            handles.push(std::thread::spawn(move || {
+                be.update_memory_conditional(eid(1), 1, &format!("winner{winner}"), 2)
+                    .unwrap()
+            }));
+        }
+        let results: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let successes = results.iter().filter(|&&x| x == 1).count();
+        assert_eq!(successes, 1, "exactly one concurrent update should win");
+        assert!(results.contains(&0), "stale writers must update 0 rows");
+
+        // The committed revision is exactly 2 (the winner's value).
+        let rec = be.read_memory(eid(1)).unwrap().unwrap();
+        assert_eq!(rec.entity_revision, 2);
+    }
+
+    #[test]
+    fn merge_races_with_concurrent_source_update() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let be = Arc::new(FjallBackend::open(dir.path().to_str().unwrap()).unwrap());
+        be.create_memory_if_absent(eid(1), "A", "fa", 0.5, 1)
+            .unwrap();
+        be.create_memory_if_absent(eid(2), "B", "fb", 0.5, 1)
+            .unwrap();
+
+        // A concurrent writer bumps source A's revision while a merge runs.
+        let barrier = Arc::new(Barrier::new(2));
+        let merge_be = Arc::clone(&be);
+        let merge_barrier = Arc::clone(&barrier);
+        let merge_handle = std::thread::spawn(move || {
+            merge_barrier.wait();
+            merge_be
+                .merge_memories(eid(3), "C", "fc", &[eid(1), eid(2)], 1)
+                .unwrap()
+        });
+        // Release both writers simultaneously, then race an update on source A.
+        barrier.wait();
+        let _ = be.update_memory_conditional(eid(1), 1, "A-raced", 2);
+
+        merge_handle.join().unwrap();
+
+        // Atomicity invariant (T-STORE-01): the merge is all-or-nothing.
+        // If result C exists, BOTH sources must be archived — never one.
+        let c = be.read_memory(eid(3)).unwrap();
+        let a = be.read_memory(eid(1)).unwrap();
+        let b = be.read_memory(eid(2)).unwrap();
+        let a_archived = a.as_ref().map(|r| r.lifecycle.as_str()) == Some("archived");
+        let b_archived = b.as_ref().map(|r| r.lifecycle.as_str()) == Some("archived");
+        match (c.is_some(), a_archived, b_archived) {
+            (true, true, true) => {}
+            (false, false, false) => {}
+            other => panic!(
+                "partial merge observed: c={:?} a_archived={:?} b_archived={:?}",
+                other.0, other.1, other.2
+            ),
+        }
     }
 }

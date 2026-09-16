@@ -20,6 +20,16 @@ impl TaskOutcome {
             TaskOutcome::Abandoned => "abandoned",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "success" => TaskOutcome::Success,
+            "partial" => TaskOutcome::Partial,
+            "failure" => TaskOutcome::Failure,
+            "abandoned" => TaskOutcome::Abandoned,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -27,6 +37,25 @@ pub enum AttemptOutcome {
     Rejected,
     Partial,
     Promising,
+}
+
+impl AttemptOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttemptOutcome::Rejected => "rejected",
+            AttemptOutcome::Partial => "partial",
+            AttemptOutcome::Promising => "promising",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "rejected" => AttemptOutcome::Rejected,
+            "partial" => AttemptOutcome::Partial,
+            "promising" => AttemptOutcome::Promising,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -90,10 +119,53 @@ pub enum SuggestionStatus {
     Dismissed,
 }
 
+impl SuggestionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SuggestionStatus::Pending => "pending",
+            SuggestionStatus::Accepted => "accepted",
+            SuggestionStatus::Dismissed => "dismissed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => SuggestionStatus::Pending,
+            "accepted" => SuggestionStatus::Accepted,
+            "dismissed" => SuggestionStatus::Dismissed,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Suggestion {
     pub id: u64,
     pub memory_id: EntityId,
     pub suggestion: String,
     pub status: SuggestionStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enums_roundtrip() {
+        assert_eq!(TaskOutcome::parse("success"), Some(TaskOutcome::Success));
+        assert_eq!(TaskOutcome::parse("nope"), None);
+        assert_eq!(
+            AttemptOutcome::parse("rejected"),
+            Some(AttemptOutcome::Rejected)
+        );
+        assert_eq!(SuggestionStatus::Pending.as_str(), "pending");
+        for v in [
+            TaskOutcome::Success,
+            TaskOutcome::Partial,
+            TaskOutcome::Failure,
+            TaskOutcome::Abandoned,
+        ] {
+            assert_eq!(TaskOutcome::parse(v.as_str()), Some(v));
+        }
+    }
 }

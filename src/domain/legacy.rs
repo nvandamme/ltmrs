@@ -197,3 +197,38 @@ pub fn all_mappings() -> Vec<&'static FieldMapping> {
 pub fn classify_unknown_field(_field: &str) -> FieldDestination {
     FieldDestination::Envelope
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_known_field_has_a_destination() {
+        for m in all_mappings() {
+            assert!(
+                !matches!(m.destination, FieldDestination::LossReport)
+                    || m.legacy_field == "outcome",
+                "unexpected loss report for {}",
+                m.legacy_field
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_fields_go_to_envelope() {
+        assert_eq!(
+            classify_unknown_field("some_future_field"),
+            FieldDestination::Envelope
+        );
+    }
+
+    #[test]
+    fn quality_score_is_canonical_optional() {
+        let m = MEMORY_FIELDS
+            .iter()
+            .find(|m| m.legacy_field == "quality_score")
+            .unwrap();
+        assert_eq!(m.destination, FieldDestination::Canonical);
+        assert_eq!(m.canonical_field, Some("quality_score"));
+    }
+}

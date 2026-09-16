@@ -27,6 +27,8 @@ pub(crate) struct CommandState<'a> {
     memories: &'a OptimisticTxKeyspace,
     relations: &'a OptimisticTxKeyspace,
     aliases: &'a OptimisticTxKeyspace,
+    projections: &'a OptimisticTxKeyspace,
+    feedback_events: &'a OptimisticTxKeyspace,
 }
 
 impl<'a> CommandState<'a> {
@@ -35,12 +37,16 @@ impl<'a> CommandState<'a> {
         memories: &'a OptimisticTxKeyspace,
         relations: &'a OptimisticTxKeyspace,
         aliases: &'a OptimisticTxKeyspace,
+        projections: &'a OptimisticTxKeyspace,
+        feedback_events: &'a OptimisticTxKeyspace,
     ) -> Self {
         Self {
             tx,
             memories,
             relations,
             aliases,
+            projections,
+            feedback_events,
         }
     }
 
@@ -126,6 +132,21 @@ impl<'a> CommandState<'a> {
         }
         Ok(to_remove.len())
     }
+
+    /// Record a pending projection (embedding not yet computed) for a memory.
+    fn record_pending_projection(&mut self, id: EntityId) -> DomainResult<()> {
+        let key = id.as_uuid().to_string();
+        self.tx.insert(self.projections, key, b"pending");
+        Ok(())
+    }
+
+    /// Invalidate a memory's pending projection so a delayed worker cannot
+    /// resurrect or index a deleted/invalidated/archived memory.
+    fn invalidate_projection(&mut self, id: EntityId) -> DomainResult<()> {
+        let key = id.as_uuid().to_string();
+        self.tx.remove(self.projections, key);
+        Ok(())
+    }
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> DomainResult<Vec<u8>> {
@@ -140,7 +161,7 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> DomainResult<T> {
 
 pub(crate) fn apply_command(
     state: &mut CommandState<'_>,
-    _ctx: &CommandContext,
+    ctx: &CommandContext,
     cmd: &DomainCommand,
 ) -> DomainResult<ReceiptOutcome> {
     match cmd {
@@ -150,7 +171,9 @@ pub(crate) fn apply_command(
             expected_revision,
             patch,
         } => apply_update_memory(state, *id, *expected_revision, patch),
-        DomainCommand::Feedback { memory_id, useful } => apply_feedback(state, *memory_id, *useful),
+        DomainCommand::Feedback { memory_id, useful } => {
+            apply_feedback(state, ctx, *memory_id, *useful)
+        }
         DomainCommand::Relate { relation } => apply_relate(state, relation),
         DomainCommand::Unrelate {
             source,
@@ -187,6 +210,10 @@ fn apply_add_memory(state: &mut CommandState<'_>, memory: &Memory) -> DomainResu
     if let Some(alias) = &memory.external_alias {
         state.put_alias(alias, memory.id)?;
     }
+    // Atomic write set (design §5.3 Add memory row): memory + alias + pending
+    // projection. No acknowledged memory is left unindexable without a tracked
+    // work item.
+    state.record_pending_projection(memory.id)?;
     Ok(ReceiptOutcome::Success {
         affected: vec![memory.id],
     })
@@ -254,6 +281,7 @@ fn apply_update_memory(
 
 fn apply_feedback(
     state: &mut CommandState<'_>,
+    ctx: &CommandContext,
     memory_id: EntityId,
     useful: bool,
 ) -> DomainResult<ReceiptOutcome> {
@@ -261,6 +289,8 @@ fn apply_feedback(
         .get_memory(memory_id)?
         .ok_or_else(|| DomainError::new(DomainErrorCode::NotFound, "memory not found"))?;
 
+    // Domain state: the observable counters and confidence are the
+    // compatibility-visible effects, persisted atomically with the command.
     if useful {
         memory.positive_feedback += 1;
         memory.confidence = (memory.confidence + 0.01).min(1.0);
@@ -268,8 +298,28 @@ fn apply_feedback(
         memory.negative_feedback += 1;
         memory.confidence = (memory.confidence - 0.05).max(0.0);
     }
-
     state.put_memory(&memory)?;
+
+    // Diagnostic telemetry: the feedback event log is separate from domain
+    // state. One logical feedback produces exactly one event, keyed by the
+    // operation so a replay cannot double-record it. The event ID is a
+    // deterministic derivation of the operation ID (distinct namespace bit).
+    let op_uuid = ctx.operation_id.as_uuid();
+    let op_bytes = op_uuid.as_bytes();
+    let mut event_uuid_bytes = [0u8; 16];
+    for i in 0..16 {
+        event_uuid_bytes[i] = op_bytes[i] ^ 0xF0;
+    }
+    let event = crate::domain::session::FeedbackEvent {
+        id: EntityId::new(uuid::Uuid::from_bytes(event_uuid_bytes)),
+        memory_id,
+        useful,
+        timestamp: Instant::new(0),
+    };
+    let key = format!("feedback:{}", ctx.operation_id.as_uuid());
+    let raw = encode(&event)?;
+    state.tx.insert(state.feedback_events, key, &raw);
+
     Ok(ReceiptOutcome::Success {
         affected: vec![memory_id],
     })
@@ -370,11 +420,19 @@ fn apply_forget(
     };
     memory.advance_eligibility();
 
-    // Hard deletion severs adjacency; invalidation/archival preserve edges as
-    // history. A deleted memory's edges must not be traversable.
+    // Deletion effects (design §5.3 Forget/invalidate row):
+    // - Adjacency: hard delete severs edges; invalidation/archival preserve them
+    //   as history so a deleted memory's edges are not traversable.
+    // - Evidence + guide links: preserved on the tombstone record for audit and
+    //   explicit history reads; never silently discarded.
+    // - Receipt history: receipts are stored in a separate keyspace and are
+    //   never removed by forget — a deleted operation stays auditable.
+    // - Pending projections: invalidated so a delayed embedding worker cannot
+    //   resurrect or index a deleted/invalidated/archived memory.
     if matches!(mode, crate::domain::command::ForgetMode::Delete) {
         state.remove_edges_involving(id)?;
     }
+    state.invalidate_projection(id)?;
 
     state.put_memory(&memory)?;
     Ok(ReceiptOutcome::Success { affected: vec![id] })

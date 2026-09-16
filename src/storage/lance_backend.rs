@@ -442,6 +442,7 @@ fn receipt_from_batch(batch: &RecordBatch) -> DomainResult<CommandReceipt> {
         channel_id: crate::domain::id::ChannelId::new(ch),
         request_digest: digest.to_string(),
         outcome,
+        retry_epoch: 0,
     })
 }
 
@@ -466,6 +467,7 @@ mod tests {
             request_digest: format!("digest-{op_num}"),
             deadline_millis: None,
             scope: Scope::default(),
+            retry_epoch: 1,
         }
     }
 
@@ -533,6 +535,7 @@ mod tests {
             outcome: ReceiptOutcome::Success {
                 affected: vec![eid(1)],
             },
+            retry_epoch: ctx.retry_epoch,
         };
         be.store_receipt(&receipt).await.unwrap();
 

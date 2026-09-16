@@ -32,3 +32,44 @@ impl Guide {
         !self.deprecated && self.superseded_by.is_none()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_guide() -> Guide {
+        Guide {
+            name: "react".into(),
+            category: "web-frontend".into(),
+            description: String::new(),
+            contexts: vec![],
+            learnings: vec![],
+            usage_count: 0,
+            last_used: None,
+            success_count: 0,
+            failure_count: 0,
+            anti_patterns: vec![],
+            pitfalls: vec![],
+            depends_on: vec![],
+            enables: vec![],
+            source_memories: vec![],
+            validated_by: vec![],
+            superseded_by: None,
+            deprecated: false,
+            entity_revision: EntityRevision::new(1),
+            created_at: Instant::new(0),
+            updated_at: Instant::new(0),
+        }
+    }
+
+    #[test]
+    fn guide_actionability() {
+        let mut g = sample_guide();
+        assert!(g.is_actionable());
+        g.deprecated = true;
+        assert!(!g.is_actionable());
+        g.deprecated = false;
+        g.superseded_by = Some("react-v2".into());
+        assert!(!g.is_actionable());
+    }
+}

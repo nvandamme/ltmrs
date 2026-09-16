@@ -134,6 +134,11 @@ pub struct CommandContext {
     pub request_digest: String,
     pub deadline_millis: Option<u64>,
     pub scope: Scope,
+    /// The frontend's retry namespace epoch. The daemon issues each frontend a
+    /// retry namespace with a fixed expiry; the frontend retains its operation
+    /// ID for IPC retries within that namespace. Reconnecting renews the
+    /// channel but cannot extend an old retry namespace.
+    pub retry_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -144,12 +149,49 @@ pub struct CommandReceipt {
     pub channel_id: ChannelId,
     pub request_digest: String,
     pub outcome: ReceiptOutcome,
+    /// The retry namespace epoch under which this operation was recorded.
+    pub retry_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReceiptOutcome {
     Success { affected: Vec<EntityId> },
     Rejected { code: DomainErrorCode },
+}
+
+/// A daemon-issued retry namespace for an authenticated frontend.
+///
+/// Each namespace has a fixed expiry, separate from the renewable
+/// channel/session binding. Receipts remain until the namespace expires.
+/// Reconnecting can renew a channel but cannot extend an old retry namespace
+/// or transplant its pending operations into a new one. Expired or
+/// resurrected namespaces are refused as stale rather than silently converted
+/// into new work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetryNamespace {
+    pub frontend_id: FrontendId,
+    pub retry_epoch: u64,
+    /// Issued timestamp in milliseconds.
+    pub issued_at: u64,
+    /// Fixed expiry in milliseconds (issued_at + namespace TTL).
+    pub expires_at: u64,
+}
+
+impl RetryNamespace {
+    /// Create a new namespace with the given TTL.
+    pub fn new(frontend_id: FrontendId, retry_epoch: u64, issued_at: u64, ttl_millis: u64) -> Self {
+        Self {
+            frontend_id,
+            retry_epoch,
+            issued_at,
+            expires_at: issued_at + ttl_millis,
+        }
+    }
+
+    /// Whether the namespace is still valid at the given time.
+    pub fn is_valid_at(&self, now_millis: u64) -> bool {
+        now_millis < self.expires_at
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
