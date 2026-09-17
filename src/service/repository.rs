@@ -494,6 +494,29 @@ impl CanonicalRepository {
 
     // ---- Snapshot-consistent reads ----
 
+    /// The store's current generation (1 for a fresh store; bumped on
+    /// destructive restores). Used in the IPC handshake to reject clients
+    /// targeting a different generation.
+    pub fn store_generation(&self) -> DomainResult<StoreGeneration> {
+        let meta = Self::keyspace(&self.db, "meta")?;
+        let snapshot = self.db.read_tx();
+        let raw = snapshot
+            .get(&meta, "store_generation")
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        match raw {
+            Some(v) => {
+                let bytes = v.as_ref();
+                if bytes.len() >= 8 {
+                    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    Ok(StoreGeneration::new(value))
+                } else {
+                    Ok(StoreGeneration::FIRST)
+                }
+            }
+            None => Ok(StoreGeneration::FIRST),
+        }
+    }
+
     pub fn lookup_receipt(
         &self,
         generation: StoreGeneration,

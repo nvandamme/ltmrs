@@ -12,7 +12,7 @@ use crate::domain::memory::{Evidence, FragmentType, Memory, MemoryLifecycle};
 use crate::domain::relation::{Relation, RelationType};
 use crate::domain::session::TaskOutcome;
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Scope {
     pub project: Option<String>,
     pub fragment_types: Option<Vec<FragmentType>>,
@@ -88,7 +88,7 @@ pub enum DomainCommand {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MemoryPatch {
     pub title: Option<String>,
     pub fragment: Option<String>,
@@ -101,7 +101,7 @@ pub struct MemoryPatch {
     pub evidence: Option<Vec<Evidence>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForgetMode {
     Delete,
     Invalidate,

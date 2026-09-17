@@ -231,16 +231,16 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### Tasks
 
-- [ ] Implement private runtime directories, OS lock, secure socket creation and safe stale-socket recovery.
-- [ ] Implement startup arbitration with multiple simultaneous frontends; validate daemon identity, store generation and IPC version.
-- [ ] Implement one frontend-side rmcp boundary and one daemon-side domain dispatcher.
-- [ ] Carry frontend/channel identity, scope, operation ID and deadline on every IPC request.
-- [ ] Bind implicit legacy sessions per channel; add an explicit native session handle path without changing legacy schemas.
-- [ ] Define reconnect/lease/idle-exit behavior and session abandonment rules; preserve history across restart.
-- [ ] Add bounded request/response frames, streamed large results, per-client quotas and cancellation handling.
-- [ ] Use dedicated blocking storage work and an embedding scheduler rather than blocking Tokio I/O workers.
-- [ ] Coordinate shutdown/restore with pending commands and background jobs; keep a receipt available for a committed request whose connection disappears.
-- [ ] Add health/doctor output showing readiness, active store, projection state and resource budgets without dumping memory contents.
+- [x] Implement private runtime directories, OS lock, secure socket creation and safe stale-socket recovery.
+- [x] Implement startup arbitration with multiple simultaneous frontends; validate daemon identity, store generation and IPC version.
+- [x] Implement one frontend-side rmcp boundary and one daemon-side domain dispatcher.
+- [x] Carry frontend/channel identity, scope, operation ID and deadline on every IPC request.
+- [x] Bind implicit legacy sessions per channel; add an explicit native session handle path without changing legacy schemas.
+- [x] Define reconnect/lease/idle-exit behavior and session abandonment rules; preserve history across restart.
+- [x] Add bounded request/response frames, streamed large results, per-client quotas and cancellation handling.
+- [x] Use dedicated blocking storage work and an embedding scheduler rather than blocking Tokio I/O workers.
+- [x] Coordinate shutdown/restore with pending commands and background jobs; keep a receipt available for a committed request whose connection disappears.
+- [x] Add health/doctor output showing readiness, active store, projection state and resource budgets without dumping memory contents.
 
 **Outputs:** daemon lifecycle, IPC envelope, frontend registry, session binding and scheduler.
 

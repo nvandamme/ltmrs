@@ -57,3 +57,92 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
   `cargo test --lib` (85 passed, 0 failed).
 
 > WP-03 complete. All ten tasks done.
+
+### WP-04 — Singleton daemon, IPC and session routing (core)
+- `src/daemon/envelope.rs`: typed IPC envelope (protocol version, store
+  generation, frontend/channel IDs, operation ID, session, retry epoch,
+  deadline, scope, typed body) with bounded length-prefixed framing
+  (MAX_FRAME_BYTES = 8 MiB); `IpcError`, `DomainRequest`/`IpcResponse`/
+  `IpcResult`; protocol-version validation.
+- `src/daemon/registry.rs`: `FrontendRegistry` binding a legacy session per
+  `(frontend_id, channel_id)` — never a daemon-global session (RV-05);
+  `start_session`/`end_session`/`record_attempt`/`resolve_session`/
+  `bind_native_session`/`expire_leases`/`set_lease`; one channel's
+  `session_end` cannot end another's.
+- `src/daemon/runtime.rs`: private 0700 runtime dir, 0600 socket, OS singleton
+  lock (flock) held for the daemon's lifetime; the lock is the ownership source
+  of truth, so a stale socket is only removed once the lock is free; symlinked
+  runtime paths are refused (T-SEC-01/02).
+- `src/daemon/dispatcher.rs`: daemon-side domain dispatcher routing typed IPC
+  requests to the `CanonicalRepository` (mutations + reads) and the registry
+  (session ops); every request scoped by frontend/channel identity; shareable
+  across connections via `Arc`/`Mutex`.
+- `src/daemon/scheduler.rs`: bounded embedding scheduler — a dedicated worker
+  owns a bounded queue and a synchronous `&mut self` model adapter, keeping
+  inference off Tokio I/O workers; backpressure is a retryable `Busy`, never
+  unbounded allocation (T-CONC-04).
+- `src/daemon/limits.rs`: per-client quotas and resource budgets (max clients,
+  per-client queue, in-flight storage, response bytes) with visible backpressure.
+- `src/daemon/health.rs`: health/doctor output (readiness, store generation,
+  projection state, resource budgets) without dumping memory contents.
+- `src/daemon/server.rs`: daemon lifecycle tying the lock, socket, dispatcher,
+  scheduler and quotas together with a bounded accept loop.
+- Added `serde` derives to `Scope`, `MemoryPatch`, `ForgetMode`; `uuid` gained
+  the `v5` feature (deterministic sub-IDs); `libc` added for the OS lock.
+- Tests (29 new): envelope framing/limits, registry 32-channel isolation + no
+  global session + lease expiry, runtime one-owner + stale recovery + symlink
+  refusal, dispatcher channel-scoped session_end + reads + protocol check,
+  scheduler bounding + backpressure + closed, limits quotas, health report,
+  daemon lifecycle.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --lib` (118 passed, 0 failed).
+
+- **Streamed large responses** (`envelope.rs`): `split_payload`/
+  `write_response_payload`/`read_response_payload` stream any response across
+  bounded frames (8-byte total-length header + per-chunk length prefixes);
+  byte-exact reassembly, never silent truncation. Server write path uses it.
+- **Cancellation policy** (`cancellation.rs`): `decide` maps (committed,
+  canceled) to Abort / Complete / KeepReceipt — canceled-before-commit aborts
+  (no memory), canceled-after-commit preserves the durable receipt.
+- **Idle-exit** (`idle.rs`): `IdleExitTracker` exits only when no connections
+  and the idle timeout elapsed; reconnects/activity reset the window.
+- **Session persistence + reconnect** (`registry.rs`): `persist`/`load`
+  serialize sessions, channel bindings and leases to JSON; a restart restores
+  durable history; reconnect restores only a verified (frontend, channel)
+  binding, never guessing.
+- **Shutdown/restore coordination** (`server.rs`): `Daemon::shutdown` persists
+  sessions and aborts the scheduler worker; `Daemon::start` reloads sessions;
+  a committed receipt survives a dropped connection (T-CONC-04/T-REC-01).
+- **Frontend-side rmcp boundary** (`frontend/mcp.rs`): `LtmrsFrontend`
+  implements `ServerHandler`, terminates stdio, and routes tool calls to typed
+  IPC envelopes via `IpcClient` (no domain logic duplicated); `route_tool` is
+  pure and testable.
+- **IPC client** (`client.rs`): `IpcClient` connects to the daemon socket,
+  writes length-prefixed request frames, reads streamed responses, supports
+  reconnect.
+- Tests (24 new): streaming split/roundtrip, cancellation matrix, idle-exit
+  window, session persist/load/reconnect-verify, shutdown persistence +
+  receipt-survives-drop, frontend tool routing + envelope identity, IPC
+  client roundtrip.
+
+### WP-04 — Connect-time handshake and retry namespace issuance
+- `src/daemon/envelope.rs`: `WireMessage` (Handshake / Request(Box<IpcEnvelope>))
+  and `WireReply` (Handshake / Response / Error(WireError));
+  `HandshakeRequest`/`HandshakeResponse`, `validate_handshake`.
+- `src/daemon/server.rs`: the first frame on every connection must be a
+  handshake; wrong generation or request-before-handshake gets an error reply
+  and is closed. Subsequent frames are requests only.
+- `src/daemon/dispatcher.rs`: `handle_handshake` validates protocol version +
+  store generation, then issues/refreshes the per-frontend retry namespace via
+  `repo.issue_namespace()`.
+- `src/daemon/client.rs`: `handshake()` on connect; stores `retry_epoch`;
+  requests carry it. `src/frontend/mcp.rs` connects + handshakes lazily and
+  stamps its envelopes with the handshake's epoch.
+- `src/service/repository.rs`: `store_generation()` reads/writes a meta key
+  (FIRST if absent), so every daemon on this store shares one generation.
+- Tests: `handshake_rejects_wrong_generation`; all existing tests adapted to
+  the tagged wire format.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (143 passed, 0 failed).
+
+> WP-04 complete. All ten tasks done.
