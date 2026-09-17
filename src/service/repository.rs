@@ -433,6 +433,7 @@ impl CanonicalRepository {
             &self.aliases,
             &self.projections,
             &self.feedback_events,
+            self.clock.now_millis(),
         );
         let outcome = apply_command(&mut state, ctx, cmd)?;
 
@@ -517,6 +518,26 @@ impl CanonicalRepository {
         }
     }
 
+    /// Set the store's active generation. Called by WP-11 restore when a
+    /// verified snapshot is activated; projection publication for any other
+    /// generation is refused until readers drain (design §8).
+    pub fn set_store_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
+        let meta = Self::keyspace(&self.db, "meta")?;
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.insert(&meta, "store_generation", generation.as_u64().to_le_bytes());
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "generation switch conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
     pub fn lookup_receipt(
         &self,
         generation: StoreGeneration,
@@ -567,16 +588,138 @@ impl CanonicalRepository {
     /// Whether a memory still has a pending projection (embedding not yet
     /// computed). Used by the projection worker to know what remains to index.
     pub fn has_pending_projection(&self, id: EntityId) -> DomainResult<bool> {
+        Ok(self.projection_job(id)?.is_some())
+    }
+
+    /// Read the durable desired-state job for a memory, if any is pending.
+    pub fn projection_job(
+        &self,
+        id: EntityId,
+    ) -> DomainResult<Option<crate::domain::projection::ProjectionJob>> {
         let snapshot = self.db.read_tx();
         let key = id.as_uuid().to_string();
         let raw = snapshot
-            .get(&self.projections, key)
+            .get(&self.projections, &key)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        Ok(raw.is_some())
+        raw.map(|v| decode::<crate::domain::projection::ProjectionJob>(v.as_ref()))
+            .transpose()
     }
 
-    /// Read all diagnostic feedback events (the telemetry log, separate from
-    /// the observable counters stored on the memory record).
+    /// List every pending projection job (the worker's durable work queue).
+    pub fn projection_jobs(&self) -> DomainResult<Vec<crate::domain::projection::ProjectionJob>> {
+        let snapshot = self.db.read_tx();
+        let mut out = Vec::new();
+        for kv in snapshot.iter(&self.projections) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            out.push(decode::<crate::domain::projection::ProjectionJob>(
+                v.as_ref(),
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Compare-and-clear a projection job. Returns true only if the stored job
+    /// still carries exactly this seq — a stale worker (whose desired revision
+    /// was superseded, or whose memory was forgotten) gets false and leaves no
+    /// trace. Retries on storage conflict from a fresh snapshot.
+    pub fn acknowledge_projection(&self, id: EntityId, seq: u64) -> DomainResult<bool> {
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let key = id.as_uuid().to_string();
+            match tx
+                .get(&self.projections, &key)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                Some(raw) => {
+                    let job: crate::domain::projection::ProjectionJob = decode(raw.as_ref())?;
+                    if job.memory_id != id || job.seq != seq {
+                        tx.rollback();
+                        return Ok(false);
+                    }
+                    tx.remove(&self.projections, &key);
+                }
+                None => {
+                    tx.rollback();
+                    return Ok(false);
+                }
+            }
+            match tx.commit() {
+                Ok(Ok(())) => return Ok(true),
+                Ok(Err(_conflict)) => continue,
+                Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+            }
+        }
+        Err(DomainError::new(
+            DomainErrorCode::Validation,
+            "max transaction retries exceeded",
+        ))
+    }
+
+    /// The count of pending projection jobs (projection lag). A stalled worker or
+    /// embedder shows up here as a non-zero, growing number — separate from both
+    /// canonical durability and vector availability.
+    pub fn projection_lag(&self) -> DomainResult<usize> {
+        Ok(self.projection_jobs()?.len())
+    }
+
+    /// The age of the oldest pending job at `now_millis`, or None when nothing is
+    /// pending. This exposes how long a write has waited to be projected (RQ-08).
+    pub fn oldest_pending_age_millis(&self, now_millis: u64) -> DomainResult<Option<u64>> {
+        let jobs = self.projection_jobs()?;
+        Ok(jobs
+            .iter()
+            .map(|j| now_millis.saturating_sub(j.enqueued_at_millis))
+            .max())
+    }
+
+    /// Enqueue (or advance) a projection job using the repository's clock for
+    /// the enqueue timestamp. Used by the projector to record semantic retries
+    /// when an embedding pass fails; `seq` must be chosen by the caller so that
+    /// stale acknowledgements cannot clear newer work.
+    pub fn enqueue_projection_job(
+        &self,
+        memory_id: EntityId,
+        desired_document_revision: crate::domain::id::DocumentRevision,
+        seq: u64,
+        is_tombstone: bool,
+    ) -> DomainResult<()> {
+        let job = crate::domain::projection::ProjectionJob {
+            memory_id,
+            desired_document_revision,
+            seq,
+            enqueued_at_millis: self.clock.now_millis(),
+            is_tombstone,
+        };
+
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(
+                &self.projections,
+                memory_id.as_uuid().to_string(),
+                serde_json::to_vec(&job)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                    .as_slice(),
+            );
+            match tx.commit() {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(_conflict)) => continue,
+                Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+            }
+        }
+        Err(DomainError::new(
+            DomainErrorCode::Validation,
+            "max transaction retries exceeded",
+        ))
+    }
+
     pub fn feedback_events(&self) -> DomainResult<Vec<crate::domain::session::FeedbackEvent>> {
         let snapshot = self.db.read_tx();
         let mut out = Vec::new();
@@ -1174,10 +1317,15 @@ mod tests {
         )
         .unwrap();
 
-        // Projection invalidated; edges severed; tombstone preserved.
+        // Projection invalidated via a durable tombstone job (the worker will
+        // remove rows); edges severed; canonical tombstone preserved.
+        let job = repo
+            .projection_job(eid(1))
+            .unwrap()
+            .expect("tombstone job recorded");
         assert!(
-            !repo.has_pending_projection(eid(1)).unwrap(),
-            "hard delete must invalidate the pending projection"
+            job.is_tombstone,
+            "hard delete must record a tombstone projection job"
         );
         assert_eq!(
             repo.neighbors(eid(1)).unwrap().len(),
@@ -1225,10 +1373,14 @@ mod tests {
         )
         .unwrap();
 
-        // Invalidation preserves edges as history; projection still invalidated.
+        // Invalidation preserves edges as history; a tombstone job is recorded.
+        let job = repo
+            .projection_job(eid(1))
+            .unwrap()
+            .expect("tombstone job recorded");
         assert!(
-            !repo.has_pending_projection(eid(1)).unwrap(),
-            "invalidation must invalidate the pending projection"
+            job.is_tombstone,
+            "invalidation must record a tombstone projection job"
         );
         assert_eq!(
             repo.neighbors(eid(1)).unwrap().len(),
@@ -1513,5 +1665,252 @@ mod tests {
         );
         let outcome2 = runner2.assess(&db).unwrap();
         assert!(matches!(outcome2, MigrationOutcome::Migrated { .. }));
+    }
+
+    // ---- WP-05 task 4: durable desired-state jobs + compare-and-clear ----
+
+    #[test]
+    fn add_memory_records_versioned_projection_job() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "hello"),
+                session: None,
+            },
+        )
+        .unwrap();
+
+        let job = repo.projection_job(eid(1)).unwrap().expect("job recorded");
+        assert_eq!(job.memory_id, eid(1));
+        // The helper view still reports pending work.
+        assert!(repo.has_pending_projection(eid(1)).unwrap());
+    }
+
+    #[test]
+    fn acknowledge_clears_matching_seq_only() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "hello"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+
+        // Wrong seq (a stale worker) must NOT clear the work.
+        assert!(
+            !repo.acknowledge_projection(eid(1), job.seq + 1).unwrap(),
+            "stale acknowledgement must leave work pending"
+        );
+        assert!(repo.has_pending_projection(eid(1)).unwrap());
+
+        // The correct seq clears exactly once.
+        assert!(repo.acknowledge_projection(eid(1), job.seq).unwrap());
+        assert!(!repo.has_pending_projection(eid(1)).unwrap());
+    }
+
+    #[test]
+    fn content_update_advances_desired_revision_and_seq() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "hello"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let job1 = repo.projection_job(eid(1)).unwrap().unwrap();
+
+        // A content-changing update re-enqueues work at the new document
+        // revision with a higher seq.
+        let patch = crate::domain::command::MemoryPatch {
+            fragment: Some("updated body".into()),
+            ..Default::default()
+        };
+        repo.apply(
+            &ctx(2, "d2"),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: None,
+                patch,
+            },
+        )
+        .unwrap();
+
+        let job2 = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert!(job2.seq > job1.seq, "seq must advance monotonically");
+        assert!(
+            job2.desired_document_revision.as_u64() > job1.desired_document_revision.as_u64(),
+            "desired revision must track the canonical document revision"
+        );
+
+        // A delayed worker holding the OLD seq cannot clear the newer work.
+        assert!(!repo.acknowledge_projection(eid(1), job1.seq).unwrap());
+        assert!(repo.has_pending_projection(eid(1)).unwrap());
+    }
+
+    #[test]
+    fn forget_writes_tombstone_job_and_stale_worker_cannot_ack() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "hello"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+
+        repo.apply(
+            &ctx(2, "d2"),
+            &DomainCommand::Forget {
+                id: eid(1),
+                mode: ForgetMode::Delete,
+            },
+        )
+        .unwrap();
+
+        // The forget atomically records a tombstone job at a higher seq — the
+        // worker will remove rows; it is NOT silently dropped.
+        let tomb = repo
+            .projection_job(eid(1))
+            .unwrap()
+            .expect("tombstone job recorded");
+        assert!(tomb.is_tombstone);
+        assert!(tomb.seq > job.seq);
+
+        // A delayed worker with the old seq must not clear it.
+        assert!(
+            !repo.acknowledge_projection(eid(1), job.seq).unwrap(),
+            "forget must make stale acknowledgements fail"
+        );
+    }
+
+    #[test]
+    fn projection_jobs_lists_all_pending() {
+        let (repo, _dir) = repo_with_ns();
+        for n in [1u64, 2, 3] {
+            repo.apply(
+                &ctx(n, &format!("d{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), &format!("m{n}")),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let jobs = repo.projection_jobs().unwrap();
+        assert_eq!(jobs.len(), 3);
+        let ids: Vec<EntityId> = jobs.iter().map(|j| j.memory_id).collect();
+        for n in [1u64, 2, 3] {
+            assert!(ids.contains(&eid(n)));
+        }
+
+        // Acknowledge one; it drops out of the list.
+        let target = repo.projection_job(eid(2)).unwrap().unwrap();
+        repo.acknowledge_projection(eid(2), target.seq).unwrap();
+        assert_eq!(repo.projection_jobs().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn jobs_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = std::sync::Arc::new(crate::domain::clock::FrozenClock::new(1000));
+        {
+            let repo =
+                CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock).unwrap();
+            let fe = crate::domain::id::FrontendId::new(Uuid::from_u128(1));
+            let ns = repo.issue_namespace(fe, 1000).unwrap();
+            let mut c = ctx(1, "d1");
+            c.retry_epoch = ns.retry_epoch;
+            repo.apply(
+                &c,
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(1), "hello"),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // Reopen: the unacknowledged job must still be pending (crash-safe).
+        let repo = CanonicalRepository::open(dir.path().to_str().unwrap()).unwrap();
+        assert!(repo.projection_job(eid(1)).unwrap().is_some());
+    }
+
+    // ---- WP-05 task 9: readiness and lag metrics ----
+
+    #[test]
+    fn projection_lag_reflects_pending_work() {
+        let (repo, _dir) = repo_with_ns();
+        assert_eq!(repo.projection_lag().unwrap(), 0);
+
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("d{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), "m"),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(repo.projection_lag().unwrap(), 2);
+
+        let j = repo.projection_job(eid(1)).unwrap().unwrap();
+        repo.acknowledge_projection(eid(1), j.seq).unwrap();
+        assert_eq!(repo.projection_lag().unwrap(), 1);
+    }
+
+    #[test]
+    fn oldest_pending_age_is_measured_from_enqueue() {
+        let (repo, _dir) = repo_with_ns();
+        // Frozen clock at 1000; the job is stamped with enqueued_at_millis=1000.
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+
+        // At the same instant, age is 0.
+        assert_eq!(repo.oldest_pending_age_millis(1000).unwrap(), Some(0));
+        // 500ms later, age is 500.
+        assert_eq!(repo.oldest_pending_age_millis(1500).unwrap(), Some(500));
+
+        // Acknowledging clears it: no pending work means None.
+        let j = repo.projection_job(eid(1)).unwrap().unwrap();
+        repo.acknowledge_projection(eid(1), j.seq).unwrap();
+        assert_eq!(repo.oldest_pending_age_millis(2000).unwrap(), None);
+    }
+
+    #[test]
+    fn oldest_pending_uses_the_minimum_enqueue_time() {
+        let (repo, _dir) = repo_with_ns();
+        // Two jobs enqueued at the same frozen instant; both age identically.
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("d{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), "m"),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(repo.oldest_pending_age_millis(1200).unwrap(), Some(200));
+
+        // Clear the older one; age now derives from the remaining job.
+        let j = repo.projection_job(eid(1)).unwrap().unwrap();
+        repo.acknowledge_projection(eid(1), j.seq).unwrap();
+        assert_eq!(repo.oldest_pending_age_millis(1200).unwrap(), Some(200));
     }
 }

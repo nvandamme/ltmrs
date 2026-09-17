@@ -18,6 +18,8 @@ use crate::daemon::runtime::{DaemonRuntime, RuntimeError, RuntimePaths, acquire_
 use crate::daemon::scheduler::{EmbeddingScheduler, SchedulerConfig};
 use crate::domain::clock::{Clock, SystemClock};
 use crate::domain::command::{DomainError, DomainErrorCode};
+use crate::search::maintenance::{MaintenanceConfig, MaintenanceScheduler};
+use crate::search::table::SearchTable;
 use crate::service::repository::CanonicalRepository;
 
 /// Configuration for the daemon.
@@ -27,10 +29,15 @@ pub struct DaemonConfig {
     pub store_path: String,
     /// The session-state path (persisted on shutdown, loaded on start).
     pub sessions_path: String,
+    /// The Lance search-projection directory. Empty disables the maintenance
+    /// scheduler (the projection is still rebuildable from canonical state).
+    pub search_path: String,
     /// Resource limits.
     pub limits: ResourceLimits,
     /// Scheduler configuration.
     pub scheduler: SchedulerConfig,
+    /// Maintenance schedule + explicit budgets for optimization/retention.
+    pub maintenance: MaintenanceConfig,
 }
 
 /// Error from the daemon.
@@ -74,12 +81,15 @@ pub struct Daemon {
     dispatcher: Arc<Dispatcher>,
     scheduler: EmbeddingScheduler,
     scheduler_worker: Option<JoinHandle<()>>,
+    maintenance_worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    maintenance_config: MaintenanceConfig,
     quotas: Arc<QuotaTracker>,
     /// The singleton lock + bound 0600 socket listener, kept alive for the
     /// daemon's lifetime.
     runtime: DaemonRuntime,
     paths: RuntimePaths,
     sessions_path: Option<std::path::PathBuf>,
+    search_path: String,
 }
 
 impl Daemon {
@@ -113,11 +123,19 @@ impl Daemon {
             dispatcher,
             scheduler,
             scheduler_worker: Some(scheduler_worker),
+            maintenance_worker: tokio::sync::Mutex::new(None),
+            maintenance_config: config.maintenance,
             quotas,
             runtime,
             paths: paths.clone(),
             sessions_path,
+            search_path: config.search_path,
         })
+    }
+
+    /// The Lance search-projection directory (empty disables maintenance).
+    pub fn search_path(&self) -> &str {
+        &self.search_path
     }
 
     /// The resolver for the socket path (for frontends to connect).
@@ -145,16 +163,26 @@ impl Daemon {
         self.scheduler_worker.is_none()
     }
 
-    /// Coordinate shutdown: persist durable session history and abort the
-    /// embedding scheduler. Committed receipts already live in the store and
-    /// survive independently; this ensures session state and background jobs
-    /// are cleaned up so a restart restores history and leaks no workers.
+    /// Coordinate shutdown: persist durable session history, abort the embedding
+    /// scheduler and stop the maintenance worker. Committed receipts already live
+    /// in the store and survive independently; this ensures session state and
+    /// background jobs are cleaned up so a restart restores history and leaks no workers.
     pub fn shutdown(&mut self) {
         if let Some(p) = &self.sessions_path {
             let _ = self.dispatcher.registry().persist(p);
         }
         if let Some(worker) = self.scheduler_worker.take() {
             worker.abort();
+        }
+        // The maintenance handle lives behind a tokio Mutex (set from serve's async
+        // context); poison is harmless here — we still abort on best effort.
+        let aborted = self
+            .maintenance_worker
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(mworker) = aborted {
+            mworker.abort();
         }
     }
 
@@ -174,9 +202,37 @@ impl Daemon {
         )
     }
 
+    /// Spawn the maintenance worker if enabled (search_path set) and not already
+    /// running. Idempotent — safe to call from both serve() and tests.
+    pub async fn start_maintenance(&self) {
+        let mut mw = self.maintenance_worker.lock().await;
+        if mw.is_some() || self.search_path.is_empty() {
+            return;
+        }
+        match SearchTable::open(&self.search_path).await {
+            Ok(table) => {
+                let sched = MaintenanceScheduler::new(table, self.maintenance_config);
+                *mw = Some(sched.spawn());
+            }
+            Err(e) => eprintln!(
+                "ltmrs: failed to open search table for maintenance: {} ({})",
+                e.code.as_str(),
+                e.message
+            ),
+        }
+    }
+
+    /// Whether the maintenance worker is currently running (diagnostics/tests).
+    pub async fn maintenance_worker_running(&self) -> bool {
+        self.maintenance_worker.lock().await.is_some()
+    }
+
     /// Run the accept loop until the socket is closed or an error occurs.
     /// Uses the 0600 listener bound at startup (already permission-locked).
     pub async fn serve(&self) -> Result<(), DaemonError> {
+        // Start background maintenance under its explicit budgets, if configured.
+        self.start_maintenance().await;
+
         let listener = &self.runtime.listener;
 
         loop {
@@ -346,6 +402,41 @@ mod tests {
         let config = DaemonConfig::default();
         assert!(config.store_path.is_empty());
         assert!(config.limits.max_clients > 0);
+    }
+
+    /// The maintenance worker spawns when a search path is configured and is
+    /// aborted on shutdown (task 10 scheduling integration).
+    #[tokio::test]
+    async fn maintenance_worker_spawns_with_search_path_and_aborts_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "maint-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            search_path: dir.path().join("search").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let mut daemon = Daemon::start(&paths, config).unwrap();
+
+        // Not running before serve/start_maintenance.
+        assert!(!daemon.maintenance_worker_running().await);
+
+        daemon.start_maintenance().await;
+        assert!(
+            daemon.maintenance_worker_running().await,
+            "maintenance worker must spawn when a search path is configured"
+        );
+
+        // Idempotent: a second call does not stack another worker.
+        daemon.start_maintenance().await;
+        assert!(daemon.maintenance_worker_running().await);
+
+        // Shutdown takes the handle out (aborting it) so no orphan survives and
+        // the daemon reports maintenance as stopped.
+        daemon.shutdown();
+        assert!(
+            !daemon.maintenance_worker_running().await,
+            "shutdown must clear the maintenance worker"
+        );
     }
 
     #[tokio::test]

@@ -15,5 +15,6 @@ pub mod interpreter;
 pub mod legacy;
 pub mod memory;
 pub mod project;
+pub mod projection;
 pub mod relation;
 pub mod session;

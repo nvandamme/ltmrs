@@ -254,17 +254,17 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### Tasks
 
-- [ ] Define search rows using domain IDs, document revision, generation, model fingerprint, chunk identity, scope/type/date and rendered text.
-- [ ] Implement lexical-ready rows even when no embedding exists; verify actual null-vector/filter support in the pinned backend.
-- [ ] Create correct FTS/scalar indexes and query them with typed predicates.
-- [ ] Implement durable desired-state jobs and compare-and-clear acknowledgements for the selected architecture.
-- [ ] Serialize projection publication per entity/generation or use a verified atomic revision guard; prevent late old embeddings from overwriting newer rows.
-- [ ] Treat events as retryable wakeups, not an event-sourced canonical history or a UUID-ordered commit log.
-- [ ] Implement tombstones/delete propagation and a rebuild path that cannot resurrect deleted generations.
-- [ ] Make model/index generation changes blue-green: build new, catch up revisions, publish atomically, retain rollback until readers drain.
-- [ ] Define lexical and semantic readiness separately; expose lag and oldest pending age.
-- [ ] Schedule index optimization and retention with explicit disk/memory budgets and snapshot protection.
-- [ ] Test query readers reopening/refreshing after commits and generation changes; do not rely on a cached handle being automatically current.
+- [x] Define search rows using domain IDs, document revision, generation, model fingerprint, chunk identity, scope/type/date and rendered text.
+- [x] Implement lexical-ready rows even when no embedding exists; verify actual null-vector/filter support in the pinned backend.
+- [x] Create correct FTS/scalar indexes and query them with typed predicates.
+- [x] Implement durable desired-state jobs and compare-and-clear acknowledgements for the selected architecture.
+- [x] Serialize projection publication per entity/generation or use a verified atomic revision guard; prevent late old embeddings from overwriting newer rows.
+- [x] Treat events as retryable wakeups, not an event-sourced canonical history or a UUID-ordered commit log.
+- [x] Implement tombstones/delete propagation and a rebuild path that cannot resurrect deleted generations.
+- [x] Make model/index generation changes blue-green: build new, catch up revisions, publish atomically, retain rollback until readers drain.
+- [x] Define lexical and semantic readiness separately; expose lag and oldest pending age.
+- [x] Schedule index optimization and retention with explicit disk/memory budgets and snapshot protection.
+- [x] Test query readers reopening/refreshing after commits and generation changes; do not rely on a cached handle being automatically current.
 
 **Outputs:** projection schema, job state machine, readiness API, rebuild/optimization commands.
 

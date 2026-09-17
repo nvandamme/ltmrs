@@ -40,6 +40,11 @@ Project instructions for coding agents working in this repository.
   Expose domain types to the rest of ltmrs.
 - No comments unless they explain non-obvious invariants, contracts or protocol
   details. No backward-compatibility shims.
+- **Deterministic async tests (STRICT)**: for time-based behavior (intervals,
+  schedules, timeouts, backoff) use tokio's paused clock via
+  `#[tokio::test(start_paused = true)]` — never real-time sleeps that race the
+  scheduler. The `test-util` feature is authorized as a dev-dependency specifically
+  for this; add it if scheduling/time tests need it rather than working around it.
 
 ## Validation
 

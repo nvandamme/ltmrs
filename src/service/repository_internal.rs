@@ -13,6 +13,7 @@ use crate::domain::command::{
 use crate::domain::graph::{GraphValidation, validate_new_edge};
 use crate::domain::id::{EntityId, EntityRevision, ExternalAlias};
 use crate::domain::memory::{Instant, Memory, MemoryLifecycle};
+use crate::domain::projection::ProjectionJob;
 use crate::domain::relation::{Relation, RelationType};
 
 use serde::de::DeserializeOwned;
@@ -29,6 +30,9 @@ pub(crate) struct CommandState<'a> {
     aliases: &'a OptimisticTxKeyspace,
     projections: &'a OptimisticTxKeyspace,
     feedback_events: &'a OptimisticTxKeyspace,
+    /// Snapshot of the clock at command-application time, used to stamp
+    /// projection jobs with their enqueue instant (for oldest-pending-age).
+    now_millis: u64,
 }
 
 impl<'a> CommandState<'a> {
@@ -39,6 +43,7 @@ impl<'a> CommandState<'a> {
         aliases: &'a OptimisticTxKeyspace,
         projections: &'a OptimisticTxKeyspace,
         feedback_events: &'a OptimisticTxKeyspace,
+        now_millis: u64,
     ) -> Self {
         Self {
             tx,
@@ -47,6 +52,7 @@ impl<'a> CommandState<'a> {
             aliases,
             projections,
             feedback_events,
+            now_millis,
         }
     }
 
@@ -133,18 +139,71 @@ impl<'a> CommandState<'a> {
         Ok(to_remove.len())
     }
 
-    /// Record a pending projection (embedding not yet computed) for a memory.
-    fn record_pending_projection(&mut self, id: EntityId) -> DomainResult<()> {
+    /// Record or advance the durable desired-state job for a memory. Called
+    /// inside the command transaction so the work is atomic with the mutation.
+    /// The seq advances monotonically per memory and is the compare-and-clear
+    /// token (RV-07): it is never derived from an identifier.
+    fn record_pending_projection(&mut self, id: EntityId, now_millis: u64) -> DomainResult<()> {
         let key = id.as_uuid().to_string();
-        self.tx.insert(self.projections, key, b"pending");
+        let raw = self.tx.get(self.projections, &key);
+        let existing = match raw {
+            Ok(Some(v)) => Some(decode::<ProjectionJob>(v.as_ref())?),
+            Ok(None) => None,
+            Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        };
+
+        // The canonical memory's current document revision is the desired one.
+        let memory = self.get_memory(id)?.ok_or_else(|| {
+            DomainError::new(
+                DomainErrorCode::Validation,
+                "cannot record projection for missing memory",
+            )
+        })?;
+
+        let job = ProjectionJob {
+            memory_id: id,
+            desired_document_revision: memory.document_revision,
+            seq: existing.map(|j| j.seq + 1).unwrap_or(1),
+            enqueued_at_millis: now_millis,
+            is_tombstone: false,
+        };
+        self.tx
+            .insert(self.projections, &key, encode(&job)?.as_slice());
         Ok(())
     }
 
-    /// Invalidate a memory's pending projection so a delayed worker cannot
-    /// resurrect or index a deleted/invalidated/archived memory.
+    /// Record a tombstone projection job so the worker removes this memory's rows.
+    /// Written atomically with the lifecycle change (design §8) so deletion
+    /// propagates without an external sweep, and a delayed worker holding an older
+    /// seq cannot resurrect it (seq is incremented). Replaces the old silent
+    /// removal: instead of dropping the work item we record explicit delete intent.
     fn invalidate_projection(&mut self, id: EntityId) -> DomainResult<()> {
         let key = id.as_uuid().to_string();
-        self.tx.remove(self.projections, key);
+        let raw = self.tx.get(self.projections, &key);
+        let existing = match raw {
+            Ok(Some(v)) => Some(decode::<ProjectionJob>(v.as_ref())?),
+            Ok(None) => None,
+            Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        };
+
+        // Capture the current document revision so a stale worker's row (written at
+        // an older revision) is unambiguously superseded by this tombstone.
+        let memory = self.get_memory(id)?.ok_or_else(|| {
+            DomainError::new(
+                DomainErrorCode::Validation,
+                "cannot record tombstone for missing memory",
+            )
+        })?;
+
+        let job = ProjectionJob {
+            memory_id: id,
+            desired_document_revision: memory.document_revision,
+            seq: existing.map(|j| j.seq + 1).unwrap_or(1),
+            enqueued_at_millis: self.now_millis,
+            is_tombstone: true,
+        };
+        self.tx
+            .insert(self.projections, &key, encode(&job)?.as_slice());
         Ok(())
     }
 }
@@ -213,7 +272,8 @@ fn apply_add_memory(state: &mut CommandState<'_>, memory: &Memory) -> DomainResu
     // Atomic write set (design §5.3 Add memory row): memory + alias + pending
     // projection. No acknowledged memory is left unindexable without a tracked
     // work item.
-    state.record_pending_projection(memory.id)?;
+    let now = state.now_millis;
+    state.record_pending_projection(memory.id, now)?;
     Ok(ReceiptOutcome::Success {
         affected: vec![memory.id],
     })
@@ -276,6 +336,12 @@ fn apply_update_memory(
     }
 
     state.put_memory(&memory)?;
+    // Content mutations enqueue a newer desired-state job so the worker
+    // re-projects at the new document revision.
+    if content_changed {
+        let now = state.now_millis;
+        state.record_pending_projection(id, now)?;
+    }
     Ok(ReceiptOutcome::Success { affected: vec![id] })
 }
 

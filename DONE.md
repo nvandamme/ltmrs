@@ -146,3 +146,49 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
   `cargo test` (143 passed, 0 failed).
 
 > WP-04 complete. All ten tasks done.
+
+### WP-05 — Versioned Lance search projection (core)
+- `src/domain/projection.rs`: durable desired-state job types (`ProjectionJob` with
+  monotonic per-memory seq as the compare-and-clear token; tombstone flag).
+- `src/service/repository.rs` + `repository_internal.rs`: add/update/forget write
+  versioned jobs atomically in the command transaction (seq advances on every
+  content mutation); `acknowledge_projection` is a true compare-and-clear keyed on
+  seq, so a stale worker cannot clear newer work; `projection_job(s)`,
+  `has_pending_projection`, `projection_lag`, `oldest_pending_age_millis`;
+  `set_store_generation` for restore-driven generation switches.
+- `src/search/row.rs`: search row schema (domain IDs, document revision, store
+  generation, model fingerprint, chunk identity, project/type/date scope, rendered
+  text, nullable embedding); lexical-ready without a vector; null-vector rows
+  round-trip and filter correctly in the pinned Lance backend.
+- `src/search/maintenance.rs`: scheduled maintenance worker (task 10) — a single
+  background task runs budgeted Lance optimization + retention on an interval.
+  Passes are sequential by construction (a slow pass delays the next tick rather
+  than overlapping it); every action is bounded by an explicit `MaintenanceBudget`
+  so nothing allocates unboundedly and no version another reader may hold is pruned.
+- `src/search/table.rs`: `MaintenanceBudget` + `optimize_with_budgets` — compaction
+  (thread/size caps), index optimize (fold unindexed tails) and retention pruning
+  under explicit budgets; snapshot protection retains versions for at least
+  `retain_millis`. `fts_query` degrades gracefully to empty when unbuilt.
+- Daemon integration (`src/daemon/server.rs`): `DaemonConfig.search_path` +
+  `maintenance` config; `start_maintenance()` idempotently spawns the worker on
+  serve, and `shutdown()` aborts it so no orphan survives (design §7.2).
+- `src/search/projector.rs`: worker that processes durable jobs end-to-end — reads
+  canonical state fresh, validates revision + lifecycle under a per-entity
+  publication lock, embeds only changed content, publishes idempotently; a stalled
+  embedder still publishes the lexical row and leaves semantic work pending
+  (T-PROJ-03); `publish_guarded` rejects stale revisions, non-recallable memories
+  and rows from an inactive store generation (T-PROJ-02); tombstone jobs propagate
+  deletion; `rebuild` never resurrects deleted generations; blue-green isolation
+  by model fingerprint (new space builds without touching the old).
+- Acceptance tests: T-PROJ-01 (kill between commit and ack keeps newer work
+  pending; replay idempotent), T-PROJ-02 (stale publication refused after a
+  generation switch), T-PROJ-03 (stalled embedder keeps lexical + direct reads),
+  T-SEARCH-01 (empty DB, unbuilt FTS, null vectors, concurrent optimization).
+- Maintenance tests: budgeted pass preserves data, config exposed for diagnostics,
+  concurrent passes serialize without corruption, spawned worker runs repeated
+  interval passes over live data; daemon test proves the worker spawns with a
+  search path and aborts on shutdown.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (187 passed, 0 failed).
+
+> WP-05 complete. All eleven tasks done.
