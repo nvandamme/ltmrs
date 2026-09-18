@@ -278,16 +278,16 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### Tasks
 
-- [ ] Pin the initial E5-small repository revision and file digests; record redistribution rights and reference environment.
-- [ ] Match its BertModel configuration and XLM-RoBERTa tokenizer artifacts; do not substitute generic WordPiece assumptions.
-- [ ] Implement document/query prefixing, padding/attention masks, masked pooling, normalization and finite-value checks.
-- [ ] Run the reference model in development-only tooling and save approved reference vectors/tokens and tolerance rationale.
-- [ ] Implement a bounded synchronous Candle worker with async service calls, request cancellation and batch accounting.
-- [ ] Implement safe tokenizer-length-aware derived chunking while retaining the original memory ID and exact offsets.
-- [ ] Separate native model adapters from Lance embedding registration; supply vectors explicitly.
-- [ ] Add explicit artifact fetch, cache verification and offline-only load modes.
-- [ ] Test CPU F32 first. Add CUDA only with separate build, numerical, resource and host tests.
-- [ ] Reject unsupported model recipes with an actionable message rather than trying any arbitrary safetensors model.
+- [x] Pin the initial E5-small repository revision and file digests; record redistribution rights and reference environment.
+- [x] Match its BertModel configuration and XLM-RoBERTa tokenizer artifacts; do not substitute generic WordPiece assumptions.
+- [x] Implement document/query prefixing, padding/attention masks, masked pooling, normalization and finite-value checks.
+- [x] Run the reference model in development-only tooling and save approved reference vectors/tokens and tolerance rationale.
+- [x] Implement a bounded synchronous Candle worker with async service calls, request cancellation and batch accounting.
+- [x] Implement safe tokenizer-length-aware derived chunking while retaining the original memory ID and exact offsets.
+- [x] Separate native model adapters from Lance embedding registration; supply vectors explicitly.
+- [x] Add explicit artifact fetch, cache verification and offline-only load modes.
+- [x] Test CPU F32 first. Add CUDA only with separate build, numerical, resource and host tests.
+- [x] Reject unsupported model recipes with an actionable message rather than trying any arbitrary safetensors model.
 
 **Outputs:** model manifest, worker/service, validated adapter, reference fixtures, supported-model entry.
 

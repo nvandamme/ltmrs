@@ -192,3 +192,46 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
   `cargo test` (187 passed, 0 failed).
 
 > WP-05 complete. All eleven tasks done.
+
+### WP-06 — Candle embedding service and model qualification
+- `src/embeddings/manifest.rs`: pinned E5-small artifact set (revision, per-file SHA-256
+  digests, license) plus the `ModelRecipe` (query/passage prefixes, max_tokens=512,
+  normalization, chunking policy). Only this qualified recipe is supported.
+- `src/embeddings/artifacts.rs`: `ArtifactCache` with explicit fetch, digest
+  verification on every load (tampering is a hard error), and an offline-only mode that
+  never attempts downloads (`OfflineMissing` errors are actionable).
+- `src/embeddings/bert_impl.rs`: Candle BertModel implementation matching the pinned
+  config — multi-head attention with `.contiguous()` after transposes (batch>1 matmul
+  requires it), attention-mask broadcasting [B,S]→[B,H,Sq,Sk], softmax over the key axis.
+- `src/embeddings/e5_small.rs`: `E5SmallAdapter` — validation of architecture/tokenizer
+  class against the recipe (rejects unsupported models with an actionable message),
+  prefixing by role, batch padding + attention masks, masked mean pooling, L2
+  normalization, finite-value checks, window enforcement (no silent truncation).
+- `src/embeddings/e5_small.rs::chunk_passage`: tokenizer-length-aware greedy unit
+  packing under the model window; chunks are verbatim spans of the fragment
+  (`fragment[char_start..char_end] == text`, blank lines stay inside the slice) so parent
+  identity is preserved exactly (T-EMB-03). Oversized single units get a disclosed hard
+  split at the tokenizer boundary via binary search on char boundaries with a progress
+  guard.
+- `src/embeddings/worker.rs`: bounded synchronous worker thread owning the adapter
+  (`&mut self`), dedicated OS thread off Tokio I/O workers; bounded queue is the
+  backpressure point (full queue → retryable `Busy`, never unbounded allocation, RQ-22);
+  generation-based `cancel_all`; stats accounting.
+- `src/embeddings/service.rs`: async `EmbeddingService` facade over the worker handle
+  (cloneable, cancellation via dropped futures).
+- `src/embeddings/fixtures/reference_fixture.json` + `plans/models/e5-small-manifest.md`:
+  reference vectors/tokens generated with the same prefix recipe as production, plus the
+  model manifest documenting redistribution rights and the reference environment.
+- Review fixes: batch>1 matmul crash (non-contiguous tensors after transpose) fixed in
+  `bert_impl.rs`; oversized-unit "hard split" now actually splits at the tokenizer limit;
+  near-limit boundary test added (508–512 tokens embed finite + normalized, over-limit
+  rejected); `pop_timeout` waits only remaining time until its deadline instead of the
+  full timeout each iteration.
+- Tests: T-EMB-01 (tokenizer IDs/special tokens/prefixing vs reference), T-EMB-02
+  (single/batched/empty/padded mixed-length/near-limit embeddings, normalization,
+  padding correctness), T-EMB-03 (fact beyond first window retrieved in the correct
+  chunk; verbatim offsets; hard-split oversized line fits the window).
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (207 passed, 0 failed).
+
+> WP-06 complete. All ten tasks done.

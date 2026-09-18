@@ -33,6 +33,10 @@ candle-transformers = { version = "0.11.0" }
 # Match candle-core 0.11.0's tokenizers to avoid a duplicate version in the graph.
 tokenizers = { version = "0.22.2" }
 
+# Artifact fetch (model downloads). rustls-tls only — pure Rust, no native TLS.
+# Already in the graph via lancedb `remote`; making it explicit keeps RQ-21 honest.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
 # OS-level primitives: singleton lock (flock), socket/permission control.
 libc = "0.2"
 

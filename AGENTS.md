@@ -86,10 +86,15 @@ CLI tools: `ccc init`, `ccc index`, `ccc search`. The index lives in `.cocoindex
 - Never amend or rewrite published history; never force-push (unless the user explicitly
   authorizes a specific history rewrite).
 - Do not commit unless explicitly asked.
-- **NO COMMIT SPREE (STRICT)**: one reviewed, coherent commit per logical unit of work.
+- **NO COMMIT SPREE (STRICT)**: one reviewed (see commit gate rule below), coherent commit per logical unit of work.
   Review the change against the plan/spec BEFORE committing — never commit first and
   patch in a follow-up commit. If a review uncovers gaps, fold them into the same
   commit (amend while unpublished) instead of stacking fix-ups.
+- **COMMIT GATE (STRICT)**: no commit until at least two full review-and-fix passes are
+  done — `impl + 2 x (review + fix) === 'COMMIT ALLOWED'`. The two passes must be distinct:
+  1. Formal review — re-read the code against plans/ requirements and verify coverage.
+  2. Functional review — hunt for bugs/logic flaws (off-by-one, races, edge cases).
+  Each pass ends with its findings fixed before the next begins. Non-compliance is a no-go.
 
 ## Tracking Rules
 
