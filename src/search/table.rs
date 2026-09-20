@@ -189,18 +189,25 @@ impl SearchTable {
 
     /// Lexical candidate query: full-text search over the rendered text.
     /// Returns empty results if no FTS index exists (graceful degradation).
-    pub async fn fts_query(&self, terms: &str, limit: usize) -> DomainResult<Vec<SearchRow>> {
+    /// `filter` optionally constrains results with a DataFusion predicate.
+    pub async fn fts_query(
+        &self,
+        terms: &str,
+        limit: usize,
+        filter: Option<&str>,
+    ) -> DomainResult<Vec<SearchRow>> {
         use lance_index::scalar::FullTextSearchQuery;
 
         // Check if FTS is available by attempting the query and handling the
         // specific error for missing INVERTED index gracefully.
-        let stream = self
+        let mut builder = self
             .table
             .query()
-            .full_text_search(FullTextSearchQuery::new(terms.to_string()))
-            .limit(limit)
-            .execute()
-            .await;
+            .full_text_search(FullTextSearchQuery::new(terms.to_string()));
+        if let Some(f) = filter {
+            builder = builder.only_if(f);
+        }
+        let stream = builder.limit(limit).execute().await;
 
         match stream {
             Ok(stream) => {
@@ -223,6 +230,71 @@ impl SearchTable {
                 }
             }
         }
+    }
+
+    /// Dense candidate query: nearest vectors to `vector` over the embedding
+    /// column, optionally constrained by a DataFusion filter. Rows without a
+    /// vector are never returned. The `_distance` column (cosine) is included
+    /// in the returned batches for reference scoring.
+    pub async fn vector_query(
+        &self,
+        vector: &[f32],
+        limit: usize,
+        filter: Option<&str>,
+    ) -> DomainResult<Vec<(SearchRow, f32)>> {
+        use lancedb::DistanceType;
+        use lancedb::query::QueryBase;
+
+        let mut builder = self
+            .table
+            .query()
+            .nearest_to(vector)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        builder = builder.distance_type(DistanceType::Cosine);
+        if let Some(f) = filter {
+            builder = builder.only_if(f);
+        }
+        let stream = builder
+            .limit(limit)
+            .execute()
+            .await
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        use futures_util::TryStreamExt;
+        let batches: Vec<arrow_array::RecordBatch> = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+
+        let mut out = Vec::new();
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let rows = batches_to_rows(std::slice::from_ref(batch));
+            let dist = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
+            for (i, row) in rows.iter().enumerate() {
+                let d = dist.map(|d| d.value(i)).unwrap_or(1.0);
+                out.push((row.clone(), d));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether an FTS (INVERTED) index exists over the lexical_text column.
+    /// Used for readiness reporting: without it, lexical recall degrades to
+    /// empty results (graceful) and must be reported as not-ready.
+    pub async fn fts_index_ready(&self) -> DomainResult<bool> {
+        use lancedb::index::IndexType;
+        let indices = self
+            .table
+            .list_indices()
+            .await
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        Ok(indices.iter().any(|c| {
+            c.columns.iter().any(|p| p == "lexical_text") && c.index_type == IndexType::FTS
+        }))
     }
 
     /// Create an FTS (BM25) index over the rendered text column.
@@ -698,7 +770,7 @@ mod tests {
         // Index must exist before full-text search can use it.
         tbl.create_fts_index().await.unwrap();
 
-        let hits = tbl.fts_query("rust async", 10).await.unwrap();
+        let hits = tbl.fts_query("rust async", 10, None).await.unwrap();
         assert!(!hits.is_empty(), "expected at least one FTS hit");
         assert!(hits.iter().any(|r| r.memory_id == eid(1)));
     }

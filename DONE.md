@@ -235,3 +235,51 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
   `cargo test` (207 passed, 0 failed).
 
 > WP-06 complete. All ten tasks done.
+
+### WP-07 — Retrieval, graph context and explanations (core)
+- `src/retrieval/engine.rs`: the recall engine composing all stages — direct-ID
+  and empty-query routing (separate from ranked search), lexical + dense legs
+  executed separately, chunk collapse by parent, one-based RRF fusion, bundle
+  resolution, bounded graph expansion, calibrated scoring, MMR, context budget,
+  explanation. `QueryEmbedder` trait keeps inference off the retrieval path.
+- `src/retrieval/scope.rs`: `EffectiveScope` resolved ONCE per call and applied
+  to both legs (Lance filter), canonical hydration and every graph step (RV-13);
+  project+global inheritance, type/date/confidence/lifecycle predicates;
+  `to_lance_filter` escapes string literals (quote doubling).
+- `src/retrieval/ranking.rs`: separate tested scorers — deterministic one-based
+  `rrf_fuse`, `legacy_reference_score` (oracle only, RV-11), calibrated
+  `native_score` (all components [0,1], frozen coefficients), `normalize_rrf`,
+  `cosine` (missing/zero/non-finite vectors → 0.0, never NaN).
+- `src/retrieval/graph_expansion.rs`: bounded expansion (depth/fan-out/node
+  caps), edge-specific policies, per-node provenance paths, scope enforced on
+  every hop, deduplicated hub contribution (no unlimited summation, RV-11).
+- `src/retrieval/bundles.rs`: supersession chains resolved from the FULL
+  relation graph (a stale candidate is caught even when its successor is not
+  independently recalled); out-of-scope replacements never leak; conflict
+  bundles preserved for MMR protection.
+- `src/retrieval/mmr.rs`: greedy MMR on calibrated scores with protected-bundle
+  priority, missing-vector lexical fallback, stable (score desc, ID asc)
+  tie-breaking.
+- `src/retrieval/context.rs`: budgets the actual serialized context,
+  `AccountingMethod` labels approximate byte accounting when no tokenizer is
+  known, conflict notice when a bundle cannot fully fit.
+- `src/retrieval/explain.rs`: frozen `RETRIEVAL_PROFILE_VERSION = "1.0.0"`,
+  per-candidate ranks/scores/graph paths/diversification decisions, readiness
+  and partial flags.
+- `src/search/table.rs`: `vector_query` (cosine, fingerprint-filtered, AD-04),
+  `fts_query` accepts a scope filter, `fts_index_ready` reports the real index
+  state for readiness.
+- `src/service/repository.rs`: `all_relations` snapshot read for graph consumers.
+- Review fixes: stale-only-recall supersession redirect (chain built from the
+  full graph, not just recalled candidates); readiness `fts_ready` now checks
+  the INVERTED index instead of row counts; Lance filter string-literal
+  escaping; dense-leg model-fingerprint filter (AD-04); graph contribution 0.0
+  for seeds; conflict notice checked against the final budgeted context.
+- Tests: T-SCOPE-01/02, T-SEARCH-02 (identifiers, accents, mixed case,
+  paths/underscores), T-RANK-01/02/03/04 (RRF arithmetic, scale separation,
+  supersession/conflict bundles, no-answer), multilingual + identifier cases,
+  stale-only-recall redirect, hub bound, scope-on-graph-step, escaping.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (275 passed, 0 failed).
+
+> WP-07 complete. All twelve tasks done.

@@ -569,6 +569,19 @@ impl CanonicalRepository {
         Ok(out)
     }
 
+    /// All canonical relations from a single snapshot (graph consumers).
+    pub fn all_relations(&self) -> DomainResult<Vec<Relation>> {
+        let snapshot = self.db.read_tx();
+        let mut out = Vec::new();
+        for kv in snapshot.iter(&self.relations) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            out.push(decode::<Relation>(v.as_ref())?);
+        }
+        Ok(out)
+    }
+
     /// Graph-neighbor traversal from a single snapshot.
     pub fn neighbors(&self, id: EntityId) -> DomainResult<Vec<Relation>> {
         let snapshot = self.db.read_tx();

@@ -353,7 +353,8 @@
         "T-RANK-01",
         "T-RANK-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_passed",
+      "evidence": "src/retrieval/ranking.rs: rrf_hand_computed_one_based, normalize_rrf_max_maps_to_one, legacy_reference_score_scale_documented, native_score_bounded_and_calibrated (separate legacy vs native evidence); mmr.rs: mmr_prefers_relevance_with_diversity_penalty"
     },
     {
       "id": "RQ-12",
@@ -366,7 +367,7 @@
         "T-RANK-03"
       ],
       "status": "executed_partial",
-      "evidence": "CanonicalRepository + graph predicates: endpoint existence, edge uniqueness, self-supersession and cycle rejection enforced in-transaction. T-GRAPH-02 retrieval preservation and T-RANK-03 (WP-07) deferred."
+      "evidence": "Mutation side (WP-03): endpoint existence, edge uniqueness, self-supersession and cycle rejection enforced in-transaction (supersession_cycle_rejected_concurrency_safely). Retrieval side (WP-07): T-GRAPH-02/T-RANK-03 covered by conflict_bundle_preserves_both_sides, superseded_memory_excluded_current_protected, stale_only_recall_redirects_to_current, scope_applies_to_all_legs_and_graph. T-GRAPH-01 full concurrent race matrix (endpoint deletion vs edge creation races) still deferred."
     },
     {
       "id": "RQ-13",
@@ -377,7 +378,8 @@
         "T-SCOPE-01",
         "T-SCOPE-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_passed",
+      "evidence": "src/retrieval/scope.rs: EffectiveScope resolved once, applied to legs (to_lance_filter), hydration and every graph step; engine.rs: scope_applies_to_all_legs_and_graph (T-SCOPE-01), min_confidence_backfilled_from_canonical (T-SCOPE-02), date filters, direct-ID scope enforcement"
     },
     {
       "id": "RQ-14",
@@ -388,7 +390,8 @@
         "T-SEARCH-02",
         "T-RANK-04"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_passed",
+      "evidence": "engine.rs: exact_identifiers_survive_lexical_leg, french_accents_and_mixed_case_survive, underscores_and_paths_preserved (T-SEARCH-02); no_answer_when_nothing_matches, dense_no_answer_threshold_filters_noise (T-RANK-04); ranking.rs: rrf/normalize/native/cosine reject non-finite, cosine_handles_missing_and_zero_vectors"
     },
     {
       "id": "RQ-15",

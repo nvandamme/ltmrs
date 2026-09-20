@@ -301,18 +301,18 @@ Rust snippets and commands in this document are design-level examples or planned
 
 ### Tasks
 
-- [ ] Implement direct-ID and empty-query routing separately from ranked search.
-- [ ] Resolve effective scope once; apply it to both candidate legs, canonical hydration and every graph step.
-- [ ] Implement identifier-preserving lexical behavior and multilingual test cases.
-- [ ] Execute lexical and dense candidate queries separately initially for explanations and reference scoring.
-- [ ] Collapse derived chunks to parent memories before fusion; retain matched spans.
-- [ ] Implement deterministic one-based RRF, the legacy reference scorer and the normalized native scorer as separate tested functions.
-- [ ] Add bounded graph expansion with edge-specific policies, limits, provenance and no unlimited hub summation.
-- [ ] Resolve supersession chains and build protected conflict/correction bundles before MMR.
-- [ ] Implement semantic/lexical diversification with explicit score normalization, missing-vector behavior and stable tie-breaking.
-- [ ] Add no-answer rules, candidate backfill, readiness/partial-result reporting and finite-score validation.
-- [ ] Budget actual serialized context; label approximate token accounting when the target tokenizer is unknown.
-- [ ] Record explanations for this call: candidate ranks, filters, revision/generation, graph paths, score components, diversification decisions and excluded/truncated context.
+- [x] Implement direct-ID and empty-query routing separately from ranked search.
+- [x] Resolve effective scope once; apply it to both candidate legs, canonical hydration and every graph step.
+- [x] Implement identifier-preserving lexical behavior and multilingual test cases.
+- [x] Execute lexical and dense candidate queries separately initially for explanations and reference scoring.
+- [x] Collapse derived chunks to parent memories before fusion; retain matched spans.
+- [x] Implement deterministic one-based RRF, the legacy reference scorer and the normalized native scorer as separate tested functions.
+- [x] Add bounded graph expansion with edge-specific policies, limits, provenance and no unlimited hub summation.
+- [x] Resolve supersession chains and build protected conflict/correction bundles before MMR.
+- [x] Implement semantic/lexical diversification with explicit score normalization, missing-vector behavior and stable tie-breaking.
+- [x] Add no-answer rules, candidate backfill, readiness/partial-result reporting and finite-score validation.
+- [x] Budget actual serialized context; label approximate token accounting when the target tokenizer is unknown.
+- [x] Record explanations for this call: candidate ranks, filters, revision/generation, graph paths, score components, diversification decisions and excluded/truncated context.
 
 **Outputs:** recall engine, context assembler, explanation schema mapping, retrieval profile version.
 

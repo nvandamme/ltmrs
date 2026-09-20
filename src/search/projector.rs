@@ -999,7 +999,12 @@ mod tests {
             .unwrap();
 
         // Empty database: FTS query and predicate queries return clean empties.
-        assert!(tbl.fts_query("anything", 10).await.unwrap().is_empty());
+        assert!(
+            tbl.fts_query("anything", 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(tbl.count_rows(None).await.unwrap(), 0);
         assert!(
             tbl.rows_where("lexical_text LIKE '%x%'")
