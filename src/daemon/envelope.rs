@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::compatibility::lemma::tool_args::ToolArgs;
 use crate::domain::command::{
     CommandContext, DomainCommand, DomainError, DomainErrorCode, DomainResult, MemoryPatch,
     ReceiptOutcome, Scope,
@@ -19,6 +20,7 @@ use crate::domain::id::{
 use crate::domain::memory::Memory;
 use crate::domain::relation::{Relation, RelationType};
 use crate::domain::session::{AttemptOutcome, TaskOutcome};
+use serde_json::Value;
 
 /// The IPC protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -98,8 +100,16 @@ pub enum DomainRequest {
     GetMemories {
         ids: Vec<EntityId>,
     },
+    /// List all canonical memories (read-only). Used by the frontend to build
+    /// the dynamic instructions index (WP-08).
+    ListMemories,
     Neighbors {
         id: EntityId,
+    },
+    /// A legacy MCP tool call (WP-08). The daemon executes the tool and returns
+    /// a shaped legacy wire result (text + structured + error flag).
+    ToolCall {
+        tool: ToolArgs,
     },
 }
 
@@ -159,7 +169,9 @@ impl DomainRequest {
             // the canonical command gateway.
             DomainRequest::SessionAttempt { .. }
             | DomainRequest::GetMemories { .. }
-            | DomainRequest::Neighbors { .. } => None,
+            | DomainRequest::ListMemories
+            | DomainRequest::Neighbors { .. }
+            | DomainRequest::ToolCall { .. } => None,
         }
     }
 }
@@ -169,6 +181,14 @@ impl DomainRequest {
 pub enum DomainPayload {
     Memories(Vec<Memory>),
     Relations(Vec<Relation>),
+    /// A shaped legacy MCP tool result (WP-08): the human-readable text, the
+    /// structured payload (when the tool has an output schema) and the tool
+    /// error flag. The frontend wraps this verbatim into the wire response.
+    ToolResult {
+        text: String,
+        structured: Option<Value>,
+        is_error: bool,
+    },
     None,
 }
 

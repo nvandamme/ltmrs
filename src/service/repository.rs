@@ -582,6 +582,37 @@ impl CanonicalRepository {
         Ok(out)
     }
 
+    /// Resolve a legacy string ID (external alias or UUID string) to an
+    /// EntityId. The legacy wire uses string IDs; ltmrs canonical IDs are
+    /// UUIDs, so an ID that is not a registered alias is parsed as a UUID.
+    pub fn resolve_id(&self, id: &str) -> DomainResult<EntityId> {
+        let snapshot = self.db.read_tx();
+        // First try the alias keyspace.
+        if let Some(raw) = snapshot
+            .get(&self.aliases, id)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+        {
+            let s = String::from_utf8_lossy(raw.as_ref()).to_string();
+            if let Ok(u) = uuid::Uuid::parse_str(&s) {
+                return Ok(EntityId::new(u));
+            }
+        }
+        // Fall back to parsing as a UUID.
+        uuid::Uuid::parse_str(id)
+            .map(EntityId::new)
+            .map_err(|_| DomainError::new(DomainErrorCode::NotFound, format!("unknown ID: {id}")))
+    }
+
+    /// The legacy string ID for a memory: its external alias if set, else the
+    /// UUID string.
+    pub fn legacy_id(&self, memory: &Memory) -> String {
+        memory
+            .external_alias
+            .as_ref()
+            .map(|a| a.as_str().to_string())
+            .unwrap_or_else(|| memory.id.as_uuid().to_string())
+    }
+
     /// Graph-neighbor traversal from a single snapshot.
     pub fn neighbors(&self, id: EntityId) -> DomainResult<Vec<Relation>> {
         let snapshot = self.db.read_tx();

@@ -1,0 +1,166 @@
+[
+  {
+    "fields": {
+      "id": "mab09cf716de9",
+      "title": "Fragment mab09cf716de9 title",
+      "description": "Fragment mab09cf716de9 summary",
+      "fragment": "## mab09cf716de9\nSynthetic body for mab09cf716de9.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-20",
+      "tags": [],
+      "associatedWith": [
+        "m253b608102d8",
+        "me65ce00b0d88",
+        "m78dcb630c3b7",
+        "m28dc1b27934f",
+        "m7e93c379e5cf",
+        "mc7a76d296913",
+        "mcdd4d7da091c",
+        "med791ac8f0e0",
+        "m2c8177d20602",
+        "m4fa380eca806",
+        "m3194bbde9b97",
+        "m93cc3925d9c5"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "me65ce00b0d88",
+          "note": "note 0"
+        },
+        {
+          "type": "related_to",
+          "id": "m253b608102d8",
+          "note": "note 1"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "expectedResponse": "=== MEMORY FRAGMENT DETAIL ===\nID: [mab09cf716de9] █████ (🤖) [vdlbee_ml]\nTitle: Gate-9 complete evaluator is neither complete nor runtime-wired\nSummary: The complete evaluator is uncalled, loses face identity, reconstructs from ortho support, and omits yield from pass criteria.\nCreated: 2026-09-20 | Confidence: 1.00\nRelated: m253b608102d8, me65ce00b0d88, m78dcb630c3b7, m28dc1b27934f\nRelations:\n  related_to → [me65ce00b0d88] — Auto-reverse of: Auto-linked: topic overlap (1.00)\n  related_to → [m253b608102d8] — Auto-reverse of: Auto-linked: co-read in same query\n--- CONTENT ---\n## Gate-9 complete evaluator is neither complete nor runtime-wired\n\n### Context\nG4 requires frozen accepted RGB–ortho outputs, post-freeze CityGML validation, four metrics, and a powered independent cohort.\n\n### Findings\n- `validate_gate9_real_citygml_complete` is not invoked by the probe main; its test only inspects source strings.\n- It collapses directional faces by `pano_id`, reconstructs patches from projected ortho footprint points rather than accepted street pixels, and derives accepted cases from lossy relation edges.\n- `all_pass` checks case count and three medians but omits the finite-valid-patch-yield threshold.\n- The truth manifest auto-regenerates when missing and is not digest-bound into a schema-versioned immutable result.\n\n### Rule\n- Gate closure must execute the actual evaluator, preserve full observation identity, consume graph-resolved accepted records/anchors, gate all four powered metrics, and persist the frozen truth/result digests.\n=============="
+  },
+  {
+    "fields": {
+      "id": "me65ce00b0d88",
+      "title": "Fragment me65ce00b0d88 title",
+      "description": "Fragment me65ce00b0d88 summary",
+      "fragment": "## me65ce00b0d88\nSynthetic body for me65ce00b0d88.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-20",
+      "tags": [],
+      "associatedWith": [
+        "m253b608102d8",
+        "mab09cf716de9",
+        "m78dcb630c3b7",
+        "m28dc1b27934f"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "mab09cf716de9",
+          "note": "note 2"
+        },
+        {
+          "type": "related_to",
+          "id": "m253b608102d8",
+          "note": "note 1"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "expectedResponse": "=== MEMORY FRAGMENT DETAIL ===\nID: [me65ce00b0d88] █████ (🤖) [vdlbee_ml]\nTitle: Phase G Gate-9 source-shape tests can mask a broken evaluator\nSummary: Gate-9 tests pass while validating only strings and callability, not real acceptance behavior.\nCreated: 2026-09-20 | Confidence: 1.00\nRelated: m253b608102d8, mab09cf716de9, m78dcb630c3b7, m28dc1b27934f\nRelations:\n  related_to → [mab09cf716de9] — Auto-linked: topic overlap (1.00)\n  related_to → [m253b608102d8] — Auto-reverse of: Auto-linked: co-read in same query\n--- CONTENT ---\n## Gate-9 scaffold tests are not acceptance evidence\nThe Phase G-bis audit found that the focused Gate-9 test passes by inspecting function source for metric names rather than executing the evaluator.\n- Direct evaluator output was only 2 cases, finite-valid-patch yield 0.50, median IoU null, anchor error 40.63 m, normal error 40.90°, and `all_pass=false`.\n- The evaluator reconstructs from projected ortho points instead of accepted street-image support, collapses directional faces, uses IoU 0.50 instead of 0.75, and omits yield 0.90 from `all_pass`.\n- Gate closure tests must assert behavioral metric values, frozen manifest/digest integrity, evidence isolation, full face identity, and every authoritative threshold.\n=============="
+  },
+  {
+    "fields": {
+      "id": "m5fe9e2a86b64",
+      "title": "Fragment m5fe9e2a86b64 title",
+      "description": "Fragment m5fe9e2a86b64 summary",
+      "fragment": "## m5fe9e2a86b64\nSynthetic body for m5fe9e2a86b64.",
+      "project": "proj_1",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-20",
+      "tags": [],
+      "associatedWith": [
+        "m9a96305535e2",
+        "md4b1c0984c1b",
+        "m34572374c840",
+        "mba77b5901ff0",
+        "m7b923acc1afd",
+        "mafdb5e03bef8",
+        "m875d75f19b6b",
+        "m42313dff67b1",
+        "mc1f2365c4799",
+        "ma5d423a58cb5",
+        "m8f5639076af4",
+        "m83f2ff973e1d",
+        "m422798cf311a",
+        "m6632418579df",
+        "m00b9aed5f029",
+        "m875c35be23e8",
+        "m2856f114c7f4",
+        "mbcdd48e97442",
+        "m5cdd6a9603f7",
+        "m1efaeb4a0c5a",
+        "seed_task_complexity",
+        "seed_prompt_engineering",
+        "seed_html_output_strategy"
+      ],
+      "relations": [],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "expectedResponse": "=== MEMORY FRAGMENT DETAIL ===\nID: [m5fe9e2a86b64] █████ (🤖) [ltmrs]\nTitle: ## ltmrs WP-07 Retrieval Complete (275 t...\nSummary: ## ltmrs WP-07 Retrieval Complete (275 tests, commit gate met)...\nCreated: 2026-09-20 | Confidence: 1.00\nRelated: m9a96305535e2, md4b1c0984c1b, m34572374c840, mba77b5901ff0, m7b923acc1afd, mafdb5e03bef8, m875d75f19b6b, m42313dff67b1, mc1f2365c4799, ma5d423a58cb5, m8f5639076af4, m83f2ff973e1d, m422798cf311a, m6632418579df, m00b9aed5f029, m875c35be23e8, m2856f114c7f4, mbcdd48e97442, m5cdd6a9603f7, m1efaeb4a0c5a, seed_task_complexity, seed_prompt_engineering, seed_html_output_strategy\n--- CONTENT ---\n## ltmrs WP-07 Committed (89f7e58)\n\n### Context\nWP-07 retrieval, graph context and explanations committed after impl + 2 review passes.\n\n### Commit\n- 89f7e58 on master: 15 files, +3847/-24.\n- 8 new modules in src/retrieval/: engine, scope, ranking, graph_expansion, bundles, mmr, context, explain.\n- Supporting: SearchTable::vector_query/fts_index_ready, fts_query filter param, repo.all_relations.\n\n### Bugs fixed in review passes\n- bundles.rs: stale-only recall (superseder not a candidate) wasn't redirected — chain built from full graph.\n- engine.rs: fts_ready counted rows (always >0) — now fts_index_ready() checks INVERTED index exists.\n- scope.rs: to_lance_filter injected project name raw — sql_quote() doubles single quotes (DataFusion).\n\n### Traceability updated\n- RQ-11, RQ-13, RQ-14: executed_passed with test evidence.\n- RQ-12: retrieval side (T-GRAPH-02) covered; T-GRAPH-01 full race matrix still deferred.\n- DONE.md + plan checkboxes marked.\n\n### Validation\nfmt OK, clippy 0, 275 tests pass.\n==============\n\n---\n**[Lemma] Session started** (vs_mudt56i6). When you finish this task, call session_end with outcome and lessons. Use memory_add to persist insights, guide_practice to track skill usage."
+  },
+  {
+    "fields": {
+      "id": "m2c8177d20602",
+      "title": "Fragment m2c8177d20602 title",
+      "description": "Fragment m2c8177d20602 summary",
+      "fragment": "## m2c8177d20602\nSynthetic body for m2c8177d20602.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-23",
+      "tags": [],
+      "associatedWith": [
+        "m7e93c379e5cf",
+        "mc7a76d296913",
+        "mcdd4d7da091c",
+        "m253b608102d8",
+        "med791ac8f0e0",
+        "m4fa380eca806",
+        "m3194bbde9b97",
+        "m93cc3925d9c5",
+        "mab09cf716de9"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "m39e037726e9a",
+          "note": "note 2"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "expectedResponse": "=== MEMORY FRAGMENT DETAIL ===\nID: [m2c8177d20602] █████ (🤖) [vdlbee_ml]\nTitle: Gate-9 matcher quality fix: vectorization + 3D silhouette\nSummary: ## Gate-9 matcher quality fix: vectorization + 3D silhouette (2026-09-20)...\nCreated: 2026-09-23 | Confidence: 1.00\nRelated: m7e93c379e5cf, mc7a76d296913, mcdd4d7da091c, m253b608102d8, med791ac8f0e0, m4fa380eca806, m3194bbde9b97, m93cc3925d9c5, mab09cf716de9\nRelations:\n  related_to → [m39e037726e9a] — Auto-linked: topic overlap (1.00)\n--- CONTENT ---\n## Gate-9 matcher quality fix: vectorization + 3D silhouette (2026-09-20)\n\n### Context\nThe full benchmark run took 20+ min. Profiled: 95% of time in `project_world_to_image` (146k calls, each recomputing camera_axes via np.cross).\n\n### Findings\n- Vectorized `_compute_projected_image_overlap`: compute camera axes once, batch-project via matrix dot products. 10x speedup (1.8s → 0.18s per face; 680 faces: 20 min → ~1 min).\n- 2D ortho footprints project to degenerate slivers (0px height) from street cameras; 3D extrusion (z=0 + z=12 + ConvexHull) fixes it.\n- `validate_gate9_real_citygml_complete(max_faces=N)` added for fast subset diagnostics (100 faces ≈ 2 min).\n- Full-run metrics after fix: 134 accepted matches, yield 0.84 (threshold 0.90), anchor distance 37.1m (≤1.0m), normal error 56.4° (≤10°).\n- Containment saturates (many candidates at 1.000) because street building silhouettes cover ~93% of the image; next fix: filter street pixels to camera side of facade plane.\n=============="
+  }
+]

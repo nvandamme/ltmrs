@@ -43,12 +43,18 @@ libc = "0.2"
 # Core async runtime + utilities.
 tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "time", "sync", "process"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: legacy wire objects (e.g. memory_stats by_source/by_project)
+# must serialize in upstream insertion order, not BTreeMap-alphabetical.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Insertion-ordered maps for wire-faithful stats/audit aggregation.
+indexmap = { version = "2", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
 anyhow = "1"
 sha2 = "0.10"
+# Best-effort secret detection for memory_add privacy (design 12.1).
+regex = { version = "1", default-features = false, features = ["std"] }
 
 # Arrow (behind storage/ only).
 arrow-array = "58"

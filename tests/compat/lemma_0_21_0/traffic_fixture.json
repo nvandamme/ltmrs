@@ -1,0 +1,392 @@
+[
+  {
+    "fields": {
+      "id": "m2aec598a7bdf",
+      "title": "Fragment m2aec598a7bdf title",
+      "description": "Fragment m2aec598a7bdf summary",
+      "fragment": "## m2aec598a7bdf\nSynthetic body for m2aec598a7bdf.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-19",
+      "tags": [
+        "tag_0",
+        "tag_1"
+      ],
+      "associatedWith": [
+        "m45a871e367e3",
+        "m663bc22457dc",
+        "m8ce311309690",
+        "m2aa8f4eb5b0f",
+        "m28dc1b27934f",
+        "mcdd4d7da091c",
+        "m593bf0272e3e",
+        "m4fa380eca806",
+        "m2aec598a7bdf",
+        "m31ebd609fdf3",
+        "mb9821614e222",
+        "m1723b13f3490",
+        "m3b69d5c3401d",
+        "m5e991196f719",
+        "mae55dc1bbc73",
+        "seed_html_output_strategy",
+        "m1567da08ab6f",
+        "m50493f78e2d4",
+        "m3b7e28935ac9"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "m45a871e367e3",
+          "note": "note 0"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [m2aec598a7bdf] █████ (🤖) [proj_0]\nTitle: Fragment m2aec598a7bdf title\nSummary: Fragment m2aec598a7bdf summary\nCreated: 2026-09-19 | Confidence: 1.00\nTags: tag_0, tag_1\nRelated: m45a871e367e3, m663bc22457dc, m8ce311309690, m2aa8f4eb5b0f, m28dc1b27934f, mcdd4d7da091c, m593bf0272e3e, m4fa380eca806, m2aec598a7bdf, m31ebd609fdf3, mb9821614e222, m1723b13f3490, m3b69d5c3401d, m5e991196f719, mae55dc1bbc73, seed_html_output_strategy, m1567da08ab6f, m50493f78e2d4, m3b7e28935ac9\nRelations:\n  related_to → [m45a871e367e3] — note 0\n--- CONTENT ---\n## m2aec598a7bdf\nSynthetic body for m2aec598a7bdf.\n==============",
+    "summary": "## Memory Fragments (proj_0)\n---\n[m2aec598a7bdf] [proj_0] Fragment m2aec598a7bdf title — Fragment m2aec598a7bdf summary\n---"
+  },
+  {
+    "fields": {
+      "id": "mce4fe49e5fd9",
+      "title": "Fragment mce4fe49e5fd9 title",
+      "description": "Fragment mce4fe49e5fd9 summary",
+      "fragment": "## mce4fe49e5fd9\nSynthetic body for mce4fe49e5fd9.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-17",
+      "tags": [
+        "tag_2",
+        "tag_3",
+        "tag_4"
+      ],
+      "associatedWith": [
+        "m98388abce2a0",
+        "mc7a76d296913",
+        "m227433b4f2e6",
+        "ma049392e35ee",
+        "m3b69d5c3401d",
+        "mb0692e93213e",
+        "md7c0b0532bd0",
+        "mc97c6431327d",
+        "m3194bbde9b97",
+        "m4b34a531d146",
+        "m2aec598a7bdf",
+        "mbad43591d0fa",
+        "m5543f9f0ed87",
+        "m77f59230ff3e",
+        "mdae769c6502d",
+        "m63b984ee7311",
+        "m99c7c5268e69",
+        "m9f0f1e660914",
+        "me469f8328fb3",
+        "m6ce86a31a133",
+        "m57eebc01f247",
+        "m956962a0abab",
+        "m72f6fd147829",
+        "mef2c8edd5add",
+        "mc48f532af3e4",
+        "m2073a1269c14",
+        "m37ea3422aba9",
+        "m389a9b8eb6b3",
+        "m1449c9b75aec",
+        "m50493f78e2d4",
+        "me31c2d96911b",
+        "m5e991196f719",
+        "m4fa380eca806",
+        "mcdd4d7da091c",
+        "m253b608102d8",
+        "mb2b5cd45ac20",
+        "m1723b13f3490",
+        "m2acd49ae9577"
+      ],
+      "relations": [],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [mce4fe49e5fd9] █████ (🤖) [proj_0]\nTitle: Fragment mce4fe49e5fd9 title\nSummary: Fragment mce4fe49e5fd9 summary\nCreated: 2026-09-17 | Confidence: 1.00\nTags: tag_2, tag_3, tag_4\nRelated: m98388abce2a0, mc7a76d296913, m227433b4f2e6, ma049392e35ee, m3b69d5c3401d, mb0692e93213e, md7c0b0532bd0, mc97c6431327d, m3194bbde9b97, m4b34a531d146, m2aec598a7bdf, mbad43591d0fa, m5543f9f0ed87, m77f59230ff3e, mdae769c6502d, m63b984ee7311, m99c7c5268e69, m9f0f1e660914, me469f8328fb3, m6ce86a31a133, m57eebc01f247, m956962a0abab, m72f6fd147829, mef2c8edd5add, mc48f532af3e4, m2073a1269c14, m37ea3422aba9, m389a9b8eb6b3, m1449c9b75aec, m50493f78e2d4, me31c2d96911b, m5e991196f719, m4fa380eca806, mcdd4d7da091c, m253b608102d8, mb2b5cd45ac20, m1723b13f3490, m2acd49ae9577\n--- CONTENT ---\n## mce4fe49e5fd9\nSynthetic body for mce4fe49e5fd9.\n==============",
+    "summary": "## Memory Fragments (proj_0)\n---\n[mce4fe49e5fd9] [proj_0] Fragment mce4fe49e5fd9 title — Fragment mce4fe49e5fd9 summary\n---"
+  },
+  {
+    "fields": {
+      "id": "m253b608102d8",
+      "title": "Fragment m253b608102d8 title",
+      "description": "Fragment m253b608102d8 summary",
+      "fragment": "## m253b608102d8\nSynthetic body for m253b608102d8.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-19",
+      "tags": [
+        "tag_3"
+      ],
+      "associatedWith": [
+        "m50493f78e2d4",
+        "me31c2d96911b",
+        "m5e991196f719",
+        "m4fa380eca806",
+        "mcdd4d7da091c",
+        "mb0692e93213e",
+        "mb2b5cd45ac20",
+        "mc7a76d296913",
+        "m98388abce2a0",
+        "m4b34a531d146",
+        "m227433b4f2e6",
+        "m3194bbde9b97",
+        "m1723b13f3490",
+        "m2073a1269c14",
+        "m5543f9f0ed87",
+        "m63b984ee7311",
+        "m1449c9b75aec",
+        "m2acd49ae9577",
+        "mce4fe49e5fd9"
+      ],
+      "relations": [],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [m253b608102d8] █████ (🤖) [proj_0]\nTitle: Fragment m253b608102d8 title\nSummary: Fragment m253b608102d8 summary\nCreated: 2026-09-19 | Confidence: 1.00\nTags: tag_3\nRelated: m50493f78e2d4, me31c2d96911b, m5e991196f719, m4fa380eca806, mcdd4d7da091c, mb0692e93213e, mb2b5cd45ac20, mc7a76d296913, m98388abce2a0, m4b34a531d146, m227433b4f2e6, m3194bbde9b97, m1723b13f3490, m2073a1269c14, m5543f9f0ed87, m63b984ee7311, m1449c9b75aec, m2acd49ae9577, mce4fe49e5fd9\n--- CONTENT ---\n## m253b608102d8\nSynthetic body for m253b608102d8.\n==============",
+    "summary": "## Memory Fragments (proj_0)\n---\n[m253b608102d8] [proj_0] Fragment m253b608102d8 title — Fragment m253b608102d8 summary\n---"
+  },
+  {
+    "fields": {
+      "id": "mab09cf716de9",
+      "title": "Fragment mab09cf716de9 title",
+      "description": "Fragment mab09cf716de9 summary",
+      "fragment": "## mab09cf716de9\nSynthetic body for mab09cf716de9.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-20",
+      "tags": [],
+      "associatedWith": [
+        "m253b608102d8",
+        "me65ce00b0d88",
+        "m78dcb630c3b7",
+        "m28dc1b27934f"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "me65ce00b0d88",
+          "note": "note 1"
+        },
+        {
+          "type": "related_to",
+          "id": "m253b608102d8",
+          "note": "note 0"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [mab09cf716de9] █████ (🤖) [proj_0]\nTitle: Fragment mab09cf716de9 title\nSummary: Fragment mab09cf716de9 summary\nCreated: 2026-09-20 | Confidence: 1.00\nRelated: m253b608102d8, me65ce00b0d88, m78dcb630c3b7, m28dc1b27934f\nRelations:\n  related_to → [me65ce00b0d88] — note 1\n  related_to → [m253b608102d8] — note 0\n--- CONTENT ---\n## mab09cf716de9\nSynthetic body for mab09cf716de9.\n==============",
+    "summary": "## Memory Fragments (proj_0)\n---\n[mab09cf716de9] [proj_0] Fragment mab09cf716de9 title — Fragment mab09cf716de9 summary\n---"
+  },
+  {
+    "fields": {
+      "id": "me65ce00b0d88",
+      "title": "Fragment me65ce00b0d88 title",
+      "description": "Fragment me65ce00b0d88 summary",
+      "fragment": "## me65ce00b0d88\nSynthetic body for me65ce00b0d88.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-20",
+      "tags": [],
+      "associatedWith": [
+        "m253b608102d8",
+        "mab09cf716de9",
+        "m78dcb630c3b7",
+        "m28dc1b27934f"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "mab09cf716de9",
+          "note": "note 2"
+        },
+        {
+          "type": "related_to",
+          "id": "m253b608102d8",
+          "note": "note 0"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [me65ce00b0d88] █████ (🤖) [proj_0]\nTitle: Fragment me65ce00b0d88 title\nSummary: Fragment me65ce00b0d88 summary\nCreated: 2026-09-20 | Confidence: 1.00\nRelated: m253b608102d8, mab09cf716de9, m78dcb630c3b7, m28dc1b27934f\nRelations:\n  related_to → [mab09cf716de9] — note 2\n  related_to → [m253b608102d8] — note 0\n--- CONTENT ---\n## me65ce00b0d88\nSynthetic body for me65ce00b0d88.\n==============",
+    "summary": "## Memory Fragments (proj_0)\n---\n[me65ce00b0d88] [proj_0] Fragment me65ce00b0d88 title — Fragment me65ce00b0d88 summary\n---"
+  },
+  {
+    "fields": {
+      "id": "m5fe9e2a86b64",
+      "title": "Fragment m5fe9e2a86b64 title",
+      "description": "Fragment m5fe9e2a86b64 summary",
+      "fragment": "## m5fe9e2a86b64\nSynthetic body for m5fe9e2a86b64.",
+      "project": "proj_1",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-20",
+      "tags": [],
+      "associatedWith": [
+        "m9a96305535e2",
+        "md4b1c0984c1b",
+        "m34572374c840",
+        "mba77b5901ff0",
+        "m7b923acc1afd",
+        "mafdb5e03bef8",
+        "m875d75f19b6b",
+        "m42313dff67b1",
+        "mc1f2365c4799",
+        "ma5d423a58cb5",
+        "m8f5639076af4",
+        "m83f2ff973e1d",
+        "m422798cf311a",
+        "m6632418579df",
+        "m00b9aed5f029",
+        "m875c35be23e8",
+        "m2856f114c7f4",
+        "mbcdd48e97442",
+        "m5cdd6a9603f7",
+        "m1efaeb4a0c5a",
+        "seed_task_complexity",
+        "seed_prompt_engineering",
+        "seed_html_output_strategy"
+      ],
+      "relations": [],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [m5fe9e2a86b64] █████ (🤖) [proj_1]\nTitle: Fragment m5fe9e2a86b64 title\nSummary: Fragment m5fe9e2a86b64 summary\nCreated: 2026-09-20 | Confidence: 1.00\nRelated: m9a96305535e2, md4b1c0984c1b, m34572374c840, mba77b5901ff0, m7b923acc1afd, mafdb5e03bef8, m875d75f19b6b, m42313dff67b1, mc1f2365c4799, ma5d423a58cb5, m8f5639076af4, m83f2ff973e1d, m422798cf311a, m6632418579df, m00b9aed5f029, m875c35be23e8, m2856f114c7f4, mbcdd48e97442, m5cdd6a9603f7, m1efaeb4a0c5a, seed_task_complexity, seed_prompt_engineering, seed_html_output_strategy\n--- CONTENT ---\n## m5fe9e2a86b64\nSynthetic body for m5fe9e2a86b64.\n==============",
+    "summary": "## Memory Fragments (proj_1)\n---\n[m5fe9e2a86b64] [proj_1] Fragment m5fe9e2a86b64 title — Fragment m5fe9e2a86b64 summary\n---"
+  },
+  {
+    "fields": {
+      "id": "m7e93c379e5cf",
+      "title": "Fragment m7e93c379e5cf title",
+      "description": "Fragment m7e93c379e5cf summary",
+      "fragment": "## m7e93c379e5cf\nSynthetic body for m7e93c379e5cf.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-23",
+      "tags": [],
+      "associatedWith": [
+        "mc7a76d296913",
+        "mcdd4d7da091c",
+        "m253b608102d8",
+        "med791ac8f0e0",
+        "m2c8177d20602",
+        "m4fa380eca806",
+        "m3194bbde9b97",
+        "m93cc3925d9c5",
+        "mab09cf716de9",
+        "m39e037726e9a",
+        "m1723b13f3490",
+        "m28dc1b27934f",
+        "m8ce311309690",
+        "m4b34a531d146",
+        "m98388abce2a0",
+        "m68d10ff475a2"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "mc7a76d296913",
+          "note": "note 3"
+        },
+        {
+          "type": "related_to",
+          "id": "mcdd4d7da091c",
+          "note": "note 3"
+        },
+        {
+          "type": "related_to",
+          "id": "m253b608102d8",
+          "note": "note 3"
+        },
+        {
+          "type": "related_to",
+          "id": "m39e037726e9a",
+          "note": "note 3"
+        },
+        {
+          "type": "related_to",
+          "id": "m1723b13f3490",
+          "note": "note 3"
+        },
+        {
+          "type": "related_to",
+          "id": "m28dc1b27934f",
+          "note": "note 3"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [m7e93c379e5cf] █████ (🤖) [proj_0]\nTitle: Fragment m7e93c379e5cf title\nSummary: Fragment m7e93c379e5cf summary\nCreated: 2026-09-23 | Confidence: 1.00\nRelated: mc7a76d296913, mcdd4d7da091c, m253b608102d8, med791ac8f0e0, m2c8177d20602, m4fa380eca806, m3194bbde9b97, m93cc3925d9c5, mab09cf716de9, m39e037726e9a, m1723b13f3490, m28dc1b27934f, m8ce311309690, m4b34a531d146, m98388abce2a0, m68d10ff475a2\nRelations:\n  related_to → [mc7a76d296913] — note 3\n  related_to → [mcdd4d7da091c] — note 3\n  related_to → [m253b608102d8] — note 3\n  related_to → [m39e037726e9a] — note 3\n  related_to → [m1723b13f3490] — note 3\n  related_to → [m28dc1b27934f] — note 3\n--- CONTENT ---\n## m7e93c379e5cf\nSynthetic body for m7e93c379e5cf.\n==============",
+    "summary": "## Memory Fragments (proj_0)\n---\n[m7e93c379e5cf] [proj_0] Fragment m7e93c379e5cf title — Fragment m7e93c379e5cf summary\n---"
+  },
+  {
+    "fields": {
+      "id": "m2c8177d20602",
+      "title": "Fragment m2c8177d20602 title",
+      "description": "Fragment m2c8177d20602 summary",
+      "fragment": "## m2c8177d20602\nSynthetic body for m2c8177d20602.",
+      "project": "proj_0",
+      "confidence": 1,
+      "source": "ai",
+      "created": "2026-09-23",
+      "tags": [],
+      "associatedWith": [
+        "m7e93c379e5cf",
+        "mc7a76d296913",
+        "mcdd4d7da091c",
+        "m253b608102d8",
+        "med791ac8f0e0",
+        "m4fa380eca806",
+        "m3194bbde9b97",
+        "m93cc3925d9c5",
+        "mab09cf716de9"
+      ],
+      "relations": [
+        {
+          "type": "related_to",
+          "id": "m39e037726e9a",
+          "note": "note 2"
+        }
+      ],
+      "positive_feedback": 0,
+      "negative_feedback": 0,
+      "refinement_count": 0,
+      "parent_id": null,
+      "child_ids": []
+    },
+    "detail": "=== MEMORY FRAGMENT DETAIL ===\nID: [m2c8177d20602] █████ (🤖) [proj_0]\nTitle: Fragment m2c8177d20602 title\nSummary: Fragment m2c8177d20602 summary\nCreated: 2026-09-23 | Confidence: 1.00\nRelated: m7e93c379e5cf, mc7a76d296913, mcdd4d7da091c, m253b608102d8, med791ac8f0e0, m4fa380eca806, m3194bbde9b97, m93cc3925d9c5, mab09cf716de9\nRelations:\n  related_to → [m39e037726e9a] — note 2\n--- CONTENT ---\n## m2c8177d20602\nSynthetic body for m2c8177d20602.\n==============",
+    "summary": "## Memory Fragments (proj_0)\n---\n[m2c8177d20602] [proj_0] Fragment m2c8177d20602 title — Fragment m2c8177d20602 summary\n---"
+  }
+]

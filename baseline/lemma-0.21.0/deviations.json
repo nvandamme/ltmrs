@@ -43,6 +43,30 @@
       "test": "T-SESS-01, T-SESS-02",
       "release_wording": "Session isolation across concurrent frontends; per-channel legacy semantics retained.",
       "approval": "pending"
+    },
+    {
+      "id": "DEV-004",
+      "class": "compatibility",
+      "tool": "memory_add",
+      "upstream_behavior": "source is a free-form string stored verbatim; the detail icon is 'ai' -> robot, anything else -> person.",
+      "ltmrs_behavior": "source is a strict enum (user|ai); unknown values are coerced to 'ai' at add time.",
+      "reason": "Strict domain typing (AGENTS.md); the real upstream DB contains non-canonical source values (e.g. 'user-corrected formal review') that the enum cannot express.",
+      "user_visible_impact": "A memory added with a non-canonical source renders the robot icon and is counted under 'ai' in stats, where upstream would show the person icon and the original string.",
+      "test": "T-MCP-02 (differential detail/summary wire tests)",
+      "release_wording": "Source is normalized to the canonical user/ai vocabulary; non-canonical upstream source strings are not preserved verbatim.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-005",
+      "class": "retrieval",
+      "tool": "memory_read, semantic_search, tools/list",
+      "upstream_behavior": "Ranks context injection and empty-query recall with injectionScore (confidence*0.7 + recency*0.3); computes a composite quality_score on every fragment touch.",
+      "ltmrs_behavior": "Uses its own calibrated native scorer (design 10.3) for ranking; quality_score is an optional passthrough field, never computed natively.",
+      "reason": "Intentional retrieval enhancement (Part I 10.3); upstream formulas retained as reference oracles (reference::injection_score, reference::calculate_quality_score) for differential testing only.",
+      "user_visible_impact": "Different recall/injection ordering and no live quality_score values; neither formula is exposed on the wire.",
+      "test": "T-RANK-01, T-RANK-02; differential tests calculate_quality_score_matches_upstream, injection_score_matches_upstream",
+      "release_wording": "Enhanced native ranking; upstream quality/injection formulas preserved as frozen reference oracles, not native behavior.",
+      "approval": "pending"
     }
   ]
 }

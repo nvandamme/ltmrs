@@ -1,0 +1,883 @@
+[
+  {
+    "name": "memory_read",
+    "description": "START HERE \u2014 call this FIRST at the beginning of every task to recall what you already know before doing any work (never re-derive or re-explore facts that may already be saved). Reads memory fragments. SUMMARY MODE: shows title + description only (not full content). Use id parameter to get full detail of a specific fragment. Use all=true to see fragments from all projects.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Project name to filter (optional, defaults to detected project)"
+        },
+        "query": {
+          "type": "string",
+          "description": "Optional semantic search keyword. Supply only if you are looking for specific context."
+        },
+        "id": {
+          "type": "string",
+          "description": "Get FULL DETAIL for a specific fragment ID. Use this after seeing the summary to read the complete content."
+        },
+        "context": {
+          "type": "string",
+          "description": "Optional context tag for this access (e.g., 'debugging', 'refactoring'). Boosts confidence and tags the fragment for future recall."
+        },
+        "all": {
+          "type": "boolean",
+          "description": "If true, show fragments from all projects. Default: false (current project + global only)"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Get full details for multiple fragment IDs at once. Optional."
+        },
+        "minConfidence": {
+          "type": "number",
+          "description": "Minimum confidence threshold (0-1). Only return fragments with confidence >= this value. Optional."
+        },
+        "afterDate": {
+          "type": "string",
+          "description": "ISO date string (e.g., '2026-04-01'). Only return fragments created on or after this date. Optional."
+        },
+        "beforeDate": {
+          "type": "string",
+          "description": "ISO date string (e.g., '2026-04-30'). Only return fragments created on or before this date. Optional."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max fragments to return per page (default 30, max 100). Only applies in browse/search mode, not for id/ids. Optional."
+        },
+        "offset": {
+          "type": "number",
+          "description": "Number of fragments to skip for pagination (default 0). Use next_offset from the previous response to fetch the next page. Optional."
+        },
+        "response_format": {
+          "type": "string",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "description": "Response format: 'markdown' (default, human-readable) or 'json' (machine-readable structured payload). Optional."
+        },
+        "expand_graph": {
+          "type": "boolean",
+          "description": "When reading a specific fragment (id), also surface related fragments reachable through its relations (bounded traversal: depth \u2264 2, strongest links first). Default: false. Optional."
+        },
+        "explain": {
+          "type": "boolean",
+          "description": "Opt in to why each returned memory was selected in THIS call, with recorded sources and evidence freshness. Default false. Does not reconstruct a past recall. Evidence files are checked only if verification.stale_check is enabled; confidence is not proof of correctness. No corrections are applied automatically."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "number",
+          "description": "Number of fragments returned in this response."
+        },
+        "fragments": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Matching memory fragments (summary fields, or full content for id/ids)."
+        },
+        "related_graph": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Fragments reached via relations when expand_graph is set (id, title, depth, score)."
+        },
+        "recall_explanation": {
+          "type": "object",
+          "properties": {
+            "applies_to": {
+              "type": "string",
+              "enum": [
+                "this_call"
+              ]
+            },
+            "scope": {
+              "type": "object"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "correction_tools": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "selection": {
+                    "type": "object"
+                  },
+                  "provenance": {
+                    "type": "object"
+                  },
+                  "freshness": {
+                    "type": "object"
+                  },
+                  "unavailable": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              }
+            }
+          },
+          "required": [
+            "applies_to",
+            "scope",
+            "notice",
+            "correction_tools",
+            "items"
+          ]
+        },
+        "has_more": {
+          "type": "boolean",
+          "description": "Whether more results are available beyond this page."
+        },
+        "next_offset": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "description": "Offset to pass for the next page, if has_more is true. Null when there is no further page."
+        }
+      }
+    }
+  },
+  {
+    "name": "memory_add",
+    "description": "MANDATORY: Call this AFTER completing analysis/research to save findings. Synthesize information into short, reusable fragments.\n\nFRAGMENT SCHEMA \u2014 always follow this structure:\n## [Topic Title]\n\n### Context\n[1-2 sentences: what and why it matters]\n\n### [Content Section]\n- [Key fact 1]\n- [Key fact 2]\n\n### Rules (optional, for patterns/warnings)\n- [Absolute constraint]\n\nRULES:\n- ALWAYS store fragments in ENGLISH regardless of conversation language. This ensures search and retrieval works correctly.\n- Title: max 80 chars, start with topic name\n- Fragment: 30-2000 chars, structured markdown, NOT plain prose\n- Every fragment MUST have a ## heading and at least one ### section\n- Type: Choose based on nature:\n  * fact = technical info, API behavior, version details\n  * pattern = repeated solution, best practice, code pattern\n  * lesson = learned from experience, mistake, debugging insight\n  * warning = caution, gotcha, pitfall to avoid\n  * context = environment info, project setup, dependencies\n- Auto-title: If you omit title, first 40 chars of fragment used\n- Auto-description: First sentence extracted from fragment",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "fragment": {
+          "type": "string",
+          "description": "The memory fragment text to store. Follow this format:\n## [Topic Title]\n[1-2 sentences of context: what and why it matters]\n- [Key fact 1]\n- [Key fact 2]\n- [Constraint or note if any]\nKeep fragments between 30-2000 characters. Use structured markdown, not plain prose."
+        },
+        "title": {
+          "type": "string",
+          "description": "Short title for the memory (auto-generated if not provided). Max 80 characters."
+        },
+        "description": {
+          "type": "string",
+          "description": "Short description/summary (auto-generated if not provided). Max 150 characters."
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Project scope. Omit to auto-file under the current project (detected from cwd). Pass 'global' or null for cross-project scope."
+        },
+        "source": {
+          "type": "string",
+          "description": "Source of the memory (default: 'ai')",
+          "default": "ai"
+        },
+        "confirm": {
+          "type": "boolean",
+          "description": "Set to true to store fragment as-is even if secrets are detected. Default: false (auto-redacts).",
+          "default": false
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "fact",
+            "pattern",
+            "lesson",
+            "warning",
+            "context"
+          ],
+          "description": "Fragment type. 'fact'=technical info, 'pattern'=repeated solution, 'lesson'=learned from experience, 'warning'=caution/gotcha, 'context'=environment info. Default: 'fact'."
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional code backing for this fragment. Cite the file and the exact snippet it was derived from; an opt-in recall check later flags the fragment if that snippet drifts. Windows-safe, no embeddings.",
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "Path to the cited source file."
+            },
+            "symbol": {
+              "type": "string",
+              "description": "Optional symbol/function/section label the snippet belongs to."
+            },
+            "snippet": {
+              "type": "string",
+              "description": "The exact code snippet the fragment is based on (stored verbatim + SHA-256)."
+            }
+          },
+          "required": [
+            "file",
+            "snippet"
+          ]
+        }
+      },
+      "required": [
+        "fragment"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "description": "Whether the fragment was stored."
+        },
+        "id": {
+          "type": "string",
+          "description": "ID of the newly stored fragment."
+        },
+        "conflicts": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Detected conflicts against existing fragments, if any."
+        }
+      },
+      "required": [
+        "success",
+        "id"
+      ]
+    }
+  },
+  {
+    "name": "memory_update",
+    "description": "Update an existing memory fragment by ID. Can update title, fragment text, confidence, or all.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The ID of the fragment to update"
+        },
+        "title": {
+          "type": "string",
+          "description": "New title text (optional)"
+        },
+        "fragment": {
+          "type": "string",
+          "description": "New fragment text (optional)"
+        },
+        "confidence": {
+          "type": "number",
+          "description": "New confidence value 0-1 (optional)"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "description": "Whether the fragment was updated."
+        },
+        "id": {
+          "type": "string",
+          "description": "ID of the updated fragment."
+        }
+      },
+      "required": [
+        "success",
+        "id"
+      ]
+    }
+  },
+  {
+    "name": "memory_feedback",
+    "description": "Provide feedback on a memory fragment after use. positive = the memory was useful (boosts confidence), negative = it was not helpful (reduces confidence by -0.1).",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The ID of the fragment to give feedback on"
+        },
+        "useful": {
+          "type": "boolean",
+          "description": "true if the memory was helpful, false if it was not relevant or incorrect"
+        }
+      },
+      "required": [
+        "id",
+        "useful"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "description": "Whether feedback was applied."
+        },
+        "id": {
+          "type": "string",
+          "description": "ID of the fragment receiving feedback."
+        },
+        "confidence": {
+          "type": "number",
+          "description": "The fragment's updated confidence (0-1)."
+        }
+      },
+      "required": [
+        "success",
+        "id"
+      ]
+    }
+  },
+  {
+    "name": "memory_forget",
+    "description": "Remove a memory fragment by ID. Pass consolidate=true to archive (down-weight, keep, reversible), or invalidate=true to hide it from recall while preserving its content and version history (reversible), instead of hard-deleting.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The ID of the fragment to remove"
+        },
+        "consolidate": {
+          "type": "boolean",
+          "description": "If true, archive the fragment (down-weight to 0.05 so recall ignores it) instead of deleting it \u2014 non-destructive and reversible. Default false (hard delete)."
+        },
+        "invalidate": {
+          "type": "boolean",
+          "description": "If true, logically invalidate the fragment: hidden from recall entirely but kept in the DB with its full version history, and reversible. Use for superseded/outdated facts you may want to audit later. Takes precedence over consolidate. Default false."
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "description": "Whether the fragment was removed."
+        },
+        "id": {
+          "type": "string",
+          "description": "ID of the removed fragment."
+        }
+      },
+      "required": [
+        "success",
+        "id"
+      ]
+    }
+  },
+  {
+    "name": "memory_merge",
+    "description": "Merge multiple memory fragments into one. You decide the merged content, this tool just executes the merge. Use when you find related/overlapping fragments that should be consolidated. Pass consolidate=true to supersede+down-weight the sources (reversible) instead of deleting them.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Array of fragment IDs to merge (will be deleted after merge)"
+        },
+        "title": {
+          "type": "string",
+          "description": "Title for the merged fragment"
+        },
+        "fragment": {
+          "type": "string",
+          "description": "The merged content you prepared"
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Project scope. Omit to auto-file under the current project (detected from cwd). Pass 'global' or null for cross-project scope. Optional."
+        },
+        "consolidate": {
+          "type": "boolean",
+          "description": "If true, keep the source fragments but mark them superseded by the merged one and down-weight them (non-destructive, reversible) instead of deleting. Default false."
+        }
+      },
+      "required": [
+        "ids",
+        "title",
+        "fragment"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "description": "Whether the merge succeeded."
+        },
+        "id": {
+          "type": "string",
+          "description": "ID of the new merged fragment."
+        },
+        "merged_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "IDs of the source fragments that were deleted."
+        }
+      },
+      "required": [
+        "success",
+        "id"
+      ]
+    }
+  },
+  {
+    "name": "memory_relate",
+    "description": "Create a typed relation between two memory fragments. Bidirectional \u2014 reverse relation auto-created.\n\nRELATION TYPES \u2014 when to use each:\n- supports: Fragment A reinforces/validates Fragment B\n- contradicts: Fragment A contradicts/invalidates Fragment B\n- supersedes: Fragment A is newer and replaces Fragment B\n- related_to: General connection between fragments\n\nWHEN TO CALL:\n- After memory_add if you know this relates to an existing fragment\n- After memory_update if content changed significantly\n- After discovering two fragments are connected during analysis",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "sourceId": {
+          "type": "string",
+          "description": "ID of the source fragment"
+        },
+        "targetId": {
+          "type": "string",
+          "description": "ID of the target fragment"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "contradicts",
+            "supersedes",
+            "supports",
+            "related_to"
+          ],
+          "description": "Type of relation"
+        },
+        "note": {
+          "type": "string",
+          "description": "Optional note explaining the relation"
+        }
+      },
+      "required": [
+        "sourceId",
+        "targetId",
+        "type"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "description": "Whether the relation was created."
+        },
+        "relation": {
+          "type": "string",
+          "description": "The relation type that was created (bidirectional auto-reverse applied)."
+        }
+      },
+      "required": [
+        "success"
+      ]
+    }
+  },
+  {
+    "name": "memory_stats",
+    "description": "Get memory store statistics: fragment counts, average confidence, project breakdown, and health metrics.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Project name to filter stats (optional, defaults to all projects)"
+        },
+        "response_format": {
+          "type": "string",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "description": "Response format: 'markdown' (default, human-readable) or 'json' (machine-readable structured payload). Optional."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "total": {
+          "type": "number",
+          "description": "Total fragment count."
+        },
+        "avg_confidence": {
+          "type": "number",
+          "description": "Average confidence across fragments (0-1)."
+        },
+        "by_source": {
+          "type": "object",
+          "description": "Fragment counts grouped by source (ai/user)."
+        },
+        "by_project": {
+          "type": "object",
+          "description": "Fragment counts grouped by project."
+        },
+        "low_confidence": {
+          "type": "number",
+          "description": "Count of low-confidence fragments."
+        },
+        "high_confidence": {
+          "type": "number",
+          "description": "Count of high-confidence fragments."
+        }
+      },
+      "required": [
+        "total"
+      ]
+    }
+  },
+  {
+    "name": "memory_audit",
+    "description": "Audit memory store for integrity issues: orphan references, duplicate IDs, confidence anomalies.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "response_format": {
+          "type": "string",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "description": "Response format: 'markdown' (default, human-readable) or 'json' (machine-readable structured payload). Optional."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "total_fragments": {
+          "type": "number",
+          "description": "Total fragment count scanned."
+        },
+        "issues_found": {
+          "type": "number",
+          "description": "Number of integrity issues detected."
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Human-readable integrity issue descriptions (orphans, duplicates, anomalies)."
+        },
+        "healthy": {
+          "type": "boolean",
+          "description": "True if no issues were found."
+        }
+      }
+    }
+  },
+  {
+    "name": "memory_library",
+    "description": "Library Mode: Analyze and organize your entire memory database. Returns a comprehensive snapshot with all fragments, guides, relations, pre-computed analysis signals (stale, duplicate, orphan detection), and suggested actions. After reviewing the snapshot, use other tools (memory_merge, memory_forget, memory_update, guide_distill, memory_relate) to execute organizational changes.\n\nWHEN TO CALL:\n- Periodically to maintain a clean, well-organized knowledge base\n- When memory feels cluttered or redundant\n- After a long project with many fragments added\n- To find distill candidates that haven't been promoted to guides",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Filter to a specific project. Omit to analyze ALL projects."
+        },
+        "focus": {
+          "type": "string",
+          "enum": [
+            "full",
+            "stale",
+            "duplicates",
+            "orphans",
+            "distill",
+            "guides"
+          ],
+          "description": "Focus area. 'full' = complete snapshot (default). Other values return only relevant sections."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max fragments to return per page (default 50, max 200). Optional."
+        },
+        "offset": {
+          "type": "number",
+          "description": "Number of fragments to skip for pagination (default 0). Optional."
+        },
+        "response_format": {
+          "type": "string",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "description": "Response format: 'markdown' (default, human-readable) or 'json' (machine-readable structured payload). Optional."
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "fragments": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Memory fragments in the snapshot."
+        },
+        "guides": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Guides in the snapshot."
+        },
+        "signals": {
+          "type": "object",
+          "description": "Pre-computed analysis signals (stale, duplicate, orphan detection)."
+        },
+        "relations": {
+          "type": "object",
+          "description": "Relation graph summary: total, by_type, isolated_fragment_ids, hub_fragments."
+        },
+        "suggestions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Suggested organizational actions as human-readable strings (null when none)."
+        },
+        "has_more": {
+          "type": "boolean",
+          "description": "Whether more fragments are available beyond this page."
+        }
+      }
+    }
+  },
+  {
+    "name": "semantic_search",
+    "description": "Search memories using TF-IDF semantic similarity. Finds related memories even when different words are used. Unlike FTS5 keyword search, this understands topic similarity. Use when keyword search fails to find related knowledge.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The text to find semantically similar memories for."
+        },
+        "project": {
+          "type": "string",
+          "description": "Filter to a specific project. Omit to search all."
+        },
+        "topK": {
+          "type": "number",
+          "description": "Maximum results to return per page (default 10, max 30)."
+        },
+        "offset": {
+          "type": "number",
+          "description": "Number of results to skip for pagination (default 0). Use next_offset from the previous response to fetch the next page. Optional."
+        },
+        "hybrid": {
+          "type": "boolean",
+          "description": "Opt into hybrid retrieval: fuse BM25 keyword ranking with TF-IDF similarity (Reciprocal Rank Fusion), rerank by recall priority, and diversify results (MMR). Better recall on mixed keyword+concept queries. Default: false (pure TF-IDF)."
+        },
+        "explain": {
+          "type": "boolean",
+          "description": "Opt in to why each returned memory was selected in THIS call, with recorded sources and evidence freshness. Default false. Does not reconstruct a past recall. Evidence files are checked only if verification.stale_check is enabled; confidence is not proof of correctness. No corrections are applied automatically."
+        },
+        "response_format": {
+          "type": "string",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "description": "Response format: 'markdown' (default, human-readable) or 'json' (machine-readable structured payload). Optional."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Semantically similar fragments with similarity scores."
+        },
+        "recall_explanation": {
+          "type": "object",
+          "properties": {
+            "applies_to": {
+              "type": "string",
+              "enum": [
+                "this_call"
+              ]
+            },
+            "scope": {
+              "type": "object"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "correction_tools": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "selection": {
+                    "type": "object"
+                  },
+                  "provenance": {
+                    "type": "object"
+                  },
+                  "freshness": {
+                    "type": "object"
+                  },
+                  "unavailable": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id"
+                ]
+              }
+            }
+          },
+          "required": [
+            "applies_to",
+            "scope",
+            "notice",
+            "correction_tools",
+            "items"
+          ]
+        },
+        "count": {
+          "type": "number",
+          "description": "Number of results returned."
+        },
+        "has_more": {
+          "type": "boolean",
+          "description": "Whether more results are available beyond this page."
+        }
+      },
+      "required": [
+        "count"
+      ]
+    }
+  }
+]

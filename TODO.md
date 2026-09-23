@@ -21,7 +21,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [ ] WP-05 — Versioned Lance search projection (S3)
 - [ ] WP-06 — Candle embedding service and model qualification (S4)
 - [ ] WP-07 — Retrieval, graph context and explanations (S5)
-- [ ] WP-08 — Complete memory MCP contract (S2/S6)
+- [x] WP-08 — Complete memory MCP contract (S2/S6) — 11 tool handlers + read side effects + instructions + notifications; differential replay harness (task 9) deferred
 - [ ] WP-09 — Guides, sessions and intelligence (S6)
 - [ ] WP-10 — CLI, managed skills, hosts and visualizer (S6)
 - [ ] WP-11 — Import, legacy interchange, backup and restore (S7)

@@ -241,6 +241,10 @@ pub(crate) fn apply_command(
         } => apply_unrelate(state, *source, *target, *relation_type),
         DomainCommand::Merge { source_ids, result } => apply_merge(state, source_ids, result),
         DomainCommand::Forget { id, mode } => apply_forget(state, *id, *mode),
+        DomainCommand::Access {
+            memory_ids,
+            context,
+        } => apply_access(state, memory_ids, context.as_deref()),
         // Session/guide commands are handled by their dedicated work packages;
         // the canonical gateway rejects them until those land.
         _ => Err(DomainError::new(
@@ -357,12 +361,18 @@ fn apply_feedback(
 
     // Domain state: the observable counters and confidence are the
     // compatibility-visible effects, persisted atomically with the command.
+    // Upstream contract: positive = boostOnAccess (+0.015 conf, access bump)
+    // + positive_feedback++; negative = recordNegativeHit (-0.02 conf,
+    // negative_hits++) + negative_feedback++.
     if useful {
         memory.positive_feedback += 1;
-        memory.confidence = (memory.confidence + 0.01).min(1.0);
+        memory.confidence = (memory.confidence + 0.015).min(1.0);
+        memory.access_count += 1;
+        memory.last_accessed_at = Some(Instant::new(state.now_millis));
     } else {
         memory.negative_feedback += 1;
-        memory.confidence = (memory.confidence - 0.05).max(0.0);
+        memory.negative_hits += 1;
+        memory.confidence = (memory.confidence - 0.02).max(0.0);
     }
     state.put_memory(&memory)?;
 
@@ -389,6 +399,34 @@ fn apply_feedback(
     Ok(ReceiptOutcome::Success {
         affected: vec![memory_id],
     })
+}
+
+fn apply_access(
+    state: &mut CommandState<'_>,
+    memory_ids: &[EntityId],
+    context: Option<&str>,
+) -> DomainResult<ReceiptOutcome> {
+    let now = state.now_millis;
+    let mut affected = Vec::new();
+    for id in memory_ids {
+        if let Some(mut memory) = state.get_memory(*id)? {
+            // Contract-visible read side effects (upstream boostOnAccess):
+            // confidence +0.015, access_count +1, last_accessed_at, context tag.
+            memory.confidence = (memory.confidence + 0.015).min(1.0);
+            memory.access_count += 1;
+            memory.last_accessed_at = Some(Instant::new(now));
+            if let Some(tag) = context
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                && !memory.tags.contains(&tag)
+            {
+                memory.tags.push(tag);
+            }
+            state.put_memory(&memory)?;
+            affected.push(*id);
+        }
+    }
+    Ok(ReceiptOutcome::Success { affected })
 }
 
 fn apply_relate(state: &mut CommandState<'_>, relation: &Relation) -> DomainResult<ReceiptOutcome> {

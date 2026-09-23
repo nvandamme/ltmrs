@@ -128,6 +128,10 @@ impl ReferenceInterpreter {
                 result,
             } => self.apply_guide_merge(source_names, result)?,
             DomainCommand::GuideForget { name } => self.apply_guide_forget(name)?,
+            DomainCommand::Access {
+                memory_ids,
+                context,
+            } => self.apply_access(memory_ids, context.as_deref())?,
         };
 
         Ok(CommandReceipt {
@@ -238,12 +242,18 @@ impl ReferenceInterpreter {
             .get_mut(&memory_id)
             .ok_or_else(|| DomainError::new(DomainErrorCode::NotFound, "memory not found"))?;
 
+        // Upstream contract: positive = boostOnAccess (+0.015 conf, access
+        // bump) + positive_feedback++; negative = recordNegativeHit (-0.02
+        // conf, negative_hits++) + negative_feedback++.
         if useful {
             memory.positive_feedback += 1;
-            memory.confidence = (memory.confidence + 0.01).min(1.0);
+            memory.confidence = (memory.confidence + 0.015).min(1.0);
+            memory.access_count += 1;
+            memory.last_accessed_at = Some(Instant::new(self.clock.now_millis()));
         } else {
             memory.negative_feedback += 1;
-            memory.confidence = (memory.confidence - 0.05).max(0.0);
+            memory.negative_hits += 1;
+            memory.confidence = (memory.confidence - 0.02).max(0.0);
         }
 
         self.feedback.push(FeedbackEvent {
@@ -354,6 +364,31 @@ impl ReferenceInterpreter {
         memory.advance_eligibility();
 
         Ok(ReceiptOutcome::Success { affected: vec![id] })
+    }
+
+    fn apply_access(
+        &mut self,
+        memory_ids: &[EntityId],
+        context: Option<&str>,
+    ) -> DomainResult<ReceiptOutcome> {
+        let now = self.clock.now_millis();
+        let mut affected = Vec::new();
+        for id in memory_ids {
+            if let Some(memory) = self.memories.get_mut(id) {
+                memory.confidence = (memory.confidence + 0.015).min(1.0);
+                memory.access_count += 1;
+                memory.last_accessed_at = Some(Instant::new(now));
+                if let Some(tag) = context
+                    .map(|t| t.trim().to_lowercase())
+                    .filter(|t| !t.is_empty())
+                    && !memory.tags.contains(&tag)
+                {
+                    memory.tags.push(tag);
+                }
+                affected.push(*id);
+            }
+        }
+        Ok(ReceiptOutcome::Success { affected })
     }
 
     fn apply_end_session(

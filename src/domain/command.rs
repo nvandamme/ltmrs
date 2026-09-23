@@ -86,6 +86,14 @@ pub enum DomainCommand {
     GuideForget {
         name: String,
     },
+    /// Record a contract-visible read access (RQ-17): increments
+    /// `access_count`, updates `last_accessed_at`, boosts confidence by
+    /// 0.015 (capped at 1.0), and optionally adds a context tag.
+    /// Persisted atomically before the read response reports success.
+    Access {
+        memory_ids: Vec<EntityId>,
+        context: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

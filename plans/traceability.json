@@ -404,7 +404,8 @@
         "T-MCP-03",
         "T-CLI-01"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "T-MCP-01: mcp.rs served_tools_match_frozen_schema (verbatim baseline). T-MCP-02: tools.rs 28 behavioral tests + 2 differential wire tests (differential_detail/summary_matches_upstream_wire) replaying an anonymized 177-fragment fixture from the real upstream DB against the pinned upstream rendering, byte-for-byte. T-MCP-03: mcp.rs typed routing + validation tests. T-MCP-04: read/feedback side-effect tests (see RQ-17). T-CLI-01 deferred to WP-10 (CLI)."
     },
     {
       "id": "RQ-16",
@@ -426,7 +427,8 @@
       "tests": [
         "T-MCP-04"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_passed",
+      "evidence": "RQ-17 read side effects persisted via canonical gateway before success: memory_read applies Access (confidence +0.015, access_count+1, last_accessed_at, context tag) in repository_internal.rs apply_access / interpreter.rs; semantic_search does not boost (upstream). Feedback: positive +0.015 + access_count + positive_feedback++, negative -0.02 + negative_hits++ + negative_feedback++. Tests: tools.rs memory_read_records_access_side_effect, memory_feedback_positive_boosts_confidence, memory_feedback_negative_reduces_confidence."
     },
     {
       "id": "RQ-18",

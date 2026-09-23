@@ -16,6 +16,7 @@ use crate::domain::command::{DomainError, DomainErrorCode, DomainResult, Receipt
 use crate::domain::id::EntityId;
 use crate::domain::memory::Instant;
 use crate::domain::session::Attempt;
+use crate::search::backend::SearchBackend;
 use crate::service::repository::CanonicalRepository;
 use uuid::Uuid;
 
@@ -26,6 +27,9 @@ pub struct Dispatcher {
     repo: Arc<CanonicalRepository>,
     registry: Mutex<FrontendRegistry>,
     clock: Arc<dyn Clock + Send + Sync>,
+    /// The search backend for semantic retrieval (WP-08). None disables dense
+    /// search (lexical/FTS still works if the table is present).
+    search: Option<Arc<SearchBackend>>,
 }
 
 impl Dispatcher {
@@ -38,7 +42,14 @@ impl Dispatcher {
             repo,
             registry: Mutex::new(registry),
             clock,
+            search: None,
         }
+    }
+
+    /// Attach a search backend (WP-08 semantic retrieval).
+    pub fn with_search(mut self, search: Arc<SearchBackend>) -> Self {
+        self.search = Some(search);
+        self
     }
 
     /// Handle the connect-time handshake: validate protocol + generation,
@@ -89,12 +100,28 @@ impl Dispatcher {
         };
 
         match &envelope.body {
+            DomainRequest::ToolCall { tool } => {
+                let result = crate::daemon::tools::execute_tool(self, envelope, tool)?;
+                Ok(IpcResponse::success(
+                    envelope.operation_id,
+                    ReceiptOutcome::Success { affected: vec![] },
+                    result,
+                ))
+            }
             DomainRequest::GetMemories { ids } => {
                 let memories = self.repo.get_memories(ids)?;
                 Ok(IpcResponse::success(
                     envelope.operation_id,
                     ReceiptOutcome::Success { affected: vec![] },
                     DomainPayload::Memories(memories),
+                ))
+            }
+            DomainRequest::ListMemories => {
+                let export = self.repo.export_snapshot()?;
+                Ok(IpcResponse::success(
+                    envelope.operation_id,
+                    ReceiptOutcome::Success { affected: vec![] },
+                    DomainPayload::Memories(export.memories),
                 ))
             }
             DomainRequest::Neighbors { id } => {
@@ -181,6 +208,16 @@ impl Dispatcher {
     /// Access the repository (for namespace issuance, GC, health).
     pub fn repo(&self) -> &CanonicalRepository {
         self.repo.as_ref()
+    }
+
+    /// Access the search backend (WP-08 semantic retrieval), if attached.
+    pub fn search(&self) -> Option<&SearchBackend> {
+        self.search.as_deref()
+    }
+
+    /// Access the clock (for tool execution timestamps).
+    pub fn clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
     }
 
     /// Lock the registry (for lease management, health, session ops).
