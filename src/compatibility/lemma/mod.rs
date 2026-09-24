@@ -4,6 +4,7 @@
 //! pinned upstream: frozen wire schemas, typed tool arguments, response
 //! shaping, behavior adapters, and DB import from a Lemma store.
 
+pub mod intelligence;
 pub mod privacy;
 pub mod reference;
 pub mod schemas;

@@ -75,11 +75,19 @@ impl SessionStatus {
 pub struct Attempt {
     pub id: EntityId,
     pub session_id: SessionHandle,
+    /// The 1-based sequence number of this attempt within its session.
+    pub seq: u32,
     pub approach: String,
     pub outcome: AttemptOutcome,
     pub critique: Option<String>,
     pub rationale: Option<String>,
     pub related_memory_id: Option<EntityId>,
+    /// Recall priority in [0,1]: decayed at each session start, boosted when
+    /// recalled or when a derived suggestion is accepted, penalized when a
+    /// derived suggestion is dismissed.
+    pub confidence: f64,
+    pub access_count: u32,
+    pub last_accessed_at: Option<Instant>,
     pub created_at: Instant,
 }
 
@@ -89,11 +97,21 @@ pub struct Session {
     pub channel_id: ChannelId,
     pub project: Option<String>,
     pub task_type: Option<String>,
+    pub technologies: Vec<String>,
     pub status: SessionStatus,
     pub attempts: Vec<Attempt>,
     pub outcome: Option<TaskOutcome>,
     pub final_approach: Option<String>,
     pub lessons: Vec<String>,
+    pub initial_approach: Option<String>,
+    /// Lowercased guide names practiced during this session.
+    pub guides_used: Vec<String>,
+    /// Legacy memory IDs read during this session.
+    pub memories_read: Vec<String>,
+    /// Legacy memory IDs created during this session.
+    pub memories_created: Vec<String>,
+    pub refinement_attempts: u32,
+    pub self_critique_count: u32,
     pub started_at: Instant,
     pub ended_at: Option<Instant>,
 }
@@ -141,9 +159,11 @@ impl SuggestionStatus {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Suggestion {
     pub id: u64,
-    pub memory_id: EntityId,
+    pub session_id: Option<String>,
     pub suggestion: String,
     pub status: SuggestionStatus,
+    pub created_at: Instant,
+    pub resolved_at: Option<Instant>,
 }
 
 #[cfg(test)]

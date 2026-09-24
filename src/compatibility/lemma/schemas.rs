@@ -66,10 +66,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_exactly_eleven_wp08_tools() {
+    fn loads_all_frozen_tools() {
         let tools = frozen_tools();
-        assert_eq!(tools.len(), 11, "WP-08 serves exactly 11 tools");
+        assert_eq!(
+            tools.len(),
+            26,
+            "frozen baseline serves 26 tools (11 WP-08 + 15 WP-09)"
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        // WP-08 tools.
         assert!(names.contains(&"memory_read"));
         assert!(names.contains(&"memory_add"));
         assert!(names.contains(&"memory_update"));
@@ -81,6 +86,22 @@ mod tests {
         assert!(names.contains(&"memory_audit"));
         assert!(names.contains(&"memory_library"));
         assert!(names.contains(&"semantic_search"));
+        // WP-09 tools.
+        assert!(names.contains(&"guide_get"));
+        assert!(names.contains(&"guide_practice"));
+        assert!(names.contains(&"guide_create"));
+        assert!(names.contains(&"guide_distill"));
+        assert!(names.contains(&"guide_update"));
+        assert!(names.contains(&"guide_forget"));
+        assert!(names.contains(&"guide_merge"));
+        assert!(names.contains(&"session_start"));
+        assert!(names.contains(&"session_attempt"));
+        assert!(names.contains(&"session_end"));
+        assert!(names.contains(&"session_stats"));
+        assert!(names.contains(&"suggestion_respond"));
+        assert!(names.contains(&"conflict_scan"));
+        assert!(names.contains(&"proactive_analysis"));
+        assert!(names.contains(&"project_analytics"));
     }
 
     #[test]

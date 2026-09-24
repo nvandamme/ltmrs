@@ -23,9 +23,12 @@ use serde_json::{Map, Value};
 
 use crate::compatibility::lemma::schemas::frozen_tools;
 use crate::compatibility::lemma::tool_args::{
-    MemoryAddArgs, MemoryAuditArgs, MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs,
-    MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs,
-    ResponseFormat, SemanticSearchArgs, ToolArgs,
+    ConflictScanArgs, GuideCreateArgs, GuideDistillArgs, GuideForgetArgs, GuideGetArgs,
+    GuideMergeArgs, GuidePracticeArgs, GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs,
+    MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs,
+    MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs, ProactiveAnalysisArgs,
+    ProjectAnalyticsArgs, ResponseFormat, SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs,
+    SessionStartArgs, SessionStatsArgs, SuggestionRespondArgs, ToolArgs,
 };
 use crate::daemon::client::IpcClient;
 use crate::daemon::envelope::{DomainRequest, HandshakeRequest, IpcEnvelope, PROTOCOL_VERSION};
@@ -271,6 +274,21 @@ pub fn route_tool(
         "memory_audit" => ToolArgs::MemoryAudit(parse_memory_audit(&args)?),
         "memory_library" => ToolArgs::MemoryLibrary(parse_memory_library(&args)?),
         "semantic_search" => ToolArgs::SemanticSearch(parse_semantic_search(&args)?),
+        "guide_get" => ToolArgs::GuideGet(parse_guide_get(&args)?),
+        "guide_practice" => ToolArgs::GuidePractice(parse_guide_practice(&args)?),
+        "guide_create" => ToolArgs::GuideCreate(parse_guide_create(&args)?),
+        "guide_distill" => ToolArgs::GuideDistill(parse_guide_distill(&args)?),
+        "guide_update" => ToolArgs::GuideUpdate(parse_guide_update(&args)?),
+        "guide_forget" => ToolArgs::GuideForget(parse_guide_forget(&args)?),
+        "guide_merge" => ToolArgs::GuideMerge(parse_guide_merge(&args)?),
+        "session_start" => ToolArgs::SessionStart(parse_session_start(&args)?),
+        "session_attempt" => ToolArgs::SessionAttempt(parse_session_attempt(&args)?),
+        "session_end" => ToolArgs::SessionEnd(parse_session_end(&args)?),
+        "session_stats" => ToolArgs::SessionStats(parse_session_stats(&args)?),
+        "suggestion_respond" => ToolArgs::SuggestionRespond(parse_suggestion_respond(&args)?),
+        "conflict_scan" => ToolArgs::ConflictScan(parse_conflict_scan(&args)?),
+        "proactive_analysis" => ToolArgs::ProactiveAnalysis(parse_proactive_analysis(&args)?),
+        "project_analytics" => ToolArgs::ProjectAnalytics(parse_project_analytics(&args)?),
         other => {
             return Err(McpError::invalid_params(
                 format!("unknown tool: {other}"),
@@ -472,6 +490,159 @@ fn parse_semantic_search(args: &Map<String, Value>) -> Result<SemanticSearchArgs
     })
 }
 
+fn str_array_field(args: &Map<String, Value>, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_guide_get(args: &Map<String, Value>) -> Result<GuideGetArgs, McpError> {
+    Ok(GuideGetArgs {
+        category: str_field(args, "category").map(|s| s.to_string()),
+        guide: str_field(args, "guide").map(|s| s.to_string()),
+        task: str_field(args, "task").map(|s| s.to_string()),
+        response_format: response_format_field(args, "response_format"),
+    })
+}
+
+fn parse_guide_practice(args: &Map<String, Value>) -> Result<GuidePracticeArgs, McpError> {
+    Ok(GuidePracticeArgs {
+        guide: require_str(args, "guide")?,
+        category: require_str(args, "category")?,
+        description: str_field(args, "description").map(|s| s.to_string()),
+        contexts: str_array_field(args, "contexts"),
+        learnings: str_array_field(args, "learnings"),
+        outcome: str_field(args, "outcome").map(|s| s.to_string()),
+    })
+}
+
+fn parse_guide_create(args: &Map<String, Value>) -> Result<GuideCreateArgs, McpError> {
+    Ok(GuideCreateArgs {
+        guide: require_str(args, "guide")?,
+        category: require_str(args, "category")?,
+        description: require_str(args, "description")?,
+        contexts: str_array_field(args, "contexts"),
+        learnings: str_array_field(args, "learnings"),
+    })
+}
+
+fn parse_guide_distill(args: &Map<String, Value>) -> Result<GuideDistillArgs, McpError> {
+    Ok(GuideDistillArgs {
+        memory_id: require_str(args, "memory_id")?,
+        guide: require_str(args, "guide")?,
+        category: str_field(args, "category").map(|s| s.to_string()),
+    })
+}
+
+fn parse_guide_update(args: &Map<String, Value>) -> Result<GuideUpdateArgs, McpError> {
+    Ok(GuideUpdateArgs {
+        guide: require_str(args, "guide")?,
+        new_name: str_field(args, "new_name").map(|s| s.to_string()),
+        category: str_field(args, "category").map(|s| s.to_string()),
+        description: str_field(args, "description").map(|s| s.to_string()),
+        add_anti_patterns: str_array_field(args, "add_anti_patterns"),
+        add_pitfalls: str_array_field(args, "add_pitfalls"),
+        add_depends_on: str_array_field(args, "add_depends_on"),
+        add_enables: str_array_field(args, "add_enables"),
+        superseded_by: str_field(args, "superseded_by").map(|s| s.to_string()),
+        deprecated: bool_field(args, "deprecated"),
+    })
+}
+
+fn parse_guide_forget(args: &Map<String, Value>) -> Result<GuideForgetArgs, McpError> {
+    Ok(GuideForgetArgs {
+        guide: require_str(args, "guide")?,
+    })
+}
+
+fn parse_guide_merge(args: &Map<String, Value>) -> Result<GuideMergeArgs, McpError> {
+    Ok(GuideMergeArgs {
+        guides: str_array_field(args, "guides"),
+        guide: require_str(args, "guide")?,
+        category: require_str(args, "category")?,
+        description: str_field(args, "description").map(|s| s.to_string()),
+        contexts: args.get("contexts").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        }),
+        learnings: args.get("learnings").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        }),
+    })
+}
+
+fn parse_session_start(args: &Map<String, Value>) -> Result<SessionStartArgs, McpError> {
+    Ok(SessionStartArgs {
+        task_type: require_str(args, "task_type")?,
+        technologies: str_array_field(args, "technologies"),
+        initial_approach: str_field(args, "initial_approach").map(|s| s.to_string()),
+    })
+}
+
+fn parse_session_attempt(args: &Map<String, Value>) -> Result<SessionAttemptArgs, McpError> {
+    Ok(SessionAttemptArgs {
+        approach: require_str(args, "approach")?,
+        outcome: require_str(args, "outcome")?,
+        critique: str_field(args, "critique").map(|s| s.to_string()),
+        rationale: str_field(args, "rationale").map(|s| s.to_string()),
+        related_memory_id: str_field(args, "related_memory_id").map(|s| s.to_string()),
+    })
+}
+
+fn parse_session_end(args: &Map<String, Value>) -> Result<SessionEndArgs, McpError> {
+    Ok(SessionEndArgs {
+        outcome: require_str(args, "outcome")?,
+        final_approach: str_field(args, "final_approach").map(|s| s.to_string()),
+        lessons: str_array_field(args, "lessons"),
+    })
+}
+
+fn parse_session_stats(args: &Map<String, Value>) -> Result<SessionStatsArgs, McpError> {
+    Ok(SessionStatsArgs {
+        count: usize_field(args, "count"),
+        response_format: response_format_field(args, "response_format"),
+    })
+}
+
+fn parse_suggestion_respond(args: &Map<String, Value>) -> Result<SuggestionRespondArgs, McpError> {
+    Ok(SuggestionRespondArgs {
+        id: args
+            .get("id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| McpError::invalid_params("id is required", None))?,
+        action: require_str(args, "action")?,
+    })
+}
+
+fn parse_conflict_scan(args: &Map<String, Value>) -> Result<ConflictScanArgs, McpError> {
+    Ok(ConflictScanArgs {
+        project: str_field(args, "project").map(|s| s.to_string()),
+        response_format: response_format_field(args, "response_format"),
+    })
+}
+
+fn parse_proactive_analysis(args: &Map<String, Value>) -> Result<ProactiveAnalysisArgs, McpError> {
+    Ok(ProactiveAnalysisArgs {
+        project: str_field(args, "project").map(|s| s.to_string()),
+        response_format: response_format_field(args, "response_format"),
+    })
+}
+
+fn parse_project_analytics(args: &Map<String, Value>) -> Result<ProjectAnalyticsArgs, McpError> {
+    Ok(ProjectAnalyticsArgs {
+        project: str_field(args, "project").map(|s| s.to_string()),
+        response_format: response_format_field(args, "response_format"),
+    })
+}
+
 impl ServerHandler for LtmrsFrontend {
     fn get_info(&self) -> InitializeResult {
         // Static teaching template always present; the dynamic memory index is
@@ -628,12 +799,15 @@ mod tests {
     }
 
     #[test]
-    fn serves_eleven_frozen_tools() {
+    fn serves_all_frozen_tools() {
         let tools = LtmrsFrontend::tools();
-        assert_eq!(tools.len(), 11, "must serve exactly 11 WP-08 tools");
+        assert_eq!(tools.len(), 26, "must serve all 26 frozen tools");
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert!(names.contains(&"memory_read".to_string()));
         assert!(names.contains(&"semantic_search".to_string()));
+        assert!(names.contains(&"guide_get".to_string()));
+        assert!(names.contains(&"session_start".to_string()));
+        assert!(names.contains(&"conflict_scan".to_string()));
     }
 
     #[test]

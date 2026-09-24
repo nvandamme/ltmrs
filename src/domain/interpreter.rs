@@ -132,6 +132,9 @@ impl ReferenceInterpreter {
                 memory_ids,
                 context,
             } => self.apply_access(memory_ids, context.as_deref())?,
+            DomainCommand::BoostConfidence { memory_ids } => {
+                self.apply_boost_confidence(memory_ids)?
+            }
         };
 
         Ok(CommandReceipt {
@@ -391,6 +394,20 @@ impl ReferenceInterpreter {
         Ok(ReceiptOutcome::Success { affected })
     }
 
+    fn apply_boost_confidence(&mut self, memory_ids: &[EntityId]) -> DomainResult<ReceiptOutcome> {
+        let now = self.clock.now_millis();
+        let mut affected = Vec::new();
+        for id in memory_ids {
+            if let Some(memory) = self.memories.get_mut(id) {
+                memory.confidence = (memory.confidence + 0.02).min(1.0);
+                memory.access_count += 1;
+                memory.last_accessed_at = Some(Instant::new(now));
+                affected.push(*id);
+            }
+        }
+        Ok(ReceiptOutcome::Success { affected })
+    }
+
     fn apply_end_session(
         &mut self,
         session: &SessionHandle,
@@ -532,11 +549,18 @@ impl ReferenceInterpreter {
                 channel_id,
                 project,
                 task_type,
+                technologies: Vec::new(),
                 status: SessionStatus::Active,
                 attempts: Vec::new(),
                 outcome: None,
                 final_approach: None,
                 lessons: Vec::new(),
+                initial_approach: None,
+                guides_used: Vec::new(),
+                memories_read: Vec::new(),
+                memories_created: Vec::new(),
+                refinement_attempts: 0,
+                self_critique_count: 0,
                 started_at: Instant::new(now),
                 ended_at: None,
             },

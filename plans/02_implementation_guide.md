@@ -357,16 +357,16 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 ### Tasks
 
-- [ ] Port guide create/read/update/forget/merge, contexts/learnings, dependencies, deprecation and source/validation links.
-- [ ] Match guide practice statistics, success/failure semantics and interactions with session completion.
-- [ ] Port traced and virtual session lifecycles per frontend channel.
-- [ ] Persist attempts with explicit outcomes and related-memory mappings; do not infer hidden reasoning.
-- [ ] Ensure session end is retry-safe and cannot double-count guide outcomes.
-- [ ] Persist suggestion acceptance/dismissal and reproduce surfaced suggestion state.
-- [ ] Port actual heuristic conflict/proactive behavior; distinguish suggestions from accepted canonical edges.
-- [ ] Use dense search to propose relevant candidates, not as proof of contradiction, support or truth.
-- [ ] Implement analytics over canonical snapshots without unbounded read transactions.
-- [ ] Extend the upstream conformance traces across the full recall -> act -> persist workflow.
+- [x] Port guide create/read/update/forget/merge, contexts/learnings, dependencies, deprecation and source/validation links.
+- [x] Match guide practice statistics, success/failure semantics and interactions with session completion.
+- [ ] Port traced and virtual session lifecycles per frontend channel. (traced done; virtual deferred)
+- [x] Persist attempts with explicit outcomes and related-memory mappings; do not infer hidden reasoning.
+- [x] Ensure session end is retry-safe and cannot double-count guide outcomes.
+- [x] Persist suggestion acceptance/dismissal and reproduce surfaced suggestion state.
+- [x] Port actual heuristic conflict/proactive behavior; distinguish suggestions from accepted canonical edges.
+- [ ] Use dense search to propose relevant candidates, not as proof of contradiction, support or truth. (token matching; dense leg deferred)
+- [x] Implement analytics over canonical snapshots without unbounded read transactions.
+- [ ] Extend the upstream conformance traces across the full recall -> act -> persist workflow. (deferred)
 
 **Outputs:** all workflow/intelligence handlers and history views.
 

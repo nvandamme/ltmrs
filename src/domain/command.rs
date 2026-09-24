@@ -94,6 +94,12 @@ pub enum DomainCommand {
         memory_ids: Vec<EntityId>,
         context: Option<String>,
     },
+    /// Boost confidence for pre-loaded memories (upstream boostConfidence):
+    /// increments `access_count`, updates `last_accessed_at`, boosts
+    /// confidence by 0.02 (capped at 1.0). No context tag.
+    BoostConfidence {
+        memory_ids: Vec<EntityId>,
+    },
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

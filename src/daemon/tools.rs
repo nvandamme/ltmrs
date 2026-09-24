@@ -13,9 +13,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compatibility::lemma::privacy;
 use crate::compatibility::lemma::tool_args::{
-    MemoryAddArgs, MemoryAuditArgs, MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs,
-    MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs,
-    ResponseFormat, SemanticSearchArgs, ToolArgs,
+    ConflictScanArgs, GuideCreateArgs, GuideDistillArgs, GuideForgetArgs, GuideGetArgs,
+    GuideMergeArgs, GuidePracticeArgs, GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs,
+    MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs,
+    MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs, ProactiveAnalysisArgs,
+    ProjectAnalyticsArgs, ResponseFormat, SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs,
+    SessionStartArgs, SessionStatsArgs, SuggestionRespondArgs, ToolArgs,
 };
 use crate::daemon::dispatcher::Dispatcher;
 use crate::daemon::envelope::{DomainPayload, IpcEnvelope};
@@ -23,9 +26,13 @@ use crate::domain::command::{
     CommandContext, DomainCommand, DomainError, DomainErrorCode, DomainResult, ForgetMode,
     MemoryPatch,
 };
-use crate::domain::id::{EntityId, OperationId};
+use crate::domain::guide::Guide;
+use crate::domain::id::{EntityId, EntityRevision, OperationId, SessionHandle};
 use crate::domain::memory::{Evidence, FragmentType, Instant, Memory, MemorySource};
 use crate::domain::relation::{Relation, RelationType};
+use crate::domain::session::{
+    Attempt, AttemptOutcome, Session, Suggestion, SuggestionStatus, TaskOutcome,
+};
 use serde_json::{Value, json};
 
 /// Execute a typed tool call, returning the shaped legacy result.
@@ -46,6 +53,21 @@ pub fn execute_tool(
         ToolArgs::MemoryAudit(args) => exec_memory_audit(disp, args),
         ToolArgs::MemoryLibrary(args) => exec_memory_library(disp, args),
         ToolArgs::SemanticSearch(args) => exec_semantic_search(disp, envelope, args),
+        ToolArgs::GuideGet(args) => exec_guide_get(disp, args),
+        ToolArgs::GuidePractice(args) => exec_guide_practice(disp, envelope, args),
+        ToolArgs::GuideCreate(args) => exec_guide_create(disp, args),
+        ToolArgs::GuideDistill(args) => exec_guide_distill(disp, args),
+        ToolArgs::GuideUpdate(args) => exec_guide_update(disp, args),
+        ToolArgs::GuideForget(args) => exec_guide_forget(disp, args),
+        ToolArgs::GuideMerge(args) => exec_guide_merge(disp, args),
+        ToolArgs::SessionStart(args) => exec_session_start(disp, envelope, args),
+        ToolArgs::SessionAttempt(args) => exec_session_attempt(disp, envelope, args),
+        ToolArgs::SessionEnd(args) => exec_session_end(disp, envelope, args),
+        ToolArgs::SessionStats(args) => exec_session_stats(disp, envelope, args),
+        ToolArgs::SuggestionRespond(args) => exec_suggestion_respond(disp, args),
+        ToolArgs::ConflictScan(args) => exec_conflict_scan(disp, args),
+        ToolArgs::ProactiveAnalysis(args) => exec_proactive_analysis(disp, args),
+        ToolArgs::ProjectAnalytics(args) => exec_project_analytics(disp, args),
     }
 }
 
@@ -1158,6 +1180,28 @@ fn exec_memory_add(
     };
     let ctx = sub_command_ctx(envelope, 0)?;
     disp.repo().apply(&ctx, &cmd)?;
+
+    // Link the created memory to the channel's active session (upstream
+    // memory_add session_link): set session_id/task_type, track memories_created.
+    {
+        let mut reg = disp.registry();
+        if let Some(handle) = reg.resolve_session(envelope.frontend_id, envelope.channel_id) {
+            let task_type = reg
+                .session(handle)
+                .and_then(|s| s.task_type.clone())
+                .unwrap_or_default();
+            reg.track_memories_created(
+                envelope.frontend_id,
+                envelope.channel_id,
+                std::slice::from_ref(&legacy_id),
+            );
+            let mut linked = memory.clone();
+            linked.session_id = Some(handle.as_uuid().to_string());
+            linked.task_type = Some(task_type);
+            linked.advance_document();
+            let _ = repo.put_memory_direct(&linked);
+        }
+    }
 
     // Find topic overlaps for auto-linking.
     let overlaps: Vec<&Memory> = export
@@ -2287,6 +2331,2098 @@ fn exec_semantic_search(
         "next_offset": if has_more { Some(next_offset) } else { None },
     });
     Ok(format_result(text, data, format))
+}
+
+// =====================================================================
+// WP-09: Guides, sessions, intelligence
+// =====================================================================
+
+/// The upstream task→guide keyword map (guides/task-map.ts).
+fn task_guide_defs() -> Vec<(&'static str, &'static str, &'static [&'static str])> {
+    vec![
+        (
+            "html",
+            "web-frontend",
+            &["web", "sayfa", "ui", "arayüz", "html"],
+        ),
+        (
+            "css",
+            "web-frontend",
+            &["stil", "style", "tasarım", "design", "css"],
+        ),
+        (
+            "javascript",
+            "programming-language",
+            &["js", "web", "frontend"],
+        ),
+        (
+            "react",
+            "web-frontend",
+            &["component", "jsx", "hook", "state", "react"],
+        ),
+        ("vue", "web-frontend", &["vue", "component", "template"]),
+        (
+            "angular",
+            "web-frontend",
+            &["angular", "component", "service"],
+        ),
+        ("tailwind", "web-frontend", &["tailwind", "css", "utility"]),
+        (
+            "nextjs",
+            "web-frontend",
+            &["next", "nextjs", "ssr", "app router"],
+        ),
+        (
+            "typescript",
+            "programming-language",
+            &["ts", "tip", "type", "interface"],
+        ),
+        (
+            "nodejs",
+            "web-backend",
+            &["node", "server", "api", "express"],
+        ),
+        (
+            "express",
+            "web-backend",
+            &["express", "router", "middleware"],
+        ),
+        (
+            "nestjs",
+            "web-backend",
+            &["nestjs", "module", "controller", "service"],
+        ),
+        (
+            "python",
+            "programming-language",
+            &["py", "django", "flask", "fastapi"],
+        ),
+        ("fastapi", "web-backend", &["fastapi", "async", "python"]),
+        ("django", "web-backend", &["django", "orm", "python"]),
+        ("rest", "web-backend", &["api", "rest", "endpoint", "http"]),
+        (
+            "graphql",
+            "web-backend",
+            &["graphql", "query", "mutation", "schema"],
+        ),
+        ("trpc", "web-backend", &["trpc", "typescript", "rpc"]),
+        (
+            "postgresql",
+            "data-storage",
+            &["postgres", "sql", "relational", "pg"],
+        ),
+        ("mongodb", "data-storage", &["mongo", "nosql", "document"]),
+        ("redis", "data-storage", &["redis", "cache", "key-value"]),
+        ("prisma", "data-storage", &["prisma", "orm", "schema"]),
+        ("sqlite", "data-storage", &["sqlite", "local", "embedded"]),
+        (
+            "supabase",
+            "data-storage",
+            &["supabase", "postgres", "auth", "storage"],
+        ),
+        (
+            "pinecone",
+            "data-storage",
+            &["pinecone", "vector", "embedding"],
+        ),
+        (
+            "elasticsearch",
+            "data-storage",
+            &["elastic", "search", "index"],
+        ),
+        ("git", "dev-tool", &["git", "commit", "branch", "merge"]),
+        ("docker", "infra-devops", &["docker", "container", "image"]),
+        ("webpack", "dev-tool", &["webpack", "bundle", "build"]),
+        ("vite", "dev-tool", &["vite", "build", "dev", "hmr"]),
+        ("jest", "dev-tool", &["jest", "test", "unit", "spec"]),
+        ("vitest", "dev-tool", &["vitest", "test", "vite"]),
+        (
+            "playwright",
+            "dev-tool",
+            &["playwright", "e2e", "browser", "test"],
+        ),
+        ("eslint", "dev-tool", &["eslint", "lint", "format"]),
+        (
+            "react-native",
+            "mobile-frontend",
+            &["react native", "mobile", "expo", "rn"],
+        ),
+        (
+            "flutter",
+            "mobile-frontend",
+            &["flutter", "dart", "mobile", "widget"],
+        ),
+        (
+            "expo",
+            "mobile-frontend",
+            &["expo", "react native", "mobile"],
+        ),
+        (
+            "swift",
+            "mobile-frontend",
+            &["swift", "ios", "iphone", "swiftui"],
+        ),
+        (
+            "kotlin",
+            "mobile-frontend",
+            &["kotlin", "android", "jetpack"],
+        ),
+        (
+            "threejs",
+            "game-frontend",
+            &["threejs", "three.js", "webgl", "3d"],
+        ),
+        (
+            "canvas",
+            "game-frontend",
+            &["canvas", "html5", "2d", "drawing"],
+        ),
+        (
+            "phaser",
+            "game-frontend",
+            &["phaser", "game", "html5", "2d"],
+        ),
+        ("webgl", "game-frontend", &["webgl", "shader", "gpu", "3d"]),
+        (
+            "godot",
+            "game-backend",
+            &["godot", "gdscript", "game engine"],
+        ),
+        (
+            "game-loop",
+            "game-backend",
+            &["game loop", "update", "render", "fixed timestep"],
+        ),
+        (
+            "state-machine",
+            "game-backend",
+            &["state", "fsm", "transition"],
+        ),
+        (
+            "ecs",
+            "game-backend",
+            &["ecs", "entity", "component", "system"],
+        ),
+        (
+            "object-pooling",
+            "game-backend",
+            &["pool", "reuse", "spawn", "bullet"],
+        ),
+        (
+            "ai-art-generation",
+            "game-tool",
+            &["ai art", "stable diffusion", "flux", "dalle"],
+        ),
+        (
+            "pixel-art",
+            "game-design",
+            &["pixel", "sprite", "8bit", "16bit", "retro"],
+        ),
+        (
+            "aseprite",
+            "game-tool",
+            &["aseprite", "sprite", "animation"],
+        ),
+        (
+            "spritesheet",
+            "game-tool",
+            &["spritesheet", "atlas", "texture", "export"],
+        ),
+        (
+            "background-removal",
+            "game-tool",
+            &["bg remove", "transparent", "cutout"],
+        ),
+        (
+            "image-upscaling",
+            "game-tool",
+            &["upscale", "esrgan", "hd", "4k"],
+        ),
+        (
+            "level-design",
+            "game-design",
+            &["level", "map", "blockout", "flow"],
+        ),
+        (
+            "character-design",
+            "game-design",
+            &["character", "silhouette", "shape language"],
+        ),
+        (
+            "texture-art",
+            "game-design",
+            &["texture", "pbr", "normal map", "material"],
+        ),
+        (
+            "animation",
+            "game-design",
+            &["animation", "walk cycle", "frame", "sprite"],
+        ),
+        (
+            "tileset",
+            "game-design",
+            &["tileset", "tile", "autotile", "seamless"],
+        ),
+        (
+            "oauth",
+            "app-security",
+            &["oauth", "auth", "login", "token"],
+        ),
+        ("jwt", "app-security", &["jwt", "token", "authentication"]),
+        (
+            "owasp",
+            "app-security",
+            &["owasp", "security", "vulnerability", "xss", "sql injection"],
+        ),
+        (
+            "cryptography",
+            "app-security",
+            &["crypto", "encrypt", "hash", "ssl", "tls"],
+        ),
+        (
+            "clerk",
+            "app-security",
+            &["clerk", "auth", "user management"],
+        ),
+        (
+            "figma",
+            "ui-design",
+            &["figma", "design", "prototype", "ui"],
+        ),
+        (
+            "accessibility",
+            "ui-design",
+            &["a11y", "accessibility", "wcag", "aria"],
+        ),
+        (
+            "design-system",
+            "ui-design",
+            &["design system", "tokens", "components"],
+        ),
+        (
+            "ci-cd",
+            "infra-devops",
+            &["ci", "cd", "pipeline", "github actions"],
+        ),
+        (
+            "kubernetes",
+            "infra-devops",
+            &["k8s", "kubernetes", "pod", "deployment"],
+        ),
+        ("aws", "infra-devops", &["aws", "s3", "lambda", "ec2"]),
+        (
+            "vercel",
+            "infra-devops",
+            &["vercel", "deploy", "edge", "serverless"],
+        ),
+        (
+            "terraform",
+            "infra-devops",
+            &["terraform", "iac", "infrastructure"],
+        ),
+        ("rust", "programming-language", &["rust", "rustlang"]),
+        ("golang", "programming-language", &["go", "golang"]),
+        ("java", "programming-language", &["java", "jvm"]),
+    ]
+}
+
+/// A guide suggestion entry (upstream GuideSuggestion).
+#[derive(Debug, Clone, serde::Serialize)]
+struct GuideSuggestion {
+    guide: String,
+    category: String,
+    keywords: Vec<String>,
+    tracked: bool,
+    usage_count: u32,
+    last_used: Option<String>,
+    learnings: Vec<String>,
+    contexts: Vec<String>,
+}
+
+fn tokenize(str_: &str) -> BTreeSet<String> {
+    str_.to_lowercase()
+        .chars()
+        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_string())
+        .collect()
+}
+
+fn has_token_match(text: &str, target: &str) -> bool {
+    let text_tokens = tokenize(text);
+    let target_tokens = tokenize(target);
+    for token in &text_tokens {
+        if target_tokens.contains(token) {
+            return true;
+        }
+    }
+    for text_token in &text_tokens {
+        for target_token in &target_tokens {
+            if text_token.contains(target_token) || target_token.contains(text_token) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Suggest guides for a task description (upstream guides.suggestGuides).
+fn suggest_guides(task_description: &str, existing_guides: &[Guide]) -> Vec<GuideSuggestion> {
+    let mut suggestions: Vec<GuideSuggestion> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let desc_lower = task_description.to_lowercase();
+
+    for (guide, category, keywords) in task_guide_defs() {
+        if seen.contains(guide) {
+            continue;
+        }
+        let guide_match = desc_lower.contains(guide);
+        let keyword_match = keywords
+            .iter()
+            .any(|kw| desc_lower.contains(&kw.to_lowercase()));
+        if guide_match || keyword_match {
+            seen.insert(guide.to_string());
+            let existing = existing_guides.iter().find(|g| g.name == guide);
+            suggestions.push(GuideSuggestion {
+                guide: guide.to_string(),
+                category: category.to_string(),
+                keywords: keywords.iter().map(|s| s.to_string()).collect(),
+                tracked: existing.is_some(),
+                usage_count: existing.map(|g| g.usage_count).unwrap_or(0),
+                last_used: existing.and_then(|g| g.last_used.map(|i| date_only(i.as_millis()))),
+                learnings: existing.map(|g| g.learnings.clone()).unwrap_or_default(),
+                contexts: existing.map(|g| g.contexts.clone()).unwrap_or_default(),
+            });
+        }
+    }
+
+    for existing in existing_guides {
+        if seen.contains(&existing.name) {
+            continue;
+        }
+        if has_token_match(&desc_lower, &existing.name)
+            || existing
+                .contexts
+                .iter()
+                .any(|ctx| has_token_match(&desc_lower, ctx))
+            || existing
+                .learnings
+                .iter()
+                .any(|l| has_token_match(&desc_lower, l))
+        {
+            seen.insert(existing.name.clone());
+            suggestions.push(GuideSuggestion {
+                guide: existing.name.clone(),
+                category: existing.category.clone(),
+                keywords: existing.contexts.clone(),
+                tracked: true,
+                usage_count: existing.usage_count,
+                last_used: existing.last_used.map(|i| date_only(i.as_millis())),
+                learnings: existing.learnings.clone(),
+                contexts: existing.contexts.clone(),
+            });
+        }
+    }
+    suggestions
+}
+
+fn format_guide_suggestions(suggestions: &[GuideSuggestion]) -> String {
+    let tracked: Vec<&GuideSuggestion> = suggestions.iter().filter(|s| s.tracked).collect();
+    let missing: Vec<&GuideSuggestion> = suggestions.iter().filter(|s| !s.tracked).collect();
+    let summary = format!(
+        "Found {} relevant guides ({} tracked, {} new)",
+        suggestions.len(),
+        tracked.len(),
+        missing.len()
+    );
+    let mut output = String::from("=== GUIDE SUGGESTIONS ===\n");
+    output.push_str(&format!("{summary}\n\n"));
+    if !tracked.is_empty() {
+        output.push_str("TRACKED (you have experience):\n");
+        for s in &tracked {
+            output.push_str(&format!(
+                "  ✓ [{}] {} ({}x, last: {})\n",
+                s.category,
+                s.guide,
+                s.usage_count,
+                s.last_used.as_deref().unwrap_or("n/a")
+            ));
+            if !s.learnings.is_empty() {
+                for l in s.learnings.iter().take(3) {
+                    output.push_str(&format!("      💡 {l}\n"));
+                }
+                if s.learnings.len() > 3 {
+                    output.push_str(&format!(
+                        "      ... and {} more learnings\n",
+                        s.learnings.len() - 3
+                    ));
+                }
+            }
+        }
+        output.push('\n');
+    }
+    if !missing.is_empty() {
+        output.push_str("SUGGESTED (not tracked yet):\n");
+        for s in &missing {
+            output.push_str(&format!("  + [{}] {}\n", s.category, s.guide));
+            if !s.keywords.is_empty() {
+                output.push_str(&format!(
+                    "      keywords: {}\n",
+                    s.keywords
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        output.push('\n');
+    }
+    if suggestions.is_empty() {
+        output.push_str("No relevant guides found for this task.\n");
+        output.push_str("Try describing the task with more specific terms.\n");
+    }
+    output.push_str("========================");
+    output
+}
+
+fn format_guide_detail(guide: &Guide) -> String {
+    let mut detail = format!("=== GUIDE: {} ===\n", guide.name);
+    detail.push_str(&format!("Category: {}\n", guide.category));
+    detail.push_str(&format!("Usage Count: {}\n", guide.usage_count));
+    detail.push_str(&format!(
+        "Last Used: {}\n",
+        guide
+            .last_used
+            .map(|i| date_only(i.as_millis()))
+            .unwrap_or_default()
+    ));
+    if !guide.description.is_empty() {
+        detail.push_str(&format!(
+            "\n=== DESCRIPTION / PROTOCOLS ===\n{}\n===============================\n",
+            guide.description
+        ));
+    }
+    if !guide.contexts.is_empty() {
+        detail.push_str(&format!("Contexts: {}\n", guide.contexts.join(", ")));
+    }
+    if !guide.learnings.is_empty() {
+        detail.push_str("Learnings:\n");
+        for l in &guide.learnings {
+            detail.push_str(&format!("  - {l}\n"));
+        }
+    }
+    let total_attempts = guide.success_count + guide.failure_count;
+    if total_attempts > 0 {
+        let rate = guide.success_count as f64 / total_attempts as f64;
+        detail.push_str(&format!(
+            "Success Rate: {:.2} ({}/{})\n",
+            rate, guide.success_count, total_attempts
+        ));
+    }
+    if !guide.anti_patterns.is_empty() {
+        detail.push_str("Anti-patterns:\n");
+        for ap in &guide.anti_patterns {
+            detail.push_str(&format!("  - {ap}\n"));
+        }
+    }
+    if !guide.pitfalls.is_empty() {
+        detail.push_str("Known Pitfalls:\n");
+        for kp in &guide.pitfalls {
+            detail.push_str(&format!("  - {kp}\n"));
+        }
+    }
+    if !guide.depends_on.is_empty() {
+        detail.push_str(&format!("Depends on: {}\n", guide.depends_on.join(", ")));
+    }
+    if !guide.enables.is_empty() {
+        detail.push_str(&format!("Enables: {}\n", guide.enables.join(", ")));
+    }
+    if let Some(s) = &guide.superseded_by {
+        detail.push_str(&format!("Superseded by: {s}\n"));
+    }
+    detail.push_str("====================");
+    detail
+}
+
+fn guide_json(g: &Guide) -> Value {
+    json!({
+        "guide": g.name,
+        "category": g.category,
+        "description": g.description,
+        "usage_count": g.usage_count,
+        "last_used": g.last_used.map(|i| date_only(i.as_millis())),
+        "success_count": g.success_count,
+        "failure_count": g.failure_count,
+        "contexts": g.contexts,
+        "learnings": g.learnings,
+    })
+}
+
+/// Build a fresh guide record (upstream createGuide).
+fn create_guide(
+    name: &str,
+    category: &str,
+    description: &str,
+    contexts: &[String],
+    learnings: &[String],
+    now: u64,
+) -> Guide {
+    Guide {
+        name: name.to_lowercase().trim().to_string(),
+        category: category.to_lowercase().trim().to_string(),
+        description: description.trim().to_string(),
+        contexts: contexts
+            .iter()
+            .map(|c| c.to_lowercase().trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
+        learnings: learnings
+            .iter()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        usage_count: 1,
+        last_used: Some(Instant::new(now)),
+        success_count: 0,
+        failure_count: 0,
+        anti_patterns: vec![],
+        pitfalls: vec![],
+        depends_on: vec![],
+        enables: vec![],
+        source_memories: vec![],
+        validated_by: vec![],
+        superseded_by: None,
+        deprecated: false,
+        entity_revision: EntityRevision::new(1),
+        created_at: Instant::new(now),
+        updated_at: Instant::new(now),
+    }
+}
+
+fn merge_guide_refs(existing: &[String], additions: &[String], self_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = existing.to_vec();
+    for a in additions {
+        let lower = a.to_lowercase().trim().to_string();
+        if lower.is_empty() || lower == self_name {
+            continue;
+        }
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(&lower)) {
+            out.push(lower);
+        }
+    }
+    out
+}
+
+// ---- guide_get ----
+
+fn exec_guide_get(disp: &Dispatcher, args: &GuideGetArgs) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    let format = args.response_format;
+    let guides = repo.get_guides()?;
+
+    // Task-based suggestions.
+    if let Some(task) = &args.task {
+        let suggestions = suggest_guides(task, &guides);
+        let text = format_guide_suggestions(&suggestions);
+        let data = json!({
+            "count": suggestions.len(),
+            "guides": suggestions.iter().map(|s| s.guide.clone()).collect::<Vec<_>>(),
+            "guide": null,
+        });
+        return Ok(format_result(text, data, format));
+    }
+
+    // Single guide detail.
+    if let Some(name) = &args.guide {
+        let g = repo.get_guide(name)?;
+        let (text, data) = match g {
+            Some(g) => (
+                format_guide_detail(&g),
+                json!({
+                    "count": 1,
+                    "guides": [guide_json(&g)],
+                    "guide": guide_json(&g),
+                }),
+            ),
+            None => (
+                "Guide not found.".to_string(),
+                json!({ "count": 0, "guides": [], "guide": null }),
+            ),
+        };
+        return Ok(format_result(text, data, format));
+    }
+
+    // Category filter or all.
+    let filtered: Vec<&Guide> = match &args.category {
+        Some(cat) => guides
+            .iter()
+            .filter(|g| g.category.eq_ignore_ascii_case(cat))
+            .collect(),
+        None => guides.iter().collect(),
+    };
+    let mut text = String::from("## Guides\n---\n");
+    if filtered.is_empty() {
+        text.push_str("(no guides tracked yet)\n---");
+    } else {
+        let lines: Vec<String> = filtered
+            .iter()
+            .take(30)
+            .map(|g| {
+                format!(
+                    "[{}] {} — {}x usage, {} learnings",
+                    g.category,
+                    g.name,
+                    g.usage_count,
+                    g.learnings.len()
+                )
+            })
+            .collect();
+        text.push_str(&lines.join("\n"));
+        text.push_str("\n---");
+    }
+    let data = json!({
+        "count": filtered.len(),
+        "guides": filtered.iter().map(|g| guide_json(g)).collect::<Vec<_>>(),
+        "guide": null,
+    });
+    Ok(format_result(text, data, format))
+}
+
+// ---- guide_practice ----
+
+fn exec_guide_practice(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &GuidePracticeArgs,
+) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    if args.guide.trim().is_empty() || args.category.trim().is_empty() {
+        return Ok(err_result("'guide' and 'category' parameters are required"));
+    }
+    let now = disp.clock().now_millis();
+    let existing = repo.get_guide(&args.guide)?;
+    let mut updated = match existing {
+        None => {
+            let mut g = create_guide(
+                &args.guide,
+                &args.category,
+                args.description.as_deref().unwrap_or(""),
+                &args.contexts,
+                &args.learnings,
+                now,
+            );
+            if args.outcome.as_deref() == Some("success") {
+                g.success_count = 1;
+            } else if args.outcome.as_deref() == Some("failure") {
+                g.failure_count = 1;
+            }
+            g
+        }
+        Some(mut g) => {
+            g.usage_count += 1;
+            g.last_used = Some(Instant::new(now));
+            if g.description.is_empty()
+                && let Some(desc) = &args.description
+            {
+                g.description = desc.trim().to_string();
+            }
+            for ctx in &args.contexts {
+                let normalized = ctx.to_lowercase().trim().to_string();
+                if !normalized.is_empty()
+                    && !g
+                        .contexts
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&normalized))
+                {
+                    g.contexts.push(normalized);
+                }
+            }
+            for learning in &args.learnings {
+                let trimmed = learning.trim().to_string();
+                if !trimmed.is_empty() && !g.learnings.contains(&trimmed) {
+                    g.learnings.push(trimmed);
+                }
+            }
+            if args.outcome.as_deref() == Some("success") {
+                g.success_count += 1;
+            } else if args.outcome.as_deref() == Some("failure") {
+                g.failure_count += 1;
+            }
+            g
+        }
+    };
+
+    // Track into the active session (best-effort), then link validated_by.
+    let validated: Vec<String> = {
+        let mut reg = disp.registry();
+        reg.track_guide_used(envelope.frontend_id, envelope.channel_id, &updated.name);
+        reg.resolve_session(envelope.frontend_id, envelope.channel_id)
+            .and_then(|h| reg.session(h).map(|s| s.memories_read.clone()))
+            .unwrap_or_default()
+    };
+    for mem_id in &validated {
+        if !updated.validated_by.contains(mem_id) {
+            updated.validated_by.push(mem_id.clone());
+        }
+    }
+    updated.updated_at = Instant::new(now);
+    repo.put_guide(&updated)?;
+
+    let is_new = updated.usage_count == 1;
+    let action = if is_new { "Created" } else { "Updated" };
+    let mut response = format!(
+        "{action} guide \"{}\" ({}): {}x usage, {} learnings, {} contexts",
+        updated.name,
+        updated.category,
+        updated.usage_count,
+        updated.learnings.len(),
+        updated.contexts.len()
+    );
+
+    let total_attempts = updated.success_count + updated.failure_count;
+    if total_attempts >= 3 {
+        let rate = updated.success_count as f64 / total_attempts as f64;
+        if rate < 0.4 {
+            response.push_str(&format!(
+                "\n\n--- HOOK SUGGESTIONS ---\nGuide \"{}\" success rate is {:.2} ({}/{}). Consider guide_update to refine.",
+                updated.name,
+                rate,
+                updated.success_count,
+                total_attempts
+            ));
+        }
+    }
+
+    let data = json!({
+        "success": true,
+        "guide": updated.name,
+        "usage_count": updated.usage_count,
+    });
+    Ok(ok_result(response, data))
+}
+
+// ---- guide_create ----
+
+fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    if args.guide.trim().is_empty()
+        || args.category.trim().is_empty()
+        || args.description.trim().is_empty()
+    {
+        return Ok(err_result(
+            "'guide', 'category', and 'description' parameters are required",
+        ));
+    }
+    let now = disp.clock().now_millis();
+
+    if let Some(existing) = repo.get_guide(&args.guide)? {
+        let mut updated = existing;
+        updated.description = args.description.clone();
+        updated.updated_at = Instant::new(now);
+        repo.put_guide(&updated)?;
+        return Ok(ok_result(
+            format!(
+                "Updated manual for existing guide \"{}\" ({})",
+                updated.name, updated.category
+            ),
+            json!({ "success": true, "guide": updated.name }),
+        ));
+    }
+
+    let guides = repo.get_guides()?;
+    let normalized_lower = args.guide.to_lowercase();
+    let normalized = normalized_lower.trim();
+    if let Some(similar) = guides
+        .iter()
+        .find(|g| g.name.contains(normalized) || normalized.contains(g.name.as_str()))
+    {
+        let mut updated = similar.clone();
+        updated.description = args.description.clone();
+        updated.updated_at = Instant::new(now);
+        repo.put_guide(&updated)?;
+        return Ok(ok_result(
+            format!(
+                "Updated manual for existing guide \"{}\" ({})",
+                updated.name, updated.category
+            ),
+            json!({ "success": true, "guide": updated.name }),
+        ));
+    }
+
+    let new_guide = create_guide(
+        &args.guide,
+        &args.category,
+        &args.description,
+        &args.contexts,
+        &args.learnings,
+        now,
+    );
+    repo.put_guide(&new_guide)?;
+    Ok(ok_result(
+        format!(
+            "Created new guide \"{}\" ({}) with a detailed manual.",
+            new_guide.name, new_guide.category
+        ),
+        json!({ "success": true, "guide": new_guide.name }),
+    ))
+}
+
+// ---- guide_distill ----
+
+fn exec_guide_distill(disp: &Dispatcher, args: &GuideDistillArgs) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    if args.memory_id.trim().is_empty() || args.guide.trim().is_empty() {
+        return Ok(err_result(
+            "'memory_id' and 'guide' parameters are required",
+        ));
+    }
+    let now = disp.clock().now_millis();
+    let eid = match resolve_id(repo, &args.memory_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(err_result(&format!(
+                "Memory fragment with ID '{}' not found.",
+                args.memory_id
+            )));
+        }
+    };
+    let fragment = match repo.get_memories(&[eid])?.first() {
+        Some(m) => m.clone(),
+        None => {
+            return Ok(err_result(&format!(
+                "Memory fragment with ID '{}' not found.",
+                args.memory_id
+            )));
+        }
+    };
+
+    let category = args
+        .category
+        .clone()
+        .unwrap_or_else(|| "dev-tool".to_string());
+    let mut updated = match repo.get_guide(&args.guide)? {
+        Some(mut g) => {
+            if !g.learnings.contains(&fragment.fragment) {
+                g.learnings.push(fragment.fragment.clone());
+            }
+            let ctx = fragment
+                .project
+                .clone()
+                .unwrap_or_else(|| "global".to_string())
+                .to_lowercase()
+                .trim()
+                .to_string();
+            if !ctx.is_empty() && !g.contexts.contains(&ctx) {
+                g.contexts.push(ctx);
+            }
+            g.usage_count += 1;
+            g.last_used = Some(Instant::new(now));
+            g
+        }
+        None => create_guide(
+            &args.guide,
+            &category,
+            "Created via distillation from memory.",
+            &[fragment
+                .project
+                .clone()
+                .unwrap_or_else(|| "global".to_string())
+                .to_lowercase()
+                .trim()
+                .to_string()],
+            std::slice::from_ref(&fragment.fragment),
+            now,
+        ),
+    };
+
+    if !updated.source_memories.contains(&eid) {
+        updated.source_memories.push(eid);
+    }
+    updated.updated_at = Instant::new(now);
+    repo.put_guide(&updated)?;
+
+    // Update the fragment: related_guides + clear distill_candidate.
+    let mut frag = fragment;
+    let normalized_name = args.guide.to_lowercase().trim().to_string();
+    if !frag.related_guides.contains(&normalized_name) {
+        frag.related_guides.push(normalized_name);
+    }
+    frag.distill_candidate = false;
+    repo.put_memory_direct(&frag)?;
+
+    let response = format!(
+        "Successfully distilled memory [{}] into guide \"{}\" ({}).\n\n{}",
+        args.memory_id,
+        updated.name,
+        updated.category,
+        format_guide_detail(&updated)
+    );
+    Ok(ok_result(
+        response,
+        json!({
+            "success": true,
+            "guide": updated.name,
+            "memory_id": args.memory_id,
+        }),
+    ))
+}
+
+// ---- guide_update ----
+
+fn exec_guide_update(disp: &Dispatcher, args: &GuideUpdateArgs) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    if args.guide.trim().is_empty() {
+        return Ok(err_result("'guide' parameter is required"));
+    }
+    let now = disp.clock().now_millis();
+    let mut guide = match repo.get_guide(&args.guide)? {
+        Some(g) => g,
+        None => return Ok(err_result(&format!("Guide \"{}\" not found.", args.guide))),
+    };
+
+    let old_name = guide.name.clone();
+    if let Some(new_name) = &args.new_name
+        && !new_name.trim().is_empty()
+    {
+        guide.name = new_name.to_lowercase().trim().to_string();
+    }
+    if let Some(category) = &args.category
+        && !category.trim().is_empty()
+    {
+        guide.category = category.to_lowercase().trim().to_string();
+    }
+    if let Some(description) = &args.description
+        && !description.trim().is_empty()
+    {
+        guide.description = description.trim().to_string();
+    }
+    if !args.add_anti_patterns.is_empty() {
+        guide.anti_patterns.extend(args.add_anti_patterns.clone());
+    }
+    if !args.add_pitfalls.is_empty() {
+        guide.pitfalls.extend(args.add_pitfalls.clone());
+    }
+    if !args.add_depends_on.is_empty() {
+        guide.depends_on = merge_guide_refs(&guide.depends_on, &args.add_depends_on, &guide.name);
+    }
+    if !args.add_enables.is_empty() {
+        guide.enables = merge_guide_refs(&guide.enables, &args.add_enables, &guide.name);
+    }
+    if let Some(superseded_by) = &args.superseded_by
+        && !superseded_by.trim().is_empty()
+    {
+        guide.superseded_by = Some(superseded_by.clone());
+    }
+    if args.deprecated {
+        guide.deprecated = true;
+    }
+    guide.updated_at = Instant::new(now);
+
+    // If renamed, delete the old key and update memory references.
+    if !old_name.eq_ignore_ascii_case(&guide.name) {
+        let _ = repo.delete_guide(&old_name);
+        rename_guide_in_memories(repo, &old_name, &guide.name);
+    }
+    repo.put_guide(&guide)?;
+
+    Ok(ok_result(
+        format!(
+            "Updated guide \"{}\":\n{}",
+            guide.name,
+            format_guide_detail(&guide)
+        ),
+        json!({ "success": true, "guide": guide.name }),
+    ))
+}
+
+// ---- guide_forget ----
+
+fn exec_guide_forget(disp: &Dispatcher, args: &GuideForgetArgs) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    if args.guide.trim().is_empty() {
+        return Ok(err_result("'guide' parameter is required"));
+    }
+    let existing = repo.get_guide(&args.guide)?;
+    if existing.is_none() {
+        return Ok(err_result(&format!("Guide \"{}\" not found.", args.guide)));
+    }
+    repo.delete_guide(&args.guide)?;
+    remove_guide_from_memories(repo, &args.guide);
+    Ok(ok_result(
+        format!("Successfully forgot guide: {}", args.guide),
+        json!({ "success": true, "guide": args.guide }),
+    ))
+}
+
+// ---- guide_merge ----
+
+fn exec_guide_merge(disp: &Dispatcher, args: &GuideMergeArgs) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    if args.guides.len() < 2 {
+        return Ok(err_result(
+            "'guides' must be an array with at least 2 guide names",
+        ));
+    }
+    if args.guide.trim().is_empty() || args.category.trim().is_empty() {
+        return Ok(err_result("'guide' and 'category' parameters are required"));
+    }
+    let now = disp.clock().now_millis();
+
+    let mut source_guides: Vec<Guide> = Vec::new();
+    let mut not_found: Vec<String> = Vec::new();
+    for name in &args.guides {
+        match repo.get_guide(name)? {
+            Some(g) => source_guides.push(g),
+            None => not_found.push(name.clone()),
+        }
+    }
+    if !not_found.is_empty() {
+        return Ok(err_result(&format!(
+            "Guide(s) not found: {}",
+            not_found.join(", ")
+        )));
+    }
+
+    let contexts = args.contexts.clone().unwrap_or_else(|| {
+        let mut set: Vec<String> = Vec::new();
+        for g in &source_guides {
+            for c in &g.contexts {
+                if !set.contains(c) {
+                    set.push(c.clone());
+                }
+            }
+        }
+        set
+    });
+    let learnings = args.learnings.clone().unwrap_or_else(|| {
+        let mut set: Vec<String> = Vec::new();
+        for g in &source_guides {
+            for l in &g.learnings {
+                if !set.contains(l) {
+                    set.push(l.clone());
+                }
+            }
+        }
+        set
+    });
+    let anti_patterns = dedup(
+        source_guides
+            .iter()
+            .flat_map(|g| g.anti_patterns.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+    let pitfalls = dedup(
+        source_guides
+            .iter()
+            .flat_map(|g| g.pitfalls.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+
+    let total_usage: u32 = source_guides.iter().map(|g| g.usage_count).sum();
+    let mut new_guide = create_guide(
+        &args.guide,
+        &args.category,
+        args.description.as_deref().unwrap_or(""),
+        &contexts,
+        &learnings,
+        now,
+    );
+    new_guide.usage_count = total_usage;
+    new_guide.anti_patterns = anti_patterns.clone();
+    new_guide.pitfalls = pitfalls.clone();
+    new_guide.source_memories = dedup(
+        source_guides
+            .iter()
+            .flat_map(|g| g.source_memories.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+    new_guide.validated_by = dedup(
+        source_guides
+            .iter()
+            .flat_map(|g| g.validated_by.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+
+    for old_name in &args.guides {
+        rename_guide_in_memories(repo, old_name, &new_guide.name);
+        let _ = repo.delete_guide(old_name);
+    }
+    repo.put_guide(&new_guide)?;
+
+    let mut response = format!(
+        "Merged {} guides into \"{}\" ({})\n",
+        args.guides.len(),
+        new_guide.name,
+        new_guide.category
+    );
+    response.push_str(&format!(
+        "Total usage: {}x | Contexts: {} | Learnings: {}\n",
+        total_usage,
+        contexts.len(),
+        learnings.len()
+    ));
+    response.push_str(&format!("Removed: {}", args.guides.join(", ")));
+
+    let mut hook: Vec<String> = Vec::new();
+    if !anti_patterns.is_empty() {
+        hook.push(format!("Anti-patterns inherited: {}", anti_patterns.len()));
+    }
+    if !pitfalls.is_empty() {
+        hook.push(format!("Pitfalls inherited: {}", pitfalls.len()));
+    }
+    let all_source_mems: Vec<_> = source_guides
+        .iter()
+        .flat_map(|g| g.source_memories.iter())
+        .collect();
+    if !all_source_mems.is_empty() {
+        hook.push(format!(
+            "Source memories linked: {} fragment(s)",
+            all_source_mems.len()
+        ));
+    }
+    let all_validated: Vec<_> = source_guides
+        .iter()
+        .flat_map(|g| g.validated_by.iter())
+        .collect();
+    if !all_validated.is_empty() {
+        hook.push(format!("Validated by: {} fragment(s)", all_validated.len()));
+    }
+    if !hook.is_empty() {
+        response.push_str("\n\n--- HOOK SUGGESTIONS ---\n");
+        for h in &hook {
+            response.push_str(&format!("{h}\n"));
+        }
+    }
+
+    Ok(ok_result(
+        response,
+        json!({
+            "success": true,
+            "guide": new_guide.name,
+            "merged": args.guides,
+        }),
+    ))
+}
+
+/// Order-preserving deduplication (upstream `[...new Set(...)]`).
+fn dedup<T: PartialEq>(items: Vec<T>) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    for item in items {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// Rename a guide reference in every memory's `related_guides`
+/// (upstream `core.renameGuideInMemories`). Best-effort.
+fn rename_guide_in_memories(
+    repo: &crate::service::repository::CanonicalRepository,
+    old_name: &str,
+    new_name: &str,
+) {
+    let old_norm = old_name.to_lowercase().trim().to_string();
+    let new_norm = new_name.to_lowercase().trim().to_string();
+    if old_norm.is_empty() || old_norm == new_norm {
+        return;
+    }
+    if let Ok(export) = repo.export_snapshot() {
+        for m in export.memories.iter().filter(|m| {
+            m.related_guides
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case(&old_norm))
+        }) {
+            let mut updated = m.clone();
+            updated.related_guides = updated
+                .related_guides
+                .iter()
+                .map(|g| {
+                    if g.eq_ignore_ascii_case(&old_norm) {
+                        new_norm.clone()
+                    } else {
+                        g.clone()
+                    }
+                })
+                .collect();
+            updated.advance_document();
+            let _ = repo.put_memory_direct(&updated);
+        }
+    }
+}
+
+/// Remove a guide reference from every memory's `related_guides`
+/// (upstream `core.removeGuideFromMemories`). Best-effort.
+fn remove_guide_from_memories(
+    repo: &crate::service::repository::CanonicalRepository,
+    guide_name: &str,
+) {
+    let normalized = guide_name.to_lowercase().trim().to_string();
+    if normalized.is_empty() {
+        return;
+    }
+    if let Ok(export) = repo.export_snapshot() {
+        for m in export.memories.iter().filter(|m| {
+            m.related_guides
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case(&normalized))
+        }) {
+            let mut updated = m.clone();
+            updated.related_guides = updated
+                .related_guides
+                .iter()
+                .filter(|g| !g.eq_ignore_ascii_case(&normalized))
+                .cloned()
+                .collect();
+            updated.advance_document();
+            let _ = repo.put_memory_direct(&updated);
+        }
+    }
+}
+
+// ---- session_start ----
+
+fn exec_session_start(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &SessionStartArgs,
+) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    if args.task_type.trim().is_empty() {
+        return Ok(err_result("'task_type' parameter is required"));
+    }
+    let now = disp.clock().now_millis();
+    // The frozen session_start schema carries no project field; the channel's
+    // session is project-less (upstream resolves it from cwd, which the daemon
+    // does not observe).
+    let project: Option<String> = None;
+
+    // Abandon any existing active session for this channel; create a fresh one.
+    let handle = {
+        let mut reg = disp.registry();
+        reg.decay_attempts(0.002);
+        let h = reg.start_legacy_session(
+            envelope.frontend_id,
+            envelope.channel_id,
+            args.task_type.clone(),
+            args.technologies.clone(),
+            now,
+        );
+        if let Some(s) = reg.session_mut(h) {
+            s.initial_approach = args.initial_approach.clone();
+        }
+        h
+    };
+
+    // Guide suggestions for the task description.
+    let task_desc = format!("{} {}", args.task_type, args.technologies.join(" "));
+    let guides = repo.get_guides()?;
+    let suggestions = suggest_guides(&task_desc, &guides);
+    let formatted_suggestions = format_guide_suggestions(&suggestions);
+
+    // Pre-load relevant memories (bounded lexical recall).
+    let export = repo.export_snapshot()?;
+    let mut relevant: Vec<&Memory> = export
+        .memories
+        .iter()
+        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| {
+            project
+                .as_deref()
+                .map(|p| m.project.as_deref() == Some(p) || m.project.is_none())
+                .unwrap_or(true)
+        })
+        .collect();
+    let q = task_desc.to_lowercase();
+    relevant.sort_by(|a, b| {
+        relevance(b, &q)
+            .partial_cmp(&relevance(a, &q))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    relevant.truncate(3);
+
+    // Boost pre-loaded memories (upstream boostConfidence 0.02).
+    let boosted: Vec<EntityId> = relevant.iter().map(|m| m.id).collect();
+    if !boosted.is_empty() {
+        let ctx = sub_command_ctx(envelope, 0)?;
+        let cmd = DomainCommand::BoostConfidence {
+            memory_ids: boosted,
+        };
+        let _ = disp.repo().apply(&ctx, &cmd);
+    }
+
+    // Track read memories into the session.
+    let read_ids: Vec<String> = relevant.iter().map(|m| legacy_id_of(repo, m)).collect();
+    {
+        let mut reg = disp.registry();
+        reg.track_memories_read(envelope.frontend_id, envelope.channel_id, &read_ids);
+    }
+
+    let mut response = format!(
+        "Session started: {} ({})\n",
+        handle.as_uuid(),
+        args.task_type
+    );
+    if !args.technologies.is_empty() {
+        response.push_str(&format!("Technologies: {}\n", args.technologies.join(", ")));
+    }
+
+    if !relevant.is_empty() {
+        response.push_str("\nPre-loaded memories:\n");
+        for m in &relevant {
+            let scope_tag = m.project.clone().unwrap_or_else(|| "global".to_string());
+            response.push_str(&format!(
+                "  [{}] [{}] {} ({:.2})\n    {}\n",
+                legacy_id_of(repo, m),
+                scope_tag,
+                m.title,
+                m.confidence,
+                m.description
+            ));
+        }
+    }
+
+    response.push_str(&format!("\n{formatted_suggestions}"));
+
+    // Continuity recall: dead-ends + lessons + warnings from prior sessions.
+    let continuity = build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
+    if !continuity.is_empty() {
+        response.push_str(&continuity);
+    }
+
+    // Surface pending improvement suggestions.
+    let pending = repo
+        .get_suggestions()?
+        .into_iter()
+        .filter(|s| s.status == SuggestionStatus::Pending)
+        .take(3)
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        response
+            .push_str("\n\n## Past improvement suggestions (consider; dismiss if not relevant)\n");
+        for s in &pending {
+            response.push_str(&format!("- [{}] {}\n", s.id, s.suggestion));
+        }
+    }
+
+    let guide_names: Vec<String> = suggestions.iter().map(|s| s.guide.clone()).collect();
+    let data = json!({
+        "session_id": handle.as_uuid().to_string(),
+        "guides": guide_names,
+        "preloaded_memories": read_ids,
+    });
+    Ok(ok_result(response, data))
+}
+
+/// Continuity recall: dead-ends, lessons and warnings from prior sessions
+/// (upstream buildContinuityRecall).
+fn build_continuity_recall(
+    disp: &Dispatcher,
+    task_type: &str,
+    project: Option<&str>,
+    now: u64,
+) -> String {
+    let sessions = disp.registry().all_sessions_owned();
+
+    // Layer 1 — dead ends from similar prior sessions.
+    let mut dead_ends: Vec<(SessionHandle, u32, String, Option<String>)> = Vec::new();
+    for s in &sessions {
+        if s.task_type.as_deref() != Some(task_type) {
+            continue;
+        }
+        if let Some(p) = project
+            && let Some(sp) = &s.project
+            && sp != p
+        {
+            continue;
+        }
+        for a in &s.attempts {
+            if matches!(
+                a.outcome,
+                AttemptOutcome::Rejected | AttemptOutcome::Partial
+            ) && a.confidence >= 0.2
+            {
+                dead_ends.push((s.handle, a.seq, a.approach.clone(), a.critique.clone()));
+            }
+        }
+    }
+    dead_ends.sort_by(|a, b| {
+        b.3.clone()
+            .unwrap_or_default()
+            .len()
+            .cmp(&a.3.clone().unwrap_or_default().len())
+    });
+    dead_ends.truncate(15);
+
+    // Layer 2 — lessons from completed similar sessions.
+    let mut lessons: Vec<String> = Vec::new();
+    for s in &sessions {
+        if s.task_type.as_deref() != Some(task_type) || s.outcome.is_none() {
+            continue;
+        }
+        if let Some(p) = project
+            && let Some(sp) = &s.project
+            && sp != p
+        {
+            continue;
+        }
+        for l in &s.lessons {
+            if !l.trim().is_empty() && !lessons.contains(l) {
+                lessons.push(l.clone());
+            }
+        }
+    }
+    lessons.truncate(5);
+
+    // Layer 3 — warning fragments for this project (or global).
+    let repo = disp.repo();
+    let export = repo.export_snapshot().unwrap_or_default();
+    let warnings: Vec<&Memory> = export
+        .memories
+        .iter()
+        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| matches!(m.fragment_type, FragmentType::Warning))
+        .filter(|m| {
+            project
+                .map(|p| m.project.as_deref() == Some(p) || m.project.is_none())
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if dead_ends.is_empty() && lessons.is_empty() && warnings.is_empty() {
+        return String::new();
+    }
+
+    let mut block = format!("\n\n## Prior reasoning on similar {task_type} tasks");
+    if !dead_ends.is_empty() {
+        block.push_str("\n### Dead ends (don't repeat)");
+        let mut boosted: Vec<(SessionHandle, u32)> = Vec::new();
+        for (handle, seq, approach, critique) in &dead_ends {
+            block.push_str(&format!(
+                "\n- Tried: {approach}. Rejected because: {}",
+                critique.as_deref().unwrap_or("unknown")
+            ));
+            boosted.push((*handle, *seq));
+        }
+        // Boost recalled attempts (best-effort).
+        let mut reg = disp.registry();
+        for (handle, seq) in boosted {
+            reg.boost_attempt(handle, seq, 0.015, now);
+        }
+    }
+    if !lessons.is_empty() {
+        block.push_str("\n### What worked / lessons");
+        for l in &lessons {
+            block.push_str(&format!("\n- {l}"));
+        }
+    }
+    if !warnings.is_empty() {
+        block.push_str("\n### Warnings");
+        for w in warnings.iter().take(5) {
+            let text = if !w.title.trim().is_empty() {
+                w.title.clone()
+            } else {
+                w.fragment.chars().take(120).collect::<String>()
+            };
+            block.push_str(&format!("\n- {text}"));
+        }
+    }
+    block
+}
+
+// ---- session_attempt ----
+
+fn exec_session_attempt(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &SessionAttemptArgs,
+) -> DomainResult<DomainPayload> {
+    if args.approach.trim().is_empty() || args.outcome.trim().is_empty() {
+        return Ok(err_result(
+            "'approach' and 'outcome' are required for session_attempt.",
+        ));
+    }
+    let outcome = match AttemptOutcome::parse(&args.outcome) {
+        Some(o) => o,
+        None => {
+            return Ok(err_result(
+                "'outcome' must be one of: rejected, partial, promising.",
+            ));
+        }
+    };
+
+    // Redact secrets from free-text fields (upstream redactSecrets).
+    let approach_redacted = privacy::redact(&args.approach);
+    let critique_redacted = args.critique.as_deref().map(privacy::redact);
+
+    // Resolve the channel's active session.
+    let session = {
+        let reg = disp.registry();
+        reg.resolve_session(envelope.frontend_id, envelope.channel_id)
+    };
+    let Some(handle) = session else {
+        return Ok(err_result(
+            "No active session. Call session_start before recording attempts.",
+        ));
+    };
+
+    // Resolve the related memory ID (best-effort).
+    let related_memory_id = args
+        .related_memory_id
+        .as_deref()
+        .and_then(|id| disp.repo().resolve_id(id).ok());
+
+    let now = disp.clock().now_millis();
+    let attempt_id = EntityId::new(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("ltmrs:attempt:{}", envelope.operation_id.as_uuid()).as_bytes(),
+    ));
+
+    // Record the attempt and compute its seq.
+    let seq = {
+        let mut reg = disp.registry();
+        let next_seq = reg
+            .session(handle)
+            .map(|s| s.attempts.len() as u32 + 1)
+            .unwrap_or(1);
+        let attempt = Attempt {
+            id: attempt_id,
+            session_id: handle,
+            seq: next_seq,
+            approach: approach_redacted.clone(),
+            outcome,
+            critique: critique_redacted.clone(),
+            rationale: args.rationale.clone(),
+            related_memory_id,
+            confidence: 1.0,
+            access_count: 0,
+            last_accessed_at: None,
+            created_at: Instant::new(now),
+        };
+        reg.record_attempt(envelope.frontend_id, envelope.channel_id, attempt);
+        next_seq
+    };
+
+    // Self-critique + refinement counters.
+    {
+        let mut reg = disp.registry();
+        if let Some(s) = reg.session_mut(handle) {
+            s.refinement_attempts += 1;
+            if matches!(outcome, AttemptOutcome::Rejected | AttemptOutcome::Partial)
+                && critique_redacted.is_some()
+            {
+                s.self_critique_count += 1;
+            }
+        }
+    }
+
+    let value_tag = match outcome {
+        AttemptOutcome::Rejected => "(dead end — most valuable)",
+        AttemptOutcome::Partial => "(partial)",
+        AttemptOutcome::Promising => "(promising)",
+    };
+    let preview = if approach_redacted.len() > 80 {
+        let mut end = 80;
+        while !approach_redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &approach_redacted[..end])
+    } else {
+        approach_redacted.clone()
+    };
+    let response = format!("Recorded attempt #{seq} — {preview} {value_tag}.");
+    let data = json!({
+        "recorded": true,
+        "attempt_id": format!("{}#{}", handle.as_uuid(), seq),
+    });
+    Ok(ok_result(response, data))
+}
+
+// ---- session_end ----
+
+fn exec_session_end(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &SessionEndArgs,
+) -> DomainResult<DomainPayload> {
+    if args.outcome.trim().is_empty() {
+        return Ok(err_result("'outcome' parameter is required"));
+    }
+    let outcome = match TaskOutcome::parse(&args.outcome) {
+        Some(o) => o,
+        None => {
+            return Ok(err_result(
+                "'outcome' must be one of: success, partial, failure, abandoned.",
+            ));
+        }
+    };
+
+    let now = disp.clock().now_millis();
+    let session = {
+        let reg = disp.registry();
+        reg.resolve_session(envelope.frontend_id, envelope.channel_id)
+    };
+    let Some(handle) = session else {
+        return Ok(err_result("No active session to end."));
+    };
+
+    // End the session (only this channel's).
+    {
+        let mut reg = disp.registry();
+        reg.end_session(
+            envelope.frontend_id,
+            envelope.channel_id,
+            outcome,
+            args.final_approach.clone(),
+            args.lessons.clone(),
+            now,
+        );
+    }
+
+    let repo = disp.repo();
+    let mut improvement_lines: Vec<String> = Vec::new();
+
+    // Evaluate guides used in this session.
+    let guides_used = {
+        let reg = disp.registry();
+        reg.session(handle)
+            .map(|s| s.guides_used.clone())
+            .unwrap_or_default()
+    };
+    for guide_name in &guides_used {
+        if let Some(mut guide) = repo.get_guide(guide_name)? {
+            if outcome == TaskOutcome::Success {
+                guide.success_count += 1;
+            } else if outcome == TaskOutcome::Failure {
+                guide.failure_count += 1;
+                let total = guide.success_count + guide.failure_count;
+                if total >= 3 {
+                    let rate = guide.success_count as f64 / total as f64;
+                    if rate < 0.4 {
+                        improvement_lines.push(format!(
+                            "  [!] Guide \"{}\" success rate is {:.2} ({}/{total}). Consider refining with guide_update.",
+                            guide.name, rate, guide.success_count
+                        ));
+                    }
+                }
+            }
+            guide.updated_at = Instant::new(now);
+            repo.put_guide(&guide)?;
+        }
+    }
+
+    // Persist improvement suggestions (best-effort).
+    for line in &improvement_lines {
+        let id = repo.next_suggestion_id()?;
+        let suggestion = Suggestion {
+            id,
+            session_id: Some(handle.as_uuid().to_string()),
+            suggestion: line.trim().to_string(),
+            status: SuggestionStatus::Pending,
+            created_at: Instant::new(now),
+            resolved_at: None,
+        };
+        let _ = repo.put_suggestion(&suggestion);
+    }
+
+    let session_end_info = {
+        let reg = disp.registry();
+        reg.session(handle).cloned()
+    };
+    let started = session_end_info
+        .as_ref()
+        .map(|s| s.started_at.as_millis())
+        .unwrap_or(now);
+
+    let mut response = format!("Session {} ended: {}\n", handle.as_uuid(), args.outcome);
+    if let Some(s) = &session_end_info {
+        response.push_str(&format!(
+            "Task: {} | Duration: {} → {}\n",
+            s.task_type.clone().unwrap_or_default(),
+            iso8601(started),
+            iso8601(now)
+        ));
+        if !s.lessons.is_empty() {
+            response.push_str(&format!("Lessons: {} recorded\n", s.lessons.len()));
+        }
+    }
+    if !improvement_lines.is_empty() {
+        response.push_str(&format!(
+            "\nIMPROVEMENT SUGGESTIONS:\n{}\n",
+            improvement_lines.join("\n")
+        ));
+    }
+
+    // Session review.
+    if let Some(s) = &session_end_info
+        && (!s.memories_read.is_empty()
+            || !s.memories_created.is_empty()
+            || !s.guides_used.is_empty())
+    {
+        response.push_str("\nSESSION REVIEW:");
+        if !s.memories_read.is_empty() {
+            response.push_str(&format!(
+                "\n  Memories read: {}",
+                s.memories_read
+                    .iter()
+                    .map(|m| format!("[{m}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !s.memories_created.is_empty() {
+            response.push_str(&format!(
+                "\n  Memories created: {}",
+                s.memories_created
+                    .iter()
+                    .map(|m| format!("[{m}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !s.guides_used.is_empty() {
+            response.push_str(&format!("\n  Guides used: {}", s.guides_used.join(", ")));
+        }
+    }
+
+    let data = json!({
+        "outcome_recorded": true,
+        "suggestions": improvement_lines,
+    });
+    Ok(ok_result(response, data))
+}
+
+// ---- session_stats ----
+
+fn exec_session_stats(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &SessionStatsArgs,
+) -> DomainResult<DomainPayload> {
+    let count = args.count.unwrap_or(10);
+    let format = args.response_format;
+
+    let sessions = disp.registry().all_sessions_owned();
+
+    // Recent completed sessions (most recent first).
+    let mut completed: Vec<&Session> = sessions
+        .iter()
+        .filter(|s| s.status == crate::domain::session::SessionStatus::Ended)
+        .collect();
+    completed.sort_by_key(|s| std::cmp::Reverse(s.started_at.as_millis()));
+    completed.truncate(count.min(5));
+
+    // Active session for this channel.
+    let active = disp
+        .registry()
+        .resolve_session(envelope.frontend_id, envelope.channel_id)
+        .and_then(|h| disp.registry().session(h).cloned());
+
+    let mut output = String::from("## Session Stats\n");
+    if let Some(current) = &active {
+        output.push_str(&format!(
+            "Active session: {} tool calls\n",
+            current.attempts.len()
+        ));
+        if !current.technologies.is_empty() {
+            output.push_str(&format!(
+                "Technologies: {}\n",
+                current.technologies.join(", ")
+            ));
+        }
+        if !current.guides_used.is_empty() {
+            output.push_str(&format!(
+                "Guides used: {}\n",
+                current.guides_used.join(", ")
+            ));
+        }
+        output.push('\n');
+    }
+
+    if !completed.is_empty() {
+        output.push_str(&format!("Recent sessions ({}):\n", completed.len()));
+        for s in &completed {
+            let techs = if !s.technologies.is_empty() {
+                format!(" [{}]", s.technologies.join(", "))
+            } else {
+                String::new()
+            };
+            output.push_str(&format!(
+                "  {}: {} calls{techs}\n",
+                s.handle.as_uuid(),
+                s.attempts.len()
+            ));
+        }
+    } else {
+        output.push_str("No past sessions recorded yet.\n");
+    }
+
+    let data = json!({
+        "active_session": active.as_ref().map(|c| {
+            json!({
+                "tool_calls": c.attempts.len(),
+                "technologies": c.technologies,
+                "guides_used": c.guides_used,
+            })
+        }),
+        "recent_sessions": completed.iter().map(|s| {
+            json!({
+                "id": s.handle.as_uuid().to_string(),
+                "duration_tool_calls": s.attempts.len(),
+                "technologies": s.technologies,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    Ok(format_result(output, data, format))
+}
+
+// ---- suggestion_respond ----
+
+fn exec_suggestion_respond(
+    disp: &Dispatcher,
+    args: &SuggestionRespondArgs,
+) -> DomainResult<DomainPayload> {
+    let action = args.action.to_lowercase();
+    if !matches!(action.as_str(), "accept" | "dismiss") {
+        return Ok(err_result("'action' must be one of: accept, dismiss."));
+    }
+    let repo = disp.repo();
+    let status = if action == "accept" {
+        SuggestionStatus::Accepted
+    } else {
+        SuggestionStatus::Dismissed
+    };
+
+    let now = disp.clock().now_millis();
+    let mut suggestion = match repo.get_suggestion(args.id)? {
+        Some(s) => s,
+        None => return Ok(err_result("Could not update this suggestion in the store.")),
+    };
+    suggestion.status = status;
+    suggestion.resolved_at = Some(Instant::new(now));
+    repo.put_suggestion(&suggestion)?;
+
+    // Adjust attempt confidence based on the action (best-effort).
+    if let Some(session_id) = &suggestion.session_id {
+        let handle_uuid = uuid::Uuid::parse_str(session_id).ok();
+        if let Some(h) = handle_uuid {
+            let handle = crate::domain::id::SessionHandle::new(h);
+            let attempts = disp
+                .registry()
+                .session(handle)
+                .map(|s| s.attempts.clone())
+                .unwrap_or_default();
+            let mut reg = disp.registry();
+            if action == "dismiss" {
+                for a in &attempts {
+                    if matches!(
+                        a.outcome,
+                        AttemptOutcome::Rejected | AttemptOutcome::Partial
+                    ) {
+                        reg.penalize_attempt(handle, a.seq, 0.02, now);
+                    }
+                }
+            } else {
+                for a in &attempts {
+                    if a.outcome == AttemptOutcome::Promising {
+                        reg.boost_attempt(handle, a.seq, 0.02, now);
+                    }
+                }
+            }
+        }
+    }
+
+    let message = if action == "accept" {
+        format!(
+            "Accepted suggestion #{}. It will no longer be surfaced; related promising attempts were reinforced.",
+            args.id
+        )
+    } else {
+        format!(
+            "Dismissed suggestion #{}. It will no longer be surfaced; related dead ends were de-prioritized.",
+            args.id
+        )
+    };
+    let data = json!({ "resolved": true, "id": args.id });
+    Ok(ok_result(message, data))
+}
+
+// ---- conflict_scan ----
+
+fn exec_conflict_scan(disp: &Dispatcher, args: &ConflictScanArgs) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    let format = args.response_format;
+    let export = repo.export_snapshot()?;
+    let memories: Vec<Memory> = export
+        .memories
+        .iter()
+        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| {
+            args.project
+                .as_deref()
+                .map(|p| m.project.as_deref() == Some(p) || m.project.is_none())
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    let legacy_id_of = |m: &Memory| repo.legacy_id(m);
+    let conflicts =
+        crate::compatibility::lemma::intelligence::scan_for_conflicts(&memories, legacy_id_of);
+    let text = crate::compatibility::lemma::intelligence::format_conflict_results(&conflicts);
+    let data = json!({ "count": conflicts.len(), "conflicts": conflicts });
+    Ok(format_result(text, data, format))
+}
+
+// ---- proactive_analysis ----
+
+fn exec_proactive_analysis(
+    disp: &Dispatcher,
+    args: &ProactiveAnalysisArgs,
+) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    let format = args.response_format;
+    let export = repo.export_snapshot()?;
+    let guides = repo.get_guides()?;
+    let memories: Vec<Memory> = export
+        .memories
+        .iter()
+        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| {
+            args.project
+                .as_deref()
+                .map(|p| m.project.as_deref() == Some(p) || m.project.is_none())
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    let legacy_id_of = |m: &Memory| repo.legacy_id(m);
+    let now = disp.clock().now_millis();
+    let mut suggestions = crate::compatibility::lemma::intelligence::run_full_analysis(
+        &memories,
+        &guides,
+        now,
+        legacy_id_of,
+    );
+
+    // Conflict count suggestion.
+    let conflicts =
+        crate::compatibility::lemma::intelligence::scan_for_conflicts(&memories, legacy_id_of);
+    if !conflicts.is_empty() {
+        suggestions.push(
+            crate::compatibility::lemma::intelligence::ProactiveSuggestion {
+                r#type: "conflict".into(),
+                priority: "high".into(),
+                message: format!(
+                    "{} conflicting memory pair(s) detected. Run conflict_scan for details.",
+                    conflicts.len()
+                ),
+                suggested_action: None,
+            },
+        );
+    }
+
+    let formatted = crate::compatibility::lemma::intelligence::format_suggestions(&suggestions);
+    let mut output = format!(
+        "=== PROACTIVE ANALYSIS ===\nAnalyzed {} memories and {} guides.\n\n",
+        memories.len(),
+        guides.len()
+    );
+    output.push_str(&formatted);
+    if suggestions.is_empty() {
+        output = "=== PROACTIVE ANALYSIS ===\nNo issues detected. Knowledge base looks healthy."
+            .to_string();
+    }
+    let data = json!({
+        "count": suggestions.len(),
+        "analyzed_memories": memories.len(),
+        "analyzed_guides": guides.len(),
+        "suggestions": suggestions,
+    });
+    Ok(format_result(output, data, format))
+}
+
+// ---- project_analytics ----
+
+fn exec_project_analytics(
+    disp: &Dispatcher,
+    args: &ProjectAnalyticsArgs,
+) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    let format = args.response_format;
+    let now = disp.clock().now_millis();
+    let export = repo.export_snapshot()?;
+    let mut guides = repo.get_guides()?;
+    guides.sort_by_key(|g| std::cmp::Reverse(g.usage_count));
+    let sessions = disp.registry().all_sessions_owned();
+    let memories: Vec<Memory> = export
+        .memories
+        .iter()
+        .filter(|m| m.lifecycle.is_recallable())
+        .cloned()
+        .collect();
+
+    match &args.project {
+        None => {
+            let all = crate::compatibility::lemma::intelligence::get_all_projects_analytics(
+                &sessions, &memories, &guides, now,
+            );
+            if all.is_empty() {
+                return Ok(ok_result(
+                    "No projects found with session or memory data.".to_string(),
+                    json!({
+                        "project": null,
+                        "health_score": null,
+                        "recent_insights": [],
+                        "count": 0,
+                        "projects": []
+                    }),
+                ));
+            }
+            let mut output = String::from("=== ALL PROJECTS OVERVIEW ===\n\n");
+            for p in &all {
+                output.push_str(&format!(
+                    "{}: {} sessions, {} memories, health {:.0}%\n",
+                    p.project,
+                    p.total_sessions,
+                    p.total_memories,
+                    p.health_score * 100.0
+                ));
+            }
+            let data = json!({
+                "project": null,
+                "health_score": null,
+                "recent_insights": [],
+                "count": all.len(),
+                "projects": all,
+            });
+            Ok(format_result(output, data, format))
+        }
+        Some(project) => {
+            let progress = crate::compatibility::lemma::intelligence::get_project_analytics(
+                project, &sessions, &memories, &guides, now,
+            );
+            let formatted =
+                crate::compatibility::lemma::intelligence::format_project_progress(&progress);
+            let data = json!({
+                "project": project,
+                "total_sessions": progress.total_sessions,
+                "total_memories": progress.total_memories,
+                "total_guides": progress.total_guides,
+                "knowledge_growth_rate": progress.knowledge_growth_rate,
+                "skill_coverage": progress.skill_coverage,
+                "recent_insights": progress.recent_insights,
+                "health_score": progress.health_score,
+            });
+            Ok(format_result(formatted, data, format))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3939,5 +6075,723 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected, "filter_by_project mismatch on case {i}");
         }
+    }
+
+    // ---- WP-09: guide tools ----
+
+    #[test]
+    fn guide_create_then_get_roundtrip() {
+        let (disp, _dir) = test_dispatcher();
+        let env = tool_call(
+            1,
+            ToolArgs::GuideCreate(GuideCreateArgs {
+                guide: "react".to_string(),
+                category: "web-frontend".to_string(),
+                description: "## React Guide\n\n### Protocol\nUse hooks.".to_string(),
+                contexts: vec!["hooks".to_string()],
+                learnings: vec!["useCallback prevents re-renders".to_string()],
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::GuideCreate(GuideCreateArgs {
+                guide: "react".to_string(),
+                category: "web-frontend".to_string(),
+                description: "## React Guide\n\n### Protocol\nUse hooks.".to_string(),
+                contexts: vec!["hooks".to_string()],
+                learnings: vec!["useCallback prevents re-renders".to_string()],
+            }),
+        );
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Created new guide \"react\""));
+
+        // Fetch it back.
+        let env2 = tool_call(
+            2,
+            ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("react".to_string()),
+                ..Default::default()
+            }),
+        );
+        let result2 = run(
+            &disp,
+            &env2,
+            &ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("react".to_string()),
+                ..Default::default()
+            }),
+        );
+        let text2 = result_text(&result2);
+        assert!(text2.contains("=== GUIDE: react ==="));
+        assert!(text2.contains("useCallback prevents re-renders"));
+    }
+
+    #[test]
+    fn guide_practice_increments_usage() {
+        let (disp, _dir) = test_dispatcher();
+        // First practice creates the guide (usage_count = 1).
+        let env = tool_call(
+            1,
+            ToolArgs::GuidePractice(GuidePracticeArgs {
+                guide: "git".to_string(),
+                category: "dev-tool".to_string(),
+                description: None,
+                contexts: vec!["commits".to_string()],
+                learnings: vec!["always stage selectively".to_string()],
+                outcome: Some("success".to_string()),
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::GuidePractice(GuidePracticeArgs {
+                guide: "git".to_string(),
+                category: "dev-tool".to_string(),
+                description: None,
+                contexts: vec!["commits".to_string()],
+                learnings: vec!["always stage selectively".to_string()],
+                outcome: Some("success".to_string()),
+            }),
+        );
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Created guide \"git\""));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(structured["usage_count"], json!(1));
+
+        // Second practice increments usage.
+        let env2 = tool_call(
+            2,
+            ToolArgs::GuidePractice(GuidePracticeArgs {
+                guide: "git".to_string(),
+                category: "dev-tool".to_string(),
+                description: None,
+                contexts: vec!["branches".to_string()],
+                learnings: vec!["rebase before merge".to_string()],
+                outcome: Some("failure".to_string()),
+            }),
+        );
+        let result2 = run(
+            &disp,
+            &env2,
+            &ToolArgs::GuidePractice(GuidePracticeArgs {
+                guide: "git".to_string(),
+                category: "dev-tool".to_string(),
+                description: None,
+                contexts: vec!["branches".to_string()],
+                learnings: vec!["rebase before merge".to_string()],
+                outcome: Some("failure".to_string()),
+            }),
+        );
+        assert!(result_text(&result2).contains("Updated guide \"git\""));
+        let structured2 = result_structured(&result2).unwrap();
+        assert_eq!(structured2["usage_count"], json!(2));
+    }
+
+    #[test]
+    fn guide_forget_removes_guide() {
+        let (disp, _dir) = test_dispatcher();
+        let env = tool_call(
+            1,
+            ToolArgs::GuideCreate(GuideCreateArgs {
+                guide: "temp".to_string(),
+                category: "dev-tool".to_string(),
+                description: "temp guide".to_string(),
+                contexts: vec![],
+                learnings: vec![],
+            }),
+        );
+        run(
+            &disp,
+            &env,
+            &ToolArgs::GuideCreate(GuideCreateArgs {
+                guide: "temp".to_string(),
+                category: "dev-tool".to_string(),
+                description: "temp guide".to_string(),
+                contexts: vec![],
+                learnings: vec![],
+            }),
+        );
+
+        let env2 = tool_call(
+            2,
+            ToolArgs::GuideForget(GuideForgetArgs {
+                guide: "temp".to_string(),
+            }),
+        );
+        let result = run(
+            &disp,
+            &env2,
+            &ToolArgs::GuideForget(GuideForgetArgs {
+                guide: "temp".to_string(),
+            }),
+        );
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Successfully forgot guide: temp"));
+
+        // Verify it's gone.
+        let env3 = tool_call(
+            3,
+            ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("temp".to_string()),
+                ..Default::default()
+            }),
+        );
+        let result3 = run(
+            &disp,
+            &env3,
+            &ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("temp".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert!(result_text(&result3).contains("Guide not found"));
+    }
+
+    #[test]
+    fn guide_distill_links_memory_to_guide() {
+        let (disp, _dir) = test_dispatcher();
+        // Create a memory.
+        let mem_id = add_fragment(
+            &disp,
+            1,
+            "## A pattern worth distilling\n\n### Context\nReusable skill.",
+        );
+        // Distill it.
+        let env = tool_call(
+            2,
+            ToolArgs::GuideDistill(GuideDistillArgs {
+                memory_id: mem_id.clone(),
+                guide: "react".to_string(),
+                category: Some("web-frontend".to_string()),
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::GuideDistill(GuideDistillArgs {
+                memory_id: mem_id.clone(),
+                guide: "react".to_string(),
+                category: Some("web-frontend".to_string()),
+            }),
+        );
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Successfully distilled memory"));
+
+        // The guide now contains the memory's fragment as a learning.
+        let env2 = tool_call(
+            3,
+            ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("react".to_string()),
+                ..Default::default()
+            }),
+        );
+        let result2 = run(
+            &disp,
+            &env2,
+            &ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("react".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert!(result_text(&result2).contains("A pattern worth distilling"));
+    }
+
+    #[test]
+    fn guide_forget_removes_memory_references() {
+        let (disp, _dir) = test_dispatcher();
+        // Create a memory and distill it into a guide (sets related_guides).
+        let mem_id = add_fragment(
+            &disp,
+            1,
+            "## Distillable pattern\n\n### Context\nReusable skill.",
+        );
+        let distill = ToolArgs::GuideDistill(GuideDistillArgs {
+            memory_id: mem_id.clone(),
+            guide: "react".to_string(),
+            category: Some("web-frontend".to_string()),
+        });
+        let env = tool_call(2, distill.clone());
+        run(&disp, &env, &distill);
+
+        // Confirm the memory now references the guide.
+        let eid = disp.repo().resolve_id(&mem_id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(mems[0].related_guides.iter().any(|g| g == "react"));
+
+        // Forget the guide.
+        let forget = ToolArgs::GuideForget(GuideForgetArgs {
+            guide: "react".to_string(),
+        });
+        let env2 = tool_call(3, forget.clone());
+        let result = run(&disp, &env2, &forget);
+        assert!(!result_is_error(&result));
+
+        // The memory must no longer reference the forgotten guide.
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            !mems[0]
+                .related_guides
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case("react")),
+            "related_guides should not reference a forgotten guide"
+        );
+    }
+
+    #[test]
+    fn guide_update_renames_memory_references() {
+        let (disp, _dir) = test_dispatcher();
+        // Create a memory and distill it into a guide.
+        let mem_id = add_fragment(
+            &disp,
+            1,
+            "## Renamable pattern\n\n### Context\nReusable skill.",
+        );
+        let distill = ToolArgs::GuideDistill(GuideDistillArgs {
+            memory_id: mem_id.clone(),
+            guide: "react".to_string(),
+            category: Some("web-frontend".to_string()),
+        });
+        let env = tool_call(2, distill.clone());
+        run(&disp, &env, &distill);
+
+        let eid = disp.repo().resolve_id(&mem_id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(mems[0].related_guides.iter().any(|g| g == "react"));
+
+        // Rename the guide.
+        let update = ToolArgs::GuideUpdate(GuideUpdateArgs {
+            guide: "react".to_string(),
+            new_name: Some("react18".to_string()),
+            ..Default::default()
+        });
+        let env2 = tool_call(3, update.clone());
+        let result = run(&disp, &env2, &update);
+        assert!(!result_is_error(&result));
+
+        // The memory must now reference the new name.
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            mems[0]
+                .related_guides
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case("react18")),
+            "related_guides should reference the renamed guide"
+        );
+        assert!(
+            !mems[0]
+                .related_guides
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case("react")),
+            "related_guides should not reference the old name"
+        );
+    }
+
+    #[test]
+    fn guide_merge_combines_guides() {
+        let (disp, _dir) = test_dispatcher();
+        // Create two guides.
+        for (op, name) in [(1, "alpha"), (2, "beta")] {
+            let env = tool_call(
+                op,
+                ToolArgs::GuideCreate(GuideCreateArgs {
+                    guide: name.to_string(),
+                    category: "dev-tool".to_string(),
+                    description: format!("{name} desc"),
+                    contexts: vec![format!("{name}-ctx")],
+                    learnings: vec![format!("{name}-learn")],
+                }),
+            );
+            run(
+                &disp,
+                &env,
+                &ToolArgs::GuideCreate(GuideCreateArgs {
+                    guide: name.to_string(),
+                    category: "dev-tool".to_string(),
+                    description: format!("{name} desc"),
+                    contexts: vec![format!("{name}-ctx")],
+                    learnings: vec![format!("{name}-learn")],
+                }),
+            );
+        }
+
+        // Merge them.
+        let env = tool_call(
+            3,
+            ToolArgs::GuideMerge(GuideMergeArgs {
+                guides: vec!["alpha".to_string(), "beta".to_string()],
+                guide: "gamma".to_string(),
+                category: "dev-tool".to_string(),
+                description: Some("merged".to_string()),
+                contexts: None,
+                learnings: None,
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::GuideMerge(GuideMergeArgs {
+                guides: vec!["alpha".to_string(), "beta".to_string()],
+                guide: "gamma".to_string(),
+                category: "dev-tool".to_string(),
+                description: Some("merged".to_string()),
+                contexts: None,
+                learnings: None,
+            }),
+        );
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Merged 2 guides into \"gamma\""));
+
+        // Sources are gone, merged guide exists with combined learnings.
+        let env2 = tool_call(
+            4,
+            ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("gamma".to_string()),
+                ..Default::default()
+            }),
+        );
+        let result2 = run(
+            &disp,
+            &env2,
+            &ToolArgs::GuideGet(GuideGetArgs {
+                guide: Some("gamma".to_string()),
+                ..Default::default()
+            }),
+        );
+        let text2 = result_text(&result2);
+        assert!(text2.contains("alpha-learn"));
+        assert!(text2.contains("beta-learn"));
+    }
+
+    // ---- WP-09: session tools ----
+
+    #[test]
+    fn session_start_attempt_end_lifecycle() {
+        let (disp, _dir) = test_dispatcher();
+        // Start.
+        let env = tool_call(
+            1,
+            ToolArgs::SessionStart(SessionStartArgs {
+                task_type: "debugging".to_string(),
+                technologies: vec!["rust".to_string()],
+                initial_approach: Some("read the code".to_string()),
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::SessionStart(SessionStartArgs {
+                task_type: "debugging".to_string(),
+                technologies: vec!["rust".to_string()],
+                initial_approach: Some("read the code".to_string()),
+            }),
+        );
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Session started:"));
+
+        // Attempt.
+        let env2 = tool_call(
+            2,
+            ToolArgs::SessionAttempt(SessionAttemptArgs {
+                approach: "try X".to_string(),
+                outcome: "rejected".to_string(),
+                critique: Some("didn't work".to_string()),
+                rationale: None,
+                related_memory_id: None,
+            }),
+        );
+        let result2 = run(
+            &disp,
+            &env2,
+            &ToolArgs::SessionAttempt(SessionAttemptArgs {
+                approach: "try X".to_string(),
+                outcome: "rejected".to_string(),
+                critique: Some("didn't work".to_string()),
+                rationale: None,
+                related_memory_id: None,
+            }),
+        );
+        assert!(!result_is_error(&result2));
+        assert!(text_contains(&result2, "Recorded attempt #1"));
+
+        // End.
+        let env3 = tool_call(
+            3,
+            ToolArgs::SessionEnd(SessionEndArgs {
+                outcome: "success".to_string(),
+                final_approach: Some("fixed it".to_string()),
+                lessons: vec!["lesson one".to_string()],
+            }),
+        );
+        let result3 = run(
+            &disp,
+            &env3,
+            &ToolArgs::SessionEnd(SessionEndArgs {
+                outcome: "success".to_string(),
+                final_approach: Some("fixed it".to_string()),
+                lessons: vec!["lesson one".to_string()],
+            }),
+        );
+        assert!(!result_is_error(&result3));
+        assert!(text_contains(&result3, "ended: success"));
+    }
+
+    #[test]
+    fn session_start_preload_boosts_confidence_by_002() {
+        let (disp, _dir) = test_dispatcher();
+        // Add a memory matching the task description so it gets pre-loaded.
+        let id = add_fragment(
+            &disp,
+            1,
+            "## Rust debugging fragment\n\n### Context\nRust debugging notes.",
+        );
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        // Lower confidence so the +0.02 boost is observable.
+        let upd = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: id.clone(),
+            confidence: Some(0.5),
+            ..Default::default()
+        });
+        let env = tool_call(2, upd.clone());
+        run(&disp, &env, &upd);
+
+        // Start a session matching "rust debugging".
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string()],
+            initial_approach: None,
+        });
+        let env = tool_call(3, start.clone());
+        let result = run(&disp, &env, &start);
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Pre-loaded memories:"));
+
+        // The pre-load boost must be +0.02 (upstream boostConfidence), not +0.015.
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            (mems[0].confidence - 0.52).abs() < 1e-9,
+            "expected 0.52, got {}",
+            mems[0].confidence
+        );
+        assert_eq!(mems[0].access_count, 1);
+    }
+
+    #[test]
+    fn session_end_is_retry_safe_no_double_count() {
+        let (disp, _dir) = test_dispatcher();
+        // Start a session and practice a guide into it.
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let env = tool_call(1, start.clone());
+        run(&disp, &env, &start);
+
+        let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "git".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec![],
+            learnings: vec![],
+            outcome: None,
+        });
+        let env = tool_call(2, practice.clone());
+        run(&disp, &env, &practice);
+
+        // First end: success. The guide's success_count should be 1.
+        let end = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "success".to_string(),
+            final_approach: None,
+            lessons: vec![],
+        });
+        let env = tool_call(3, end.clone());
+        let result = run(&disp, &env, &end);
+        assert!(!result_is_error(&result));
+        let guide = disp.repo().get_guide("git").unwrap().unwrap();
+        assert_eq!(guide.success_count, 1, "first end should count once");
+
+        // Second end (retry): must be rejected and must NOT double-count.
+        let env = tool_call(4, end.clone());
+        let result2 = run(&disp, &env, &end);
+        assert!(result_is_error(&result2));
+        assert!(result_text(&result2).contains("No active session"));
+        let guide = disp.repo().get_guide("git").unwrap().unwrap();
+        assert_eq!(
+            guide.success_count, 1,
+            "a retried session_end must not double-count guide outcomes"
+        );
+    }
+
+    #[test]
+    fn session_attempt_without_session_is_error() {
+        let (disp, _dir) = test_dispatcher();
+        let env = tool_call(
+            1,
+            ToolArgs::SessionAttempt(SessionAttemptArgs {
+                approach: "try X".to_string(),
+                outcome: "rejected".to_string(),
+                critique: None,
+                rationale: None,
+                related_memory_id: None,
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::SessionAttempt(SessionAttemptArgs {
+                approach: "try X".to_string(),
+                outcome: "rejected".to_string(),
+                critique: None,
+                rationale: None,
+                related_memory_id: None,
+            }),
+        );
+        assert!(result_is_error(&result));
+        assert!(result_text(&result).contains("No active session"));
+    }
+
+    #[test]
+    fn session_end_without_session_is_error() {
+        let (disp, _dir) = test_dispatcher();
+        let env = tool_call(
+            1,
+            ToolArgs::SessionEnd(SessionEndArgs {
+                outcome: "success".to_string(),
+                final_approach: None,
+                lessons: vec![],
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::SessionEnd(SessionEndArgs {
+                outcome: "success".to_string(),
+                final_approach: None,
+                lessons: vec![],
+            }),
+        );
+        assert!(result_is_error(&result));
+        assert!(result_text(&result).contains("No active session"));
+    }
+
+    // ---- WP-09: intelligence tools ----
+
+    #[test]
+    fn conflict_scan_detects_opposing_fragments() {
+        let (disp, _dir) = test_dispatcher();
+        // Shared topic (redis/caching/session/data) with opposing negation
+        // ("always" vs "never") — distinct enough to pass add-dedup, overlapping
+        // enough for the conflict heuristic to fire.
+        add_fragment(
+            &disp,
+            1,
+            "Always use Redis for caching session data in the API layer.",
+        );
+        add_fragment(
+            &disp,
+            2,
+            "Never use Redis for caching session data; pick Memcached instead.",
+        );
+
+        let env = tool_call(3, ToolArgs::ConflictScan(ConflictScanArgs::default()));
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::ConflictScan(ConflictScanArgs::default()),
+        );
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert!(
+            structured["count"].as_u64().unwrap() >= 1,
+            "expected a conflict pair"
+        );
+        assert!(result_text(&result).contains("CONFLICT DETECTION"));
+    }
+
+    #[test]
+    fn proactive_analysis_runs_cleanly() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## A fact\n\n### Context\nSome durable fact.");
+
+        let env = tool_call(
+            2,
+            ToolArgs::ProactiveAnalysis(ProactiveAnalysisArgs::default()),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::ProactiveAnalysis(ProactiveAnalysisArgs::default()),
+        );
+        assert!(!result_is_error(&result));
+        let text = result_text(&result);
+        assert!(text.contains("PROACTIVE ANALYSIS"));
+    }
+
+    #[test]
+    fn project_analytics_all_projects_overview() {
+        let (disp, _dir) = test_dispatcher();
+        let env = tool_call(
+            1,
+            ToolArgs::ProjectAnalytics(ProjectAnalyticsArgs::default()),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::ProjectAnalytics(ProjectAnalyticsArgs::default()),
+        );
+        assert!(!result_is_error(&result));
+        // No projects yet.
+        assert!(result_text(&result).contains("No projects found"));
+    }
+
+    // ---- WP-09: suggestion_respond ----
+
+    #[test]
+    fn suggestion_respond_requires_valid_action() {
+        let (disp, _dir) = test_dispatcher();
+        let env = tool_call(
+            1,
+            ToolArgs::SuggestionRespond(SuggestionRespondArgs {
+                id: 1,
+                action: "bogus".to_string(),
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::SuggestionRespond(SuggestionRespondArgs {
+                id: 1,
+                action: "bogus".to_string(),
+            }),
+        );
+        assert!(result_is_error(&result));
+        assert!(result_text(&result).contains("must be one of: accept, dismiss"));
+    }
+
+    #[test]
+    fn suggestion_respond_missing_suggestion_is_error() {
+        let (disp, _dir) = test_dispatcher();
+        let env = tool_call(
+            1,
+            ToolArgs::SuggestionRespond(SuggestionRespondArgs {
+                id: 999,
+                action: "accept".to_string(),
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::SuggestionRespond(SuggestionRespondArgs {
+                id: 999,
+                action: "accept".to_string(),
+            }),
+        );
+        assert!(result_is_error(&result));
+        assert!(result_text(&result).contains("Could not update this suggestion"));
+    }
+
+    fn text_contains(p: &DomainPayload, needle: &str) -> bool {
+        result_text(p).contains(needle)
     }
 }

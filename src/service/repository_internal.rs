@@ -245,6 +245,7 @@ pub(crate) fn apply_command(
             memory_ids,
             context,
         } => apply_access(state, memory_ids, context.as_deref()),
+        DomainCommand::BoostConfidence { memory_ids } => apply_boost_confidence(state, memory_ids),
         // Session/guide commands are handled by their dedicated work packages;
         // the canonical gateway rejects them until those land.
         _ => Err(DomainError::new(
@@ -422,6 +423,26 @@ fn apply_access(
             {
                 memory.tags.push(tag);
             }
+            state.put_memory(&memory)?;
+            affected.push(*id);
+        }
+    }
+    Ok(ReceiptOutcome::Success { affected })
+}
+
+/// Upstream boostConfidence (session_start pre-load): +0.02 confidence,
+/// +1 access_count, last_accessed_at. No context tag, no quality recompute.
+fn apply_boost_confidence(
+    state: &mut CommandState<'_>,
+    memory_ids: &[EntityId],
+) -> DomainResult<ReceiptOutcome> {
+    let now = state.now_millis;
+    let mut affected = Vec::new();
+    for id in memory_ids {
+        if let Some(mut memory) = state.get_memory(*id)? {
+            memory.confidence = (memory.confidence + 0.02).min(1.0);
+            memory.access_count += 1;
+            memory.last_accessed_at = Some(Instant::new(now));
             state.put_memory(&memory)?;
             affected.push(*id);
         }

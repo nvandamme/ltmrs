@@ -287,7 +287,8 @@
         "T-SESS-01",
         "T-SESS-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "WP-04: registry per-(frontend,channel) session binding, no daemon-global session, lease expiry. WP-09: session_start/attempt/end route by (frontend,channel) via registry; session_end_is_retry_safe_no_double_count proves a retried end is rejected before guide evaluation. T-SESS-01 (32-channel interleave with colliding MCP request IDs) and T-SESS-02 (reconnect/lease/restart/subagent) still deferred to a dedicated concurrency test."
     },
     {
       "id": "RQ-06",
@@ -405,7 +406,7 @@
         "T-CLI-01"
       ],
       "status": "executed_partial",
-      "evidence": "T-MCP-01: mcp.rs served_tools_match_frozen_schema (verbatim baseline). T-MCP-02: tools.rs 28 behavioral tests + 2 differential wire tests (differential_detail/summary_matches_upstream_wire) replaying an anonymized 177-fragment fixture from the real upstream DB against the pinned upstream rendering, byte-for-byte. T-MCP-03: mcp.rs typed routing + validation tests. T-MCP-04: read/feedback side-effect tests (see RQ-17). T-CLI-01 deferred to WP-10 (CLI)."
+      "evidence": "T-MCP-01: mcp.rs served_tools_match_frozen_schema (26 tools, verbatim baseline). T-MCP-02: tools.rs 45+ behavioral tests + 2 differential wire tests (byte-for-byte vs upstream). T-MCP-03: mcp.rs typed routing + validation tests. T-MCP-04: read/feedback/session side-effect tests (see RQ-17). WP-09: 15 new tools (7 guide, 5 session/suggestion, 3 intelligence) with 17 behavioral tests. T-CLI-01 deferred to WP-10 (CLI). Differential replay for the 15 WP-09 tools deferred (behavioral tests encode the contract instead)."
     },
     {
       "id": "RQ-16",

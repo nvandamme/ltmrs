@@ -117,6 +117,8 @@ pub struct CanonicalRepository {
     namespaces: OptimisticTxKeyspace,
     projections: OptimisticTxKeyspace,
     feedback_events: OptimisticTxKeyspace,
+    guides: OptimisticTxKeyspace,
+    suggestions: OptimisticTxKeyspace,
     fault_injector: std::sync::Arc<FaultInjector>,
     clock: std::sync::Arc<dyn crate::domain::clock::Clock + Send + Sync>,
 }
@@ -173,6 +175,8 @@ impl CanonicalRepository {
         let namespaces = Self::keyspace(&db, "namespaces")?;
         let projections = Self::keyspace(&db, "projections")?;
         let feedback_events = Self::keyspace(&db, "feedback_events")?;
+        let guides = Self::keyspace(&db, "guides")?;
+        let suggestions = Self::keyspace(&db, "suggestions")?;
 
         Ok(Self {
             db,
@@ -183,6 +187,8 @@ impl CanonicalRepository {
             namespaces,
             projections,
             feedback_events,
+            guides,
+            suggestions,
             fault_injector,
             clock,
         })
@@ -774,6 +780,154 @@ impl CanonicalRepository {
             out.push(decode::<crate::domain::session::FeedbackEvent>(v.as_ref())?);
         }
         Ok(out)
+    }
+
+    // ---- Guide and suggestion storage (WP-09) ----
+
+    /// All guides from a single snapshot.
+    pub fn get_guides(&self) -> DomainResult<Vec<crate::domain::guide::Guide>> {
+        let snapshot = self.db.read_tx();
+        let mut out = Vec::new();
+        for kv in snapshot.iter(&self.guides) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            out.push(decode::<crate::domain::guide::Guide>(v.as_ref())?);
+        }
+        Ok(out)
+    }
+
+    /// A single guide by name (case-insensitive, matching upstream COLLATE NOCASE).
+    pub fn get_guide(&self, name: &str) -> DomainResult<Option<crate::domain::guide::Guide>> {
+        let target = name.to_lowercase();
+        Ok(self
+            .get_guides()?
+            .into_iter()
+            .find(|g| g.name.eq_ignore_ascii_case(&target)))
+    }
+
+    /// Store a guide (keyed by lowercased name).
+    pub fn put_guide(&self, guide: &crate::domain::guide::Guide) -> DomainResult<()> {
+        let key = guide.name.to_lowercase();
+        let raw = serde_json::to_vec(guide)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.insert(&self.guides, &key, raw.as_slice());
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "guide write conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// Write a memory record directly (WP-09 guide_distill side-effect on a
+    /// fragment's related_guides / distill_candidate). Bypasses the command
+    /// gateway: used only for the compatibility adapter's derived writes, which
+    /// are not themselves user-addressable operations.
+    pub fn put_memory_direct(&self, memory: &Memory) -> DomainResult<()> {
+        let key = memory.id.as_uuid().to_string();
+        let raw = serde_json::to_vec(memory)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.insert(&self.memories, &key, raw.as_slice());
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "memory write conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// Delete a guide by name (case-insensitive). Returns true if removed.
+    pub fn delete_guide(&self, name: &str) -> DomainResult<bool> {
+        let key = name.to_lowercase();
+        let snapshot = self.db.read_tx();
+        let exists = snapshot
+            .get(&self.guides, &key)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.remove(&self.guides, &key);
+        match tx.commit() {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "guide delete conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// All suggestions from a single snapshot.
+    pub fn get_suggestions(&self) -> DomainResult<Vec<crate::domain::session::Suggestion>> {
+        let snapshot = self.db.read_tx();
+        let mut out = Vec::new();
+        for kv in snapshot.iter(&self.suggestions) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            out.push(decode::<crate::domain::session::Suggestion>(v.as_ref())?);
+        }
+        Ok(out)
+    }
+
+    /// A single suggestion by ID.
+    pub fn get_suggestion(
+        &self,
+        id: u64,
+    ) -> DomainResult<Option<crate::domain::session::Suggestion>> {
+        Ok(self.get_suggestions()?.into_iter().find(|s| s.id == id))
+    }
+
+    /// Store a suggestion (keyed by ID).
+    pub fn put_suggestion(
+        &self,
+        suggestion: &crate::domain::session::Suggestion,
+    ) -> DomainResult<()> {
+        let key = suggestion.id.to_string();
+        let raw = serde_json::to_vec(suggestion)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.insert(&self.suggestions, &key, raw.as_slice());
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "suggestion write conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// Next suggestion ID (max existing + 1, or 1 if none).
+    pub fn next_suggestion_id(&self) -> DomainResult<u64> {
+        Ok(self
+            .get_suggestions()?
+            .iter()
+            .map(|s| s.id)
+            .max()
+            .unwrap_or(0)
+            + 1)
     }
 
     /// Export traversal from a single snapshot.

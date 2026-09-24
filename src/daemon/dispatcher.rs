@@ -148,11 +148,15 @@ impl Dispatcher {
                         format!("ltmrs:attempt:{}", envelope.operation_id.as_uuid()).as_bytes(),
                     )),
                     session_id: session,
+                    seq: 0,
                     approach: approach.clone(),
                     outcome: *outcome,
                     critique: critique.clone(),
                     rationale: rationale.clone(),
                     related_memory_id: *related_memory_id,
+                    confidence: 1.0,
+                    access_count: 0,
+                    last_accessed_at: None,
                     created_at: Instant::new(self.clock.now_millis()),
                 };
                 self.registry.lock().unwrap().record_attempt(

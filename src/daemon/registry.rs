@@ -86,11 +86,18 @@ impl FrontendRegistry {
             channel_id,
             project,
             task_type,
+            technologies: Vec::new(),
             status: SessionStatus::Active,
             attempts: Vec::new(),
             outcome: None,
             final_approach: None,
             lessons: Vec::new(),
+            initial_approach: None,
+            guides_used: Vec::new(),
+            memories_read: Vec::new(),
+            memories_created: Vec::new(),
+            refinement_attempts: 0,
+            self_critique_count: 0,
             started_at: Instant::new(now_millis),
             ended_at: None,
         };
@@ -136,14 +143,77 @@ impl FrontendRegistry {
             channel_id,
             project: None,
             task_type: None,
+            technologies: Vec::new(),
             status: SessionStatus::Active,
             attempts: Vec::new(),
             outcome: None,
             final_approach: None,
             lessons: Vec::new(),
+            initial_approach: None,
+            guides_used: Vec::new(),
+            memories_read: Vec::new(),
+            memories_created: Vec::new(),
+            refinement_attempts: 0,
+            self_critique_count: 0,
             started_at: Instant::new(0),
             ended_at: None,
         });
+    }
+
+    /// Legacy `session_start` (WP-09): abandon the channel's existing active
+    /// session (if any) and create a fresh traced session. Returns the new
+    /// handle. Per-channel isolation is preserved (RV-05).
+    pub fn start_legacy_session(
+        &mut self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+        task_type: String,
+        technologies: Vec<String>,
+        now_millis: u64,
+    ) -> SessionHandle {
+        let k = Self::key(frontend_id, channel_id);
+        if let Some(b) = self.channels.get(&k)
+            && let Some(h) = b.session
+            && let Some(s) = self.sessions.get_mut(&h)
+            && s.can_end()
+        {
+            s.status = SessionStatus::Abandoned;
+            s.outcome = Some(TaskOutcome::Abandoned);
+            s.ended_at = Some(Instant::new(now_millis));
+        }
+        let handle = self.next_handle();
+        let session = Session {
+            handle,
+            channel_id,
+            project: None,
+            task_type: Some(task_type),
+            technologies,
+            status: SessionStatus::Active,
+            attempts: Vec::new(),
+            outcome: None,
+            final_approach: None,
+            lessons: Vec::new(),
+            initial_approach: None,
+            guides_used: Vec::new(),
+            memories_read: Vec::new(),
+            memories_created: Vec::new(),
+            refinement_attempts: 0,
+            self_critique_count: 0,
+            started_at: Instant::new(now_millis),
+            ended_at: None,
+        };
+        self.sessions.insert(handle, session);
+        self.channels.insert(
+            k,
+            ChannelBinding {
+                frontend_id,
+                channel_id,
+                session: Some(handle),
+                lease: None,
+                explicit: false,
+            },
+        );
+        handle
     }
 
     /// Record an attempt on the channel's session. Returns the session handle.
@@ -162,6 +232,114 @@ impl FrontendRegistry {
         }
         session.attempts.push(attempt);
         Some(handle)
+    }
+
+    /// Track a practiced guide into the channel's active session (lowercased,
+    /// de-duplicated). Best-effort; no-op if no active session.
+    pub fn track_guide_used(
+        &mut self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+        guide: &str,
+    ) {
+        let k = Self::key(frontend_id, channel_id);
+        let handle = match self.channels.get(&k).and_then(|b| b.session) {
+            Some(h) => h,
+            None => return,
+        };
+        let session = match self.sessions.get_mut(&handle) {
+            Some(s) => s,
+            None => return,
+        };
+        let lower = guide.to_lowercase();
+        if !session.guides_used.contains(&lower) {
+            session.guides_used.push(lower);
+        }
+    }
+
+    /// Track read memory IDs into the channel's active session (de-duplicated).
+    pub fn track_memories_read(
+        &mut self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+        ids: &[String],
+    ) {
+        let k = Self::key(frontend_id, channel_id);
+        let handle = match self.channels.get(&k).and_then(|b| b.session) {
+            Some(h) => h,
+            None => return,
+        };
+        let session = match self.sessions.get_mut(&handle) {
+            Some(s) => s,
+            None => return,
+        };
+        for id in ids {
+            if !session.memories_read.contains(id) {
+                session.memories_read.push(id.clone());
+            }
+        }
+    }
+
+    /// Track created memory IDs into the channel's active session.
+    pub fn track_memories_created(
+        &mut self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+        ids: &[String],
+    ) {
+        let k = Self::key(frontend_id, channel_id);
+        let handle = match self.channels.get(&k).and_then(|b| b.session) {
+            Some(h) => h,
+            None => return,
+        };
+        let session = match self.sessions.get_mut(&handle) {
+            Some(s) => s,
+            None => return,
+        };
+        for id in ids {
+            if !session.memories_created.contains(id) {
+                session.memories_created.push(id.clone());
+            }
+        }
+    }
+
+    /// Decay every attempt's confidence by `delta` (floored at 0). Called at
+    /// session start so stale dead-ends lose priority over time.
+    pub fn decay_attempts(&mut self, delta: f64) {
+        for s in self.sessions.values_mut() {
+            for a in &mut s.attempts {
+                a.confidence = (a.confidence - delta).max(0.0);
+            }
+        }
+    }
+
+    /// Boost an attempt's confidence by `delta` (capped at 1) and bump its
+    /// access counters. Best-effort; no-op if not found.
+    pub fn boost_attempt(&mut self, handle: SessionHandle, seq: u32, delta: f64, now: u64) {
+        if let Some(s) = self.sessions.get_mut(&handle)
+            && let Some(a) = s.attempts.iter_mut().find(|a| a.seq == seq)
+        {
+            a.confidence = (a.confidence + delta).min(1.0);
+            a.access_count += 1;
+            a.last_accessed_at = Some(Instant::new(now));
+        }
+    }
+
+    /// Penalize an attempt's confidence by `delta` (floored at 0) and bump its
+    /// access counters. Best-effort; no-op if not found.
+    pub fn penalize_attempt(&mut self, handle: SessionHandle, seq: u32, delta: f64, now: u64) {
+        if let Some(s) = self.sessions.get_mut(&handle)
+            && let Some(a) = s.attempts.iter_mut().find(|a| a.seq == seq)
+        {
+            a.confidence = (a.confidence - delta).max(0.0);
+            a.access_count += 1;
+            a.last_accessed_at = Some(Instant::new(now));
+        }
+    }
+
+    /// All sessions as owned clones (for analytics over the canonical snapshot).
+    pub fn all_sessions_owned(&self) -> Vec<crate::domain::session::Session> {
+        self.sessions.values().cloned().collect()
     }
 
     /// End the channel's session. Only affects THIS channel's session — a
@@ -254,6 +432,11 @@ impl FrontendRegistry {
     /// Get a session by handle (for diagnostics/tests).
     pub fn session(&self, handle: SessionHandle) -> Option<&Session> {
         self.sessions.get(&handle)
+    }
+
+    /// Mutable access to a session by handle (for in-place updates).
+    pub fn session_mut(&mut self, handle: SessionHandle) -> Option<&mut Session> {
+        self.sessions.get_mut(&handle)
     }
 
     /// Persist the registry state (sessions, channel bindings, leases) to a
@@ -351,11 +534,15 @@ mod tests {
         Attempt {
             id: crate::domain::id::EntityId::new(Uuid::from_u128(id as u128)),
             session_id: session,
+            seq: 1,
             approach: "try X".into(),
             outcome: crate::domain::session::AttemptOutcome::Rejected,
             critique: None,
             rationale: None,
             related_memory_id: None,
+            confidence: 1.0,
+            access_count: 0,
+            last_accessed_at: None,
             created_at: Instant::new(0),
         }
     }
