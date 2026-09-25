@@ -8,8 +8,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::domain::command::DomainResult;
+use crate::domain::command::{DomainError, DomainErrorCode, DomainResult};
+use crate::embeddings::e5_small::{Chunk, E5SmallAdapter, EmbedInput};
+use crate::embeddings::recipe::Role;
 use crate::retrieval::engine::{Engine, QueryEmbedder, RetrievalRequest, RetrievalResult};
+use crate::search::projector::{Embedder, TextChunk};
 use crate::search::table::SearchTable;
 use crate::service::repository::CanonicalRepository;
 
@@ -22,7 +25,9 @@ pub trait QueryEmbedderProvider: Send + Sync {
 /// A search backend: the canonical repository + Lance table + embedder.
 ///
 /// The dense leg's model fingerprint travels per-request in
-/// `RetrievalRequest::model_fingerprint`, so the backend holds no model state.
+/// `RetrievalRequest::model_fingerprint`, so the backend caches no
+/// fingerprint/generation state (it may hold model weights behind the
+/// embedder trait object).
 pub struct SearchBackend {
     repo: Arc<CanonicalRepository>,
     table: SearchTable,
@@ -140,5 +145,117 @@ impl QueryEmbedderProvider for MutexEmbedder {
                 format!("embedding failed: {e}"),
             )
         })
+    }
+}
+
+/// Map E5 derived chunks (verbatim fragment spans, fragment-relative offsets)
+/// to projector units: re-prefix each span for lexical searchability and
+/// shift its offsets by the rendered title prefix into rendered coordinates
+/// (the contract `Embedder::chunk_text` documents).
+pub fn e5_chunks_to_text_chunks(title: &str, chunks: &[Chunk]) -> Vec<TextChunk> {
+    let base = title.len() as u64 + 1; // "title\n" rendered prefix
+    chunks
+        .iter()
+        .map(|c| TextChunk {
+            text: format!("{title}\n{}", c.text),
+            char_start: base + c.char_start as u64,
+            char_end: base + c.char_end as u64,
+        })
+        .collect()
+}
+
+fn poisoned_lock() -> DomainError {
+    DomainError::new(DomainErrorCode::Validation, "embedder lock poisoned")
+}
+
+/// Document-side bridge: the projector's `Embedder` seam over the pinned
+/// E5-small adapter (Passage role). Oversized input errors instead of
+/// truncating; the projector treats that as pending semantic work.
+impl Embedder for E5SmallAdapter {
+    fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        self.embed_batch(&[EmbedInput {
+            text: text.to_string(),
+            role: Role::Passage,
+        }])
+        .map_err(|e| e.to_string())?
+        .pop()
+        .map(|s| s.vector)
+        .ok_or_else(|| "embedding returned no sequences".to_string())
+    }
+
+    fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
+        e5_chunks_to_text_chunks(title, &self.chunk_passage(title, fragment))
+    }
+}
+
+/// Query-side bridge: E5 with the Query role. Prefix asymmetry is
+/// load-bearing for quality — queries must never go through the
+/// Passage-role document seam above; the type separation enforces that.
+///
+/// Runs inference inline behind a mutex (the dispatcher already runs on
+/// `spawn_blocking`, so Tokio core workers are not blocked). Routing queries
+/// through the bounded cancellable worker (`EmbeddingService`) is deferred —
+/// this path is unbounded, serialized and non-cancellable (RQ-22 follow-up).
+impl QueryEmbedderProvider for Mutex<E5SmallAdapter> {
+    fn embed_query(&self, query: &str) -> DomainResult<Vec<f32>> {
+        let mut guard = self.lock().map_err(|_| poisoned_lock())?;
+        guard
+            .embed_batch(&[EmbedInput {
+                text: query.to_string(),
+                role: Role::Query,
+            }])
+            .map_err(|e| {
+                DomainError::new(
+                    DomainErrorCode::Validation,
+                    format!("query embedding failed: {e}"),
+                )
+            })?
+            .pop()
+            .map(|s| s.vector)
+            .ok_or_else(|| {
+                DomainError::new(
+                    DomainErrorCode::Validation,
+                    "query embedding returned no sequences",
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embeddings::e5_small::Chunk;
+
+    /// The E5 chunk mapping re-prefixes each verbatim fragment span for
+    /// lexical searchability and shifts its offsets into rendered coordinates.
+    #[test]
+    fn e5_chunk_mapping_reprefixes_and_shifts_to_rendered_coords() {
+        let chunks = vec![
+            Chunk {
+                text: "alpha".into(),
+                char_start: 0,
+                char_end: 5,
+                token_count: 3,
+            },
+            Chunk {
+                text: "beta".into(),
+                char_start: 6,
+                char_end: 10,
+                token_count: 2,
+            },
+        ];
+        let units = e5_chunks_to_text_chunks("T", &chunks);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].text, "T\nalpha");
+        assert_eq!((units[0].char_start, units[0].char_end), (2, 7));
+        assert_eq!(units[1].text, "T\nbeta");
+        assert_eq!((units[1].char_start, units[1].char_end), (8, 12));
+    }
+
+    /// An empty chunk set maps to no units (the projector's own fallback
+    /// covers a misbehaving embedder; the mapping itself adds nothing).
+    #[test]
+    fn e5_chunk_mapping_preserves_empty() {
+        assert!(e5_chunks_to_text_chunks("T", &[]).is_empty());
     }
 }

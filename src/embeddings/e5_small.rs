@@ -789,6 +789,72 @@ mod tests {
         );
     }
 
+    /// Projector bridge: the adapter exposes chunk_passage through the
+    /// projector Embedder seam with rendered-coordinate spans, and its
+    /// document embedding matches the Passage-role recipe exactly.
+    #[test]
+    fn projector_bridge_chunks_and_embeds_as_passage() {
+        use crate::search::projector::Embedder as ProjectorEmbedder;
+        let (cache, guard) = test_cache();
+        if !populate_cache(&cache, &guard) {
+            eprintln!("SKIP: artifacts not present");
+            return;
+        }
+        let mut adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
+        let fixture = load_fixture();
+        let title = fixture["long_document"]["title"].as_str().unwrap();
+        let fragment = fixture["long_document"]["fragment"].as_str().unwrap();
+
+        let units = adapter.chunk_text(title, fragment);
+        let spans = adapter.chunk_passage(title, fragment);
+        assert_eq!(units.len(), spans.len(), "one unit per derived chunk");
+        assert!(units.len() > 1, "reference long document must chunk");
+        let shift = title.len() as u64 + 1;
+        for (u, s) in units.iter().zip(spans.iter()) {
+            assert_eq!(u.text, format!("{title}\n{}", s.text));
+            assert_eq!(
+                (u.char_start, u.char_end),
+                (shift + s.char_start as u64, shift + s.char_end as u64)
+            );
+        }
+
+        // Document embedding through the seam equals the Passage-role recipe.
+        // (Qualified syntax: the inherent role-taking `embed` shadows the
+        // trait seam by name — the seam is the Passage-role projection.)
+        let via_seam = ProjectorEmbedder::embed(&mut adapter, &units[0].text).unwrap();
+        let via_recipe = adapter.embed(&units[0].text, Role::Passage).unwrap();
+        assert_eq!(via_seam, via_recipe.vector);
+    }
+
+    /// Query bridge: the mutex-guarded adapter serves the query role through
+    /// the search backend seam, with prefix-asymmetry evidence (Query !=
+    /// Passage vectors for the same text).
+    #[test]
+    fn query_bridge_uses_query_role() {
+        use crate::search::backend::QueryEmbedderProvider;
+        use std::sync::Mutex;
+        let (cache, guard) = test_cache();
+        if !populate_cache(&cache, &guard) {
+            eprintln!("SKIP: artifacts not present");
+            return;
+        }
+        let mut adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
+        let text = "how to configure fjall persistence";
+        let expected_q = adapter.embed(text, Role::Query).unwrap().vector;
+        let expected_p = adapter.embed(text, Role::Passage).unwrap().vector;
+        assert_ne!(
+            expected_q, expected_p,
+            "prefix asymmetry must hold for the bridge to be meaningful"
+        );
+
+        let bridged = Mutex::new(adapter);
+        let via_bridge = bridged.embed_query(text).unwrap();
+        assert_eq!(
+            via_bridge, expected_q,
+            "query bridge must embed with the Query role"
+        );
+    }
+
     /// Task 10: unsupported model recipes are rejected with actionable errors.
     #[test]
     fn t_emb_rejects_unsupported_recipe() {

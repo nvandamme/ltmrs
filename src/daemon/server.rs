@@ -2,7 +2,7 @@
 //! socket, dispatcher, scheduler and quotas into a running daemon with a
 //! bounded accept loop and graceful shutdown.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
@@ -18,9 +18,28 @@ use crate::daemon::runtime::{DaemonRuntime, RuntimeError, RuntimePaths, acquire_
 use crate::daemon::scheduler::{EmbeddingScheduler, SchedulerConfig};
 use crate::domain::clock::{Clock, SystemClock};
 use crate::domain::command::{DomainError, DomainErrorCode};
+use crate::embeddings::artifacts::ArtifactCache;
+use crate::embeddings::e5_small::E5SmallAdapter;
+use crate::search::backend::SearchBackend;
 use crate::search::maintenance::{MaintenanceConfig, MaintenanceScheduler};
 use crate::search::table::SearchTable;
 use crate::service::repository::CanonicalRepository;
+
+/// Which embedding backend the daemon runs (design §9; RQ-09).
+#[derive(Debug, Clone, Default)]
+pub enum EmbeddingMode {
+    /// No dense embedding: lexical/canonical retrieval only. Tools fall back
+    /// to the canonical snapshot scan when no search backend is attached.
+    #[default]
+    Disabled,
+    /// Load the pinned E5-small adapter from a model cache dir at startup
+    /// (fail fast when artifacts are missing) and attach the query-side
+    /// dense bridge to the dispatcher. Requires `search_path` for the
+    /// projection table. Wiring only: per-request fingerprint plumbing and
+    /// the projection loop that writes dense vectors land separately, so a
+    /// fresh E5 start still serves lexical/canonical recall.
+    E5SmallCached { cache_dir: String },
+}
 
 /// Configuration for the daemon.
 #[derive(Debug, Clone, Default)]
@@ -34,6 +53,8 @@ pub struct DaemonConfig {
     pub search_path: String,
     /// Resource limits.
     pub limits: ResourceLimits,
+    /// Which embedding backend to run. Disabled by default (lexical-only).
+    pub embedding: EmbeddingMode,
     /// Scheduler configuration.
     pub scheduler: SchedulerConfig,
     /// Maintenance schedule + explicit budgets for optimization/retention.
@@ -56,6 +77,8 @@ pub enum DaemonError {
     },
     #[error("ipc: {0}")]
     Ipc(IpcError),
+    #[error("embedding: {message}")]
+    Embedding { message: String },
 }
 
 impl From<DomainError> for DaemonError {
@@ -94,8 +117,9 @@ pub struct Daemon {
 
 impl Daemon {
     /// Start the daemon: acquire the singleton lock, open the store, wire the
-    /// components. The returned daemon must be kept alive to hold the lock.
-    pub fn start(paths: &RuntimePaths, config: DaemonConfig) -> Result<Self, DaemonError> {
+    /// components. Async because E5 mode opens the Lance projection table.
+    /// The returned daemon must be kept alive to hold the lock.
+    pub async fn start(paths: &RuntimePaths, config: DaemonConfig) -> Result<Self, DaemonError> {
         let runtime = acquire_singleton(paths)?;
 
         let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SystemClock);
@@ -111,7 +135,32 @@ impl Daemon {
             let registry = FrontendRegistry::load(&p).map_err(DaemonError::Io)?;
             (registry, Some(p))
         };
-        let dispatcher = Arc::new(Dispatcher::new(repo, registry, clock));
+        let dispatcher = match &config.embedding {
+            EmbeddingMode::Disabled => Arc::new(Dispatcher::new(repo, registry, clock)),
+            EmbeddingMode::E5SmallCached { cache_dir } => {
+                if config.search_path.is_empty() {
+                    return Err(DaemonError::Embedding {
+                        message: "E5 embedding requires search_path for the projection table"
+                            .into(),
+                    });
+                }
+                let cache = ArtifactCache::new(cache_dir);
+                let adapter = E5SmallAdapter::load_from_cache(&cache).map_err(|e| {
+                    DaemonError::Embedding {
+                        message: e.to_string(),
+                    }
+                })?;
+                let table = SearchTable::open(&config.search_path)
+                    .await
+                    .map_err(DaemonError::from)?;
+                let backend = Arc::new(SearchBackend::new(
+                    Arc::clone(&repo),
+                    table,
+                    Arc::new(Mutex::new(adapter)),
+                ));
+                Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend))
+            }
+        };
 
         let (scheduler, scheduler_worker) = EmbeddingScheduler::spawn(
             Box::new(crate::daemon::scheduler::FixedDimAdapter { dim: 384 }),
@@ -415,7 +464,7 @@ mod tests {
             search_path: dir.path().join("search").to_str().unwrap().to_string(),
             ..Default::default()
         };
-        let mut daemon = Daemon::start(&paths, config).unwrap();
+        let mut daemon = Daemon::start(&paths, config).await.unwrap();
 
         // Not running before serve/start_maintenance.
         assert!(!daemon.maintenance_worker_running().await);
@@ -439,6 +488,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn embedding_disabled_by_default() {
+        assert!(
+            matches!(DaemonConfig::default().embedding, EmbeddingMode::Disabled),
+            "the daemon must stay lexical-only unless embedding is configured"
+        );
+    }
+
+    /// E5 mode without model artifacts fails fast at startup (no silent
+    /// lexical-only fallback that callers could mistake for dense search).
+    #[tokio::test]
+    async fn e5_mode_with_missing_cache_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "e5-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            search_path: dir.path().join("search").to_str().unwrap().to_string(),
+            embedding: EmbeddingMode::E5SmallCached {
+                cache_dir: dir
+                    .path()
+                    .join("no-models-here")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            },
+            ..Default::default()
+        };
+        let err = match Daemon::start(&paths, config).await {
+            Ok(_) => panic!("startup with a missing model cache must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DaemonError::Embedding { .. }),
+            "missing model cache must fail fast with an embedding error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn start_and_serve_lifecycle() {
         // Verify the daemon starts, acquires the lock, and exposes the socket.
@@ -448,10 +534,10 @@ mod tests {
             store_path: dir.path().join("store").to_str().unwrap().to_string(),
             ..Default::default()
         };
-        let daemon = Daemon::start(&paths, config.clone()).unwrap();
+        let daemon = Daemon::start(&paths, config.clone()).await.unwrap();
         assert!(daemon.socket_path().ends_with("daemon.sock"));
         // The lock is held; a second start must fail.
-        let result = Daemon::start(&paths, config);
+        let result = Daemon::start(&paths, config).await;
         assert!(result.is_err());
     }
 
@@ -518,7 +604,7 @@ mod tests {
             sessions_path: sessions_path.to_str().unwrap().to_string(),
             ..Default::default()
         };
-        let mut daemon = Daemon::start(&paths, config).unwrap();
+        let mut daemon = Daemon::start(&paths, config).await.unwrap();
         // Start a session through the dispatcher so there is state to persist.
         daemon
             .dispatcher()

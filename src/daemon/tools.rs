@@ -619,7 +619,9 @@ fn expand_graph(
 }
 
 /// Recall memories for browse/query mode: search backend when available,
-/// else a canonical snapshot scan (lexical fallback).
+/// else a canonical snapshot scan (lexical fallback). An attached but empty
+/// backend (e.g. a fresh E5 start before projection runs) also falls back —
+/// an empty dense/lexical index must never hide canonical knowledge.
 fn recall_browse(disp: &Dispatcher, args: &MemoryReadArgs) -> DomainResult<Vec<Memory>> {
     if let Some(sb) = disp.search() {
         let req = crate::retrieval::engine::RetrievalRequest {
@@ -633,7 +635,9 @@ fn recall_browse(disp: &Dispatcher, args: &MemoryReadArgs) -> DomainResult<Vec<M
             result_limit: 100,
             ..Default::default()
         };
-        if let Ok(result) = sb.retrieve_sync(&req) {
+        if let Ok(result) = sb.retrieve_sync(&req)
+            && !result.results.is_empty()
+        {
             return Ok(result.results.into_iter().map(|r| r.memory).collect());
         }
     }
@@ -4687,6 +4691,65 @@ mod tests {
         assert!(text.contains("Browseable Fragment One"));
         let structured = result_structured(&result).unwrap();
         assert_eq!(structured["count"].as_u64().unwrap(), 2);
+    }
+
+    /// An attached but empty search backend must not hide canonical
+    /// knowledge: browse falls back to the snapshot scan (fresh-E5-start
+    /// regression test — an empty index is not a no-answer).
+    #[tokio::test]
+    async fn memory_read_browse_falls_back_on_empty_backend() {
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Fallback Fragment\n\n### Context\nVisible without an index.",
+        );
+
+        // Empty projection table behind a working embedder.
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+        let backend = Arc::new(SearchBackend::new(Arc::clone(&repo), table, embedder));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+        let args = MemoryReadArgs {
+            query: Some("fallback".to_string()),
+            all: true,
+            ..Default::default()
+        };
+
+        // retrieve_sync bridges onto the runtime and must run from a
+        // synchronous context, exactly like the dispatcher's spawn_blocking.
+        let out = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "empty backend must fall back to the snapshot scan"
+        );
     }
 
     #[test]

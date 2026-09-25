@@ -216,7 +216,7 @@ mod tests {
             store_path: dir.path().join("store").to_str().unwrap().to_string(),
             ..Default::default()
         };
-        let daemon = Daemon::start(&paths, config).unwrap();
+        let daemon = Daemon::start(&paths, config).await.unwrap();
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
 
@@ -254,7 +254,7 @@ mod tests {
             store_path: dir.path().join("store").to_str().unwrap().to_string(),
             ..Default::default()
         };
-        let daemon = Daemon::start(&paths, config).unwrap();
+        let daemon = Daemon::start(&paths, config).await.unwrap();
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
 
