@@ -5458,6 +5458,107 @@ mod tests {
         assert!(result_text(&result).contains("LIBRARY MODE SNAPSHOT"));
     }
 
+    /// Golden wire pin: the exact stats text on a fixed two-fragment store
+    /// (frozen clock, no reads yet). Any rendering drift fails loudly here
+    /// instead of slipping into the compatibility surface.
+    ///
+    /// Recorded outputs: captured from the reviewed implementation on the
+    /// fixed fixtures in each test; any rendering change must update these
+    /// deliberately, never silently. Regression pins, not upstream
+    /// differentials (see the differential harness for memory_read).
+    const GOLDEN_STATS_TEXT: &str = "## Memory Stats\nTotal: 2 fragments | Avg confidence: 1\nHigh confidence (>0.8): 2 | Low (<0.3): 0\nSources: ai: 2\nProjects: (global): 2\n";
+    const GOLDEN_AUDIT_TEXT: &str =
+        "## Memory Audit\nTotal fragments: 1 | Issues: 0\nAll clear — no issues found.\n";
+
+    #[test]
+    fn memory_stats_golden_text() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(
+            &disp,
+            1,
+            "## Golden Stats One\n\n### Context\nFirst golden memory.",
+        );
+        add_fragment(
+            &disp,
+            2,
+            "## Golden Stats Two\n\n### Context\nSecond golden memory.",
+        );
+        let env = tool_call(3, ToolArgs::MemoryStats(MemoryStatsArgs::default()));
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::MemoryStats(MemoryStatsArgs::default()),
+        );
+        assert!(!result_is_error(&result));
+        assert_eq!(result_text(&result), GOLDEN_STATS_TEXT);
+    }
+
+    /// Golden wire pin: the exact audit text on a fixed healthy store.
+    #[test]
+    fn memory_audit_golden_text() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(
+            &disp,
+            1,
+            "## Golden Audit\n\n### Context\nHealthy golden memory.",
+        );
+        let env = tool_call(2, ToolArgs::MemoryAudit(MemoryAuditArgs::default()));
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::MemoryAudit(MemoryAuditArgs::default()),
+        );
+        assert!(!result_is_error(&result));
+        assert_eq!(result_text(&result), GOLDEN_AUDIT_TEXT);
+    }
+
+    /// Error envelopes: unknown IDs and out-of-range values fail loudly
+    /// with actionable messages (never silent success or empty results).
+    #[test]
+    fn error_envelope_unknown_ids_and_bad_values() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(
+            &disp,
+            1,
+            "## Envelope Fragment\n\n### Context\nFor error testing.",
+        );
+
+        // Feedback on an unknown memory.
+        let fb = ToolArgs::MemoryFeedback(MemoryFeedbackArgs {
+            id: "missing".to_string(),
+            useful: true,
+        });
+        let result = run(&disp, &tool_call(2, fb.clone()), &fb);
+        assert!(result_is_error(&result));
+
+        // Forget on an unknown memory.
+        let forget = ToolArgs::MemoryForget(MemoryForgetArgs {
+            id: "missing".to_string(),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(3, forget.clone()), &forget);
+        assert!(result_is_error(&result));
+
+        // Relate to an unknown target.
+        let relate = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: id.clone(),
+            target_id: "missing".to_string(),
+            relation_type: "supports".to_string(),
+            note: None,
+        });
+        let result = run(&disp, &tool_call(4, relate.clone()), &relate);
+        assert!(result_is_error(&result));
+
+        // Update with an out-of-range confidence.
+        let upd = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id,
+            confidence: Some(5.0),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(5, upd.clone()), &upd);
+        assert!(result_is_error(&result));
+    }
+
     // ---- semantic_search ----
 
     #[test]
