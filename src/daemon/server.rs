@@ -2,7 +2,7 @@
 //! socket, dispatcher, scheduler and quotas into a running daemon with a
 //! bounded accept loop and graceful shutdown.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
@@ -19,7 +19,6 @@ use crate::daemon::scheduler::{EmbeddingScheduler, SchedulerConfig};
 use crate::domain::clock::{Clock, SystemClock};
 use crate::domain::command::{DomainError, DomainErrorCode};
 use crate::embeddings::artifacts::ArtifactCache;
-use crate::embeddings::e5_small::E5SmallAdapter;
 use crate::search::backend::SearchBackend;
 use crate::search::maintenance::{MaintenanceConfig, MaintenanceScheduler};
 use crate::search::table::SearchTable;
@@ -104,6 +103,10 @@ pub struct Daemon {
     dispatcher: Arc<Dispatcher>,
     scheduler: EmbeddingScheduler,
     scheduler_worker: Option<JoinHandle<()>>,
+    /// Owned embedding worker (E5 mode): shut down explicitly so no
+    /// inference thread outlives daemon shutdown (the backend holds its
+    /// own clone for queries; Drop would only fire at full teardown).
+    embedding: Option<crate::embeddings::service::EmbeddingService>,
     maintenance_worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     maintenance_config: MaintenanceConfig,
     quotas: Arc<QuotaTracker>,
@@ -135,8 +138,8 @@ impl Daemon {
             let registry = FrontendRegistry::load(&p).map_err(DaemonError::Io)?;
             (registry, Some(p))
         };
-        let dispatcher = match &config.embedding {
-            EmbeddingMode::Disabled => Arc::new(Dispatcher::new(repo, registry, clock)),
+        let (dispatcher, embedding) = match &config.embedding {
+            EmbeddingMode::Disabled => (Arc::new(Dispatcher::new(repo, registry, clock)), None),
             EmbeddingMode::E5SmallCached { cache_dir } => {
                 if config.search_path.is_empty() {
                     return Err(DaemonError::Embedding {
@@ -145,20 +148,23 @@ impl Daemon {
                     });
                 }
                 let cache = ArtifactCache::new(cache_dir);
-                let adapter = E5SmallAdapter::load_from_cache(&cache).map_err(|e| {
-                    DaemonError::Embedding {
-                        message: e.to_string(),
-                    }
-                })?;
+                let service =
+                    crate::embeddings::service::EmbeddingService::load_e5_small_from_cache(&cache)
+                        .map_err(|e| DaemonError::Embedding {
+                            message: e.to_string(),
+                        })?;
                 let table = SearchTable::open(&config.search_path)
                     .await
                     .map_err(DaemonError::from)?;
-                let backend = Arc::new(SearchBackend::new(
-                    Arc::clone(&repo),
-                    table,
-                    Arc::new(Mutex::new(adapter)),
-                ));
-                Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend))
+                let embedder: std::sync::Arc<dyn crate::retrieval::engine::QueryEmbedder> =
+                    std::sync::Arc::new(crate::search::backend::ServiceQueryEmbedder::new(
+                        service.clone(),
+                    ));
+                let backend = Arc::new(SearchBackend::new(Arc::clone(&repo), table, embedder));
+                (
+                    Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend)),
+                    Some(service),
+                )
             }
         };
 
@@ -172,6 +178,7 @@ impl Daemon {
             dispatcher,
             scheduler,
             scheduler_worker: Some(scheduler_worker),
+            embedding,
             maintenance_worker: tokio::sync::Mutex::new(None),
             maintenance_config: config.maintenance,
             quotas,
@@ -219,6 +226,9 @@ impl Daemon {
     pub fn shutdown(&mut self) {
         if let Some(p) = &self.sessions_path {
             let _ = self.dispatcher.registry().persist(p);
+        }
+        if let Some(svc) = self.embedding.take() {
+            svc.shutdown();
         }
         if let Some(worker) = self.scheduler_worker.take() {
             worker.abort();

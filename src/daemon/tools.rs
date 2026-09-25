@@ -4729,7 +4729,11 @@ mod tests {
             .await
             .unwrap();
         let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
-        let backend = Arc::new(SearchBackend::new(Arc::clone(&repo), table, embedder));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
         let disp = Dispatcher::new(
             repo,
             crate::daemon::registry::FrontendRegistry::new(),
