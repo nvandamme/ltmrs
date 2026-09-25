@@ -240,7 +240,7 @@
         "T-REC-01"
       ],
       "status": "executed_passed",
-      "evidence": "fjall_backend: fjall_atomic_merge_no_partial_state, fjall_kill_reopen_durability_syncall; lance_backend: stepwise_merge_exposes_partial_publication_boundary, test_kill_and_reopen_durability; domain interpreter serial-history oracle"
+      "evidence": "fjall_backend: fjall_atomic_merge_no_partial_state, fjall_kill_reopen_durability_syncall; lance_backend: stepwise_merge_exposes_partial_publication_boundary, test_kill_and_reopen_durability; domain interpreter serial-history oracle; canonical merge records result pending + source tombstone jobs atomically with the mutation (§5.3 write set, merge_enqueues_jobs_and_dirties_pipeline)"
     },
     {
       "id": "RQ-02",
@@ -276,7 +276,7 @@
         "T-GRAPH-01"
       ],
       "status": "executed_partial",
-      "evidence": "CanonicalRepository: one_winner_for_concurrent_absent_key (T-CONC-02), stale_revision_conflict_is_not_blindly_rebased, supersession_cycle_rejected_concurrency_safely, uniqueness invariants. T-CONC-01 disjoint-field races and full T-GRAPH-01 race matrix deferred."
+      "evidence": "CanonicalRepository: one_winner_for_concurrent_absent_key (T-CONC-02), stale_revision_conflict_is_not_blindly_rebased, supersession_cycle_rejected_concurrency_safely, concurrent_opposite_supersession_edges_keep_graph_acyclic (Barrier(2) A→B ∥ B→A, exactly one winner via SSI predicate + retry), uniqueness invariants. T-CONC-01 disjoint-field races and the remaining T-GRAPH-01 race matrix (endpoint deletion vs edge creation) deferred."
     },
     {
       "id": "RQ-05",
@@ -288,7 +288,7 @@
         "T-SESS-02"
       ],
       "status": "executed_partial",
-      "evidence": "WP-04: registry per-(frontend,channel) session binding, no daemon-global session, lease expiry. WP-09: session_start/attempt/end route by (frontend,channel) via registry; session_end_is_retry_safe_no_double_count proves a retried end is rejected before guide evaluation. T-SESS-01 (32-channel interleave with colliding MCP request IDs) and T-SESS-02 (reconnect/lease/restart/subagent) still deferred to a dedicated concurrency test."
+      "evidence": "WP-04: registry per-(frontend,channel) session binding, no daemon-global session, lease expiry. WP-09: session_start/attempt/end route by (frontend,channel) via registry; session_end_is_retry_safe_no_double_count proves a retried end is rejected before guide evaluation. IPC layer binds every frame to the handshake identity (frontend_mismatch rejection, mismatched_frame_frontend_rejected). T-SESS-01 (32-channel interleave with colliding MCP request IDs) and T-SESS-02 (reconnect/lease/restart/subagent) still deferred to a dedicated concurrency test."
     },
     {
       "id": "RQ-06",
@@ -311,7 +311,8 @@
         "T-PROJ-01",
         "T-PROJ-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "T-PROJ-01 (kill between commit and ack keeps newer work pending, replay idempotent), T-PROJ-02 (stale publication refused after generation change) pass. Blue-green lifecycle: stage/note/activate/abandon with single-transaction pointer flip (cutover_is_atomic_and_requires_readiness), stale-watermark refusal, rollback, interrupted-build resolution, idempotent re-activation, build-dirty gate (mid-build writes block activation until re-note), generation reaper (expiry-gated). Full process-crash matrices and multi-frontend convergence runs deferred."
     },
     {
       "id": "RQ-08",
@@ -322,7 +323,8 @@
         "T-PROJ-03",
         "T-SEARCH-01"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "T-PROJ-03 (stalled embedder keeps lexical + direct reads, semantic stays pending) and T-SEARCH-01 (empty/unbuilt/null/concurrent optimization) pass. Split lexical/semantic readiness, no-answer rules, empty-backend fallbacks (recall_browse, semantic_search) and per-request active-generation resolution covered. Soak and multi-client freshness runs deferred."
     },
     {
       "id": "RQ-09",
@@ -333,7 +335,8 @@
         "T-EMB-01",
         "T-EMB-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "Recipe validation (BertModel + XLMRobertaTokenizer, unsupported-recipe rejection), tokenizer/prefix checks, reference-vector equivalence (cosine >= 0.999, abs <= 1e-3 — proposed 0.99999/1e-4 thresholds were loosened with rationale, not measurements), projector/query bridges with role-equivalence + prefix-asymmetry tests. Weight-gated tests execute where artifacts are present and SKIP otherwise; GPU/mixed-precision profile deferred."
     },
     {
       "id": "RQ-10",
@@ -368,7 +371,7 @@
         "T-RANK-03"
       ],
       "status": "executed_partial",
-      "evidence": "Mutation side (WP-03): endpoint existence, edge uniqueness, self-supersession and cycle rejection enforced in-transaction (supersession_cycle_rejected_concurrency_safely). Retrieval side (WP-07): T-GRAPH-02/T-RANK-03 covered by conflict_bundle_preserves_both_sides, superseded_memory_excluded_current_protected, stale_only_recall_redirects_to_current, scope_applies_to_all_legs_and_graph. T-GRAPH-01 full concurrent race matrix (endpoint deletion vs edge creation races) still deferred."
+      "evidence": "Mutation side (WP-03): endpoint existence, edge uniqueness, self-supersession and cycle rejection enforced in-transaction (supersession_cycle_rejected_concurrency_safely, concurrent_opposite_supersession_edges_keep_graph_acyclic). Retrieval side (WP-07): T-GRAPH-02/T-RANK-03 covered by conflict_bundle_preserves_both_sides, superseded_memory_excluded_current_protected, stale_only_recall_redirects_to_current, scope_applies_to_all_legs_and_graph. T-GRAPH-01 full concurrent race matrix (endpoint deletion vs edge creation races) still deferred."
     },
     {
       "id": "RQ-13",
@@ -406,7 +409,7 @@
         "T-CLI-01"
       ],
       "status": "executed_partial",
-      "evidence": "T-MCP-01: mcp.rs served_tools_match_frozen_schema (26 tools, verbatim baseline). T-MCP-02: tools.rs 45+ behavioral tests + 2 differential wire tests (byte-for-byte vs upstream). T-MCP-03: mcp.rs typed routing + validation tests. T-MCP-04: read/feedback/session side-effect tests (see RQ-17). WP-09: 15 new tools (7 guide, 5 session/suggestion, 3 intelligence) with 17 behavioral tests. T-CLI-01 deferred to WP-10 (CLI). Differential replay for the 15 WP-09 tools deferred (behavioral tests encode the contract instead)."
+      "evidence": "T-MCP-01: mcp.rs served_tools_match_frozen_schema (26 tools, verbatim baseline). T-MCP-02: tools.rs behavioral tests + 2 differential wire tests (byte-for-byte vs upstream) + stats/audit golden regression pins (honestly labeled, not upstream oracles) + error-envelope tests. T-MCP-03: mcp.rs typed routing + validation tests. T-MCP-04: read/feedback/session side-effect tests (see RQ-17). WP-09: 15 tools with behavioral tests incl. session_stats backing (empty/active/completed). T-CLI-01 deferred to WP-10 (CLI). Differential replay for the 15 WP-09 tools deferred (behavioral tests encode the contract instead)."
     },
     {
       "id": "RQ-16",
@@ -466,7 +469,8 @@
         "T-SEC-02",
         "T-SEC-03"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "Same-UID peer-credential check before any frame (pair-tested), past-deadline refusal, handshake validation, bounded frames, per-frame frontend binding (frontend_mismatch rejection), WireReply shape fix (rejections parseable). Full adversarial suites (fuzzing, 32-startup arbitration, malicious-archive/visualizer vectors) deferred."
     },
     {
       "id": "RQ-21",
@@ -488,7 +492,8 @@
         "T-CONC-04",
         "T-BENCH-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "Bounded embedding worker (queue depth, batch accounting, cancel, stats) with async service bridge (Busy maps to retryable busy:); quotas wired end-to-end (client register/unregister lifecycle, per-client queue, in-flight storage, response byte budget — all with backpressure tests); idle-exit mode; sequential maintenance passes. Saturation benchmarks and fairness-under-load measurement deferred to WP-12."
     },
     {
       "id": "RQ-23",

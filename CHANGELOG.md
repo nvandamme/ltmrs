@@ -5,6 +5,239 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 0427c3a (2026-09-26) — IPC hardening: peer-cred, deadline, quotas, idle-exit, wire fix
+
+- `src/daemon/server.rs`: same-UID peer-credential check before any frame
+  (`peer_authorized` + `check_peer_cred`, strict incl. root); client
+  register/unregister lifecycle (hoisted `ClientGuard` bound to the
+  handshake ID, per-frame `frontend_mismatch` rejection); in-flight
+  storage slots with balanced finish/dequeue; response byte budget with
+  explicit refusal (control replies bypass); idle-exit serve mode
+  (`idle_timeout_millis`, 0 = forever) with panic-safe disconnect notes.
+- `src/daemon/dispatcher.rs`: past-deadline refusal at handle entry.
+- `src/daemon/limits.rs`: `unregister_client` (absent is no-op).
+- `src/daemon/envelope.rs`: `WireReply` adjacently tagged — the inner
+  `WireError.kind` collided with internal tagging, making every rejection
+  unparseable (pre-existing bug, first tested here).
+- Review fixes: guard-scope lifetime, frame-ID binding, refcount direction,
+  Drop-time panic safety; lifecycle + mismatch tests added.
+- Tests: peer pure+live, deadline past/future, unregister, client-limit,
+  slot lifecycle, mismatch, storage-busy, response-cap, idle-exit (11 new).
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (412 passed, 0 failed).
+
+## 6958b5c (2026-09-26) — golden wire pins and error envelopes for memory tools
+
+- `src/daemon/tools.rs`: exact-text regression pins for memory_stats +
+  memory_audit on fixed fixtures (deterministic, double-run; honestly
+  labeled pins, not upstream oracles — `legacy_oracle` stays `not_run`
+  except memory_read); error envelopes for unknown IDs
+  (feedback/forget/relate) and out-of-range confidence, each verified to
+  error for the right reason.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (401 passed, 0 failed).
+
+## b5891bf (2026-09-26) — per-request E5 fingerprint plumbing
+
+- `src/embeddings/e5_small.rs::E5_SMALL_FINGERPRINT` (value 1, matching the
+  de-facto test convention; no space change); `ModelFingerprint::new` is now
+  `const fn` (behavior-neutral).
+- `src/daemon/tools.rs`: `recall_browse` + `exec_semantic_search` pin the
+  E5 fingerprint when a backend is attached (dense leg runs; empty tables
+  fall back gracefully, unchanged).
+- Tests: attached backend runs the dense leg once (counter-pinned,
+  RED-verified) with fallback results intact.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (398 passed, 0 failed).
+
+## 03871eb (2026-09-26) — bounded-worker query routing over async bridge
+
+- `src/search/backend.rs`: `ServiceQueryEmbedder` implements the engine
+  async seam directly (no `block_on` anywhere in the query path — an early
+  sync-bridge draft nested it and would panic on any dense query);
+  `Busy` maps to retryable `busy:`-prefixed errors; `SearchBackend` holds
+  the async trait (sync adapter kept public for sync providers/tests).
+- `src/daemon/server.rs`: E5 arm builds the worker service; daemon owns +
+  shuts it down explicitly.
+- Tests: role evidence, shutdown error, Busy retryable (deterministic),
+  no-nesting dense retrieve_sync with embed-call counter.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (397 passed, 0 failed).
+
+## eb4cfcb (2026-09-26) — table-measured generation convergence check
+
+- `src/search/projector.rs::verify_generation_converged`: true when every
+  live recallable memory has ≥1 row in the generation (subset, not
+  equality — tombstones excluded; lexical rows count, vectors are a
+  readiness dimension; empty-live vacuously true; generation-scoped,
+  fingerprint-blind by the same-space rule). Operator calls it after the
+  final build instead of trusting the reported numerator alone.
+- Tests: detects-missing (false→true across convergence), scoped +
+  ignores-deleted.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (393 passed, 0 failed).
+
+## 2a1296f (2026-09-26) — per-generation build-dirtiness for cutover safety
+
+- `src/domain/projection.rs`: `GenerationRecord.build_dirty` (fail-closed
+  serde default: pre-upgrade records decode dirty, must be re-reported).
+- `src/service/repository_internal.rs`: `CommandState` carries the
+  `generations` keyspace; `mark_build_dirty()` set atomically with memory
+  add / content update / forget / merge (merge also gained the missing
+  result pending job + source tombstone jobs per §5.3, and project-only
+  updates now count as content since project is Lance-indexed);
+  `src/domain/interpreter.rs` mirrors the project gate (oracle parity).
+- `src/service/repository.rs`: `note_generation_progress` clears dirty
+  (trusted attestation, documented); `activate_generation` refuses dirty
+  Ready pipelines ("rebuild and re-note first"), Retired rollback exempt;
+  `abandon`/restore preserve the flag (moot under the exemption).
+- Reviews (formal + functional): merge job/dirty hole, project-column gap,
+  dirty-Retired stuck state, fail-closed default, trust-boundary docs —
+  all fixed; mutant-killed (dirty-message assert, Retired exemption).
+- Tests: mid-build add/forget block activation until re-note, merge
+  jobs+dirty, project-only enqueues+dirties, confidence-only stays clean,
+  old-record decodes dirty, dirty-Retired still rolls back.
+- Explicit follow-ups (not claimed): per-memory pending verification,
+  table-measured numerator (closed by eb4cfcb above), merge required
+  edges/references (§5.3).
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (391 passed, 0 failed).
+
+## d305be3 (2026-09-25) — wire generation reaper into maintenance passes
+
+- `src/search/maintenance.rs`: `MaintenanceScheduler::with_repo` + explicit
+  `generation_retain_millis` config (7-day default); one shared
+  `maintenance_pass` body for `run_pass` and the spawned loop; unwired
+  passes behave exactly as before (paired wired/unwired tests).
+- `src/daemon/dispatcher.rs` + `server.rs`: new `repo_arc()` accessor;
+  `start_maintenance` attaches the dispatcher repository so daemon passes reap.
+- Tests: wired pass reaps expired retired rows, unwired pass skips (2 new).
+- Review passes (formal + functional): PASS with zero findings.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (383 passed, 0 failed).
+
+## c970d3a (2026-09-25) — review gaps: adapter gate, ledgers, session_stats deadlock
+
+- `src/storage/mod.rs`: losing Lance canonical probe gated behind
+  `#[cfg(test)]` per AD-01/WP-02 D4 (production tree clean; 9 counterexample
+  tests still run under `cargo test`).
+- `plans/conformance_matrix.json`: 15 WP-09 tools to `executed_passed` on
+  schema/defaults/output/state (behavioral tests verified);
+  `semantic_search` owner WP-09 → WP-08.
+- `plans/traceability.json`: RQ-06 evidence now describes the shipped 24h
+  retry namespaces + `gc_expired`.
+- `src/daemon/tools.rs`: fixed `exec_session_stats` registry double-lock
+  deadlock — chaining `disp.registry()` guards in one expression hung every
+  call with an active session (non-reentrant Mutex); single guard instead,
+  all other call sites audited safe. Backing test for empty/active/
+  completed states (the conformance flip that caught it).
+- Review passes (formal + functional): one HIGH finding (unbacked
+  `session_stats` flip) fixed with the test above.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (381 passed, 0 failed).
+
+## d6c9df3 (2026-09-25) — chunker-version column with version-scoped purge
+
+- `src/search/row.rs` + `table.rs`: `chunker_version` String appended last
+  (slot 13, positional reads stable); `search_schema`, `row_batch`,
+  `batches_to_rows`; shared open/refresh gate (name + slot + type +
+  nullability) — pre-versioning tables fail fast with a rebuild directive
+  (projection is derived state).
+- `src/search/projector.rs`: `Embedder::chunker_version` (default
+  `single-chunk-v1`); every row stamped incl. the empty-chunk fallback.
+  Corrected unit-1 rule: same model+recipe is one vector space, so policy
+  changes bump the version, never the fingerprint.
+- `src/search/backend.rs`: `E5_CHUNK_VERSION = "e5-chunks-v1"` for the recipe
+  mapping; distinctness pinned by test.
+- `src/search/table.rs`: same-revision republish under a new version purges
+  the old policy's chunk ids (RQ-08, mutant-verified).
+- Review fixes: orphan purge, refresh gate sharing, strict slot/type gate,
+  test-double version attribution, schema slot pin, ranking-across-versions
+  doc softening (WP-12 calibration owns it).
+- Tests: field, round-trip, open rejection, plumbing, const distinctness,
+  slot pin, policy purge (7 new).
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (380 passed, 0 failed).
+
+## 9bc6be1 (2026-09-25) — blue-green generation cutover with atomic activation
+
+- `src/domain/projection.rs`: `GenerationStatus`
+  (Staged/Building/Ready/Active/Retired) + `GenerationRecord` (fingerprint
+  Option for pre-record eras).
+- `src/service/repository.rs`: `generations` keyspace; stage (watermark
+  denominator snapshotted, one pipeline at a time), progress notes
+  (Staged→Building→Ready), single-transaction activation (live watermark
+  re-check, pointer flip, predecessor retired, pre-record predecessor
+  auto-retired); rollback re-activates retained rows (watermark-exempt);
+  abandon path; restore retires all live records; Active-preferring
+  `store_generation`; idempotent re-activation; `checked_add` on the counter.
+- `src/retrieval/engine.rs`: `store_generation` is now Option (None = active
+  pointer resolved per request, Some = pinned); repository errors propagate.
+- `src/search/projector.rs`: staged-generation writes allowed only under
+  construction AND fingerprint match (`generation_under_construction` moved
+  to the repository).
+- `src/search/maintenance.rs`: `reap_retired_generations` (expired Retired
+  only, active never touched).
+- Review fixes: rebuild-based R6 (pre-activation invisibility proven with
+  ranked-path query; list mode is generation-agnostic by design), abandon
+  path, restore sweep, fingerprint binding (mutant-killed), idempotency,
+  overflow guard, engine error propagation. Mid-build-write window and
+  table-measured numerator recorded as explicit follow-ups (per-generation
+  pending work).
+- Tests: atomic cutover, stale watermark, rollback, interrupted build
+  (reopen), abandon, restore sweep, idempotent activate, wrong-fingerprint
+  refusal, active-pointer resolution, reaper expiry (10 new).
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (373 passed, 0 failed).
+- Note: WP-03 concurrent-cycle barrier test rode along in `repository.rs`
+  (same-file adjacency to the cutover methods).
+
+## 281f7ff (2026-09-25) — E5 embedding bridges plus daemon wiring for dense retrieval
+
+- `src/search/backend.rs`: `e5_chunks_to_text_chunks` mapping (verbatim
+  spans re-prefixed, offsets shifted to rendered coordinates); `impl
+  Embedder for E5SmallAdapter` (Passage role, window errors surface as
+  pending — never silent truncation); `impl QueryEmbedderProvider for
+  Mutex<E5SmallAdapter>` (Query role; type separation enforces prefix
+  asymmetry); bounded-worker routing noted as deferred (RQ-22).
+- `src/daemon/server.rs`: `EmbeddingMode` (Disabled default / E5SmallCached
+  with fail-fast artifact load, search_path validated first); `Daemon::start`
+  is now async (removes the `block_on` panic class); `SearchBackend`
+  attached via the pre-built `with_search` seam; new `DaemonError::Embedding`.
+- `src/daemon/tools.rs`: `recall_browse` falls back to the snapshot scan on
+  empty backend results (fresh-E5-start regression test, non-vacuous).
+- `src/daemon/client.rs`: async-start call-site churn (one `.await` each).
+- Review fixes: empty-table recall regression, async start, query-bridge
+  role-equivalence + asymmetry test, narrowed wiring-only claims, reworded
+  model-state doc, validation order. Inherent `embed` shadows the trait seam
+  (tests use qualified syntax); `retrieve_sync` requires sync context
+  (tests use `spawn_blocking` like the dispatcher).
+- Tests: chunk mapping, Passage/Query bridge equivalence + asymmetry,
+  disabled default, fail-fast, empty-backend fallback (7 new).
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (363 passed, 0 failed).
+- Deferred: projection loop writing dense vectors, per-request fingerprint
+  plumbing, bounded-worker query routing.
+
+## fa9cd7c (2026-09-25) — chunk-aware search projection with guarded multi-row publish
+
+- `src/search/projector.rs`: `Embedder::chunk_text` (default single unit,
+  byte-identical rows) + `TextChunk` (rendered-coordinate spans);
+  `render_chunk_rows` shared by `process_job` + `rebuild`;
+  `publish_rows_guarded` validates once, publishes the chunk set together,
+  rejects mixed sets with `Validation` (not `debug_assert`), empty input
+  returns `Ok(false)`; all-or-pending ack preserves the
+  Published/SemanticPending contract.
+- Tests: one-row-per-chunk (+span coverage asserts), rebuild-supersedes-as-
+  unit, stalled-leaves-lexical, mixed-partial-stays-pending (all-vs-any swap
+  verified to fail) (4 new).
+- Review fixes: E5-mapping doc corrected (fragment-relative + fingerprint
+  precondition, later superseded by the version column); test-helper
+  char-boundary fix; chunker-version/atomicity limits recorded as explicit
+  follow-ups, not claimed.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (356 passed, 0 failed).
+
 ## 3a31362 (2026-09-24) — complete WP-09 guides, sessions and intelligence
 
 - `src/compatibility/lemma/tools_lemma_0_21_0.json`: 15 new frozen tool schemas

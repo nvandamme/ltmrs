@@ -364,7 +364,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 - [x] Ensure session end is retry-safe and cannot double-count guide outcomes.
 - [x] Persist suggestion acceptance/dismissal and reproduce surfaced suggestion state.
 - [x] Port actual heuristic conflict/proactive behavior; distinguish suggestions from accepted canonical edges.
-- [ ] Use dense search to propose relevant candidates, not as proof of contradiction, support or truth. (token matching; dense leg deferred)
+- [ ] Use dense search to propose relevant candidates, not as proof of contradiction, support or truth. (token matching; dense query path exists, proposal integration deferred)
 - [x] Implement analytics over canonical snapshots without unbounded read transactions.
 - [ ] Extend the upstream conformance traces across the full recall -> act -> persist workflow. (deferred)
 

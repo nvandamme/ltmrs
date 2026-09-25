@@ -505,6 +505,29 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    /// Every reply shape — including rejections — must survive a
+    /// serialize/parse round trip (the inner `WireError.kind` once collided
+    /// with internal tagging, making all rejections unparseable).
+    #[test]
+    fn wire_reply_error_roundtrips() {
+        for reply in [
+            WireReply::Error(WireError {
+                kind: "handshake_rejected".into(),
+                message: "bad generation".into(),
+            }),
+            WireReply::Error(WireError {
+                kind: "unauthorized".into(),
+                message: "wrong uid".into(),
+            }),
+        ] {
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            match serde_json::from_slice::<WireReply>(&bytes).unwrap() {
+                WireReply::Error(err) => assert!(!err.kind.is_empty()),
+                other => panic!("expected error reply, got: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn oversized_frame_rejected() {
         let big = vec![0u8; MAX_FRAME_BYTES + 1];

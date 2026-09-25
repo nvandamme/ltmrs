@@ -5561,6 +5561,85 @@ mod tests {
 
     // ---- semantic_search ----
 
+    /// Semantic fallback: with a backend attached but an empty table, the
+    /// dense leg runs and finds nothing, and the lexical snapshot fallback
+    /// still answers (mirrors the browse fallback above).
+    #[tokio::test]
+    async fn semantic_search_falls_back_on_empty_backend() {
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::table::SearchTable;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Semantic Fallback\n\n### Context\nLexical fallback must answer.",
+        );
+
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder = Arc::new(ClosureEmbedder::new({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![0.0; 384])
+            }
+        }));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+        let args = SemanticSearchArgs {
+            query: "fallback".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: false,
+            explain: false,
+            response_format: None,
+        };
+        let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+        // Same sync-context rule as the dispatcher: bridge from blocking code.
+        let tool = ToolArgs::SemanticSearch(args);
+        let result = tokio::task::spawn_blocking(move || run(&disp, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert!(
+            structured["count"].as_u64().unwrap() >= 1,
+            "lexical fallback must answer on an empty backend"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "dense leg must have run before falling back"
+        );
+    }
+
     #[test]
     fn semantic_search_finds_relevant() {
         let (disp, _dir) = test_dispatcher();
