@@ -67,6 +67,21 @@ pub struct GenerationRecord {
     /// activation, retirement). The reaper measures retention from the
     /// retirement timestamp.
     pub updated_at_millis: u64,
+    /// True when canonical state mutated after the last build report: a
+    /// mid-build write the new generation may not have converged yet.
+    /// Set atomically with memory add/update/forget/merge while a pipeline
+    /// is open; cleared by the next progress note (which attests a fresh
+    /// build); blocks activation until cleared.
+    /// Fail-closed on upgrade: records predating the flag decode as dirty,
+    /// so an open pipeline of unknown build state must be re-reported.
+    #[serde(default = "dirty_by_default")]
+    pub build_dirty: bool,
+}
+
+/// Records predating the dirty flag never observed a build report under the
+/// new regime, so they load dirty rather than trusted clean.
+fn dirty_by_default() -> bool {
+    true
 }
 
 #[cfg(test)]

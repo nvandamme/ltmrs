@@ -442,6 +442,7 @@ impl CanonicalRepository {
             &self.relations,
             &self.aliases,
             &self.projections,
+            &self.generations,
             &self.feedback_events,
             self.clock.now_millis(),
         );
@@ -631,6 +632,7 @@ impl CanonicalRepository {
             desired_memories: desired,
             projected_memories: 0,
             updated_at_millis: now,
+            build_dirty: false,
         };
         tx.insert(
             &self.generations,
@@ -652,6 +654,12 @@ impl CanonicalRepository {
     /// Building and to Ready once the watermark is met (projected >=
     /// desired). Ready is sticky upward only through this path — a lower
     /// recount moves it back to Building rather than silently holding Ready.
+    ///
+    /// Trust boundary: the report attests a fresh build and clears the dirty
+    /// flag unconditionally — the repository cannot distinguish a real
+    /// rebuild from a bare recount. The operator protocol (final rebuild
+    /// before note) is assumed, not enforced; only the refusal paths
+    /// (dirty, watermark) are verified.
     pub fn note_generation_progress(
         &self,
         generation: StoreGeneration,
@@ -675,6 +683,9 @@ impl CanonicalRepository {
         }
         rec.projected_memories = projected;
         rec.updated_at_millis = self.clock.now_millis();
+        // The report attests a fresh build of current canonical state, so it
+        // clears the dirty flag set by any mid-build write.
+        rec.build_dirty = false;
         rec.status = if projected >= rec.desired_memories {
             GenerationStatus::Ready
         } else {
@@ -794,14 +805,14 @@ impl CanonicalRepository {
     /// Re-activating the already-active generation is a no-op success, so
     /// operator retries after a timeout do not look like failures.
     ///
-    /// Mid-build-write window (explicit, not closed here): a canonical write
-    /// that lands after the build's final pass but before activation is
-    /// published by the old generation's worker only. The operator protocol
-    /// is build → quiesce → final rebuild → note → activate; per-generation
-    /// pending work that closes the window structurally is a follow-up.
-    /// The watermark numerator is operator-reported; the projector's
-    /// `rebuild()` return is its honest source. Table-measured verification
-    /// of the numerator is a follow-up.
+    /// Generation-granularity safety is structural: any canonical memory
+    /// write while a pipeline is open durties it atomically, and activation
+    /// refuses dirty pipelines until a fresh build is reported via
+    /// `note_generation_progress`. What remains trusted (not verified) is
+    /// the report itself — `note()` attests a fresh build and the projected
+    /// count comes from the projector's `rebuild()` return. Independently
+    /// verify with `Projector::verify_generation_converged` (table-measured)
+    /// before activating; per-memory pending verification is a follow-up.
     pub fn activate_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
         let mut tx = self
             .db
@@ -824,6 +835,16 @@ impl CanonicalRepository {
         }
         let current = self.resolve_generation(&tx)?;
         let live = self.recallable_count(&tx)? as u64;
+        // A dirty pipeline must be rebuilt and re-reported before activation
+        // — except rollback: a Retired generation reuses retained rows, so
+        // dirt is moot there exactly as the watermark is (abandon/restore
+        // preserve the flag, and Retired has no clearing path by design).
+        if rec.status == GenerationStatus::Ready && rec.build_dirty {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "build is dirty: canonical state changed since the last build report; rebuild and re-note first",
+            ));
+        }
         if rec.status == GenerationStatus::Ready && rec.projected_memories < live {
             return Err(DomainError::new(
                 DomainErrorCode::Validation,
@@ -873,6 +894,7 @@ impl CanonicalRepository {
                     desired_memories: 0,
                     projected_memories: 0,
                     updated_at_millis: now,
+                    build_dirty: false,
                 };
                 tx.insert(
                     &self.generations,
@@ -1909,6 +1931,234 @@ mod tests {
             repo.generation_record(next).unwrap().unwrap().status,
             GenerationStatus::Retired
         );
+    }
+
+    /// A canonical write during an open build dirties the pipeline: activation
+    /// is refused until a fresh build is reported, so a mid-build write can
+    /// never slip into a silently partial generation.
+    #[test]
+    fn mid_build_write_blocks_activation_until_renote() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.note_generation_progress(next, 1).unwrap();
+        // A concurrent write lands mid-build.
+        repo.apply(
+            &ctx(2, "m2"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(2), "m2"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let err = repo.activate_generation(next).unwrap_err();
+        assert!(
+            err.message.contains("dirty"),
+            "dirty pipeline must refuse activation, got: {}",
+            err.message
+        );
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::FIRST);
+        // Fresh build covering both memories converges the cutover.
+        repo.note_generation_progress(next, 2).unwrap();
+        repo.activate_generation(next).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), next);
+    }
+
+    /// Deletions dirty the pipeline too: a forget removes projected content,
+    /// so the build must be refreshed before activation.
+    #[test]
+    fn forget_mid_build_dirties_pipeline() {
+        let (repo, _dir) = repo_with_ns();
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("m{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), &format!("m{n}")),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.note_generation_progress(next, 2).unwrap();
+        repo.apply(
+            &ctx(3, "f1"),
+            &DomainCommand::Forget {
+                id: eid(1),
+                mode: crate::domain::command::ForgetMode::Delete,
+            },
+        )
+        .unwrap();
+        assert!(repo.activate_generation(next).is_err());
+    }
+
+    /// Writes with no open pipeline touch no records: staging starts clean.
+    #[test]
+    fn writes_without_pipeline_leave_no_dirty_state() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        let rec = repo.generation_record(next).unwrap().unwrap();
+        assert!(!rec.build_dirty);
+    }
+
+    /// Merge changes the recallable set (archived sources, new live result),
+    /// so it must enqueue projection work for both and dirty open builds —
+    /// otherwise a cutover could activate missing the result entirely.
+    #[test]
+    fn merge_enqueues_jobs_and_dirties_pipeline() {
+        let (repo, _dir) = repo_with_ns();
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("m{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), &format!("m{n}")),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.apply(
+            &ctx(3, "merge"),
+            &DomainCommand::Merge {
+                source_ids: vec![eid(1), eid(2)],
+                result: memory(eid(3), "m3"),
+            },
+        )
+        .unwrap();
+        // Result gets a pending job; archived sources get tombstone jobs.
+        let result_job = repo.projection_job(eid(3)).unwrap().unwrap();
+        assert!(!result_job.is_tombstone);
+        for s in [eid(1), eid(2)] {
+            let tomb = repo.projection_job(s).unwrap().unwrap();
+            assert!(tomb.is_tombstone, "archived source needs a tombstone job");
+        }
+        // And the open build is dirty.
+        assert!(repo.generation_record(next).unwrap().unwrap().build_dirty);
+        assert!(repo.activate_generation(next).is_err());
+    }
+
+    /// Project-only updates change indexed rows (project column), so they
+    /// enqueue work and dirty builds exactly like content changes.
+    #[test]
+    fn project_only_update_enqueues_and_dirties() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.note_generation_progress(next, 1).unwrap();
+        let seq_before = repo.projection_job(eid(1)).unwrap().unwrap().seq;
+        repo.apply(
+            &ctx(2, "proj"),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: None,
+                patch: crate::domain::command::MemoryPatch {
+                    project: Some(Some("elsewhere".to_string())),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert!(
+            job.seq > seq_before,
+            "project change must enqueue a newer job"
+        );
+        assert!(repo.generation_record(next).unwrap().unwrap().build_dirty);
+    }
+
+    /// Confidence-only updates touch no indexed column: no new job, no dirty.
+    #[test]
+    fn confidence_only_update_stays_clean() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        let seq_before = repo.projection_job(eid(1)).unwrap().unwrap().seq;
+        repo.apply(
+            &ctx(2, "conf"),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: None,
+                patch: crate::domain::command::MemoryPatch {
+                    confidence: Some(0.9),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert_eq!(job.seq, seq_before, "confidence change enqueues nothing");
+        assert!(!repo.generation_record(next).unwrap().unwrap().build_dirty);
+    }
+
+    /// Pre-upgrade records without the flag decode as dirty (fail-closed):
+    /// an open pipeline of unknown build state must be re-reported, never
+    /// trusted clean.
+    #[test]
+    fn old_record_without_flag_decodes_dirty() {
+        let raw = r#"{"generation":2,"model_fingerprint":7,"status":"Staged","desired_memories":1,"projected_memories":0,"updated_at_millis":1000}"#;
+        let rec: crate::domain::projection::GenerationRecord = serde_json::from_str(raw).unwrap();
+        assert!(rec.build_dirty);
+    }
+
+    /// A dirty retired pipeline still rolls back: retained rows need no
+    /// build, so the dirty gate (like the watermark) exempts rollback.
+    #[test]
+    fn dirty_retired_generation_still_rolls_back() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.note_generation_progress(next, 1).unwrap();
+        // Mid-build write, then abandon instead of rebuilding.
+        repo.apply(
+            &ctx(2, "m2"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(2), "m2"),
+                session: None,
+            },
+        )
+        .unwrap();
+        repo.abandon_generation(next).unwrap();
+        // Rollback to the abandoned generation succeeds despite the dirt:
+        // it reuses retained rows.
+        repo.activate_generation(next).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), next);
     }
 
     /// Abandoning a staged pipeline retires it (partial rows become reaper

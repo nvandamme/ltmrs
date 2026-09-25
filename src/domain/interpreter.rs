@@ -214,6 +214,9 @@ impl ReferenceInterpreter {
         }
         if let Some(project) = &patch.project {
             memory.project = project.clone();
+            // Project is Lance-indexed: mirrors the canonical gateway, where
+            // it counts as content for re-projection (parity).
+            content_changed = true;
         }
         if let Some(confidence) = patch.confidence {
             memory.confidence = confidence;

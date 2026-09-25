@@ -13,7 +13,7 @@ use crate::domain::command::{
 use crate::domain::graph::{GraphValidation, validate_new_edge};
 use crate::domain::id::{EntityId, EntityRevision, ExternalAlias};
 use crate::domain::memory::{Instant, Memory, MemoryLifecycle};
-use crate::domain::projection::ProjectionJob;
+use crate::domain::projection::{GenerationStatus, ProjectionJob};
 use crate::domain::relation::{Relation, RelationType};
 
 use serde::de::DeserializeOwned;
@@ -29,6 +29,7 @@ pub(crate) struct CommandState<'a> {
     relations: &'a OptimisticTxKeyspace,
     aliases: &'a OptimisticTxKeyspace,
     projections: &'a OptimisticTxKeyspace,
+    generations: &'a OptimisticTxKeyspace,
     feedback_events: &'a OptimisticTxKeyspace,
     /// Snapshot of the clock at command-application time, used to stamp
     /// projection jobs with their enqueue instant (for oldest-pending-age).
@@ -36,12 +37,17 @@ pub(crate) struct CommandState<'a> {
 }
 
 impl<'a> CommandState<'a> {
+    // Eight args: one handle per keyspace plus tx and clock. Bundling them
+    // into a params struct is churn without benefit while each call site
+    // passes the same fixed set; revisit if a ninth arg appears.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tx: &'a mut OptimisticWriteTx,
         memories: &'a OptimisticTxKeyspace,
         relations: &'a OptimisticTxKeyspace,
         aliases: &'a OptimisticTxKeyspace,
         projections: &'a OptimisticTxKeyspace,
+        generations: &'a OptimisticTxKeyspace,
         feedback_events: &'a OptimisticTxKeyspace,
         now_millis: u64,
     ) -> Self {
@@ -51,6 +57,7 @@ impl<'a> CommandState<'a> {
             relations,
             aliases,
             projections,
+            generations,
             feedback_events,
             now_millis,
         }
@@ -172,6 +179,29 @@ impl<'a> CommandState<'a> {
         Ok(())
     }
 
+    /// Mark every open pipeline dirty: canonical memory state just mutated,
+    /// so a staged generation may not have converged it. Written atomically
+    /// with the mutation, so activation can never observe the write without
+    /// observing the flag. No pipeline open means no records touched.
+    fn mark_build_dirty(&mut self) -> DomainResult<()> {
+        for kv in self.tx.iter(self.generations) {
+            let (k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut rec: crate::domain::projection::GenerationRecord = decode(v.as_ref())?;
+            if matches!(
+                rec.status,
+                GenerationStatus::Staged | GenerationStatus::Building | GenerationStatus::Ready
+            ) && !rec.build_dirty
+            {
+                rec.build_dirty = true;
+                let raw = encode(&rec)?;
+                self.tx.insert(self.generations, k, &raw);
+            }
+        }
+        Ok(())
+    }
+
     /// Record a tombstone projection job so the worker removes this memory's rows.
     /// Written atomically with the lifecycle change (design §8) so deletion
     /// propagates without an external sweep, and a delayed worker holding an older
@@ -279,6 +309,8 @@ fn apply_add_memory(state: &mut CommandState<'_>, memory: &Memory) -> DomainResu
     // work item.
     let now = state.now_millis;
     state.record_pending_projection(memory.id, now)?;
+    // The projected set changed: any open build must be refreshed.
+    state.mark_build_dirty()?;
     Ok(ReceiptOutcome::Success {
         affected: vec![memory.id],
     })
@@ -322,6 +354,9 @@ fn apply_update_memory(
     }
     if let Some(project) = &patch.project {
         memory.project = project.clone();
+        // Project is a Lance-indexed, scope-filtered column: changing it
+        // must re-project exactly like content changes.
+        content_changed = true;
     }
     if let Some(confidence) = patch.confidence {
         memory.confidence = confidence;
@@ -346,6 +381,8 @@ fn apply_update_memory(
     if content_changed {
         let now = state.now_millis;
         state.record_pending_projection(id, now)?;
+        // The projected set changed: any open build must be refreshed.
+        state.mark_build_dirty()?;
     }
     Ok(ReceiptOutcome::Success { affected: vec![id] })
 }
@@ -525,6 +562,19 @@ fn apply_merge(
     state.put_memory(&result)?;
     affected.push(result.id);
 
+    // Merge write set, pending-work half (design §5.3 Merge row also lists
+    // required edges/references, which remain unimplemented here and in the
+    // reference interpreter): the result is new recallable content (pending
+    // job) and archived sources lose recallability (tombstone jobs so
+    // workers remove their rows). The projected set changed, so any open
+    // build must be refreshed.
+    let now = state.now_millis;
+    state.record_pending_projection(result.id, now)?;
+    for source_id in source_ids {
+        state.invalidate_projection(*source_id)?;
+    }
+    state.mark_build_dirty()?;
+
     Ok(ReceiptOutcome::Success { affected })
 }
 
@@ -560,5 +610,7 @@ fn apply_forget(
     state.invalidate_projection(id)?;
 
     state.put_memory(&memory)?;
+    // The recallable set changed: any open build must be refreshed.
+    state.mark_build_dirty()?;
     Ok(ReceiptOutcome::Success { affected: vec![id] })
 }
