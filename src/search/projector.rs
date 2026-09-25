@@ -272,8 +272,14 @@ impl Projector {
         let lock = self.publication_lock(first.memory_id);
         let _lock = lock.lock().await;
 
-        // Reject rows from a stale or future store generation.
-        if self.repo.store_generation()? != first.store_generation {
+        // Reject rows from a stale or future store generation — except rows
+        // for a generation under construction (blue-green build): a staged
+        // generation is writable before activation so the new vector space
+        // can converge alongside the old. Readers only follow the active
+        // pointer (or an explicit pin), never a partial build.
+        if self.repo.store_generation()? != first.store_generation
+            && !self.generation_under_construction(first.store_generation)?
+        {
             return Ok(false);
         }
 
@@ -295,6 +301,17 @@ impl Projector {
 
         self.table.publish_rows(rows).await?;
         Ok(true)
+    }
+
+    /// Whether a generation is under construction (staged but not yet
+    /// active) for this projector's fingerprint: its rows may be published
+    /// before activation. Retired, fingerprint-mismatched and unknown
+    /// generations stay refused — a misconfigured projector advancing the
+    /// wrong vector space, or a delayed worker writing a dead generation,
+    /// cannot overwrite or resurrect state.
+    fn generation_under_construction(&self, generation: StoreGeneration) -> DomainResult<bool> {
+        self.repo
+            .generation_under_construction(generation, self.fingerprint)
     }
 
     /// Delete propagation (task 7): remove every projected row for a memory so
@@ -801,6 +818,31 @@ mod tests {
             0,
             "a new model must not write into the old vector space"
         );
+    }
+
+    /// A projector with the wrong fingerprint cannot advance a staged build:
+    /// staged publication is bound to the recorded build fingerprint so
+    /// vector spaces never mix silently.
+    #[tokio::test]
+    async fn staged_build_rejects_wrong_fingerprint() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "t", "f");
+        let gen2 = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+
+        let mut p_wrong = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 384 }),
+            ModelFingerprint::new(8),
+            gen2,
+        );
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert_eq!(
+            p_wrong.process_job(&job).await.unwrap(),
+            ProjectorOutcome::StaleRevision,
+            "wrong-fingerprint rows must be refused during a staged build"
+        );
+        assert_eq!(table.count_rows(None).await.unwrap(), 0);
     }
 
     /// Task 6: replaying an already-acknowledged job is idempotent — a retried

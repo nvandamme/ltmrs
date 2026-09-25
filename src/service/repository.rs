@@ -18,8 +18,9 @@ use crate::domain::command::{
     ReceiptOutcome, RetryNamespace,
 };
 use crate::domain::export::CanonicalExport;
-use crate::domain::id::{EntityId, FrontendId, OperationId, StoreGeneration};
+use crate::domain::id::{EntityId, FrontendId, ModelFingerprint, OperationId, StoreGeneration};
 use crate::domain::memory::Memory;
+use crate::domain::projection::{GenerationRecord, GenerationStatus};
 use crate::domain::relation::Relation;
 use crate::service::migrations::{
     MigrationOutcome, MigrationPlan, MigrationRunner, MigrationSafetyRules,
@@ -116,6 +117,7 @@ pub struct CanonicalRepository {
     aliases: OptimisticTxKeyspace,
     namespaces: OptimisticTxKeyspace,
     projections: OptimisticTxKeyspace,
+    generations: OptimisticTxKeyspace,
     feedback_events: OptimisticTxKeyspace,
     guides: OptimisticTxKeyspace,
     suggestions: OptimisticTxKeyspace,
@@ -174,6 +176,7 @@ impl CanonicalRepository {
         let aliases = Self::keyspace(&db, "aliases")?;
         let namespaces = Self::keyspace(&db, "namespaces")?;
         let projections = Self::keyspace(&db, "projections")?;
+        let generations = Self::keyspace(&db, "generations")?;
         let feedback_events = Self::keyspace(&db, "feedback_events")?;
         let guides = Self::keyspace(&db, "guides")?;
         let suggestions = Self::keyspace(&db, "suggestions")?;
@@ -186,6 +189,7 @@ impl CanonicalRepository {
             aliases,
             namespaces,
             projections,
+            generations,
             feedback_events,
             guides,
             suggestions,
@@ -504,7 +508,23 @@ impl CanonicalRepository {
     /// The store's current generation (1 for a fresh store; bumped on
     /// destructive restores). Used in the IPC handshake to reject clients
     /// targeting a different generation.
+    ///
+    /// Prefers the cutover record: exactly one generation is Active at a
+    /// time, and `activate_generation` flips it atomically with the pointer.
+    /// Pre-cutover stores have no records and read the meta pointer.
+    /// (Defensive max: multiple Actives are unreachable via this API —
+    /// both writers retire the predecessor in the same commit — and
+    /// `set_store_generation` heals them; max keeps reads available.)
     pub fn store_generation(&self) -> DomainResult<StoreGeneration> {
+        if let Some(active) = self
+            .list_generations()?
+            .into_iter()
+            .filter(|r| r.status == GenerationStatus::Active)
+            .map(|r| r.generation)
+            .max_by_key(|g| g.as_u64())
+        {
+            return Ok(active);
+        }
         let meta = Self::keyspace(&self.db, "meta")?;
         let snapshot = self.db.read_tx();
         let raw = snapshot
@@ -527,6 +547,13 @@ impl CanonicalRepository {
     /// Set the store's active generation. Called by WP-11 restore when a
     /// verified snapshot is activated; projection publication for any other
     /// generation is refused until readers drain (design §8).
+    ///
+    /// A restore creates a new generation, so past pipeline records must not
+    /// survive it: every non-retired record is retired in the same commit.
+    /// That keeps the "Active record == pointer" invariant (a stale Active
+    /// can never shadow the restored pointer) and kills pre-restore staged
+    /// workers' publish rights (design §12.3 step 9: old projection work is
+    /// invalidated). A fresh pipeline can be staged immediately after.
     pub fn set_store_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
         let meta = Self::keyspace(&self.db, "meta")?;
         let mut tx = self
@@ -534,6 +561,21 @@ impl CanonicalRepository {
             .write_tx()
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
         tx.insert(&meta, "store_generation", generation.as_u64().to_le_bytes());
+        let now = self.clock.now_millis();
+        let retired = self.read_generation_records(&tx)?;
+        for mut rec in retired
+            .into_iter()
+            .filter(|r| !matches!(r.status, GenerationStatus::Retired))
+        {
+            rec.status = GenerationStatus::Retired;
+            rec.updated_at_millis = now;
+            tx.insert(
+                &self.generations,
+                generation_key(rec.generation),
+                serde_json::to_vec(&rec)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
+            );
+        }
         match tx.commit() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(DomainError::new(
@@ -542,6 +584,392 @@ impl CanonicalRepository {
             )),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
         }
+    }
+
+    /// Stage a blue-green generation build (design §8.2): allocates the next
+    /// generation number, snapshots the watermark denominator (recallable
+    /// canonical memories now), and records the build fingerprint. Exactly
+    /// one pipeline (Staged/Building/Ready) may exist at a time. The active
+    /// pointer is untouched — staging is never observable to readers.
+    pub fn stage_generation(&self, fingerprint: ModelFingerprint) -> DomainResult<StoreGeneration> {
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let records = self.read_generation_records(&tx)?;
+        if records.iter().any(|r| {
+            matches!(
+                r.status,
+                GenerationStatus::Staged | GenerationStatus::Building | GenerationStatus::Ready
+            )
+        }) {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "a generation build is already in progress",
+            ));
+        }
+        let max_record = records.iter().map(|r| r.generation.as_u64()).max();
+        let mut next = StoreGeneration::FIRST
+            .as_u64()
+            .max(self.meta_generation(&tx)?.as_u64());
+        if let Some(m) = max_record {
+            next = next.max(m);
+        }
+        let next = StoreGeneration::new(next.checked_add(1).ok_or_else(|| {
+            DomainError::new(DomainErrorCode::Validation, "generation counter exhausted")
+        })?);
+        let desired = self.recallable_count(&tx)? as u64;
+        let now = self.clock.now_millis();
+        let rec = GenerationRecord {
+            generation: next,
+            model_fingerprint: Some(fingerprint),
+            status: if desired == 0 {
+                GenerationStatus::Ready
+            } else {
+                GenerationStatus::Staged
+            },
+            desired_memories: desired,
+            projected_memories: 0,
+            updated_at_millis: now,
+        };
+        tx.insert(
+            &self.generations,
+            generation_key(next),
+            serde_json::to_vec(&rec)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
+        );
+        match tx.commit() {
+            Ok(Ok(())) => Ok(next),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "generation staging conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// Report build progress for a staged generation. Promotes Staged to
+    /// Building and to Ready once the watermark is met (projected >=
+    /// desired). Ready is sticky upward only through this path — a lower
+    /// recount moves it back to Building rather than silently holding Ready.
+    pub fn note_generation_progress(
+        &self,
+        generation: StoreGeneration,
+        projected: u64,
+    ) -> DomainResult<GenerationRecord> {
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut rec = self
+            .read_generation_record(&tx, generation)?
+            .ok_or_else(|| DomainError::new(DomainErrorCode::Validation, "unknown generation"))?;
+        match rec.status {
+            GenerationStatus::Staged | GenerationStatus::Building | GenerationStatus::Ready => {}
+            GenerationStatus::Active | GenerationStatus::Retired => {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "only a staged generation accepts build progress",
+                ));
+            }
+        }
+        rec.projected_memories = projected;
+        rec.updated_at_millis = self.clock.now_millis();
+        rec.status = if projected >= rec.desired_memories {
+            GenerationStatus::Ready
+        } else {
+            GenerationStatus::Building
+        };
+        tx.insert(
+            &self.generations,
+            generation_key(generation),
+            serde_json::to_vec(&rec)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
+        );
+        match tx.commit() {
+            Ok(Ok(())) => Ok(rec),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "generation progress conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// Fetch one generation record, if present.
+    pub fn generation_record(
+        &self,
+        generation: StoreGeneration,
+    ) -> DomainResult<Option<GenerationRecord>> {
+        let snapshot = self.db.read_tx();
+        let raw = snapshot
+            .get(&self.generations, generation_key(generation))
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        raw.map(|v| decode_generation(v.as_ref())).transpose()
+    }
+
+    /// Whether a generation currently accepts projection publication for a
+    /// model fingerprint: staged (or building/ready) with a matching build
+    /// fingerprint. Retired, active-through-pointer and unknown generations
+    /// are refused — a misconfigured projector advancing the wrong vector
+    /// space, or a delayed worker writing a dead generation, is rejected
+    /// rather than silently mixed.
+    pub fn generation_under_construction(
+        &self,
+        generation: StoreGeneration,
+        fingerprint: ModelFingerprint,
+    ) -> DomainResult<bool> {
+        Ok(matches!(
+            self.generation_record(generation)?,
+            Some(rec)
+                if matches!(
+                    rec.status,
+                    GenerationStatus::Staged
+                        | GenerationStatus::Building
+                        | GenerationStatus::Ready
+                ) && rec.model_fingerprint == Some(fingerprint)
+        ))
+    }
+
+    /// Abandon a staged pipeline that will never activate (interrupted build,
+    /// misconfigured fingerprint): marks it Retired so the reaper cleans any
+    /// partial rows after retention and a fresh pipeline can be staged.
+    /// Active generations cannot be abandoned — restore or cut over instead.
+    pub fn abandon_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut rec = self
+            .read_generation_record(&tx, generation)?
+            .ok_or_else(|| DomainError::new(DomainErrorCode::Validation, "unknown generation"))?;
+        match rec.status {
+            GenerationStatus::Staged | GenerationStatus::Building | GenerationStatus::Ready => {}
+            GenerationStatus::Active | GenerationStatus::Retired => {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "only a staged pipeline can be abandoned",
+                ));
+            }
+        }
+        rec.status = GenerationStatus::Retired;
+        rec.updated_at_millis = self.clock.now_millis();
+        tx.insert(
+            &self.generations,
+            generation_key(generation),
+            serde_json::to_vec(&rec)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
+        );
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "generation abandon conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// All generation records from a single snapshot (cutover/reaper views).
+    pub fn list_generations(&self) -> DomainResult<Vec<GenerationRecord>> {
+        let snapshot = self.db.read_tx();
+        let mut out = Vec::new();
+        for kv in snapshot.iter(&self.generations) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            out.push(decode_generation(v.as_ref())?);
+        }
+        out.sort_by_key(|r| r.generation.as_u64());
+        Ok(out)
+    }
+
+    /// Atomically publish a ready generation (design §12.3 steps 5-8): one
+    /// commit flips the active pointer, marks the generation Active, and
+    /// retires its predecessor (creating a Retired record when the previous
+    /// generation predates cutover records). Ready is re-validated against
+    /// the CURRENT recallable count inside the same transaction, so memories
+    /// added mid-build cannot slip into a silently partial generation.
+    /// Retired generations may be re-activated (rollback needs no rebuild).
+    /// Re-activating the already-active generation is a no-op success, so
+    /// operator retries after a timeout do not look like failures.
+    ///
+    /// Mid-build-write window (explicit, not closed here): a canonical write
+    /// that lands after the build's final pass but before activation is
+    /// published by the old generation's worker only. The operator protocol
+    /// is build → quiesce → final rebuild → note → activate; per-generation
+    /// pending work that closes the window structurally is a follow-up.
+    /// The watermark numerator is operator-reported; the projector's
+    /// `rebuild()` return is its honest source. Table-measured verification
+    /// of the numerator is a follow-up.
+    pub fn activate_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        if self.resolve_generation(&tx)? == generation {
+            return Ok(());
+        }
+        let mut rec = self
+            .read_generation_record(&tx, generation)?
+            .ok_or_else(|| DomainError::new(DomainErrorCode::Validation, "unknown generation"))?;
+        match rec.status {
+            GenerationStatus::Ready | GenerationStatus::Retired => {}
+            GenerationStatus::Staged | GenerationStatus::Building | GenerationStatus::Active => {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "only a ready (or retained retired) generation can be activated",
+                ));
+            }
+        }
+        let current = self.resolve_generation(&tx)?;
+        let live = self.recallable_count(&tx)? as u64;
+        if rec.status == GenerationStatus::Ready && rec.projected_memories < live {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                format!(
+                    "stale watermark: {} projected but {} recallable; rebuild first",
+                    rec.projected_memories, live
+                ),
+            ));
+        }
+        // Note: re-activating a Retired generation (rollback) skips the
+        // watermark — it reuses retained rows, no build needed. Rolling back
+        // after the reaper deleted those rows yields an empty generation;
+        // the retention window is the guardrail, not this check.
+        let now = self.clock.now_millis();
+        tx.insert(
+            &Self::keyspace(&self.db, "meta")?,
+            "store_generation",
+            generation.as_u64().to_le_bytes(),
+        );
+        rec.status = GenerationStatus::Active;
+        rec.updated_at_millis = now;
+        tx.insert(
+            &self.generations,
+            generation_key(generation),
+            serde_json::to_vec(&rec)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
+        );
+        match self.read_generation_record(&tx, current)? {
+            Some(mut prev) => {
+                prev.status = GenerationStatus::Retired;
+                prev.updated_at_millis = now;
+                tx.insert(
+                    &self.generations,
+                    generation_key(current),
+                    serde_json::to_vec(&prev).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?,
+                );
+            }
+            None => {
+                // Pre-record predecessor: create its Retired record so the
+                // reaper sees a uniform retention view (fingerprint unknown).
+                let prev = GenerationRecord {
+                    generation: current,
+                    model_fingerprint: None,
+                    status: GenerationStatus::Retired,
+                    desired_memories: 0,
+                    projected_memories: 0,
+                    updated_at_millis: now,
+                };
+                tx.insert(
+                    &self.generations,
+                    generation_key(current),
+                    serde_json::to_vec(&prev).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?,
+                );
+            }
+        }
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "generation activation conflicted",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
+    /// Read one generation record inside a write transaction.
+    fn read_generation_record(
+        &self,
+        tx: &OptimisticWriteTx,
+        generation: StoreGeneration,
+    ) -> DomainResult<Option<GenerationRecord>> {
+        let raw = tx
+            .get(&self.generations, generation_key(generation))
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        raw.map(|v| decode_generation(v.as_ref())).transpose()
+    }
+
+    /// Read all generation records inside a write transaction.
+    fn read_generation_records(
+        &self,
+        tx: &OptimisticWriteTx,
+    ) -> DomainResult<Vec<GenerationRecord>> {
+        let mut out = Vec::new();
+        for kv in tx.iter(&self.generations) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            out.push(decode_generation(v.as_ref())?);
+        }
+        Ok(out)
+    }
+
+    /// Resolve the active generation inside a write transaction: the Active
+    /// record when present, else the meta pointer (pre-cutover stores).
+    fn resolve_generation(&self, tx: &OptimisticWriteTx) -> DomainResult<StoreGeneration> {
+        if let Some(active) = self
+            .read_generation_records(tx)?
+            .into_iter()
+            .filter(|r| r.status == GenerationStatus::Active)
+            .map(|r| r.generation)
+            .max_by_key(|g| g.as_u64())
+        {
+            return Ok(active);
+        }
+        self.meta_generation(tx)
+    }
+
+    /// Read the raw meta pointer inside a write transaction.
+    fn meta_generation(&self, tx: &OptimisticWriteTx) -> DomainResult<StoreGeneration> {
+        let meta = Self::keyspace(&self.db, "meta")?;
+        let raw = tx
+            .get(&meta, "store_generation")
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        match raw {
+            Some(v) => {
+                let bytes = v.as_ref();
+                if bytes.len() >= 8 {
+                    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    Ok(StoreGeneration::new(value))
+                } else {
+                    Ok(StoreGeneration::FIRST)
+                }
+            }
+            None => Ok(StoreGeneration::FIRST),
+        }
+    }
+
+    /// Count recallable canonical memories inside a write transaction (the
+    /// watermark denominator/numerator guard for staging and activation).
+    fn recallable_count(&self, tx: &OptimisticWriteTx) -> DomainResult<usize> {
+        let mut count = 0usize;
+        for kv in tx.iter(&self.memories) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let memory: Memory = serde_json::from_slice(v.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if memory.lifecycle.is_recallable() {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn lookup_receipt(
@@ -958,6 +1386,15 @@ impl CanonicalRepository {
     }
 }
 
+fn generation_key(generation: StoreGeneration) -> String {
+    generation.as_u64().to_string()
+}
+
+fn decode_generation(bytes: &[u8]) -> DomainResult<GenerationRecord> {
+    serde_json::from_slice(bytes)
+        .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
+}
+
 fn receipt_key(
     generation: StoreGeneration,
     frontend_id: FrontendId,
@@ -1060,7 +1497,7 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> DomainResult<T> {
 mod tests {
     use super::*;
     use crate::domain::command::{DomainCommand, ForgetMode};
-    use crate::domain::id::{EntityId, StoreGeneration};
+    use crate::domain::id::{EntityId, ModelFingerprint, StoreGeneration};
     use crate::domain::memory::{FragmentType, Memory, MemoryLifecycle, MemorySource};
     use crate::domain::relation::{Relation, RelationType};
     use uuid::Uuid;
@@ -1287,6 +1724,295 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, DomainErrorCode::SupersessionCycle);
+    }
+
+    #[test]
+    fn concurrent_opposite_supersession_edges_keep_graph_acyclic() {
+        // T-GRAPH-01 race: A→B ∥ B→A supersedes with a barrier so both
+        // validate against the same snapshot. Exactly one must win; the
+        // loser must observe SupersessionCycle (via SSI conflict + retry
+        // or by seeing the winner's edge directly). Final graph is acyclic.
+        let (repo, _dir) = repo_with_ns();
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("m{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), &format!("m{n}")),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        let repo = std::sync::Arc::new(repo);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for (i, (s, t, rid)) in [(eid(1), eid(2), eid(100)), (eid(2), eid(1), eid(101))]
+            .into_iter()
+            .enumerate()
+        {
+            let repo = std::sync::Arc::clone(&repo);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let c = ctx(i as u64 + 200, &format!("race{i}"));
+                repo.apply(
+                    &c,
+                    &DomainCommand::Relate {
+                        relation: rel(rid, s, t, RelationType::Supersedes),
+                    },
+                )
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().unwrap());
+        }
+        let winners = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one opposite edge must win, got {results:?}"
+        );
+        for r in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert_eq!(r.code, DomainErrorCode::SupersessionCycle);
+        }
+        // Final graph holds a single supersession edge: still acyclic.
+        // Note neighbors(id) returns edges where id is source OR target,
+        // so one edge is visible from both endpoints: dedupe by relation id.
+        let mut ids: Vec<EntityId> = repo
+            .neighbors(eid(1))
+            .unwrap()
+            .into_iter()
+            .chain(repo.neighbors(eid(2)).unwrap())
+            .map(|r| r.id)
+            .collect();
+        ids.sort_by_key(|id| id.as_uuid());
+        ids.dedup_by_key(|id| id.as_uuid());
+        assert_eq!(ids.len(), 1, "one surviving supersession edge expected");
+    }
+
+    use crate::domain::projection::GenerationStatus;
+
+    /// Blue-green cutover is atomic: staging and partial builds never move the
+    /// active pointer; one activation publishes the new generation in a single
+    /// step while the old rows stay retained for rollback.
+    #[test]
+    fn cutover_is_atomic_and_requires_readiness() {
+        let (repo, _dir) = repo_with_ns();
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("m{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), &format!("m{n}")),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        assert_eq!(next, StoreGeneration::new(2));
+        // Staged only: pointer unchanged, activation refused.
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::FIRST);
+        let rec = repo.generation_record(next).unwrap().unwrap();
+        assert_eq!(rec.status, GenerationStatus::Staged);
+        assert_eq!(rec.desired_memories, 2);
+        // Partial build: still not ready.
+        repo.note_generation_progress(next, 1).unwrap();
+        assert_eq!(
+            repo.generation_record(next).unwrap().unwrap().status,
+            GenerationStatus::Building
+        );
+        assert!(repo.activate_generation(next).is_err());
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::FIRST);
+        // Complete build: ready, then exactly-one-step activation.
+        repo.note_generation_progress(next, 2).unwrap();
+        assert_eq!(
+            repo.generation_record(next).unwrap().unwrap().status,
+            GenerationStatus::Ready
+        );
+        repo.activate_generation(next).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), next);
+        assert_eq!(
+            repo.generation_record(next).unwrap().unwrap().status,
+            GenerationStatus::Active
+        );
+        // Previous generation retired with a timestamp for the reaper.
+        let prev = repo
+            .generation_record(StoreGeneration::FIRST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prev.status, GenerationStatus::Retired);
+    }
+
+    /// The watermark is conservative: memories added mid-build make the staged
+    /// denominator stale, and activation must refuse until a fresh build
+    /// covers them (no silent partial generation).
+    #[test]
+    fn activate_rejects_stale_watermark() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        // A concurrent write lands mid-build.
+        repo.apply(
+            &ctx(2, "m2"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(2), "m2"),
+                session: None,
+            },
+        )
+        .unwrap();
+        // The build covered only the staged denominator: Ready by count, but
+        // activation sees the newer recallable memory and refuses.
+        repo.note_generation_progress(next, 1).unwrap();
+        assert_eq!(
+            repo.generation_record(next).unwrap().unwrap().status,
+            GenerationStatus::Ready
+        );
+        assert!(repo.activate_generation(next).is_err());
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::FIRST);
+    }
+
+    /// Rollback needs no rebuild: a retired generation's rows are retained,
+    /// so re-activating it flips the pointer back in one step.
+    #[test]
+    fn rollback_restores_previous_generation() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.note_generation_progress(next, 1).unwrap();
+        repo.activate_generation(next).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), next);
+        // Roll back: no build, just re-activation.
+        repo.activate_generation(StoreGeneration::FIRST).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::FIRST);
+        assert_eq!(
+            repo.generation_record(StoreGeneration::FIRST)
+                .unwrap()
+                .unwrap()
+                .status,
+            GenerationStatus::Active
+        );
+        assert_eq!(
+            repo.generation_record(next).unwrap().unwrap().status,
+            GenerationStatus::Retired
+        );
+    }
+
+    /// Abandoning a staged pipeline retires it (partial rows become reaper
+    /// food) and unblocks fresh staging. Active generations cannot be
+    /// abandoned — restore or cut over instead.
+    #[test]
+    fn abandon_releases_staged_pipeline() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let staged = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.abandon_generation(staged).unwrap();
+        assert_eq!(
+            repo.generation_record(staged).unwrap().unwrap().status,
+            GenerationStatus::Retired
+        );
+        // Fresh pipeline stages immediately after (numbers keep advancing).
+        let next = repo.stage_generation(ModelFingerprint::new(8)).unwrap();
+        assert_eq!(next, StoreGeneration::new(3));
+        // Unknown and active generations cannot be abandoned.
+        assert!(repo.abandon_generation(StoreGeneration::new(99)).is_err());
+        assert!(repo.abandon_generation(StoreGeneration::FIRST).is_err());
+    }
+
+    /// A restore retires every live pipeline record: pre-restore staged
+    /// workers lose publish rights and fresh staging works immediately.
+    #[test]
+    fn restore_retires_staged_pipeline() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let staged = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.set_store_generation(StoreGeneration::new(9)).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::new(9));
+        assert_eq!(
+            repo.generation_record(staged).unwrap().unwrap().status,
+            GenerationStatus::Retired
+        );
+        let next = repo.stage_generation(ModelFingerprint::new(8)).unwrap();
+        assert_eq!(next, StoreGeneration::new(10));
+    }
+
+    /// Re-activating the active generation succeeds, so operator retries
+    /// after a timeout do not look like failures.
+    #[test]
+    fn activate_is_idempotent() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let next = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        repo.note_generation_progress(next, 1).unwrap();
+        repo.activate_generation(next).unwrap();
+        repo.activate_generation(next).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), next);
+    }
+
+    /// An interrupted build (staged record, no activation) still resolves to
+    /// the last verified generation after reopen — never a partial one.
+    #[test]
+    fn interrupted_build_resolves_to_last_active() {
+        let (repo, dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let staged = repo.stage_generation(ModelFingerprint::new(7)).unwrap();
+        assert_eq!(staged, StoreGeneration::new(2));
+        // Simulate a crash between stage and activate: drop the handle and
+        // reopen over the same directory (dir stays alive, like the Fjall
+        // kill/reopen durability test).
+        let path = dir.path().to_str().unwrap().to_string();
+        drop(repo);
+        let clock = std::sync::Arc::new(crate::domain::clock::FrozenClock::new(1000));
+        let repo = CanonicalRepository::open_with_clock(&path, clock).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::FIRST);
+        let staged = repo
+            .generation_record(StoreGeneration::new(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.status, GenerationStatus::Staged);
+        // A stale activation attempt against the partial build still fails.
+        assert!(repo.activate_generation(StoreGeneration::new(2)).is_err());
     }
 
     fn rel(id: EntityId, s: EntityId, t: EntityId, ty: RelationType) -> Relation {

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::id::{DocumentRevision, EntityId};
+use crate::domain::id::{DocumentRevision, EntityId, ModelFingerprint, StoreGeneration};
 
 /// A durable desired-state item: "project memory `memory_id` at this document
 /// revision". The worker acknowledges by compare-and-clearing on `seq`.
@@ -29,6 +29,44 @@ pub struct ProjectionJob {
     /// lifecycle change so deletion propagates without an external sweep.
     #[serde(default)]
     pub is_tombstone: bool,
+}
+
+/// Lifecycle of a store generation under blue-green cutover (design §8.2):
+/// build the new generation alongside the old, verify its watermark, then
+/// publish the active pointer atomically while the old rows stay retained
+/// for rollback. UUIDs are identities, never commit order (RV-07) — the
+/// watermark counts projected vs desired memories instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenerationStatus {
+    /// Staged but no build progress reported yet.
+    Staged,
+    /// Build in progress, watermark not yet met.
+    Building,
+    /// Watermark met (projected >= desired); eligible for activation.
+    Ready,
+    /// The live generation readers resolve by default.
+    Active,
+    /// Superseded but retained until the reaper's retention expires.
+    Retired,
+}
+
+/// Durable per-generation cutover record (WP-05 task 8). One record per
+/// store generation; transitions are owned by the canonical repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationRecord {
+    pub generation: StoreGeneration,
+    /// Model fingerprint the generation was built with. None for records
+    /// auto-created for pre-record generations (unknown vector space).
+    pub model_fingerprint: Option<ModelFingerprint>,
+    pub status: GenerationStatus,
+    /// Recallable canonical memories at stage time (watermark denominator).
+    pub desired_memories: u64,
+    /// Memories projected into this generation (watermark numerator).
+    pub projected_memories: u64,
+    /// Wall-clock millis of the last transition (staging, progress,
+    /// activation, retirement). The reaper measures retention from the
+    /// retirement timestamp.
+    pub updated_at_millis: u64,
 }
 
 #[cfg(test)]

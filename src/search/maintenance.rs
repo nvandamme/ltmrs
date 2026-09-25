@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::domain::command::DomainResult;
+use crate::domain::projection::GenerationStatus;
 use crate::search::table::{MaintenanceBudget, SearchTable};
+use crate::service::repository::CanonicalRepository;
 
 /// Configuration for the maintenance scheduler's schedule and budgets.
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +108,34 @@ impl MaintenanceScheduler {
     pub fn budget(&self) -> MaintenanceBudget {
         self.config.budget
     }
+}
+
+/// Reap expired retired generations (design §12.3 rollback retention): delete
+/// every projected row of a Retired generation whose retirement age reached
+/// `retain_millis`. Fresh-retired rows stay for rollback; the active
+/// generation is never touched (it has no Retired record). Returns the number
+/// of generations reaped. Safe against stale projectors: their rows are
+/// refused by the publication guard, so a reaped generation cannot be
+/// resurrected by a delayed worker.
+pub async fn reap_retired_generations(
+    table: &SearchTable,
+    repo: &CanonicalRepository,
+    now_millis: u64,
+    retain_millis: u64,
+) -> DomainResult<u64> {
+    let mut reaped = 0u64;
+    for rec in repo.list_generations()? {
+        if rec.status != GenerationStatus::Retired {
+            continue;
+        }
+        if now_millis.saturating_sub(rec.updated_at_millis) < retain_millis {
+            continue;
+        }
+        let filter = format!("store_generation = {}", rec.generation.as_u64());
+        table.delete_where(&filter).await?;
+        reaped += 1;
+    }
+    Ok(reaped)
 }
 
 #[cfg(test)]
@@ -323,5 +353,97 @@ mod tests {
         let (_repo, table, _guard) = env().await;
         let sched = MaintenanceScheduler::new(table, MaintenanceConfig::default());
         assert_eq!(sched.run_until_idle(3).await.unwrap(), 3);
+    }
+
+    /// The reaper deletes only expired retired generations: fresh-retired
+    /// rows stay for rollback, and the active generation is never touched.
+    #[tokio::test]
+    async fn reaper_deletes_only_expired_retired_generations() {
+        use crate::domain::id::ModelFingerprint as Fp;
+        use crate::domain::id::StoreGeneration as Gen;
+
+        let (repo, table, _guard) = env().await;
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n),
+                &DomainCommand::AddMemory {
+                    memory: memory(n),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        // Project both memories at generation 1.
+        let mut p1 = crate::search::projector::Projector::new(
+            Arc::clone(&repo),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 384 }),
+            Fp::new(1),
+            Gen::FIRST,
+        );
+        p1.run_until_idle().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+
+        // Cut over to generation 2 (retires generation 1 at frozen t=1000).
+        let gen2 = repo.stage_generation(Fp::new(2)).unwrap();
+        repo.note_generation_progress(gen2, 2).unwrap();
+        repo.activate_generation(gen2).unwrap();
+
+        // Before the retain period elapses: nothing reaped (rollback intact).
+        assert_eq!(
+            reap_retired_generations(&table, &repo, 1000, 60_000)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+
+        // After expiry: generation-1 rows are gone, generation-2 rows (none
+        // projected yet) untouched, and the active pointer is unaffected.
+        // Project one memory at gen 2 first so the active space is non-empty.
+        repo.apply(
+            &ctx(3),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: None,
+                patch: crate::domain::command::MemoryPatch {
+                    fragment: Some("f-1-v2".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        let mut p2 = crate::search::projector::Projector::new(
+            Arc::clone(&repo),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 384 }),
+            Fp::new(2),
+            gen2,
+        );
+        p2.run_until_idle().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 3);
+
+        assert_eq!(
+            reap_retired_generations(&table, &repo, 1000 + 60_000 + 1, 60_000)
+                .await
+                .unwrap(),
+            1,
+            "exactly the expired retired generation is reaped"
+        );
+        assert_eq!(
+            table
+                .count_rows(Some("store_generation = 1"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            table
+                .count_rows(Some("store_generation = 2"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(repo.store_generation().unwrap(), gen2);
     }
 }

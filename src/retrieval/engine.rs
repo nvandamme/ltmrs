@@ -50,8 +50,10 @@ pub struct RetrievalRequest {
     pub direct_ids: Vec<EntityId>,
     /// The raw request scope.
     pub scope: Scope,
-    /// The store generation to read.
-    pub store_generation: StoreGeneration,
+    /// The store generation to read. None resolves the active pointer per
+    /// request (blue-green cutover); Some pins a generation (rollback reads,
+    /// tests). Never a commit cursor (RV-07).
+    pub store_generation: Option<StoreGeneration>,
     /// The model fingerprint for the dense leg (None: dense leg disabled).
     pub model_fingerprint: Option<ModelFingerprint>,
     /// How many candidates to fetch per leg.
@@ -76,7 +78,7 @@ impl Default for RetrievalRequest {
             query: String::new(),
             direct_ids: vec![],
             scope: Scope::default(),
-            store_generation: StoreGeneration::FIRST,
+            store_generation: None,
             model_fingerprint: None,
             candidate_limit: 50,
             min_similarity: None,
@@ -138,7 +140,13 @@ impl Engine {
     ) -> DomainResult<RetrievalResult> {
         // Stage 1: resolve the effective scope ONCE.
         let scope = EffectiveScope::resolve(&req.scope);
-        let store_gen = req.store_generation;
+        // Unpinned requests follow the active pointer per call so a cutover
+        // takes effect on the next query; pinned requests stay put. A
+        // repository error propagates (never masked as generation 1).
+        let store_gen = match req.store_generation {
+            Some(g) => g,
+            None => self.repo.store_generation()?,
+        };
 
         // Stage 2: direct-ID routing (bypasses the ranker entirely).
         if !req.direct_ids.is_empty() {
@@ -415,7 +423,7 @@ impl Engine {
         });
 
         let mut explanation = explanation;
-        let readiness = self.readiness(req).await?;
+        let readiness = self.readiness(req, store_gen).await?;
         explanation.fts_ready = readiness.fts_ready;
         explanation.dense_ready = readiness.dense_ready;
         explanation.projection_lag = readiness.projection_lag;
@@ -435,9 +443,13 @@ impl Engine {
     /// and how much projection work is still pending. Never claims false
     /// completeness. Scoped to the requested generation/fingerprint so a
     /// blue-green deployment reports readiness for the space it actually reads.
-    async fn readiness(&self, req: &RetrievalRequest) -> DomainResult<Readiness> {
+    async fn readiness(
+        &self,
+        req: &RetrievalRequest,
+        store_gen: StoreGeneration,
+    ) -> DomainResult<Readiness> {
         let projection_lag = self.repo.projection_lag()?;
-        let gen_filter = format!("store_generation = {}", req.store_generation.as_u64());
+        let gen_filter = format!("store_generation = {}", store_gen.as_u64());
         // The FTS leg is ready only if the inverted index exists (without it,
         // lexical recall silently degrades to empty results).
         let fts_ready = self.table.fts_index_ready().await?;
@@ -483,7 +495,7 @@ impl Engine {
             &req.context_budget,
         );
         let mut explanation = RetrievalExplanation::new(store_gen, req.model_fingerprint);
-        let readiness = self.readiness(req).await?;
+        let readiness = self.readiness(req, store_gen).await?;
         explanation.fts_ready = readiness.fts_ready;
         explanation.dense_ready = readiness.dense_ready;
         explanation.projection_lag = readiness.projection_lag;
@@ -543,7 +555,7 @@ impl Engine {
         let mut explanation = RetrievalExplanation::new(store_gen, req.model_fingerprint);
         explanation.no_match = true;
         explanation.scope_filter = scope.to_lance_filter();
-        let readiness = self.readiness(req).await?;
+        let readiness = self.readiness(req, store_gen).await?;
         explanation.fts_ready = readiness.fts_ready;
         explanation.dense_ready = readiness.dense_ready;
         explanation.projection_lag = readiness.projection_lag;
@@ -855,6 +867,63 @@ mod tests {
             .unwrap();
         assert!(result.results.is_empty());
         assert!(result.explanation.no_match);
+    }
+
+    /// Cutover readers: a request without a pinned generation reads the
+    /// active pointer per call; an explicit generation stays pinned
+    /// (rollback reads). Uses the ranked path: list mode reads canonical
+    /// state directly and is generation-agnostic by design.
+    #[tokio::test]
+    async fn none_generation_resolves_active_pointer() {
+        let (repo, table, _proj, _guard) = env().await;
+        add(&repo, 1, "gen two", "second generation body", None);
+        // Build generation 2 alongside generation 1, before activation.
+        let gen2 = repo.stage_generation(ModelFingerprint::new(2)).unwrap();
+        let mut proj2 = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 384 }),
+            ModelFingerprint::new(2),
+            gen2,
+        );
+        proj2.run_until_idle().await.unwrap();
+        repo.note_generation_progress(gen2, 1).unwrap();
+        table.create_fts_index().await.unwrap();
+
+        let req = RetrievalRequest {
+            query: "generation".into(),
+            ..Default::default()
+        };
+        assert!(req.store_generation.is_none());
+        // Pre-activation: the converging build is invisible to default readers.
+        let pre = Engine::new(repo.clone(), table.clone())
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert!(
+            pre.results.is_empty(),
+            "unactivated build must stay invisible"
+        );
+
+        repo.activate_generation(gen2).unwrap();
+        // Unpinned request follows the active pointer to the gen-2 row.
+        let post = Engine::new(repo.clone(), table.clone())
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert_eq!(post.results.len(), 1, "active pointer must resolve");
+
+        // Explicit pin to the old generation sees nothing projected there.
+        let pinned = RetrievalRequest {
+            query: "generation".into(),
+            store_generation: Some(StoreGeneration::FIRST),
+            ..Default::default()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&pinned, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert!(result.results.is_empty(), "pinned old generation is stable");
     }
 
     /// T-SEARCH-02: exact technical identifiers (flags, paths, underscores)
