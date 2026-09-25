@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::domain::command::DomainResult;
+use crate::domain::command::{DomainError, DomainErrorCode, DomainResult};
 use crate::domain::id::{ChunkId, EntityId, ModelFingerprint, StoreGeneration};
 use crate::domain::projection::ProjectionJob;
 use crate::search::row::SearchRow;
@@ -22,6 +22,43 @@ use crate::search::table::SearchTable;
 /// lexical indexing.
 pub trait Embedder: Send {
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, String>;
+
+    /// Split rendered memory text into embeddable units (RQ-10). The default is
+    /// a single unit covering the whole rendered text — byte-identical to the
+    /// pre-chunking behavior. A model-aware override returns one unit per
+    /// derived chunk so tail content beyond the first model window gets its
+    /// own vector.
+    ///
+    /// Mapping contract for a future override over the E5 `chunk_passage`
+    /// recipe (which yields unprefixed fragment spans with fragment-relative
+    /// offsets): re-prefix each span for lexical searchability
+    /// (`format!("{title}\n{span}")`) and shift its offsets by
+    /// `title.len() + 1` into rendered coordinates; the model embed input
+    /// additionally carries the recipe prefix (`passage: {title}\n{span}`).
+    /// Precondition: changing the chunking policy requires a new model
+    /// fingerprint — chunk sets produced by different policies must never
+    /// share one, or incompatible vector spaces would mix silently (a
+    /// same-revision chunk-count shrink otherwise orphans the dropped
+    /// chunk ids, which group cleanup keyed on revision cannot see).
+    fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
+        let text = render_text(title, fragment);
+        let len = text.len() as u64;
+        vec![TextChunk {
+            text,
+            char_start: 0,
+            char_end: len,
+        }]
+    }
+}
+
+/// One embeddable unit of a memory: the row's lexical text plus the evidence
+/// span of its matched content in rendered-text coordinates
+/// (`render_text(title, fragment)` byte offsets).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextChunk {
+    pub text: String,
+    pub char_start: u64,
+    pub char_end: u64,
 }
 
 /// Deterministic test embedder: a fixed-dimension vector derived from the text.
@@ -134,34 +171,20 @@ impl Projector {
             return Ok(ProjectorOutcome::StaleRevision);
         }
 
-        // Step 3: render and embed only the changed fields (single chunk here).
-        let text = render_text(&memory.title, &memory.fragment);
-        let embedding = self.embedder.embed(&text).ok();
-
-        let row = SearchRow {
-            store_generation: self.generation,
-            memory_id: job.memory_id,
-            document_revision: memory.document_revision,
-            model_fingerprint: self.fingerprint,
-            chunk_id: ChunkId::new(0),
-            lexical_text: text.clone(),
-            char_start: 0,
-            char_end: text.len() as u64,
-            project: memory.project.clone(),
-            fragment_type: memory.fragment_type.as_str().to_string(),
-            created_at_millis: memory.created_at.as_millis(),
-            updated_at_millis: memory.updated_at.as_millis(),
-            embedding,
-        };
+        // Step 3: render and embed only the changed fields, one row per chunk
+        // (RQ-10). A chunk-aware embedder returns a unit per derived chunk so
+        // tail content beyond the first model window gets its own vector.
+        let rows = self.render_chunk_rows(&memory, job.memory_id);
 
         // Step 5: idempotent publication under the per-entity guard.
-        if !self.publish_guarded(&row).await? {
+        if !self.publish_rows_guarded(&rows).await? {
             return Ok(ProjectorOutcome::StaleRevision);
         }
 
         // Step 6: compare-and-clear exactly the job we published — but only when
-        // both phases are done; a missing vector leaves semantic work pending.
-        if row.embedding.is_some() {
+        // every chunk has its vector; a missing vector leaves semantic work
+        // pending while all chunks stay lexically indexed.
+        if rows.iter().all(|r| r.embedding.is_some()) {
             self.repo.acknowledge_projection(job.memory_id, job.seq)?;
             Ok(ProjectorOutcome::Published)
         } else {
@@ -177,29 +200,92 @@ impl Projector {
         }
     }
 
+    /// Render one [`SearchRow`] per [`TextChunk`] of a memory at its current
+    /// canonical revision. Each chunk is embedded independently; a chunk whose
+    /// embedding fails keeps a lexical-only row so a stalled worker never
+    /// blocks indexing. An embedder that wrongly returns zero chunks falls back
+    /// to the default single unit rather than silently dropping the memory.
+    fn render_chunk_rows(
+        &mut self,
+        memory: &crate::domain::memory::Memory,
+        memory_id: EntityId,
+    ) -> Vec<SearchRow> {
+        let mut chunks = self.embedder.chunk_text(&memory.title, &memory.fragment);
+        if chunks.is_empty() {
+            let text = render_text(&memory.title, &memory.fragment);
+            let len = text.len() as u64;
+            chunks = vec![TextChunk {
+                text,
+                char_start: 0,
+                char_end: len,
+            }];
+        }
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SearchRow {
+                store_generation: self.generation,
+                memory_id,
+                document_revision: memory.document_revision,
+                model_fingerprint: self.fingerprint,
+                chunk_id: ChunkId::new(i as u32),
+                lexical_text: c.text.clone(),
+                char_start: c.char_start,
+                char_end: c.char_end,
+                project: memory.project.clone(),
+                fragment_type: memory.fragment_type.as_str().to_string(),
+                created_at_millis: memory.created_at.as_millis(),
+                updated_at_millis: memory.updated_at.as_millis(),
+                embedding: self.embedder.embed(&c.text).ok(),
+            })
+            .collect()
+    }
+
     /// The publication guard (task 5): re-validate canonical state immediately
     /// before writing so a late old embedding cannot regress a newer row. Holds
     /// the per-entity lock across validate + write, serializing concurrent
     /// projectors on the same memory within this daemon. Also rejects rows from
     /// an inactive store generation (T-PROJ-02).
     pub async fn publish_guarded(&mut self, row: &SearchRow) -> DomainResult<bool> {
-        let lock = self.publication_lock(row.memory_id);
+        self.publish_rows_guarded(std::slice::from_ref(row)).await
+    }
+
+    /// Multi-row publication guard: validates once, then publishes the whole
+    /// chunk set of one memory in a single guarded section, so a chunked
+    /// revision cannot interleave with a newer revision's chunks from another
+    /// projector sharing this instance. (Crash/replay interleaving below the
+    /// table's merge-then-cleanup phases is still covered by the revision
+    /// re-validation on retry, not by this lock.) All rows must belong to one
+    /// memory at one revision; violations are rejected, never asserted.
+    pub async fn publish_rows_guarded(&mut self, rows: &[SearchRow]) -> DomainResult<bool> {
+        let Some(first) = rows.first() else {
+            return Ok(false);
+        };
+        if !rows.iter().all(|r| {
+            r.memory_id == first.memory_id && r.document_revision == first.document_revision
+        }) {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "guarded chunk set must belong to one memory at one revision",
+            ));
+        }
+        let lock = self.publication_lock(first.memory_id);
         let _lock = lock.lock().await;
 
         // Reject rows from a stale or future store generation.
-        if self.repo.store_generation()? != row.store_generation {
+        if self.repo.store_generation()? != first.store_generation {
             return Ok(false);
         }
 
-        // Reject if the canonical revision has moved past this row's.
+        // Reject if the canonical revision has moved past this set's.
         let Some(memory) = self
             .repo
-            .get_memories(std::slice::from_ref(&row.memory_id))?
+            .get_memories(std::slice::from_ref(&first.memory_id))?
             .pop()
         else {
             return Ok(false);
         };
-        if memory.document_revision != row.document_revision {
+        if memory.document_revision != first.document_revision {
             return Ok(false);
         }
         // Reject non-recallable memories (deleted/invalidated/archived).
@@ -207,7 +293,7 @@ impl Projector {
             return Ok(false);
         }
 
-        self.table.publish_rows(std::slice::from_ref(row)).await?;
+        self.table.publish_rows(rows).await?;
         Ok(true)
     }
 
@@ -269,27 +355,10 @@ impl Projector {
                 continue;
             }
 
-            let text = render_text(&memory.title, &memory.fragment);
+            let rows = self.render_chunk_rows(memory, memory.id);
             // A stalled embedder must not block lexical indexing (T-PROJ-03):
-            // publish the lexical row now and leave the vector retry pending.
-            let embedding = self.embedder.embed(&text).ok();
-            let row = SearchRow {
-                store_generation: self.generation,
-                memory_id: memory.id,
-                document_revision: memory.document_revision,
-                model_fingerprint: self.fingerprint,
-                chunk_id: ChunkId::new(0),
-                lexical_text: text.clone(),
-                char_start: 0,
-                char_end: text.len() as u64,
-                project: memory.project.clone(),
-                fragment_type: memory.fragment_type.as_str().to_string(),
-                created_at_millis: memory.created_at.as_millis(),
-                updated_at_millis: memory.updated_at.as_millis(),
-                embedding,
-            };
-
-            if self.publish_guarded(&row).await? {
+            // publish the lexical rows now and leave the vector retry pending.
+            if self.publish_rows_guarded(&rows).await? {
                 published += 1;
             }
         }
@@ -1050,5 +1119,272 @@ mod tests {
 
     async fn table_with_vector_count(tbl: &SearchTable) -> u64 {
         tbl.count_rows(Some("embedding IS NOT NULL")).await.unwrap()
+    }
+
+    // ---- RQ-10 multi-chunk projection (WP-06 follow-up) ----
+
+    /// Shared halving policy for the chunk-aware test doubles below: split the
+    /// fragment at a line boundary when present, else at a char boundary near
+    /// the midpoint. Each unit carries the title prefix for lexical
+    /// searchability with offsets in rendered coordinates.
+    fn halving_chunks(title: &str, fragment: &str) -> Vec<TextChunk> {
+        let base = title.len() + 1; // "title\n" rendered prefix
+        let mid = fragment.find('\n').map(|i| i + 1).unwrap_or_else(|| {
+            let mut m = fragment.len() / 2;
+            while !fragment.is_char_boundary(m) {
+                m -= 1;
+            }
+            m
+        });
+        let (first, second) = fragment.split_at(mid);
+        vec![
+            TextChunk {
+                text: format!("{title}\n{first}"),
+                char_start: base as u64,
+                char_end: (base + first.len()) as u64,
+            },
+            TextChunk {
+                text: format!("{title}\n{second}"),
+                char_start: (base + first.len()) as u64,
+                char_end: (base + fragment.len()) as u64,
+            },
+        ]
+    }
+
+    /// Test embedder with a chunk-aware policy: splits the fragment into two
+    /// halves (line boundary when present) and embeds each span separately.
+    /// `fail` models a stalled worker for the SemanticPending policy test.
+    struct HalvingEmbedder {
+        dim: usize,
+        fail: bool,
+    }
+
+    impl Embedder for HalvingEmbedder {
+        fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+            if self.fail {
+                return Err("embedding service unavailable".into());
+            }
+            Ok((0..self.dim)
+                .map(|i| {
+                    ((text.bytes().fold(0u64, |a, b| a.wrapping_add(b as u64)) >> (i % 64))
+                        ^ i as u64) as f32
+                        / 1e9
+                })
+                .collect())
+        }
+
+        fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
+            halving_chunks(title, fragment)
+        }
+    }
+
+    /// Test embedder whose second chunk always fails: pins the all-or-pending
+    /// policy for mixed partial embeddings (an `any`-instead-of-`all` ack
+    /// check must not pass this test).
+    struct SecondChunkFailsEmbedder {
+        dim: usize,
+    }
+
+    impl Embedder for SecondChunkFailsEmbedder {
+        fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+            if text.contains("beta-half") {
+                return Err("tail chunk unavailable".into());
+            }
+            Ok(vec![0.5; self.dim])
+        }
+
+        fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
+            halving_chunks(title, fragment)
+        }
+    }
+
+    /// RQ-10: a long memory projects one row per chunk (not a single
+    /// first-window row). Each row carries its chunk id, evidence span and
+    /// vector; the job is acknowledged only when every chunk is embedded.
+    #[tokio::test]
+    async fn long_memory_projects_one_row_per_chunk() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "long", "alpha-half\nbeta-half");
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+
+        let mut p = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(HalvingEmbedder {
+                dim: 384,
+                fail: false,
+            }),
+            ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+        assert_eq!(
+            p.process_job(&job).await.unwrap(),
+            ProjectorOutcome::Published
+        );
+        assert!(!repo.has_pending_projection(eid(1)).unwrap());
+
+        let rows = table.rows_where("embedding IS NOT NULL").await.unwrap();
+        assert_eq!(rows.len(), 2, "one vector row per chunk expected");
+        let mut chunk_ids: Vec<u32> = rows.iter().map(|r| r.chunk_id.as_u32()).collect();
+        chunk_ids.sort_unstable();
+        assert_eq!(chunk_ids, vec![0, 1]);
+        // Evidence spans are disjoint and jointly cover the fragment body.
+        let mut spans: Vec<(u64, u64)> = rows.iter().map(|r| (r.char_start, r.char_end)).collect();
+        spans.sort_unstable();
+        assert!(spans[0].1 <= spans[1].0, "chunk spans must not overlap");
+        let title_len = "long".len() as u64;
+        assert_eq!(
+            spans[0].0,
+            title_len + 1,
+            "first span must start at the fragment body"
+        );
+        assert_eq!(
+            spans[0].1, spans[1].0,
+            "adjacent chunk spans must join with no dropped middle"
+        );
+        assert_eq!(
+            spans[1].1,
+            render_text("long", "alpha-half\nbeta-half").len() as u64,
+            "last span must reach the end of the rendered text"
+        );
+        assert!(
+            rows.iter().any(|r| r.lexical_text.contains("alpha-half")),
+            "first-half content must be projected"
+        );
+        assert!(
+            rows.iter().any(|r| r.lexical_text.contains("beta-half")),
+            "tail content beyond the first window must be projected"
+        );
+    }
+
+    /// A chunked rebuild supersedes as a unit: after a content update the new
+    /// revision has exactly the new chunk set and no row of the old revision
+    /// survives (exercises table.rs group cleanup with multi-chunk sets).
+    #[tokio::test]
+    async fn chunked_rebuild_supersedes_as_unit() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "long", "alpha-half\nbeta-half");
+
+        let mut p = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(HalvingEmbedder {
+                dim: 384,
+                fail: false,
+            }),
+            ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+        assert_eq!(p.rebuild().await.unwrap(), 1);
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+
+        // Update content: canonical document_revision advances to 2.
+        let patch = crate::domain::command::MemoryPatch {
+            fragment: Some("gamma-half\ndelta-half".into()),
+            ..Default::default()
+        };
+        repo.apply(
+            &ctx(2),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: None,
+                patch,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.rebuild().await.unwrap(), 1);
+
+        let rev2 = table.rows_where("document_revision = 2").await.unwrap();
+        assert_eq!(rev2.len(), 2, "new revision must carry the full chunk set");
+        let rev1 = table.rows_where("document_revision = 1").await.unwrap();
+        assert_eq!(rev1.len(), 0, "no old-revision chunk may survive");
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+    }
+
+    /// All-or-pending chunk policy: when any chunk embedding fails, every
+    /// chunk still gets its lexical row now, the job stays pending, and a
+    /// recovered worker converges all chunks to vectors without duplicates.
+    #[tokio::test]
+    async fn stalled_chunking_embedder_leaves_all_chunks_lexical_and_pending() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "long", "alpha-half\nbeta-half");
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+
+        let mut p_stalled = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(HalvingEmbedder {
+                dim: 384,
+                fail: true,
+            }),
+            ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+        assert_eq!(
+            p_stalled.process_job(&job).await.unwrap(),
+            ProjectorOutcome::SemanticPending
+        );
+        // Both chunks indexed lexically; no vector claimed.
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            table.count_rows(Some("embedding IS NULL")).await.unwrap(),
+            2
+        );
+        assert!(repo.has_pending_projection(eid(1)).unwrap());
+
+        // A recovered worker completes every chunk; replay is idempotent.
+        let mut p_working = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(HalvingEmbedder {
+                dim: 384,
+                fail: false,
+            }),
+            ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+        p_working.run_until_idle().await.unwrap();
+        assert!(!repo.has_pending_projection(eid(1)).unwrap());
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            table
+                .count_rows(Some("embedding IS NOT NULL"))
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    /// Mixed partial embeddings stay pending: when only one chunk has a
+    /// vector, the job must NOT be acknowledged (an `any`-instead-of-`all`
+    /// ack check must fail this test). Both chunks stay lexically indexed.
+    #[tokio::test]
+    async fn mixed_partial_embedding_stays_pending() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "long", "alpha-half\nbeta-half");
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+
+        let mut p = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(SecondChunkFailsEmbedder { dim: 384 }),
+            ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+        assert_eq!(
+            p.process_job(&job).await.unwrap(),
+            ProjectorOutcome::SemanticPending,
+            "one missing chunk vector must keep the job pending"
+        );
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            table
+                .count_rows(Some("embedding IS NOT NULL"))
+                .await
+                .unwrap(),
+            1,
+            "only the successful chunk may carry a vector"
+        );
+        assert!(repo.has_pending_projection(eid(1)).unwrap());
     }
 }
