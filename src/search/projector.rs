@@ -35,11 +35,10 @@ pub trait Embedder: Send {
     /// (`format!("{title}\n{span}")`) and shift its offsets by
     /// `title.len() + 1` into rendered coordinates; the model embed input
     /// additionally carries the recipe prefix (`passage: {title}\n{span}`).
-    /// Precondition: changing the chunking policy requires a new model
-    /// fingerprint — chunk sets produced by different policies must never
-    /// share one, or incompatible vector spaces would mix silently (a
-    /// same-revision chunk-count shrink otherwise orphans the dropped
-    /// chunk ids, which group cleanup keyed on revision cannot see).
+    /// Precondition: changing the chunking policy bumps the chunker version
+    /// (see `chunker_version`), never the model fingerprint — the fingerprint
+    /// stays model-bound while the version attributes each row to the policy
+    /// that produced it.
     fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
         let text = render_text(title, fragment);
         let len = text.len() as u64;
@@ -49,7 +48,16 @@ pub trait Embedder: Send {
             char_end: len,
         }]
     }
+
+    /// Chunking-policy version stamped on every projected row. Bump whenever
+    /// the chunking policy changes so rows stay attributable per policy.
+    fn chunker_version(&self) -> String {
+        SINGLE_CHUNK_VERSION.to_string()
+    }
 }
+
+/// Version stamped by the default single-unit chunking policy.
+pub const SINGLE_CHUNK_VERSION: &str = "single-chunk-v1";
 
 /// One embeddable unit of a memory: the row's lexical text plus the evidence
 /// span of its matched content in rendered-text coordinates
@@ -229,6 +237,7 @@ impl Projector {
                 document_revision: memory.document_revision,
                 model_fingerprint: self.fingerprint,
                 chunk_id: ChunkId::new(i as u32),
+                chunker_version: self.embedder.chunker_version(),
                 lexical_text: c.text.clone(),
                 char_start: c.char_start,
                 char_end: c.char_end,
@@ -568,6 +577,7 @@ mod tests {
             document_revision: DocumentRevision::new(1),
             model_fingerprint: ModelFingerprint::new(1),
             chunk_id: ChunkId::new(0),
+            chunker_version: "single-chunk-v1".to_string(),
             lexical_text: "stale text".into(),
             char_start: 0,
             char_end: 10,
@@ -601,6 +611,7 @@ mod tests {
             document_revision: DocumentRevision::new(1),
             model_fingerprint: ModelFingerprint::new(1),
             chunk_id: ChunkId::new(0),
+            chunker_version: "single-chunk-v1".to_string(),
             lexical_text: "current text".into(),
             char_start: 0,
             char_end: 12,
@@ -629,6 +640,7 @@ mod tests {
             document_revision: DocumentRevision::new(1),
             model_fingerprint: ModelFingerprint::new(1),
             chunk_id: ChunkId::new(0),
+            chunker_version: "single-chunk-v1".to_string(),
             lexical_text: "x".into(),
             char_start: 0,
             char_end: 1,
@@ -1131,6 +1143,7 @@ mod tests {
             document_revision: DocumentRevision::new(0),
             model_fingerprint: ModelFingerprint::new(1),
             chunk_id: ChunkId::new(0),
+            chunker_version: "single-chunk-v1".to_string(),
             lexical_text: "only text".into(),
             char_start: 0,
             char_end: 9,
@@ -1218,11 +1231,16 @@ mod tests {
         fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
             halving_chunks(title, fragment)
         }
+
+        fn chunker_version(&self) -> String {
+            "test-halving-v1".to_string()
+        }
     }
 
     /// Test embedder whose second chunk always fails: pins the all-or-pending
     /// policy for mixed partial embeddings (an `any`-instead-of-`all` ack
-    /// check must not pass this test).
+    /// check must not pass this test). Shares the halving policy — and its
+    /// version — with HalvingEmbedder so attribution stays exact.
     struct SecondChunkFailsEmbedder {
         dim: usize,
     }
@@ -1238,6 +1256,39 @@ mod tests {
         fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
             halving_chunks(title, fragment)
         }
+
+        fn chunker_version(&self) -> String {
+            "test-halving-v1".to_string()
+        }
+    }
+
+    /// Projected rows carry the embedder's chunker version so a policy
+    /// change is attributable per row (never silently mixed).
+    #[tokio::test]
+    async fn projected_rows_carry_chunker_version() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "long", "alpha-half\nbeta-half");
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+        let mut p = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(HalvingEmbedder {
+                dim: 384,
+                fail: false,
+            }),
+            ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+        assert_eq!(
+            p.process_job(&job).await.unwrap(),
+            ProjectorOutcome::Published
+        );
+        let rows = table
+            .rows_where("chunker_version = 'test-halving-v1'")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "every chunk row carries the version");
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
     }
 
     /// RQ-10: a long memory projects one row per chunk (not a single

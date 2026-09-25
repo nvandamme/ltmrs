@@ -148,6 +148,11 @@ impl QueryEmbedderProvider for MutexEmbedder {
     }
 }
 
+/// Chunking-policy version for rows built through the E5 mapping below.
+/// Bumped whenever the mapping changes; the model fingerprint stays
+/// model-bound (see `SearchRow::chunker_version`).
+pub const E5_CHUNK_VERSION: &str = "e5-chunks-v1";
+
 /// Map E5 derived chunks (verbatim fragment spans, fragment-relative offsets)
 /// to projector units: re-prefix each span for lexical searchability and
 /// shift its offsets by the rendered title prefix into rendered coordinates
@@ -185,6 +190,10 @@ impl Embedder for E5SmallAdapter {
 
     fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
         e5_chunks_to_text_chunks(title, &self.chunk_passage(title, fragment))
+    }
+
+    fn chunker_version(&self) -> String {
+        E5_CHUNK_VERSION.to_string()
     }
 }
 
@@ -225,6 +234,15 @@ impl QueryEmbedderProvider for Mutex<E5SmallAdapter> {
 mod tests {
     use super::*;
     use crate::embeddings::e5_small::Chunk;
+
+    /// Policy versions are distinct strings: the E5 recipe must never share
+    /// the default single-chunk version.
+    #[test]
+    fn e5_chunk_version_differs_from_default() {
+        use crate::search::projector::SINGLE_CHUNK_VERSION;
+        assert!(!E5_CHUNK_VERSION.is_empty());
+        assert_ne!(E5_CHUNK_VERSION, SINGLE_CHUNK_VERSION);
+    }
 
     /// The E5 chunk mapping re-prefixes each verbatim fragment span for
     /// lexical searchability and shifts its offsets into rendered coordinates.

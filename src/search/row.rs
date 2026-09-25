@@ -10,6 +10,15 @@ pub struct SearchRow {
     pub document_revision: DocumentRevision,
     pub model_fingerprint: ModelFingerprint,
     pub chunk_id: ChunkId,
+    /// Chunking-policy version that produced this row (e.g. "single-chunk-v1",
+    /// "e5-chunks-v1"). Same model + same recipe is one vector space whatever
+    /// the chunking, so versions under one fingerprint stay dimensionally
+    /// comparable; the version attributes each row to its policy and scopes
+    /// targeted purges (a same-revision republish under a new version purges
+    /// the old policy's chunk ids). Ranking across versions during a
+    /// transition is uncalibrated (WP-12); the purge above is what converges
+    /// the transition instead of lingering mixed-policy rows.
+    pub chunker_version: String,
     /// Rendered searchable text (title prefix + fragment content).
     pub lexical_text: String,
     /// Byte offsets of this chunk within the rendered source.
@@ -33,6 +42,28 @@ mod tests {
     }
 
     #[test]
+    fn row_carries_chunker_version() {
+        let row = SearchRow {
+            store_generation: StoreGeneration::new(7),
+            memory_id: eid(42),
+            document_revision: DocumentRevision::new(3),
+            model_fingerprint: ModelFingerprint::new(99),
+            chunk_id: ChunkId::new(1),
+            chunker_version: "e5-chunks-v1".to_string(),
+            lexical_text: "hello world".into(),
+            char_start: 0,
+            char_end: 11,
+            project: Some("ltmrs".into()),
+            fragment_type: "fact".into(),
+            created_at_millis: 1000,
+            updated_at_millis: 2000,
+            embedding: None,
+        };
+
+        assert_eq!(row.chunker_version, "e5-chunks-v1");
+    }
+
+    #[test]
     fn row_holds_all_identity_and_scope_fields() {
         let row = SearchRow {
             store_generation: StoreGeneration::new(7),
@@ -40,6 +71,7 @@ mod tests {
             document_revision: DocumentRevision::new(3),
             model_fingerprint: ModelFingerprint::new(99),
             chunk_id: ChunkId::new(1),
+            chunker_version: "single-chunk-v1".to_string(),
             lexical_text: "hello world".into(),
             char_start: 0,
             char_end: 11,
@@ -69,6 +101,7 @@ mod tests {
             document_revision: DocumentRevision::new(0),
             model_fingerprint: ModelFingerprint::new(1),
             chunk_id: ChunkId::new(0),
+            chunker_version: "single-chunk-v1".to_string(),
             lexical_text: "text".into(),
             char_start: 0,
             char_end: 4,

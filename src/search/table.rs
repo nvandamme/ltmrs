@@ -45,6 +45,9 @@ impl Default for MaintenanceBudget {
 
 /// Arrow schema for the search projection table. The vector column is a
 /// nullable fixed-size list so lexical-ready rows carry no embedding (AD-06).
+/// `chunker_version` is appended last so all pre-existing column positions
+/// stay stable; tables predating it are refused at open with a rebuild
+/// directive (the projection is derived state, rebuilt from canonical).
 pub fn search_schema(dim: u32) -> SchemaRef {
     Arc::new(arrow_schema::Schema::new(vec![
         Field::new("store_generation", DataType::UInt64, false),
@@ -67,6 +70,7 @@ pub fn search_schema(dim: u32) -> SchemaRef {
             ),
             true,
         ),
+        Field::new("chunker_version", DataType::Utf8, false),
     ]))
 }
 
@@ -97,6 +101,15 @@ impl SearchTable {
         };
         let table =
             table.map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        // Schema gate: tables predating chunker versioning would misalign
+        // positional reads. The projection is derived state — rebuild it
+        // from canonical (delete the table directory, re-project) rather
+        // than misreading shifted columns.
+        let live_schema = table
+            .schema()
+            .await
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        require_chunker_version(&live_schema)?;
         Ok(Self {
             db: db.clone(),
             table,
@@ -122,6 +135,9 @@ impl SearchTable {
         // Newest document revision per (generation, memory, fingerprint) group.
         let mut newest: std::collections::BTreeMap<(u64, String, u64), u64> =
             std::collections::BTreeMap::new();
+        // Published chunker versions per group (same-revision migration).
+        let mut versions: std::collections::BTreeMap<(u64, String, u64), Vec<String>> =
+            std::collections::BTreeMap::new();
         for row in rows {
             let key = (
                 row.store_generation.as_u64(),
@@ -129,9 +145,13 @@ impl SearchTable {
                 row.model_fingerprint.as_u64(),
             );
             newest
-                .entry(key)
+                .entry(key.clone())
                 .and_modify(|m| *m = (*m).max(row.document_revision.as_u64()))
                 .or_insert_with(|| row.document_revision.as_u64());
+            let vers = versions.entry(key).or_default();
+            if !vers.contains(&row.chunker_version) {
+                vers.push(row.chunker_version.clone());
+            }
         }
 
         let reader = Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
@@ -149,13 +169,32 @@ impl SearchTable {
             .await
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
 
-        // Drop superseded revisions for every group we just published.
+        // Drop superseded revisions for every group we just published, plus
+        // same-revision rows from superseded chunking policies: a policy
+        // change republishes the revision under a new version, and the old
+        // policy's chunk ids must not linger as current (RQ-08).
         for ((generation, memory_id, fingerprint), max_rev) in &newest {
             let filter = format!(
                 "store_generation = {} AND memory_id = '{}' AND model_fingerprint = {} AND document_revision < {}",
                 generation, memory_id, fingerprint, max_rev
             );
             self.delete_where(&filter).await?;
+            let kept_key = (*generation, memory_id.clone(), *fingerprint);
+            let kept: Vec<String> = versions
+                .get(&kept_key)
+                .map(|vers| vers.iter().map(|v| format!("'{v}'")).collect())
+                .unwrap_or_default();
+            if !kept.is_empty() {
+                let filter = format!(
+                    "store_generation = {} AND memory_id = '{}' AND model_fingerprint = {} AND document_revision = {} AND chunker_version NOT IN ({})",
+                    generation,
+                    memory_id,
+                    fingerprint,
+                    max_rev,
+                    kept.join(",")
+                );
+                self.delete_where(&filter).await?;
+            }
         }
         Ok(())
     }
@@ -418,6 +457,8 @@ impl SearchTable {
     }
 
     /// Reopen the underlying table handle so new commits become visible.
+    /// Re-applies the schema gate: a table swapped for a pre-versioning one
+    /// under a live handle is refused rather than misread on next query.
     pub async fn refresh(&mut self) -> DomainResult<()> {
         let table = self
             .db
@@ -426,6 +467,11 @@ impl SearchTable {
             .execute()
             .await
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let live_schema = table
+            .schema()
+            .await
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        require_chunker_version(&live_schema)?;
         self.table = table;
         Ok(())
     }
@@ -433,6 +479,30 @@ impl SearchTable {
     pub fn table(&self) -> &lancedb::table::Table {
         &self.table
     }
+}
+
+/// Schema gate shared by open and refresh: the chunker_version column must
+/// exist at its exact positional slot with the exact type, because reads
+/// are positional. Anything else risks silent column misalignment, so it is
+/// refused with a rebuild directive (the projection is derived state).
+fn require_chunker_version(schema: &SchemaRef) -> DomainResult<()> {
+    let rebuild = || {
+        DomainError::new(
+            DomainErrorCode::Validation,
+            "search table predates chunker versioning; rebuild the projection",
+        )
+    };
+    let field = schema
+        .field_with_name("chunker_version")
+        .map_err(|_| rebuild())?;
+    let at_slot = schema.index_of("chunker_version").map_err(|_| rebuild())?;
+    if at_slot != 13 || field.data_type() != &DataType::Utf8 || field.is_nullable() {
+        return Err(DomainError::new(
+            DomainErrorCode::Validation,
+            "search table has an incompatible chunker_version column; rebuild the projection",
+        ));
+    }
+    Ok(())
 }
 
 fn row_batch(rows: &[SearchRow], schema: &SchemaRef) -> DomainResult<arrow_array::RecordBatch> {
@@ -518,6 +588,9 @@ fn row_batch(rows: &[SearchRow], schema: &SchemaRef) -> DomainResult<arrow_array
                 rows.iter().map(|r| r.updated_at_millis),
             )),
             Arc::new(list_array),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|r| r.chunker_version.clone()),
+            )),
         ],
     )
     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
@@ -597,6 +670,7 @@ fn batches_to_rows(batches: &[arrow_array::RecordBatch]) -> Vec<SearchRow> {
                 created_at_millis: u64c(10),
                 updated_at_millis: u64c(11),
                 embedding,
+                chunker_version: s(13),
             });
         }
     }
@@ -622,6 +696,7 @@ mod tests {
             document_revision: DocumentRevision::new(rev),
             model_fingerprint: ModelFingerprint::new(1),
             chunk_id: ChunkId::new(0),
+            chunker_version: "single-chunk-v1".to_string(),
             lexical_text: text.to_string(),
             char_start: 0,
             char_end: text.len() as u64,
@@ -647,6 +722,118 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].memory_id, eid(1));
         assert_eq!(rows[0].document_revision.as_u64(), 0);
+    }
+
+    /// The chunker version round-trips per row so policy changes stay
+    /// attributable (never silently mixed under one fingerprint).
+    #[tokio::test]
+    async fn chunker_version_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let tbl = SearchTable::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let mut a = row(1, "alpha text", 0, None);
+        a.chunker_version = "e5-chunks-v1".to_string();
+        let mut b = row(2, "beta text", 0, None);
+        b.chunker_version = "single-chunk-v1".to_string();
+        tbl.publish_rows(&[a, b]).await.unwrap();
+
+        let e5 = tbl
+            .rows_where("chunker_version = 'e5-chunks-v1'")
+            .await
+            .unwrap();
+        assert_eq!(e5.len(), 1);
+        assert_eq!(e5[0].memory_id, eid(1));
+        let single = tbl
+            .rows_where("chunker_version = 'single-chunk-v1'")
+            .await
+            .unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].memory_id, eid(2));
+    }
+
+    /// The version column is appended last: positional reads depend on it,
+    /// so its slot is pinned here, not just its name.
+    #[test]
+    fn schema_appends_chunker_version_last() {
+        let schema = search_schema(EMBEDDING_DIM);
+        assert_eq!(schema.fields().len(), 14);
+        assert_eq!(schema.fields()[13].name(), "chunker_version");
+    }
+
+    /// Same-revision policy migration converges: republishing a revision
+    /// under a new chunker version purges the old policy's chunk ids instead
+    /// of lingering mixed-policy rows as current (RQ-08).
+    #[tokio::test]
+    async fn same_revision_policy_change_purges_old_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let tbl = SearchTable::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        // Revision 0 under policy A with 3 chunks.
+        let mut set_a = Vec::new();
+        for c in 0..3u32 {
+            let mut r = row(1, &format!("chunk {c} text"), 0, None);
+            r.chunk_id = ChunkId::new(c);
+            r.chunker_version = "policy-a-v1".to_string();
+            set_a.push(r);
+        }
+        tbl.publish_rows(&set_a).await.unwrap();
+        assert_eq!(tbl.count_rows(None).await.unwrap(), 3);
+        // Same revision under policy B with 2 chunks.
+        let mut set_b = Vec::new();
+        for c in 0..2u32 {
+            let mut r = row(1, &format!("chunk {c} text"), 0, None);
+            r.chunk_id = ChunkId::new(c);
+            r.chunker_version = "policy-b-v1".to_string();
+            set_b.push(r);
+        }
+        tbl.publish_rows(&set_b).await.unwrap();
+        // Exactly the new policy's chunk set survives.
+        assert_eq!(tbl.count_rows(None).await.unwrap(), 2);
+        let kept = tbl
+            .rows_where("chunker_version = 'policy-b-v1'")
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        let stale = tbl
+            .rows_where("chunker_version = 'policy-a-v1'")
+            .await
+            .unwrap();
+        assert!(
+            stale.is_empty(),
+            "old-policy chunks must not linger as current"
+        );
+    }
+
+    /// Opening a table that predates chunker versioning fails fast with a
+    /// rebuild directive instead of misreading shifted columns.
+    #[tokio::test]
+    async fn open_rejects_table_without_chunker_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        // Craft a pre-versioning table: current schema minus the last column.
+        let full = search_schema(EMBEDDING_DIM);
+        let old = Arc::new(arrow_schema::Schema::new(
+            full.fields()[..full.fields().len() - 1].to_vec(),
+        ));
+        let db = lancedb::connect(&uri).execute().await.unwrap();
+        db.create_empty_table(SEARCH_TABLE, old)
+            .mode(lancedb::database::CreateTableMode::exist_ok(|req| req))
+            .execute()
+            .await
+            .unwrap();
+        drop(db);
+
+        let err = match SearchTable::open(&uri).await {
+            Ok(_) => panic!("opening a pre-versioning table must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("rebuild"),
+            "must direct a rebuild, got: {}",
+            err.message
+        );
     }
 
     /// RQ-08: publishing a newer revision must remove the superseded row so an
