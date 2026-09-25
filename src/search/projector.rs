@@ -323,6 +323,35 @@ impl Projector {
             .generation_under_construction(generation, self.fingerprint)
     }
 
+    /// Table-measured convergence check (cutover watermark verification):
+    /// true when every live recallable canonical memory has at least one
+    /// projected row in this generation. Lexical-only rows count (vectors
+    /// are a separate readiness dimension); deleted/invalidated memories are
+    /// excluded via the tombstone path, not required. The operator calls
+    /// this after the final build and before activation instead of trusting
+    /// the reported numerator alone.
+    pub async fn verify_generation_converged(
+        &self,
+        generation: StoreGeneration,
+    ) -> DomainResult<bool> {
+        let live: std::collections::BTreeSet<EntityId> = self
+            .repo
+            .export_snapshot()?
+            .memories
+            .into_iter()
+            .filter(|m| m.lifecycle.is_recallable())
+            .map(|m| m.id)
+            .collect();
+        if live.is_empty() {
+            return Ok(true);
+        }
+        let filter = format!("store_generation = {}", generation.as_u64());
+        let rows = self.table.rows_where(&filter).await?;
+        Ok(live
+            .iter()
+            .all(|id| rows.iter().any(|r| r.memory_id == *id)))
+    }
+
     /// Delete propagation (task 7): remove every projected row for a memory so
     /// deleted knowledge cannot be recalled or resurrected by a delayed worker.
     pub async fn propagate_deletion(&self, memory_id: EntityId) -> DomainResult<()> {
@@ -1479,5 +1508,80 @@ mod tests {
             "only the successful chunk may carry a vector"
         );
         assert!(repo.has_pending_projection(eid(1)).unwrap());
+    }
+
+    /// Table-measured convergence: every live recallable memory has at
+    /// least one row in the generation (vectors not required — lexical rows
+    /// count; deleted memories are excluded, not required).
+    #[tokio::test]
+    async fn verify_generation_converged_detects_missing() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "one", "first body");
+        add(&repo, 2, "two", "second body");
+
+        let mut p = projector(repo.clone(), table.clone());
+        // Project only the first memory.
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert_eq!(
+            p.process_job(&job).await.unwrap(),
+            ProjectorOutcome::Published
+        );
+        assert!(
+            !p.verify_generation_converged(StoreGeneration::FIRST)
+                .await
+                .unwrap(),
+            "second memory has no rows yet"
+        );
+        // Converge the second memory: now the generation is complete.
+        let job = repo.projection_job(eid(2)).unwrap().unwrap();
+        assert_eq!(
+            p.process_job(&job).await.unwrap(),
+            ProjectorOutcome::Published
+        );
+        assert!(
+            p.verify_generation_converged(StoreGeneration::FIRST)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Convergence is scoped per generation and ignores deleted memories.
+    #[tokio::test]
+    async fn verify_generation_is_scoped_and_ignores_deleted() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "one", "first body");
+        add(&repo, 2, "two", "second body");
+
+        let mut p = projector(repo.clone(), table.clone());
+        p.run_until_idle().await.unwrap();
+        assert!(
+            p.verify_generation_converged(StoreGeneration::FIRST)
+                .await
+                .unwrap()
+        );
+        // An empty generation with no rows is unconverged while live
+        // memories exist.
+        assert!(
+            !p.verify_generation_converged(StoreGeneration::new(9))
+                .await
+                .unwrap()
+        );
+        // Deleting a converged memory keeps the generation converged: the
+        // tombstone path removes its rows and it is no longer required.
+        repo.apply(
+            &ctx(3),
+            &DomainCommand::Forget {
+                id: eid(1),
+                mode: ForgetMode::Delete,
+            },
+        )
+        .unwrap();
+        p.run_until_idle().await.unwrap();
+        assert!(
+            p.verify_generation_converged(StoreGeneration::FIRST)
+                .await
+                .unwrap()
+        );
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
     }
 }
