@@ -300,7 +300,7 @@
         "T-REC-02"
       ],
       "status": "executed_partial",
-      "evidence": "CanonicalRepository: idempotent_replay_returns_recorded_receipt, key_reuse_with_different_input_is_error, unknown-outcome resolution via receipt. Fixed-expiry retry namespaces and GC deferred."
+      "evidence": "CanonicalRepository: idempotent_replay_returns_recorded_receipt, key_reuse_with_different_input_is_error, unknown-outcome resolution via receipt. Fixed-expiry retry namespaces (24h TTL, issue_namespace) + gc_expired + handshake issuance implemented with tests (namespace expiry/GC, frontend-scoped GC); periodic background GC scheduling + T-CONC-03/T-REC-02 full race matrix still deferred."
     },
     {
       "id": "RQ-07",

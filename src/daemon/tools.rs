@@ -4111,7 +4111,11 @@ fn exec_session_stats(
     let count = args.count.unwrap_or(10);
     let format = args.response_format;
 
-    let sessions = disp.registry().all_sessions_owned();
+    // One guard for the whole read: chaining disp.registry() calls in a
+    // single expression would deadlock (the first temporary guard outlives
+    // the nested lock on a non-reentrant Mutex).
+    let reg = disp.registry();
+    let sessions = reg.all_sessions_owned();
 
     // Recent completed sessions (most recent first).
     let mut completed: Vec<&Session> = sessions
@@ -4122,10 +4126,9 @@ fn exec_session_stats(
     completed.truncate(count.min(5));
 
     // Active session for this channel.
-    let active = disp
-        .registry()
+    let active = reg
         .resolve_session(envelope.frontend_id, envelope.channel_id)
-        .and_then(|h| disp.registry().session(h).cloned());
+        .and_then(|h| reg.session(h).cloned());
 
     let mut output = String::from("## Session Stats\n");
     if let Some(current) = &active {
@@ -6597,6 +6600,56 @@ mod tests {
         );
         assert!(!result_is_error(&result3));
         assert!(text_contains(&result3, "ended: success"));
+    }
+
+    #[test]
+    fn session_stats_reports_active_completed_and_empty() {
+        let stats = |disp: &Dispatcher, op: u64| {
+            let args = ToolArgs::SessionStats(SessionStatsArgs {
+                count: Some(10),
+                response_format: None,
+            });
+            run(disp, &tool_call(op, args.clone()), &args)
+        };
+        // Empty store: no sessions recorded yet.
+        let (disp, _dir) = test_dispatcher();
+        let empty = stats(&disp, 1);
+        assert!(!result_is_error(&empty));
+        assert!(result_text(&empty).contains("No past sessions recorded yet."));
+
+        // Active session with one attempt and technologies.
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string()],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(2, start.clone()), &start);
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: "try X".to_string(),
+            outcome: "rejected".to_string(),
+            critique: None,
+            rationale: None,
+            related_memory_id: None,
+        });
+        run(&disp, &tool_call(3, attempt.clone()), &attempt);
+        let active = stats(&disp, 4);
+        assert!(!result_is_error(&active));
+        let text = result_text(&active);
+        assert!(text.contains("Active session: 1 tool calls"));
+        assert!(text.contains("Technologies: rust"));
+
+        // Ended session moves to recent history.
+        let end = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "success".to_string(),
+            final_approach: None,
+            lessons: vec![],
+        });
+        run(&disp, &tool_call(5, end.clone()), &end);
+        let done = stats(&disp, 6);
+        assert!(!result_is_error(&done));
+        let text = result_text(&done);
+        assert!(text.contains("Recent sessions (1):"));
+        assert!(!text.contains("Active session:"));
     }
 
     #[test]
