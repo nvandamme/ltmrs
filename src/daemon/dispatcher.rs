@@ -93,6 +93,17 @@ impl Dispatcher {
             .check_protocol()
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
 
+        // Bounded wait: a request arriving past its deadline is refused
+        // instead of executed late (design §7.2 cancellation semantics).
+        if let Some(deadline) = envelope.deadline_millis
+            && self.clock.now_millis() >= deadline
+        {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "deadline exceeded before dispatch",
+            ));
+        }
+
         // Resolve the channel's active session (never a daemon-global session).
         let session = {
             let reg = self.registry.lock().unwrap();
@@ -335,5 +346,29 @@ mod tests {
         env.protocol_version = 99;
         let result = disp.handle(&env);
         assert!(result.is_err());
+    }
+
+    /// A request arriving past its deadline is refused instead of executed
+    /// late (frozen clock is at 1000 here).
+    #[test]
+    fn past_deadline_refused_before_dispatch() {
+        let disp = test_dispatcher().0;
+        let mut env = envelope(fe(1), ch(1), 1, DomainRequest::ListMemories);
+        env.deadline_millis = Some(0);
+        let err = disp.handle(&env).unwrap_err();
+        assert!(
+            err.message.contains("deadline"),
+            "expired deadline must refuse, got: {}",
+            err.message
+        );
+    }
+
+    /// A future deadline proceeds normally.
+    #[test]
+    fn future_deadline_proceeds() {
+        let disp = test_dispatcher().0;
+        let mut env = envelope(fe(1), ch(1), 1, DomainRequest::ListMemories);
+        env.deadline_millis = Some(2000);
+        assert!(disp.handle(&env).is_ok());
     }
 }

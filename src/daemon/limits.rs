@@ -79,6 +79,13 @@ impl QuotaTracker {
         Ok(())
     }
 
+    /// Unregister a client, freeing its slot. Absent IDs are a no-op so a
+    /// disconnect guard can run unconditionally at connection end.
+    pub fn unregister_client(&self, frontend_id: FrontendId) {
+        let mut clients = self.clients.lock().unwrap();
+        clients.retain(|c| c != &frontend_id);
+    }
+
     /// Try to enqueue a job for a client. Fails if the per-client queue is full.
     pub fn try_enqueue(&self, frontend_id: FrontendId) -> Result<(), QuotaError> {
         let mut queued = self.queued.lock().unwrap();
@@ -203,5 +210,24 @@ mod tests {
         });
         assert!(tracker.allows_response(50));
         assert!(!tracker.allows_response(150));
+    }
+
+    #[test]
+    fn unregister_frees_client_slot() {
+        let tracker = QuotaTracker::new(ResourceLimits {
+            max_clients: 1,
+            ..Default::default()
+        });
+        tracker.register_client(fe(1)).unwrap();
+        assert_eq!(
+            tracker.register_client(fe(2)),
+            Err(QuotaError::TooManyClients)
+        );
+        tracker.unregister_client(fe(1));
+        assert!(tracker.register_client(fe(2)).is_ok());
+        assert_eq!(tracker.client_count(), 1);
+        // Unregistering an absent client is a no-op.
+        tracker.unregister_client(fe(99));
+        assert_eq!(tracker.client_count(), 1);
     }
 }

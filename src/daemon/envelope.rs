@@ -386,9 +386,12 @@ pub enum WireMessage {
 }
 
 /// A tagged wire reply: the handshake ack, a typed domain response, or a
-/// wire-level rejection (bad handshake, protocol violation).
+/// wire-level rejection (bad handshake, protocol violation). Adjacently
+/// tagged: the inner `WireError.kind` string would collide with an
+/// internally-tagged envelope (`duplicate field 'kind'`), making every
+/// rejection unparseable by the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum WireReply {
     Handshake(HandshakeResponse),
     Response(IpcResponse),

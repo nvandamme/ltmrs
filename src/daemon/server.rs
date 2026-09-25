@@ -52,6 +52,9 @@ pub struct DaemonConfig {
     pub search_path: String,
     /// Resource limits.
     pub limits: ResourceLimits,
+    /// Idle-exit timeout: serve() returns once no connection has been active
+    /// for this long. 0 (default) serves forever, preserving current behavior.
+    pub idle_timeout_millis: u64,
     /// Which embedding backend to run. Disabled by default (lexical-only).
     pub embedding: EmbeddingMode,
     /// Scheduler configuration.
@@ -116,6 +119,7 @@ pub struct Daemon {
     paths: RuntimePaths,
     sessions_path: Option<std::path::PathBuf>,
     search_path: String,
+    idle_timeout_millis: u64,
 }
 
 impl Daemon {
@@ -186,6 +190,7 @@ impl Daemon {
             paths: paths.clone(),
             sessions_path,
             search_path: config.search_path,
+            idle_timeout_millis: config.idle_timeout_millis,
         })
     }
 
@@ -287,7 +292,8 @@ impl Daemon {
         self.maintenance_worker.lock().await.is_some()
     }
 
-    /// Run the accept loop until the socket is closed or an error occurs.
+    /// Run the accept loop until the socket is closed, an error occurs, or
+    /// the idle timeout elapses with no connections (design §7.2).
     /// Uses the 0600 listener bound at startup (already permission-locked).
     pub async fn serve(&self) -> Result<(), DaemonError> {
         // Start background maintenance under its explicit budgets, if configured.
@@ -295,20 +301,100 @@ impl Daemon {
 
         let listener = &self.runtime.listener;
 
+        if self.idle_timeout_millis == 0 {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let dispatcher = Arc::clone(&self.dispatcher);
+                        let quotas = Arc::clone(&self.quotas);
+                        tokio::spawn(async move {
+                            let _ = handle_connection(stream, dispatcher, quotas).await;
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        // Idle-exit mode: bound each accept wait by the timeout, then exit
+        // once no connection has been active for the window. Precision is
+        // one timeout granularity — fine for a hygiene shutdown.
+        let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::daemon::idle::IdleExitTracker::new(wall_now_millis()),
+        ));
         loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
+            let wait = tokio::time::timeout(
+                std::time::Duration::from_millis(self.idle_timeout_millis),
+                listener.accept(),
+            )
+            .await;
+            match wait {
+                Ok(Ok((stream, _))) => {
+                    tracker.lock().unwrap().note_connect(wall_now_millis());
                     let dispatcher = Arc::clone(&self.dispatcher);
                     let quotas = Arc::clone(&self.quotas);
+                    let tracker = std::sync::Arc::clone(&tracker);
                     tokio::spawn(async move {
+                        // Disconnect is noted via Drop so a panicking
+                        // connection cannot wedge the counter (which would
+                        // disable idle-exit forever — fail-safe is to exit).
+                        struct DropNote {
+                            tracker: std::sync::Arc<
+                                std::sync::Mutex<crate::daemon::idle::IdleExitTracker>,
+                            >,
+                        }
+                        impl Drop for DropNote {
+                            fn drop(&mut self) {
+                                // Never panic in Drop (would abort during
+                                // unwinding): a poisoned mutex just skips.
+                                if let Ok(mut t) = self.tracker.lock() {
+                                    t.note_disconnect(wall_now_millis());
+                                }
+                            }
+                        }
+                        let _note = DropNote { tracker };
                         let _ = handle_connection(stream, dispatcher, quotas).await;
                     });
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    let t = tracker.lock().unwrap();
+                    if t.should_exit(wall_now_millis(), self.idle_timeout_millis) {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
+}
+
+/// Wall-clock millis for idle tracking (same shape as the maintenance
+/// retention clock; serve has no injected clock by design).
+fn wall_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Same-user IPC boundary (design §7.1): the peer's UID must equal ours.
+/// The 0600 socket already restricts access; this closes the remainder
+/// (permissive umask at bind, fd passing). Raw UIDs, no exceptions — not
+/// even root connecting elsewhere.
+fn peer_authorized(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid
+}
+
+/// Reject connections from other UIDs before reading any frame.
+fn check_peer_cred(stream: &tokio::net::UnixStream) -> Result<(), DaemonError> {
+    let peer = stream.peer_cred().map_err(DaemonError::from)?.uid();
+    // SAFETY: geteuid takes no arguments and only reads process state.
+    if !peer_authorized(peer, unsafe { libc::geteuid() }) {
+        return Err(DaemonError::Ipc(IpcError::Unauthorized));
+    }
+    Ok(())
 }
 
 /// Handle a single client connection: read frames, dispatch, write responses.
@@ -319,20 +405,53 @@ pub async fn handle_connection(
     dispatcher: Arc<Dispatcher>,
     quotas: Arc<QuotaTracker>,
 ) -> Result<(), DaemonError> {
+    // Same-user boundary first: never read a frame from another UID.
+    if let Err(e) = check_peer_cred(&stream) {
+        let err = WireError {
+            kind: "unauthorized".into(),
+            message: e.to_string(),
+        };
+        write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+        return Ok(());
+    }
     let mut buf = Vec::with_capacity(4096);
+
+    // Released at connection end on every path below: assigned after a
+    // successful handshake, dropped when this function returns.
+    let _client_guard: Option<ClientGuard>;
+    // Handshake-authenticated frontend; every later frame must carry it.
+    let authed: Option<crate::domain::id::FrontendId>;
 
     // ---- Handshake: the first frame on every connection ----
     let first = read_wire_frame(&mut stream, &mut buf).await?;
     match first {
         WireMessage::Handshake(req) => {
+            let frontend = req.frontend_id;
             let dispatcher = Arc::clone(&dispatcher);
             let result = tokio::task::spawn_blocking(move || dispatcher.handle_handshake(&req))
                 .await
                 .unwrap_or_else(|e| Err(IpcError::from(std::io::Error::other(e.to_string()))));
             match result {
                 Ok(hs) => {
+                    // Admit the client to the quota table; a full table
+                    // rejects instead of over-admitting (RQ-22).
+                    if let Err(qe) = quotas.register_client(frontend) {
+                        let err = WireError {
+                            kind: "client_limit_reached".into(),
+                            message: qe.to_string(),
+                        };
+                        write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+                        return Ok(());
+                    }
+                    // Free the client's quota slot at connection end on every
+                    // path below. Bound to the handshake-authenticated ID, not
+                    // request-claimed ones; parallel connections of one
+                    // frontend share a slot (approximate by design: the first
+                    // disconnect frees it while a sibling is still active).
+                    _client_guard = Some(ClientGuard::new(Arc::clone(&quotas), frontend));
+                    authed = Some(frontend);
                     let reply = WireReply::Handshake(hs);
-                    write_reply(&mut stream, &reply).await?;
+                    write_reply(&mut stream, &reply, &quotas).await?;
                 }
                 Err(e) => {
                     // Rejected handshake: send a wire error and close.
@@ -340,7 +459,7 @@ pub async fn handle_connection(
                         kind: "handshake_rejected".into(),
                         message: e.to_string(),
                     };
-                    write_reply(&mut stream, &WireReply::Error(err)).await?;
+                    write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
                     return Ok(());
                 }
             }
@@ -351,11 +470,13 @@ pub async fn handle_connection(
                 kind: "handshake_required".into(),
                 message: "first frame must be a handshake".into(),
             };
-            write_reply(&mut stream, &WireReply::Error(err)).await?;
+            write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
             return Ok(());
         }
     }
 
+    // Free the client's quota slot at connection end on every path below.
+    // (Guard created in the handshake arm above.)
     // ---- Request loop ----
     loop {
         let msg = match read_wire_frame(&mut stream, &mut buf).await {
@@ -373,16 +494,38 @@ pub async fn handle_connection(
                     kind: "unexpected_handshake".into(),
                     message: "handshake already completed".into(),
                 };
-                write_reply(&mut stream, &WireReply::Error(err)).await?;
+                write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
                 continue;
             }
         };
+        // Bind every frame to the handshake identity (RQ-05): a frame
+        // claiming another frontend is a protocol violation, never routed
+        // into its session namespace or quota bucket.
+        if Some(envelope.frontend_id) != authed {
+            let err = WireError {
+                kind: "frontend_mismatch".into(),
+                message: "frame frontend differs from handshake identity".into(),
+            };
+            write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+            continue;
+        }
+        // (Client slot was bound to the handshake ID by the guard above.)
 
         // Enforce the per-client quota: visible backpressure, not unbounded work.
         if let Err(qe) = quotas.try_enqueue(envelope.frontend_id) {
             let busy = DomainError::new(DomainErrorCode::Validation, format!("backpressure: {qe}"));
             let resp = IpcResponse::error(envelope.operation_id, &busy);
-            write_reply(&mut stream, &WireReply::Response(resp)).await?;
+            write_reply(&mut stream, &WireReply::Response(resp), &quotas).await?;
+            continue;
+        }
+
+        // In-flight storage bound: refuse visibly instead of piling up
+        // blocking work beyond the configured concurrency.
+        if let Err(qe) = quotas.try_start_storage() {
+            quotas.dequeue(envelope.frontend_id);
+            let busy = DomainError::new(DomainErrorCode::Validation, format!("backpressure: {qe}"));
+            let resp = IpcResponse::error(envelope.operation_id, &busy);
+            write_reply(&mut stream, &WireReply::Response(resp), &quotas).await?;
             continue;
         }
 
@@ -403,10 +546,31 @@ pub async fn handle_connection(
             Ok(r) => r,
             Err(e) => IpcResponse::error(op_id, &e),
         };
+        quotas.finish_storage();
         quotas.dequeue(fe_id);
 
         // Write the response.
-        write_reply(&mut stream, &WireReply::Response(response)).await?;
+        write_reply(&mut stream, &WireReply::Response(response), &quotas).await?;
+    }
+}
+
+/// Unregisters the connection's frontend from the quota table on drop, so a
+/// disconnect frees its client slot on every return path above. Bound to the
+/// handshake-authenticated ID at construction (never request-claimed IDs).
+struct ClientGuard {
+    quotas: Arc<QuotaTracker>,
+    frontend: crate::domain::id::FrontendId,
+}
+
+impl ClientGuard {
+    fn new(quotas: Arc<QuotaTracker>, frontend: crate::domain::id::FrontendId) -> Self {
+        Self { quotas, frontend }
+    }
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.quotas.unregister_client(self.frontend);
     }
 }
 
@@ -438,8 +602,27 @@ async fn read_wire_frame(
 async fn write_reply(
     stream: &mut tokio::net::UnixStream,
     reply: &WireReply,
+    quotas: &QuotaTracker,
 ) -> Result<(), DaemonError> {
     let payload = serde_json::to_vec(reply)?;
+    // Response byte budget (RQ-22): oversized data responses are refused
+    // explicitly, never silently truncated. Control replies (handshake,
+    // errors) always pass — they are small by construction and required
+    // for the protocol to report failures at all.
+    if matches!(reply, WireReply::Response(_)) && !quotas.allows_response(payload.len()) {
+        let too_big = DomainError::new(
+            DomainErrorCode::Validation,
+            format!("response exceeds budget ({} bytes)", payload.len()),
+        );
+        let op_id = match reply {
+            WireReply::Response(resp) => resp.operation_id,
+            _ => unreachable!("checked above"),
+        };
+        let fallback = WireReply::Response(IpcResponse::error(op_id, &too_big));
+        let payload = serde_json::to_vec(&fallback)?;
+        write_response_payload(stream, &payload).await?;
+        return Ok(());
+    }
     write_response_payload(stream, &payload).await?;
     Ok(())
 }
@@ -462,6 +645,22 @@ mod tests {
         let config = DaemonConfig::default();
         assert!(config.store_path.is_empty());
         assert!(config.limits.max_clients > 0);
+        assert_eq!(config.idle_timeout_millis, 0, "serve forever by default");
+    }
+
+    /// Same-user IPC boundary: a connected peer with our UID passes.
+    #[test]
+    fn peer_authorized_matches_uids() {
+        assert!(peer_authorized(1000, 1000));
+        assert!(!peer_authorized(0, 1000));
+        assert!(!peer_authorized(1000, 0));
+    }
+
+    /// A live socket pair shares our UID, so the peer check passes.
+    #[tokio::test]
+    async fn peer_cred_same_uid_passes() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        assert!(check_peer_cred(&a).is_ok());
     }
 
     /// The maintenance worker spawns when a search path is configured and is
@@ -550,6 +749,303 @@ mod tests {
         // The lock is held; a second start must fail.
         let result = Daemon::start(&paths, config).await;
         assert!(result.is_err());
+    }
+
+    /// Test dispatcher with explicit quotas (bypasses Daemon::start, which
+    /// always uses the configured limits).
+    fn test_dispatcher_with_quotas(
+        dir: &tempfile::TempDir,
+        quotas: std::sync::Arc<crate::daemon::limits::QuotaTracker>,
+    ) -> (
+        std::sync::Arc<crate::daemon::dispatcher::Dispatcher>,
+        std::sync::Arc<crate::daemon::limits::QuotaTracker>,
+    ) {
+        use crate::daemon::dispatcher::Dispatcher;
+        use crate::daemon::registry::FrontendRegistry;
+        use crate::service::repository::CanonicalRepository;
+
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        repo.issue_namespace(FrontendId::new(Uuid::from_u128(1)), 1000)
+            .unwrap();
+        (
+            Arc::new(Dispatcher::new(repo, FrontendRegistry::new(), clock)),
+            quotas,
+        )
+    }
+
+    fn handshake_as(fe_n: u64) -> crate::daemon::envelope::HandshakeRequest {
+        crate::daemon::envelope::HandshakeRequest {
+            protocol_version: crate::daemon::envelope::PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: FrontendId::new(Uuid::from_u128(fe_n as u128)),
+            channel_id: ChannelId::new(Uuid::from_u128(2)),
+        }
+    }
+
+    /// A full client table rejects new handshakes instead of over-admitting.
+    #[tokio::test]
+    async fn handshake_rejected_when_client_limit_reached() {
+        use crate::daemon::client::IpcClient;
+        use crate::daemon::limits::{QuotaTracker, ResourceLimits};
+
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = Arc::new(QuotaTracker::new(ResourceLimits {
+            max_clients: 1,
+            ..Default::default()
+        }));
+        // Fill the single slot with another frontend.
+        quotas
+            .register_client(FrontendId::new(Uuid::from_u128(99)))
+            .unwrap();
+        let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_stream);
+        let err = client.handshake(&handshake_as(1)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("limit")
+                || err.to_string().contains("reject")
+                || err.to_string().contains("handshake"),
+            "full table must reject, got: {err}"
+        );
+        let _ = server.await;
+    }
+
+    /// The client slot is held for the whole connection: a second client is
+    /// rejected while the first is connected, and admitted after it
+    /// disconnects (no sleeps — EOF drives every transition).
+    #[tokio::test]
+    async fn client_slot_held_during_connection() {
+        use crate::daemon::client::IpcClient;
+        use crate::daemon::limits::{QuotaTracker, ResourceLimits};
+
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = Arc::new(QuotaTracker::new(ResourceLimits {
+            max_clients: 1,
+            ..Default::default()
+        }));
+        let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
+
+        // First client connects: slot held.
+        let (a_stream, a_server) = tokio::net::UnixStream::pair().unwrap();
+        let a_task = tokio::spawn(handle_connection(
+            a_server,
+            Arc::clone(&dispatcher),
+            Arc::clone(&quotas),
+        ));
+        let mut client_a = IpcClient::new(std::path::PathBuf::from("unused"));
+        client_a.set_stream(a_stream);
+        client_a.handshake(&handshake_as(1)).await.unwrap();
+        assert_eq!(quotas.client_count(), 1);
+
+        // Second client rejected while the first is live.
+        let (b_stream, b_server) = tokio::net::UnixStream::pair().unwrap();
+        let b_task = tokio::spawn(handle_connection(
+            b_server,
+            Arc::clone(&dispatcher),
+            Arc::clone(&quotas),
+        ));
+        let mut client_b = IpcClient::new(std::path::PathBuf::from("unused"));
+        client_b.set_stream(b_stream);
+        assert!(client_b.handshake(&handshake_as(2)).await.is_err());
+        let _ = b_task.await;
+
+        // First disconnects: slot freed, third client admitted.
+        client_a.close();
+        let _ = a_task.await;
+        assert_eq!(quotas.client_count(), 0);
+        let (c_stream, c_server) = tokio::net::UnixStream::pair().unwrap();
+        let c_task = tokio::spawn(handle_connection(
+            c_server,
+            Arc::clone(&dispatcher),
+            Arc::clone(&quotas),
+        ));
+        let mut client_c = IpcClient::new(std::path::PathBuf::from("unused"));
+        client_c.set_stream(c_stream);
+        client_c.handshake(&handshake_as(3)).await.unwrap();
+        client_c.close();
+        let _ = c_task.await;
+    }
+
+    /// Frames claiming another frontend than the handshake are rejected
+    /// before dispatch (RQ-05 channel binding).
+    #[tokio::test]
+    async fn mismatched_frame_frontend_rejected() {
+        use crate::daemon::client::IpcClient;
+
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = Arc::new(crate::daemon::limits::QuotaTracker::new(
+            crate::daemon::limits::ResourceLimits::default(),
+        ));
+        let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let _server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_stream);
+        client.handshake(&handshake_as(1)).await.unwrap();
+        // Same channel, forged frontend: must not route.
+        let mut env = IpcEnvelope {
+            protocol_version: crate::daemon::envelope::PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: FrontendId::new(Uuid::from_u128(1)),
+            channel_id: ChannelId::new(Uuid::from_u128(2)),
+            operation_id: OperationId::new(Uuid::from_u128(10)),
+            session: None,
+            retry_epoch: 1,
+            deadline_millis: None,
+            scope: Scope::default(),
+            body: DomainRequest::ListMemories,
+        };
+        env.frontend_id = FrontendId::new(Uuid::from_u128(99));
+        assert!(
+            client.roundtrip(&env).await.is_err(),
+            "forged frontend frame must be rejected"
+        );
+    }
+
+    /// In-flight storage exhaustion answers busy instead of queueing
+    /// unboundedly.
+    #[tokio::test]
+    async fn storage_busy_answers_backpressure() {
+        use crate::daemon::client::IpcClient;
+        use crate::daemon::envelope::IpcResult;
+        use crate::daemon::limits::{QuotaTracker, ResourceLimits};
+
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = Arc::new(QuotaTracker::new(ResourceLimits {
+            max_in_flight_storage: 0,
+            ..Default::default()
+        }));
+        let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let _server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_stream);
+        client.handshake(&handshake_as(1)).await.unwrap();
+        let env = DomainRequest::ListMemories;
+        let envelope = IpcEnvelope {
+            protocol_version: crate::daemon::envelope::PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: FrontendId::new(Uuid::from_u128(1)),
+            channel_id: ChannelId::new(Uuid::from_u128(2)),
+            operation_id: OperationId::new(Uuid::from_u128(1)),
+            session: None,
+            retry_epoch: 1,
+            deadline_millis: None,
+            scope: Scope::default(),
+            body: env,
+        };
+        let resp = client.roundtrip(&envelope).await.unwrap();
+        match resp.result {
+            IpcResult::Error { message, .. } => assert!(
+                message.contains("backpressure") || message.contains("busy"),
+                "must signal busy, got: {message}"
+            ),
+            other => panic!("expected busy error, got: {other:?}"),
+        }
+    }
+
+    /// Responses beyond the byte budget are refused explicitly, never
+    /// truncated: seed enough content to overflow a tiny budget, then a
+    /// list read comes back as an explicit error (control replies such as
+    /// the handshake itself always pass — they are small by construction).
+    #[tokio::test]
+    async fn oversized_response_is_refused_not_truncated() {
+        use crate::daemon::client::IpcClient;
+        use crate::daemon::envelope::{HandshakeRequest, PROTOCOL_VERSION};
+        use crate::daemon::limits::{QuotaTracker, ResourceLimits};
+
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = Arc::new(QuotaTracker::new(ResourceLimits {
+            max_response_bytes: 512,
+            ..Default::default()
+        }));
+        let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_stream);
+        let hs = client
+            .handshake(&HandshakeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: fe(1),
+                channel_id: ch(1),
+            })
+            .await
+            .unwrap();
+        // Seed five memories (~2KB of list output, far over the budget).
+        for n in 1..=5u64 {
+            let env = IpcEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: fe(1),
+                channel_id: ch(1),
+                operation_id: op(10 + n),
+                session: None,
+                retry_epoch: hs.retry_epoch,
+                deadline_millis: None,
+                scope: Scope::default(),
+                body: DomainRequest::AddMemory {
+                    memory: test_memory(n),
+                },
+            };
+            client.roundtrip(&env).await.unwrap();
+        }
+        // The list response overflows the budget: explicit error, not a
+        // silently truncated payload.
+        let env = IpcEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(1),
+            channel_id: ch(1),
+            operation_id: op(99),
+            session: None,
+            retry_epoch: hs.retry_epoch,
+            deadline_millis: None,
+            scope: Scope::default(),
+            body: DomainRequest::ListMemories,
+        };
+        let resp = client.roundtrip(&env).await.unwrap();
+        match resp.result {
+            crate::daemon::envelope::IpcResult::Error { message, .. } => assert!(
+                message.contains("exceeds budget"),
+                "over-budget list must be refused, got: {message}"
+            ),
+            other => panic!("expected budget error, got: {other:?}"),
+        }
+        drop(client);
+        let _ = server.await;
+    }
+
+    /// serve() exits when the idle timeout elapses with no connections
+    /// (outer timeout guards against hanging here forever).
+    #[tokio::test]
+    async fn serve_exits_on_idle_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "idle-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            idle_timeout_millis: 50,
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), daemon.serve())
+            .await
+            .expect("serve must exit on idle timeout, not hang")
+            .unwrap();
     }
 
     // ---- Cancellation / receipt-survives-connection-loss (T-CONC-04) ----
