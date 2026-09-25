@@ -169,7 +169,7 @@ pub struct SearchIdentity {
 pub struct ModelFingerprint(u64);
 
 impl ModelFingerprint {
-    pub fn new(value: u64) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
     pub fn as_u64(&self) -> u64 {

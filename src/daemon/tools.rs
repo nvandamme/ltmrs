@@ -632,6 +632,10 @@ fn recall_browse(disp: &Dispatcher, args: &MemoryReadArgs) -> DomainResult<Vec<M
                 min_confidence: args.min_confidence,
                 ..Default::default()
             },
+            // An attached backend means dense retrieval is available: run
+            // the dense leg in the pinned E5 space (empty tables yield no
+            // dense hits and fall back gracefully below).
+            model_fingerprint: Some(crate::embeddings::e5_small::E5_SMALL_FINGERPRINT),
             result_limit: 100,
             ..Default::default()
         };
@@ -2230,6 +2234,9 @@ fn exec_semantic_search(
                 all_projects: false,
                 ..Default::default()
             },
+            // Dense leg in the pinned E5 space when a backend is attached;
+            // no backend (or no dense hits) falls back to lexical below.
+            model_fingerprint: Some(crate::embeddings::e5_small::E5_SMALL_FINGERPRINT),
             result_limit: top_k + offset,
             ..Default::default()
         };
@@ -4756,6 +4763,76 @@ mod tests {
             out.len(),
             1,
             "empty backend must fall back to the snapshot scan"
+        );
+    }
+
+    /// Fingerprint plumbing: with a backend attached, browse requests run
+    /// the dense leg (embedder invoked once) instead of skipping it for a
+    /// missing fingerprint. Empty table → fallback results, dense attempted.
+    #[tokio::test]
+    async fn recall_browse_passes_fingerprint_to_dense_leg() {
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::table::SearchTable;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Plumbed Fragment\n\n### Context\nDense leg must run.",
+        );
+
+        // Empty table behind a counting embedder.
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder = Arc::new(ClosureEmbedder::new({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![0.0; 384])
+            }
+        }));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+        let args = MemoryReadArgs {
+            query: Some("plumbed".to_string()),
+            all: true,
+            ..Default::default()
+        };
+
+        let out = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.len(), 1, "empty table falls back to the snapshot");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "attached backend must run the dense leg"
         );
     }
 

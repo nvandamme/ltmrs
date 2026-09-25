@@ -12,10 +12,19 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use tokenizers::{Encoding, Tokenizer};
 
+use crate::domain::id::ModelFingerprint;
 use crate::embeddings::artifacts::{ArtifactCache, ArtifactError, ArtifactResult, HttpClient};
 use crate::embeddings::bert_impl::{BertConfig, BertModel};
 use crate::embeddings::manifest::{ModelRecipe, e5_small_artifact, e5_small_recipe};
 use crate::embeddings::recipe::{Normalization, Role};
+
+/// Canonical fingerprint for requests in the E5-small vector space (AD-04:
+/// never mix vectors across spaces). Pins the request side to the same
+/// namespace the test fixtures and staged generation records already use
+/// by value; the production projector must take the same value when it is
+/// wired. Changing the model or recipe requires a new value, while
+/// chunking-policy changes bump only the chunker version.
+pub const E5_SMALL_FINGERPRINT: ModelFingerprint = ModelFingerprint::new(1);
 
 /// A single embedding request: text plus its role (determines the prefix).
 #[derive(Debug, Clone)]
