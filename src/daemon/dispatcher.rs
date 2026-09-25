@@ -214,6 +214,11 @@ impl Dispatcher {
         self.repo.as_ref()
     }
 
+    /// Shared ownership of the repository (for maintenance wiring).
+    pub fn repo_arc(&self) -> Arc<CanonicalRepository> {
+        Arc::clone(&self.repo)
+    }
+
     /// Access the search backend (WP-08 semantic retrieval), if attached.
     pub fn search(&self) -> Option<&SearchBackend> {
         self.search.as_deref()

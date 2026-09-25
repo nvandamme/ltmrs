@@ -22,3 +22,4 @@
 *.lemma-backup
 *.ltmrs-backup
 /models-cache/
+/prompt impl.md

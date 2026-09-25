@@ -260,7 +260,8 @@ impl Daemon {
         }
         match SearchTable::open(&self.search_path).await {
             Ok(table) => {
-                let sched = MaintenanceScheduler::new(table, self.maintenance_config);
+                let sched = MaintenanceScheduler::new(table, self.maintenance_config)
+                    .with_repo(self.dispatcher.repo_arc());
                 *mw = Some(sched.spawn());
             }
             Err(e) => eprintln!(

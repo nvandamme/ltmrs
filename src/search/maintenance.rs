@@ -6,6 +6,7 @@
 //! `MaintenanceBudget`; snapshot protection keeps a version alive while any
 //! reader may still hold it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -22,6 +23,9 @@ pub struct MaintenanceConfig {
     pub interval: Duration,
     /// Explicit resource budgets applied to every pass.
     pub budget: MaintenanceBudget,
+    /// Retired-generation retention before the reaper deletes rows.
+    /// Fresh-retired rows stay for rollback until this age.
+    pub generation_retain_millis: u64,
 }
 
 impl Default for MaintenanceConfig {
@@ -29,6 +33,7 @@ impl Default for MaintenanceConfig {
         Self {
             interval: Duration::from_secs(300),
             budget: MaintenanceBudget::default(),
+            generation_retain_millis: 7 * 24 * 60 * 60 * 1000, // 7 days
         }
     }
 }
@@ -48,21 +53,29 @@ pub enum PassOutcome {
 pub struct MaintenanceScheduler {
     table: SearchTable,
     config: MaintenanceConfig,
+    repo: Option<Arc<CanonicalRepository>>,
 }
 
 impl MaintenanceScheduler {
     pub fn new(table: SearchTable, config: MaintenanceConfig) -> Self {
-        Self { table, config }
+        Self {
+            table,
+            config,
+            repo: None,
+        }
+    }
+
+    /// Attach the canonical repository so passes also reap expired retired
+    /// generations. Without it, passes only optimize (generation rows stay).
+    pub fn with_repo(mut self, repo: Arc<CanonicalRepository>) -> Self {
+        self.repo = Some(repo);
+        self
     }
 
     /// Run one maintenance pass (optimization + retention under the budget).
     /// Exposed separately so tests and shutdown can drive it deterministically.
     pub async fn run_pass(&self) -> DomainResult<PassOutcome> {
-        // Snapshot protection is enforced inside optimize_with_budgets: pruning
-        // never removes a version younger than `retain_millis`, so any reader
-        // that opened the table within the retention window keeps its files.
-        self.table.optimize_with_budgets(self.config.budget).await?;
-        Ok(PassOutcome::Completed)
+        maintenance_pass(&self.table, &self.config, self.repo.as_deref()).await
     }
 
     /// Spawn the background loop. The returned handle must be aborted on daemon
@@ -71,10 +84,11 @@ impl MaintenanceScheduler {
     pub fn spawn(&self) -> JoinHandle<()> {
         let table = self.table.clone();
         let config = self.config;
+        let repo = self.repo.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(config.interval).await;
-                if let Err(e) = table.optimize_with_budgets(config.budget).await {
+                if let Err(e) = maintenance_pass(&table, &config, repo.as_deref()).await {
                     // A failed maintenance pass must not kill the daemon: log and
                     // retry on the next tick. Canonical state is untouched either
                     // way (design §8.1); derived cleanup is always recoverable.
@@ -108,6 +122,40 @@ impl MaintenanceScheduler {
     pub fn budget(&self) -> MaintenanceBudget {
         self.config.budget
     }
+}
+
+/// One maintenance pass body shared by run_pass and the spawned loop:
+/// budgeted optimization, then expired-retired-generation reaping where a
+/// repository is attached. Snapshot protection is enforced inside
+/// optimize_with_budgets: pruning never removes a version younger than
+/// `retain_millis`, so any reader that opened the table within the
+/// retention window keeps its files.
+async fn maintenance_pass(
+    table: &SearchTable,
+    config: &MaintenanceConfig,
+    repo: Option<&CanonicalRepository>,
+) -> DomainResult<PassOutcome> {
+    table.optimize_with_budgets(config.budget).await?;
+    if let Some(repo) = repo {
+        reap_retired_generations(
+            table,
+            repo,
+            wall_now_millis(),
+            config.generation_retain_millis,
+        )
+        .await?;
+    }
+    Ok(PassOutcome::Completed)
+}
+
+/// Wall-clock millis for retention measurements (production clock; tests
+/// control retirement timestamps through the repository's frozen clock and
+/// pass explicit `now` to the reaper directly).
+fn wall_now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Reap expired retired generations (design §12.3 rollback retention): delete
@@ -255,6 +303,7 @@ mod tests {
                     max_compact_bytes_per_file: 1024 * 1024,
                     retain_millis: 3_600_000, // 1 hour retention
                 },
+                generation_retain_millis: 3_600_000,
             },
         );
         assert_eq!(sched.run_pass().await.unwrap(), PassOutcome::Completed);
@@ -335,6 +384,7 @@ mod tests {
             MaintenanceConfig {
                 interval: std::time::Duration::from_secs(60),
                 budget: MaintenanceBudget::default(),
+                generation_retain_millis: MaintenanceConfig::default().generation_retain_millis,
             },
         );
         let handle = sched.spawn();
@@ -353,6 +403,94 @@ mod tests {
         let (_repo, table, _guard) = env().await;
         let sched = MaintenanceScheduler::new(table, MaintenanceConfig::default());
         assert_eq!(sched.run_until_idle(3).await.unwrap(), 3);
+    }
+
+    /// A wired scheduler reaps expired retired generations on every pass:
+    /// retired-at is frozen-clock old, wall-clock now is far later, so the
+    /// retention window has always elapsed in this setup.
+    #[tokio::test]
+    async fn run_pass_reaps_expired_retired_generations() {
+        use crate::domain::id::{ModelFingerprint as Fp, StoreGeneration as Gen};
+
+        let (repo, table, _guard) = env().await;
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n),
+                &DomainCommand::AddMemory {
+                    memory: memory(n),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        let mut p1 = crate::search::projector::Projector::new(
+            Arc::clone(&repo),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 384 }),
+            Fp::new(1),
+            Gen::FIRST,
+        );
+        p1.run_until_idle().await.unwrap();
+        assert_eq!(table.count_rows(None).await.unwrap(), 2);
+
+        // Cut over: generation 1 retires at frozen t=1000.
+        let gen2 = repo.stage_generation(Fp::new(2)).unwrap();
+        repo.note_generation_progress(gen2, 2).unwrap();
+        repo.activate_generation(gen2).unwrap();
+
+        let sched = MaintenanceScheduler::new(table.clone(), MaintenanceConfig::default())
+            .with_repo(Arc::clone(&repo));
+        sched.run_pass().await.unwrap();
+        assert_eq!(
+            table
+                .count_rows(Some("store_generation = 1"))
+                .await
+                .unwrap(),
+            0,
+            "expired retired generation must be reaped on a pass"
+        );
+        assert_eq!(repo.store_generation().unwrap(), gen2);
+    }
+
+    /// An unwired scheduler changes nothing about generations: the reaper
+    /// only runs where a repository is attached.
+    #[tokio::test]
+    async fn run_pass_without_repo_skips_reaping() {
+        use crate::domain::id::{ModelFingerprint as Fp, StoreGeneration as Gen};
+
+        let (repo, table, _guard) = env().await;
+        repo.apply(
+            &ctx(1),
+            &DomainCommand::AddMemory {
+                memory: memory(1),
+                session: None,
+            },
+        )
+        .unwrap();
+        let mut p1 = crate::search::projector::Projector::new(
+            Arc::clone(&repo),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 384 }),
+            Fp::new(1),
+            Gen::FIRST,
+        );
+        p1.run_until_idle().await.unwrap();
+        let gen2 = repo.stage_generation(Fp::new(2)).unwrap();
+        repo.note_generation_progress(gen2, 1).unwrap();
+        repo.activate_generation(gen2).unwrap();
+
+        MaintenanceScheduler::new(table.clone(), MaintenanceConfig::default())
+            .run_pass()
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .count_rows(Some("store_generation = 1"))
+                .await
+                .unwrap(),
+            1,
+            "unwired passes must not reap"
+        );
     }
 
     /// The reaper deletes only expired retired generations: fresh-retired
