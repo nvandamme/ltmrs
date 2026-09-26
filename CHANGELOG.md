@@ -5,6 +5,9 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 3956c3b (2026-09-26) — WP-10a CLI parser with help/version and real library output
+
+
 ## 2a72460 (2026-09-26) — whole-learning-workflow trace through tool handlers
 
 

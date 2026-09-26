@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod compatibility;
 pub mod config;
 pub mod daemon;

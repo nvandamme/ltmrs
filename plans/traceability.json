@@ -288,7 +288,7 @@
         "T-SESS-02"
       ],
       "status": "executed_partial",
-      "evidence": "WP-04: registry per-(frontend,channel) session binding, no daemon-global session, lease expiry. WP-09: session_start/attempt/end route by (frontend,channel) via registry; session_end_is_retry_safe_no_double_count proves a retried end is rejected before guide evaluation. IPC layer binds every frame to the handshake identity (frontend_mismatch rejection, mismatched_frame_frontend_rejected). T-SESS-01 (32-channel interleave with colliding MCP request IDs) and T-SESS-02 (reconnect/lease/restart/subagent) still deferred to a dedicated concurrency test."
+      "evidence": "WP-04: registry per-(frontend,channel) session binding, no daemon-global session, lease expiry. WP-09: session_start/attempt/end route by (frontend,channel) via registry; session_end_is_retry_safe_no_double_count proves a retried end is rejected before guide evaluation. IPC layer binds every frame to the handshake identity (frontend_mismatch rejection, mismatched_frame_frontend_rejected). Per-channel virtual sessions for session-less calls (120s idle / 30min lifetime, upstream timeouts; traced shadows virtual; memory_add links + job re-point). T-SESS-01 (32-channel interleave with colliding MCP request IDs) and T-SESS-02 (reconnect/lease/restart/subagent) still deferred to a dedicated concurrency test."
     },
     {
       "id": "RQ-06",
@@ -409,7 +409,7 @@
         "T-CLI-01"
       ],
       "status": "executed_partial",
-      "evidence": "T-MCP-01: mcp.rs served_tools_match_frozen_schema (26 tools, verbatim baseline). T-MCP-02: tools.rs behavioral tests + 2 differential wire tests (byte-for-byte vs upstream) + stats/audit golden regression pins (honestly labeled, not upstream oracles) + error-envelope tests. T-MCP-03: mcp.rs typed routing + validation tests. T-MCP-04: read/feedback/session side-effect tests (see RQ-17). WP-09: 15 tools with behavioral tests incl. session_stats backing (empty/active/completed). T-CLI-01 deferred to WP-10 (CLI). Differential replay for the 15 WP-09 tools deferred (behavioral tests encode the contract instead)."
+      "evidence": "T-MCP-01: mcp.rs served_tools_match_frozen_schema (26 tools, verbatim baseline). T-MCP-02: tools.rs behavioral tests + 2 differential wire tests (byte-for-byte vs upstream) + stats/audit golden regression pins (honestly labeled, not upstream oracles) + error-envelope tests + whole-learning-workflow trace (recall/act/persist/practice/record/end with canonical-state attribution). T-MCP-03: mcp.rs typed routing + validation tests. T-MCP-04: read/feedback/session side-effect tests (see RQ-17). WP-09: 15 tools with behavioral tests incl. session_stats backing (empty/active/completed); dense memory preload and per-channel virtual sessions covered. T-CLI-01: CLI parser/aliases/exit-codes/help/version/-lib covered (15 parser tests, live-binary verified); visualizer/skill behavior deferred to WP-10b/c. Differential replay for the 15 WP-09 tools deferred (behavioral tests encode the contract instead)."
     },
     {
       "id": "RQ-16",

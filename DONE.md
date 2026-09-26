@@ -7,26 +7,6 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
 
 ## Unreleased Commit
 
-### WP-10a CLI parser + help/version + real -lib (uncommitted)
-
-- `src/cli.rs` (new, lib): two-phase parser — help/version short-circuit
-  anywhere (help wins), then collect-all/validate (conflicting commands
-  error either order, options bound to commands, flag-like values
-  rejected, repeats last-wins, port 1-65535, unknown/positionals error);
-  exit codes 0/1/2/3; `-lib` executes for real (explicit `--store`,
-  must-exist check so reads never create stores).
-- `src/main.rs`: thin dispatch (help/version/-lib real; stdio/visualizer/
-  skill arms explicit `Unimplemented` exit 3, never silent); stdout flush
-  before exit; errors to stderr.
-- Reviews (formal + functional): double PASS (9 checks + 8 hunts);
-  restructured from single-pass after review caught silent-precedence
-  bugs; live binary verified (help/version/usage/unimplemented/-lib).
-- Tests: 15 parser/execution pins.
-  (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test`: 435 passed, 0 failed.)
-- Notes: value-position -h quirk (documented); live-store -lib lock
-  contention needs a UX decision with the daemon-lifecycle slice.
-
 ### WP-10b managed skill installer (uncommitted)
 
 - `src/skills/installer.rs` (new) + `ltmrs_skill.md` (native asset):
