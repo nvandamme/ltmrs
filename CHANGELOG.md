@@ -5,6 +5,9 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## ad6d3a3 (2026-09-26) — per-channel virtual sessions for session-less calls
+
+
 ## 0427c3a (2026-09-26) — IPC hardening: peer-cred, deadline, quotas, idle-exit, wire fix
 
 - `src/daemon/server.rs`: same-UID peer-credential check before any frame

@@ -114,6 +114,11 @@ pub struct Session {
     pub self_critique_count: u32,
     pub started_at: Instant,
     pub ended_at: Option<Instant>,
+    /// True for implicit per-channel virtual sessions (session-less calls);
+    /// false for traced sessions. Defaults false so pre-virtual records
+    /// decode as traced, which is what they were.
+    #[serde(default)]
+    pub is_virtual: bool,
 }
 
 impl Session {

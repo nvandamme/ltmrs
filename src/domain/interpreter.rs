@@ -566,6 +566,7 @@ impl ReferenceInterpreter {
                 self_critique_count: 0,
                 started_at: Instant::new(now),
                 ended_at: None,
+                is_virtual: false,
             },
         );
     }

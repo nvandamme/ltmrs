@@ -359,7 +359,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 - [x] Port guide create/read/update/forget/merge, contexts/learnings, dependencies, deprecation and source/validation links.
 - [x] Match guide practice statistics, success/failure semantics and interactions with session completion.
-- [ ] Port traced and virtual session lifecycles per frontend channel. (traced done; virtual deferred)
+- [x] Port traced and virtual session lifecycles per frontend channel. (traced done; per-channel virtual sessions with 120s idle / 30min lifetime bounds, upstream timeouts, never daemon-global; memory_add links + job re-point)
 - [x] Persist attempts with explicit outcomes and related-memory mappings; do not infer hidden reasoning.
 - [x] Ensure session end is retry-safe and cannot double-count guide outcomes.
 - [x] Persist suggestion acceptance/dismissal and reproduce surfaced suggestion state.

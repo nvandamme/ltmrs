@@ -1189,25 +1189,49 @@ fn exec_memory_add(
     let ctx = sub_command_ctx(envelope, 0)?;
     disp.repo().apply(&ctx, &cmd)?;
 
-    // Link the created memory to the channel's active session (upstream
-    // memory_add session_link): set session_id/task_type, track memories_created.
+    // Link the created memory to session context (upstream memory_add
+    // session_link): the channel's traced session when present, else its
+    // virtual session — session-less calls are attributed per channel,
+    // never silently dropped (DEV-003: no daemon-global session).
     {
         let mut reg = disp.registry();
-        if let Some(handle) = reg.resolve_session(envelope.frontend_id, envelope.channel_id) {
-            let task_type = reg
-                .session(handle)
-                .and_then(|s| s.task_type.clone())
-                .unwrap_or_default();
-            reg.track_memories_created(
-                envelope.frontend_id,
-                envelope.channel_id,
-                std::slice::from_ref(&legacy_id),
-            );
-            let mut linked = memory.clone();
-            linked.session_id = Some(handle.as_uuid().to_string());
-            linked.task_type = Some(task_type);
-            linked.advance_document();
-            let _ = repo.put_memory_direct(&linked);
+        let handle = reg.ensure_virtual_session(
+            envelope.frontend_id,
+            envelope.channel_id,
+            disp.clock().now_millis(),
+        );
+        let task_type = reg
+            .session(handle)
+            .and_then(|s| s.task_type.clone())
+            .unwrap_or_default();
+        if let Some(s) = reg.session_mut(handle)
+            && !s.memories_created.contains(&legacy_id)
+        {
+            s.memories_created.push(legacy_id.clone());
+        }
+        let mut linked = memory.clone();
+        linked.session_id = Some(handle.as_uuid().to_string());
+        linked.task_type = Some(task_type);
+        linked.advance_document();
+        if repo.put_memory_direct(&linked).is_ok() {
+            // The link bump advances the document revision; re-point the
+            // pending job so the worker projects the linked revision
+            // instead of stalling on the pre-link one forever. Unconditional:
+            // a worker may have acknowledged the old job in between, in
+            // which case seq restarts (mirroring record_pending_projection).
+            let seq = repo
+                .projection_job(memory.id)
+                .ok()
+                .flatten()
+                .map(|j| j.seq + 1)
+                .unwrap_or(1);
+            if let Err(e) =
+                repo.enqueue_projection_job(memory.id, linked.document_revision, seq, false)
+            {
+                eprintln!("ltmrs: failed to re-point projection job: {}", e.message);
+            }
+        } else {
+            eprintln!("ltmrs: failed to persist session-linked memory");
         }
     }
 
@@ -4833,6 +4857,80 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "attached backend must run the dense leg"
+        );
+    }
+
+    /// Without a traced session, memory_add links the fragment to the
+    /// channel's virtual session (per-channel upstream parity) instead of
+    /// leaving it unlinked.
+    #[test]
+    fn memory_add_links_virtual_session_without_traced() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(
+            &disp,
+            1,
+            "## Virtual Link\n\n### Context\nUnlinked without virtual sessions.",
+        );
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        let virtual_handle = disp
+            .registry()
+            .virtual_session(fe(1), ch(1))
+            .expect("virtual session must exist after session-less add");
+        assert_eq!(
+            mems[0].session_id.as_deref(),
+            Some(virtual_handle.as_uuid().to_string()).as_deref(),
+            "fragment must link the virtual session"
+        );
+        let session = disp.registry().session(virtual_handle).unwrap().clone();
+        assert!(
+            session.is_virtual && session.memories_created.contains(&id),
+            "virtual session must track the created memory"
+        );
+    }
+
+    /// A traced session shadows the virtual one: new fragments link the
+    /// traced handle, and the virtual session stays separate.
+    #[test]
+    fn memory_add_prefers_traced_over_virtual() {
+        let (disp, _dir) = test_dispatcher();
+        let first = add_fragment(
+            &disp,
+            1,
+            "## Before Traced\n\n### Context\nLinks virtual first.",
+        );
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(2, start.clone()), &start);
+        let second = add_fragment(
+            &disp,
+            3,
+            "## After Traced\n\n### Context\nLinks traced now.",
+        );
+        let traced = disp
+            .registry()
+            .resolve_session(fe(1), ch(1))
+            .expect("traced session must be active");
+        let virtual_handle = disp
+            .registry()
+            .virtual_session(fe(1), ch(1))
+            .expect("virtual session persists alongside");
+        assert_ne!(traced, virtual_handle);
+        let get = |id: &str| {
+            let eid = disp.repo().resolve_id(id).unwrap();
+            disp.repo().get_memories(&[eid]).unwrap().pop().unwrap()
+        };
+        assert_eq!(
+            get(&first).session_id.as_deref(),
+            Some(virtual_handle.as_uuid().to_string()).as_deref()
+        );
+        assert_eq!(
+            get(&second).session_id.as_deref(),
+            Some(traced.as_uuid().to_string()).as_deref(),
+            "traced session must shadow the virtual one"
         );
     }
 

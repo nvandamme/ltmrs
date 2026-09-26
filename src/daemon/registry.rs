@@ -21,6 +21,12 @@ pub struct Lease {
     pub expires_at: u64,
 }
 
+/// Upstream virtual-session timeouts, applied per channel (never
+/// daemon-global, RV-05): idle virtual sessions finalize after 120s without
+/// a touch; no virtual session lives past 30 minutes from its start.
+pub const VIRTUAL_IDLE_TIMEOUT_MILLIS: u64 = 120_000;
+pub const VIRTUAL_LIFETIME_MILLIS: u64 = 1_800_000;
+
 /// A registered frontend channel with its bound session and lease.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChannelBinding {
@@ -28,6 +34,17 @@ pub struct ChannelBinding {
     pub channel_id: ChannelId,
     /// The bound session handle (implicit legacy or explicit native).
     pub session: Option<SessionHandle>,
+    /// The channel's virtual session for session-less calls (never shadows
+    /// a traced session; see `ensure_virtual_session`). Defaults to none so
+    /// pre-virtual snapshots load cleanly.
+    #[serde(default)]
+    pub virtual_session: Option<SessionHandle>,
+    /// Idle deadline for the virtual session above. Separate from `lease`
+    /// (which governs traced-session expiry): virtual touches must never
+    /// extend a traced session's lease, and traced cycles must never wipe
+    /// virtual idle tracking.
+    #[serde(default)]
+    pub virtual_lease: Option<Lease>,
     pub lease: Option<Lease>,
     /// Whether this channel uses an explicit native session binding.
     pub explicit: bool,
@@ -100,15 +117,22 @@ impl FrontendRegistry {
             self_critique_count: 0,
             started_at: Instant::new(now_millis),
             ended_at: None,
+            is_virtual: false,
         };
         self.sessions.insert(handle, session);
+        // The channel's virtual session (if any) survives traced cycles:
+        // attribution continuity must not reset on session_start.
+        let virtual_session = self.channels.get(&k).and_then(|b| b.virtual_session);
+        let virtual_lease = self.channels.get(&k).and_then(|b| b.virtual_lease);
         self.channels.insert(
             k,
             ChannelBinding {
                 frontend_id,
                 channel_id,
                 session: Some(handle),
+                virtual_session,
                 lease: None,
+                virtual_lease,
                 explicit: false,
             },
         );
@@ -128,13 +152,17 @@ impl FrontendRegistry {
             .get(&k)
             .map(|b| b.channel_id)
             .unwrap_or(channel_id);
+        let virtual_session = self.channels.get(&k).and_then(|b| b.virtual_session);
+        let virtual_lease = self.channels.get(&k).and_then(|b| b.virtual_lease);
         self.channels.insert(
             k,
             ChannelBinding {
                 frontend_id,
                 channel_id: existing,
                 session: Some(handle),
+                virtual_session,
                 lease: None,
+                virtual_lease,
                 explicit: true,
             },
         );
@@ -157,6 +185,7 @@ impl FrontendRegistry {
             self_critique_count: 0,
             started_at: Instant::new(0),
             ended_at: None,
+            is_virtual: false,
         });
     }
 
@@ -201,15 +230,22 @@ impl FrontendRegistry {
             self_critique_count: 0,
             started_at: Instant::new(now_millis),
             ended_at: None,
+            is_virtual: false,
         };
         self.sessions.insert(handle, session);
+        // The channel's virtual session (if any) survives traced cycles:
+        // attribution continuity must not reset on session_start.
+        let virtual_session = self.channels.get(&k).and_then(|b| b.virtual_session);
+        let virtual_lease = self.channels.get(&k).and_then(|b| b.virtual_lease);
         self.channels.insert(
             k,
             ChannelBinding {
                 frontend_id,
                 channel_id,
                 session: Some(handle),
+                virtual_session,
                 lease: None,
+                virtual_lease,
                 explicit: false,
             },
         );
@@ -381,6 +417,133 @@ impl FrontendRegistry {
         } else {
             Some(handle)
         }
+    }
+
+    /// The channel's live virtual session, if one is bound (for tests and
+    /// session-less attribution). Traced sessions are NOT returned here;
+    /// use `resolve_session` for those.
+    pub fn virtual_session(
+        &self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+    ) -> Option<SessionHandle> {
+        let k = Self::key(frontend_id, channel_id);
+        let handle = self.channels.get(&k)?.virtual_session?;
+        let session = self.sessions.get(&handle)?;
+        if session.is_virtual && !session.status.is_terminal() {
+            Some(handle)
+        } else {
+            None
+        }
+    }
+
+    /// Ensure session context for a session-less call on a channel
+    /// (per-channel virtual sessions, WP-09): a traced session shadows
+    /// everything and is returned as-is; otherwise the channel's live
+    /// virtual session is returned (lease refreshed); otherwise a fresh
+    /// virtual session is created and bound. Expired virtual sessions are
+    /// swept first, so this never returns a dead handle.
+    pub fn ensure_virtual_session(
+        &mut self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+        now_millis: u64,
+    ) -> SessionHandle {
+        self.sweep_virtual_sessions(now_millis);
+        if let Some(handle) = self.resolve_session(frontend_id, channel_id) {
+            return handle;
+        }
+        let k = Self::key(frontend_id, channel_id);
+        if let Some(handle) = self.channels.get(&k).and_then(|b| b.virtual_session)
+            && let Some(session) = self.sessions.get(&handle)
+            && session.is_virtual
+            && !session.status.is_terminal()
+            && let Some(binding) = self.channels.get_mut(&k)
+        {
+            binding.virtual_lease = Some(Lease {
+                expires_at: now_millis + VIRTUAL_IDLE_TIMEOUT_MILLIS,
+            });
+            return handle;
+        }
+        let handle = self.next_handle();
+        let session = Session {
+            handle,
+            channel_id,
+            project: None,
+            task_type: None,
+            technologies: Vec::new(),
+            status: SessionStatus::Active,
+            attempts: Vec::new(),
+            outcome: None,
+            final_approach: None,
+            lessons: Vec::new(),
+            initial_approach: None,
+            guides_used: Vec::new(),
+            memories_read: Vec::new(),
+            memories_created: Vec::new(),
+            refinement_attempts: 0,
+            self_critique_count: 0,
+            started_at: Instant::new(now_millis),
+            ended_at: None,
+            is_virtual: true,
+        };
+        self.sessions.insert(handle, session);
+        let binding = self.channels.entry(k).or_insert(ChannelBinding {
+            frontend_id,
+            channel_id,
+            session: None,
+            virtual_session: None,
+            lease: None,
+            virtual_lease: None,
+            explicit: false,
+        });
+        binding.virtual_session = Some(handle);
+        binding.virtual_lease = Some(Lease {
+            expires_at: now_millis + VIRTUAL_IDLE_TIMEOUT_MILLIS,
+        });
+        handle
+    }
+
+    /// Finalize virtual sessions past idle timeout or lifetime bound.
+    /// Returns finalized handles. Only virtual sessions are touched;
+    /// traced sessions follow the lease path (`expire_leases`) instead.
+    pub fn sweep_virtual_sessions(&mut self, now_millis: u64) -> Vec<SessionHandle> {
+        let mut finalized = Vec::new();
+        let keys: Vec<(FrontendId, ChannelId)> = self.channels.keys().cloned().collect();
+        for k in keys {
+            let handle = match self.channels.get(&k).and_then(|b| b.virtual_session) {
+                Some(h) => h,
+                None => continue,
+            };
+            let expired = match self.sessions.get(&handle) {
+                Some(s) if s.is_virtual && !s.status.is_terminal() => {
+                    let idle = match self.channels.get(&k).and_then(|b| b.virtual_lease) {
+                        Some(lease) => now_millis >= lease.expires_at,
+                        None => true,
+                    };
+                    let aged = now_millis.saturating_sub(s.started_at.as_millis())
+                        >= VIRTUAL_LIFETIME_MILLIS;
+                    idle || aged
+                }
+                _ => false,
+            };
+            if !expired {
+                continue;
+            }
+            if let Some(s) = self.sessions.get_mut(&handle) {
+                s.status = SessionStatus::Abandoned;
+                s.outcome = Some(TaskOutcome::Abandoned);
+                s.ended_at = Some(Instant::new(now_millis));
+            }
+            if let Some(binding) = self.channels.get_mut(&k)
+                && binding.virtual_session == Some(handle)
+            {
+                binding.virtual_session = None;
+                binding.virtual_lease = None;
+            }
+            finalized.push(handle);
+        }
+        finalized
     }
 
     /// Whether a channel uses an explicit native binding.
@@ -692,5 +855,59 @@ mod tests {
         let reg = FrontendRegistry::load(&path).unwrap();
         assert_eq!(reg.channel_count(), 0);
         assert_eq!(reg.session_count(), 0);
+    }
+
+    /// Virtual sessions are stable per channel, isolated across channels,
+    /// and never shadow a traced session.
+    #[test]
+    fn virtual_session_stable_per_channel_and_isolated() {
+        let mut reg = FrontendRegistry::new();
+        let v1 = reg.ensure_virtual_session(fe(1), ch(1), 0);
+        assert!(reg.session(v1).unwrap().is_virtual);
+        // Same channel, still live: same handle.
+        assert_eq!(reg.ensure_virtual_session(fe(1), ch(1), 1_000), v1);
+        // Another channel gets its own virtual session.
+        let v2 = reg.ensure_virtual_session(fe(1), ch(2), 1_000);
+        assert_ne!(v1, v2);
+        // Traced sessions shadow virtual ones; resolve_session is untouched.
+        let traced = reg.start_legacy_session(fe(1), ch(1), "debugging".to_string(), vec![], 2_000);
+        assert!(!reg.session(traced).unwrap().is_virtual);
+        assert_eq!(reg.ensure_virtual_session(fe(1), ch(1), 2_000), traced);
+        assert_eq!(reg.resolve_session(fe(1), ch(1)), Some(traced));
+    }
+
+    /// Virtual sessions idle-finalize after 120s and die after 30min,
+    /// matching the upstream timeouts per channel (never daemon-global).
+    #[test]
+    fn virtual_session_idle_finalize_and_lifetime_bound() {
+        let mut reg = FrontendRegistry::new();
+        let v1 = reg.ensure_virtual_session(fe(1), ch(1), 0);
+        // Activity at 119s keeps it alive (lease refreshed).
+        assert_eq!(reg.ensure_virtual_session(fe(1), ch(1), 119_999), v1);
+        // Touch refreshed the deadline: still alive at 200s (would expire
+        // at 120s without the refresh above).
+        assert_eq!(
+            reg.ensure_virtual_session(fe(1), ch(1), 200_000),
+            v1,
+            "touch must refresh the idle deadline"
+        );
+        // Idle past the refreshed deadline (200s + 120s): finalized, a
+        // fresh virtual session starts.
+        let v2 = reg.ensure_virtual_session(fe(1), ch(1), 321_000);
+        assert_ne!(v1, v2);
+        assert!(reg.session(v1).unwrap().status.is_terminal());
+        // Lifetime bound: constant activity still retires at 30 minutes.
+        let v3 = reg.ensure_virtual_session(fe(1), ch(2), 0);
+        let mut t = 0u64;
+        while t + 60_000 < 1_800_000 {
+            t += 60_000;
+            assert_eq!(reg.ensure_virtual_session(fe(1), ch(2), t), v3);
+        }
+        assert_eq!(reg.ensure_virtual_session(fe(1), ch(2), 1_799_999), v3);
+        assert_ne!(
+            v3,
+            reg.ensure_virtual_session(fe(1), ch(2), 1_800_000),
+            "30-minute lifetime bound must retire even active virtual sessions"
+        );
     }
 }
