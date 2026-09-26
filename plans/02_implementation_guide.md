@@ -380,14 +380,14 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 ### Tasks
 
-- [ ] Implement native commands and the exact claimed legacy aliases, exit codes, stdout/stderr separation and argument errors.
-- [ ] Implement managed skill installation, update, ownership/hash markers, atomic writes and explicit replacement of foreign assets.
-- [ ] Test the pinned upstream skill workflow against the compatibility tool names; keep native multilingual guidance separate and documented.
-- [ ] Provide an opt-in legacy executable shim; detect PATH collisions without silently replacing an existing installation.
-- [ ] Verify client-configured server names/tool namespaces rather than relying on `serverInfo.name` alone.
-- [ ] Implement the visualizer invocation/foreground/port behavior and the claimed functional routes. Graph rendering itself need not be pixel-identical to upstream.
-- [ ] Use loopback binding, local access controls and safe output encoding for any UI; a localhost UI is still a separate input surface.
-- [ ] Record which host versions discover which skill path and how the workflow is activated.
+- [x] Implement native commands and the exact claimed legacy aliases, exit codes, stdout/stderr separation and argument errors. (CLI parser + stdio/visualizer/skill/shim wiring; pinned by cli.rs tests and live-binary smoke tests.)
+- [x] Implement managed skill installation, update, ownership/hash markers, atomic writes and explicit replacement of foreign assets. (skills/installer.rs + tests.)
+- [x] Test the pinned upstream skill workflow against the compatibility tool names; keep native multilingual guidance separate and documented. (skill_workflow_tools_match_frozen_names + multilingual section pin in skills/installer.rs tests.)
+- [x] Provide an opt-in legacy executable shim; detect PATH collisions without silently replacing an existing installation. (--install-shim installs ~/.local/bin/lemma symlink; foreign paths refuse; PATH collisions warn; skills/shim.rs tests.)
+- [x] Verify client-configured server names/tool namespaces rather than relying on `serverInfo.name` alone. (routing_needs_no_server_name: routing depends only on tool names; namespaces documented as host-configured in skills/hosts.rs.)
+- [x] Implement the visualizer invocation/foreground/port behavior and the claimed functional routes. Graph rendering itself need not be pixel-identical to upstream. (visualizer/mod.rs + live smoke tests; routes are ltmrs-native: / and /api/library.)
+- [x] Use loopback binding, local access controls and safe output encoding for any UI; a localhost UI is still a separate input surface. (127.0.0.1-only bind pinned; HTML escaping pinned.)
+- [x] Record which host versions discover which skill path and how the workflow is activated. (Mechanism-based recipes in skills/hosts.rs; deviation: no per-host versions claimed — entries are documented recipes, not verified host behavior.)
 
 **Outputs:** CLI help/reference, installers, host recipes and functional visualizer.
 

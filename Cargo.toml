@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # MCP protocol (frontend stdio boundary + daemon dispatcher).
 # server feature gives the stdio/async-rw transports; avoid auth/reqwest (C code).
-rmcp = { version = "3.4.0", default-features = false, features = ["server", "transport-async-rw"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["server", "transport-async-rw", "transport-io"] }
 
 # Candidate A: LanceDB canonical + retrieval (Lance engine).
 # default-features=false: no cloud/object-store/GPU. zstd (C) is unavoidable.
@@ -41,7 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 libc = "0.2"
 
 # Core async runtime + utilities.
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "time", "sync", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "io-std", "net", "signal", "time", "sync", "process"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: legacy wire objects (e.g. memory_stats by_source/by_project)
 # must serialize in upstream insertion order, not BTreeMap-alphabetical.

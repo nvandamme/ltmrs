@@ -3,9 +3,15 @@
 //! stdout carries protocol data and help/version text; diagnostics and
 //! errors go to stderr. Exit codes follow `CliError::exit_code`.
 
-use ltmrs::cli::{CliError, Command, help_text, parse_args, run_library, version_text};
+use ltmrs::cli::{
+    CliError, Command, help_text, install_shim_command, install_skill_command, parse_args,
+    run_library, version_text,
+};
+use ltmrs::frontend::serve::serve_stdio;
+use ltmrs::visualizer::run_visualize;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = match parse_args(&argv) {
         Ok(Command::Help) => {
@@ -23,11 +29,35 @@ fn main() {
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::Stdio { .. }) => fail(&CliError::Unimplemented(
-            "stdio serving wires up with the daemon lifecycle",
-        )),
-        Ok(Command::Visualize { .. }) => fail(&CliError::Unimplemented("visualizer serving")),
-        Ok(Command::InstallSkill) => fail(&CliError::Unimplemented("skill installer")),
+        Ok(Command::Stdio { socket }) => {
+            match serve_stdio(socket, std::env::var("HOME").ok()).await {
+                Ok(()) => 0,
+                Err(e) => fail(&e),
+            }
+        }
+        Ok(Command::Visualize { foreground, port }) => {
+            match run_visualize(foreground, port, std::env::var("HOME").ok()).await {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(e) => fail(&e),
+            }
+        }
+        Ok(Command::InstallSkill) => match install_skill_command(std::env::var("HOME").ok()) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => fail(&e),
+        },
+        Ok(Command::InstallShim) => match install_shim_command(std::env::var("HOME").ok()) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => fail(&e),
+        },
         Err(e) => fail(&e),
     };
     flush_stdout();

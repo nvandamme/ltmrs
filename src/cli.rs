@@ -18,6 +18,8 @@ pub enum Command {
     Visualize { foreground: bool, port: Option<u16> },
     /// Install/update the managed skill (wired in a later slice).
     InstallSkill,
+    /// Install the opt-in legacy `lemma` executable shim.
+    InstallShim,
     /// Print help to stdout.
     Help,
     /// Print the version to stdout.
@@ -67,6 +69,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         Library,
         Visualize,
         InstallSkill,
+        InstallShim,
     }
     let mut selected: Option<Selected> = None;
     let mut select = |next: Selected| -> Result<(), CliError> {
@@ -91,6 +94,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             "-lib" | "--library" => select(Selected::Library)?,
             "-vis" | "--visualize" => select(Selected::Visualize)?,
             "--install-skill" => select(Selected::InstallSkill)?,
+            "--install-shim" => select(Selected::InstallShim)?,
             "--fg" => foreground = true,
             "-p" | "--port" => {
                 let raw = args.next().ok_or_else(|| {
@@ -145,6 +149,14 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             }
             Ok(Command::InstallSkill)
         }
+        Some(Selected::InstallShim) => {
+            if store.is_some() || socket.is_some() || foreground || port.is_some() {
+                return Err(CliError::Usage(
+                    "--install-shim takes no options".to_string(),
+                ));
+            }
+            Ok(Command::InstallShim)
+        }
         None => {
             if store.is_some() {
                 return Err(CliError::Usage(
@@ -193,6 +205,7 @@ Commands (default with no arguments: stdio):
   -lib, --library         Print a knowledge-base snapshot [--store PATH]
   -vis, --visualize       Run the visualizer [--fg] [-p PORT | --port PORT]
   --install-skill         Install/update the managed skill
+  --install-shim          Install the opt-in legacy `lemma` shim
   -h, --help              Show this help
   -V, --version           Print the version
 
@@ -216,8 +229,7 @@ pub fn version_text() -> String {
     format!("ltmrs {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Print a knowledge-base snapshot of the store at `path`.
-/// `None` is a usage error: ltmrs invents no default home for your data.
+/// Print a knowledge-base snapshot of the store at `path`./// `None` is a usage error: ltmrs invents no default home for your data.
 /// A missing path is also a usage error (a read must not create stores).
 pub fn run_library(store: Option<String>) -> Result<String, CliError> {
     let path = store.ok_or_else(|| CliError::Usage("-lib requires --store <path>".to_string()))?;
@@ -234,6 +246,84 @@ pub fn run_library(store: Option<String>) -> Result<String, CliError> {
     out.push_str(&format!("Relations: {}\n", export.relations.len()));
     for m in &export.memories {
         out.push_str(&format!("- [{}] {}\n", m.id, m.title));
+    }
+    Ok(out)
+}
+
+/// Install the managed native skill under `home` (`None`/empty = missing HOME).
+/// Returns the human-readable result; refusals are runtime errors (the
+/// arguments parsed fine — the environment or existing content blocks).
+/// Foreign content and user-modified current files name the path and how
+/// to proceed without data loss (back it up first — there is no --force).
+pub fn install_skill_command(home: Option<String>) -> Result<String, CliError> {
+    use crate::skills::installer::{InstallOutcome, install_native_skill};
+
+    let home = home
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| CliError::Runtime("HOME is not set".to_string()))?;
+    let path = crate::skills::installer::skill_path(std::path::Path::new(&home), "ltmrs");
+    match install_native_skill(std::path::Path::new(&home))
+        .map_err(|e| CliError::Runtime(format!("skill install failed: {e}")))?
+    {
+        // The recipe count keeps "installed" and "host loaded it" as separate
+        // evidence fields (T-HOST-01): installation never claims host uptake.
+        InstallOutcome::Installed => Ok(format!(
+            "Installed skill at {}; host recipes: {} documented",
+            path.display(),
+            crate::skills::hosts::HOST_RECIPES.len()
+        )),
+        InstallOutcome::AlreadyCurrent => Ok(format!(
+            "Skill already current at {}; host recipes: {} documented",
+            path.display(),
+            crate::skills::hosts::HOST_RECIPES.len()
+        )),
+        InstallOutcome::RefusedForeign => Err(CliError::Runtime(format!(
+            "refused: {} is not managed by ltmrs; back it up, then remove it to install",
+            path.display()
+        ))),
+        InstallOutcome::RefusedModified => Err(CliError::Runtime(format!(
+            "refused: {} carries your edits on the current version; back it up, then remove it to install",
+            path.display()
+        ))),
+    }
+}
+
+/// Install the opt-in legacy `lemma` shim under `home` (`None`/empty =
+/// missing HOME). Returns the human-readable result: the outcome plus any
+/// PATH collisions (a collision never blocks, but is always reported).
+pub fn install_shim_command(home: Option<String>) -> Result<String, CliError> {
+    use crate::skills::shim::{ShimOutcome, install_shim, shim_path};
+
+    let home = home
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| CliError::Runtime("HOME is not set".to_string()))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| CliError::Runtime(format!("cannot locate ltmrs binary: {e}")))?;
+    let path = shim_path(std::path::Path::new(&home));
+    let report = install_shim(std::path::Path::new(&home), &exe, None)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut out = match report.outcome {
+        ShimOutcome::Installed => {
+            format!(
+                "Installed legacy shim at {} (-> {})",
+                path.display(),
+                exe.display()
+            )
+        }
+        ShimOutcome::AlreadyCurrent => {
+            format!("Legacy shim already current at {}", path.display())
+        }
+    };
+    if !report.collisions.is_empty() {
+        let list = report
+            .collisions
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "; warning: PATH already provides `lemma` at: {list} (the shim may be shadowed)"
+        ));
     }
     Ok(out)
 }
@@ -326,6 +416,8 @@ mod tests {
     fn conflicting_commands_rejected() {
         assert!(parse(&["-vis", "-lib"]).is_err());
         assert!(parse(&["-lib", "--install-skill"]).is_err());
+        assert!(parse(&["-lib", "--install-shim"]).is_err());
+        assert!(parse(&["--install-shim", "--install-skill"]).is_err());
         assert!(parse(&["--install-skill", "-vis"]).is_err());
         assert!(parse(&["-vis", "--install-skill"]).is_err());
         assert!(parse(&["-vis", "--fg", "-p", "1", "--install-skill"]).is_err());
@@ -338,6 +430,7 @@ mod tests {
         assert!(parse(&["-vis", "--store", "/tmp/s"]).is_err());
         assert!(parse(&["-lib", "--socket", "/tmp/d.sock"]).is_err());
         assert!(parse(&["--install-skill", "--store", "/tmp/s"]).is_err());
+        assert!(parse(&["--install-shim", "-p", "8080"]).is_err());
     }
 
     /// Flag-like option values are rejected, never swallowed as paths.
@@ -414,6 +507,7 @@ mod tests {
             "-p",
             "--port",
             "--install-skill",
+            "--install-shim",
             "--store",
             "--socket",
         ] {
@@ -461,5 +555,87 @@ mod tests {
             run_library(Some("/nonexistent-dir-xyz/store".to_string())),
             Err(CliError::Usage(_))
         ));
+    }
+
+    /// --install-skill installs idempotently under an explicit home.
+    #[test]
+    fn install_skill_command_installs_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap().to_string();
+        let first = install_skill_command(Some(home.clone())).unwrap();
+        assert!(
+            first.contains("Installed"),
+            "fresh install reports, got: {first}"
+        );
+        let second = install_skill_command(Some(home.clone())).unwrap();
+        assert!(
+            second.contains("current"),
+            "reinstall is a no-op, got: {second}"
+        );
+        // The installed asset carries the ownership marker + content.
+        let text = std::fs::read_to_string(
+            dir.path()
+                .join(".agents")
+                .join("skills")
+                .join("ltmrs")
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert!(text.contains("ltmrs-skill"));
+        assert!(text.contains("recall"));
+    }
+
+    /// Missing HOME and foreign content fail explicitly (exit 1 via Runtime).
+    #[test]
+    fn install_skill_command_refuses_cleanly() {
+        assert!(matches!(
+            install_skill_command(None),
+            Err(CliError::Runtime(_))
+        ));
+        assert!(matches!(
+            install_skill_command(Some(String::new())),
+            Err(CliError::Runtime(_))
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap().to_string();
+        let foreign = dir.path().join(".agents").join("skills").join("ltmrs");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("SKILL.md"), "# Mine\n").unwrap();
+        let err = install_skill_command(Some(home)).unwrap_err();
+        assert!(matches!(err, CliError::Runtime(_)));
+        assert!(err.to_string().contains("refused"));
+    }
+
+    /// --install-shim selects the shim command and installs idempotently
+    /// under an explicit home (missing HOME fails explicitly).
+    #[test]
+    fn install_shim_command_installs_idempotently() {
+        assert_eq!(parse(&["--install-shim"]).unwrap(), Command::InstallShim);
+        assert!(matches!(
+            install_shim_command(None),
+            Err(CliError::Runtime(_))
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap().to_string();
+        let first = install_shim_command(Some(home.clone())).unwrap();
+        assert!(
+            first.contains("Installed"),
+            "fresh install reports, got: {first}"
+        );
+        assert!(
+            first.contains("lemma"),
+            "names the legacy shim, got: {first}"
+        );
+        let second = install_shim_command(Some(home.clone())).unwrap();
+        assert!(
+            second.contains("current"),
+            "reinstall is a no-op, got: {second}"
+        );
+        // The shim is a symlink to this very binary.
+        let link = crate::skills::shim::shim_path(dir.path());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::env::current_exe().unwrap()
+        );
     }
 }

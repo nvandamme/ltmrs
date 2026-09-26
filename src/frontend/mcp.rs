@@ -1009,6 +1009,27 @@ mod tests {
         assert!(route_tool("nonexistent", &None).is_err());
     }
 
+    /// Tool routing depends only on the tool name: every frozen
+    /// compatibility name resolves without consulting any configured server
+    /// name. With no arguments the outcome is either `Ok` or an
+    /// argument-validation error — never "unknown tool". (Hosts configure
+    /// their own server name/namespaces; see `skills::hosts`.)
+    #[test]
+    fn routing_needs_no_server_name() {
+        let tools = frozen_tools();
+        assert!(!tools.is_empty(), "frozen set must not be empty");
+        for tool in &tools {
+            match route_tool(&tool.name, &None) {
+                Ok(_) => {}
+                Err(e) => assert!(
+                    !e.to_string().contains("unknown tool"),
+                    "{} must resolve by name alone, got: {e}",
+                    tool.name
+                ),
+            }
+        }
+    }
+
     #[test]
     fn envelope_carries_identity() {
         let id = FrontendIdentity::new(

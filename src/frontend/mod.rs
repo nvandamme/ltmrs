@@ -6,3 +6,5 @@
 //! client and keeps the routing logic testable.
 
 pub mod mcp;
+
+pub mod serve;
