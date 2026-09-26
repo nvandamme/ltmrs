@@ -5,6 +5,45 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 20dbcb7 (2026-09-26) — WP-11 native backup restore and legacy verdict
+
+### WP-11 native backup/restore + legacy verdict
+
+- Format `ltmrs-backup` v1 (`src/interchange/backup.rs`): coherent
+  single-read-tx full export (memories/relations/guides/feedback/
+  suggestions; sessions ride from the registry; archives/history/projects
+  have no storage and count zero by design), manifest counts + snapshot
+  digest, tmp+rename atomic publish, re-read verify, 128 MiB bound.
+  `backup_create` native MCP tool (explicit directory, no invented
+  default); tools/list 29 (26 frozen-verbatim + 3 native).
+- Restore machine (`src/interchange/restore.rs`): preview readiness +
+  blockers, single-use 10-min TTL tokens bound to digest+generation+
+  channel; confirm re-validates everything; safety backup first;
+  single-tx atomic replace with quarantine list; generation bump
+  retiring pre-restore pipelines; live sessions abandoned (reported);
+  rollback = second restore of the safety file. `backup_preview` /
+  `backup_restore` native tools; end-to-end rollback test.
+- Legacy verdict (`src/interchange/legacy.rs`): `.lemma-backup` SQLite
+  payloads refused explicitly (RQ-21, no C engine) with reason;
+  never converted, never relabeled; no-mutation hash proof; unknown
+   top-level keys flatten-captured, counted and reported through
+   backup_preview (pre-confirm warning + structured count) and
+   backup_restore (report text + structured; tool descriptions document
+   the loss fields).
+- Hardening: truncation/depth-bomb/lying-manifest/oversize tests;
+  concurrent-export consistency; pipeline invalidation proof
+  (stage → restore → publish refused via generation gate).
+- Maintenance barrier by construction (atomic replace + optimistic
+  conflict failure + generation retirement + projector publish gate
+  checking generation, revision and recallability).
+- Reviews: formal (seam inventory, role separation, token lifecycle) +
+  functional (#[test] theft repair, DomainError has no Display,
+  namespace issuance in tests, export_snapshot partial → export_full,
+  virtual-session counts, backtick shell mangling).
+- Validation: `cargo fmt -- --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo test`:
+  492 lib + stdio_smoke (1) + vis_smoke (1) passed, 0 failed.
+
 ## f09b2c8 (2026-09-26) — WP-09 dense guide candidates and differential workflow replay
 
 ### WP-09 remainings: dense guide candidates + differential workflow replay

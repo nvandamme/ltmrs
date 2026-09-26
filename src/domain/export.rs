@@ -19,6 +19,10 @@ pub struct CanonicalExport {
     pub projects: Vec<Project>,
     pub archives: Vec<ArchivedFragment>,
     pub history: Vec<FragmentHistory>,
+    /// Forward-compat catch-all (WP-11c loss accounting): unknown top-level
+    /// keys are captured, never dropped, so a newer producer's fields
+    /// survive a read untouched and can be counted/reported.
+    #[serde(flatten)]
     pub unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 

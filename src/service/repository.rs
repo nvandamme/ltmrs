@@ -1406,6 +1406,140 @@ impl CanonicalRepository {
             ..Default::default()
         })
     }
+
+    /// Full domain export for native backup (WP-11): every stored collection
+    /// in one read transaction (memories, relations, guides, feedback,
+    /// suggestions). Sessions ride the envelope separately (registry-owned);
+    /// projects/archives/history have no storage yet and stay empty by
+    /// design (documented, counted as zero — never silently dropped).
+    pub fn export_full(&self) -> DomainResult<CanonicalExport> {
+        let snapshot = self.db.read_tx();
+        let read_all = |ks: &OptimisticTxKeyspace| -> DomainResult<Vec<Vec<u8>>> {
+            let mut out = Vec::new();
+            for kv in snapshot.iter(ks) {
+                let (_k, v) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                out.push(v.as_ref().to_vec());
+            }
+            Ok(out)
+        };
+        let memories: Vec<Memory> = read_all(&self.memories)?
+            .iter()
+            .map(|v| decode::<Memory>(v))
+            .collect::<DomainResult<_>>()?;
+        let relations: Vec<Relation> = read_all(&self.relations)?
+            .iter()
+            .map(|v| decode::<Relation>(v))
+            .collect::<DomainResult<_>>()?;
+        let guides: Vec<crate::domain::guide::Guide> = read_all(&self.guides)?
+            .iter()
+            .map(|v| decode::<crate::domain::guide::Guide>(v))
+            .collect::<DomainResult<_>>()?;
+        let feedback: Vec<crate::domain::session::FeedbackEvent> = read_all(&self.feedback_events)?
+            .iter()
+            .map(|v| decode::<crate::domain::session::FeedbackEvent>(v))
+            .collect::<DomainResult<_>>()?;
+        let suggestions: Vec<crate::domain::session::Suggestion> = read_all(&self.suggestions)?
+            .iter()
+            .map(|v| decode::<crate::domain::session::Suggestion>(v))
+            .collect::<DomainResult<_>>()?;
+        Ok(CanonicalExport {
+            memories,
+            relations,
+            guides,
+            feedback,
+            suggestions,
+            ..Default::default()
+        })
+    }
+
+    /// Atomically replace the domain record sets (WP-11 restore): clears the
+    /// five domain keyspaces and inserts the given records in one write
+    /// transaction. Keys mirror the put_* schemes (memory/relation UUIDs,
+    /// lowercased guide names, suggestion ids, `feedback:{id}`). A concurrent
+    /// mutation conflicts instead of partially merging (caller retries from a
+    /// fresh preview). Sessions live in the daemon registry, not here.
+    pub fn replace_domain(
+        &self,
+        memories: &[Memory],
+        relations: &[Relation],
+        guides: &[crate::domain::guide::Guide],
+        feedback: &[crate::domain::session::FeedbackEvent],
+        suggestions: &[crate::domain::session::Suggestion],
+    ) -> DomainResult<()> {
+        fn drain(
+            snapshot: &fjall::Snapshot,
+            ks: &OptimisticTxKeyspace,
+        ) -> DomainResult<Vec<String>> {
+            let mut keys = Vec::new();
+            for kv in snapshot.iter(ks) {
+                let (k, _) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                keys.push(String::from_utf8_lossy(k.as_ref()).into_owned());
+            }
+            Ok(keys)
+        }
+        let read = self.db.read_tx();
+        let doomed: Vec<(&OptimisticTxKeyspace, Vec<String>)> = vec![
+            (&self.memories, drain(&read, &self.memories)?),
+            (&self.relations, drain(&read, &self.relations)?),
+            (&self.guides, drain(&read, &self.guides)?),
+            (&self.feedback_events, drain(&read, &self.feedback_events)?),
+            (&self.suggestions, drain(&read, &self.suggestions)?),
+        ];
+        drop(read);
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        for (ks, keys) in &doomed {
+            for key in keys {
+                tx.remove(ks, key);
+            }
+        }
+        let mut put = |ks: &OptimisticTxKeyspace, key: String, raw: Vec<u8>| {
+            tx.insert(ks, &key, raw.as_slice());
+        };
+        for m in memories {
+            let raw = serde_json::to_vec(m)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            put(&self.memories, m.id.as_uuid().to_string(), raw);
+        }
+        for r in relations {
+            let raw = serde_json::to_vec(r)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            put(&self.relations, r.id.as_uuid().to_string(), raw);
+        }
+        for g in guides {
+            let raw = serde_json::to_vec(g)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            put(&self.guides, g.name.to_lowercase(), raw);
+        }
+        for f in feedback {
+            let raw = serde_json::to_vec(f)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            put(
+                &self.feedback_events,
+                format!("feedback:{}", f.id.as_uuid()),
+                raw,
+            );
+        }
+        for s in suggestions {
+            let raw = serde_json::to_vec(s)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            put(&self.suggestions, s.id.to_string(), raw);
+        }
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "restore replace conflicted with a concurrent write",
+            )),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
 }
 
 fn generation_key(generation: StoreGeneration) -> String {

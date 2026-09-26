@@ -403,6 +403,22 @@ impl FrontendRegistry {
         Some(handle)
     }
 
+    /// Abandon every live session (restore path): marks non-terminal
+    /// sessions Abandoned with the restore timestamp and returns the count.
+    /// Backup sessions stay abandoned history (upstream parity) — reported,
+    /// never resurrected into live channels.
+    pub fn abandon_all_sessions(&mut self, now_millis: u64) -> usize {
+        let mut abandoned = 0;
+        for session in self.sessions.values_mut() {
+            if session.can_end() {
+                session.status = crate::domain::session::SessionStatus::Abandoned;
+                session.ended_at = Some(crate::domain::memory::Instant::new(now_millis));
+                abandoned += 1;
+            }
+        }
+        abandoned
+    }
+
     /// Resolve the active session for a channel (None if none or terminal).
     pub fn resolve_session(
         &self,

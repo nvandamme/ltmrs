@@ -23,12 +23,13 @@ use serde_json::{Map, Value};
 
 use crate::compatibility::lemma::schemas::frozen_tools;
 use crate::compatibility::lemma::tool_args::{
-    ConflictScanArgs, GuideCreateArgs, GuideDistillArgs, GuideForgetArgs, GuideGetArgs,
-    GuideMergeArgs, GuidePracticeArgs, GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs,
-    MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs,
-    MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs, ProactiveAnalysisArgs,
-    ProjectAnalyticsArgs, ResponseFormat, SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs,
-    SessionStartArgs, SessionStatsArgs, SuggestionRespondArgs, ToolArgs,
+    BackupCreateArgs, BackupPreviewArgs, BackupRestoreArgs, ConflictScanArgs, GuideCreateArgs,
+    GuideDistillArgs, GuideForgetArgs, GuideGetArgs, GuideMergeArgs, GuidePracticeArgs,
+    GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs, MemoryFeedbackArgs, MemoryForgetArgs,
+    MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs,
+    MemoryUpdateArgs, ProactiveAnalysisArgs, ProjectAnalyticsArgs, ResponseFormat,
+    SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs, SessionStartArgs, SessionStatsArgs,
+    SuggestionRespondArgs, ToolArgs,
 };
 use crate::daemon::client::IpcClient;
 use crate::daemon::envelope::{DomainRequest, HandshakeRequest, IpcEnvelope, PROTOCOL_VERSION};
@@ -231,10 +232,12 @@ impl LtmrsFrontend {
         })
     }
 
-    /// The tool list advertised to the host: the 11 frozen WP-08 tools, served
-    /// verbatim from the baseline capture (T-MCP-01).
+    /// The tool list advertised to the host: the 26 frozen tools, served
+    /// verbatim from the baseline capture (T-MCP-01), plus native ltmrs
+    /// extensions (backup_create/preview/restore). Native tools are marked
+    /// in their descriptions.
     pub fn tools() -> Vec<Tool> {
-        frozen_tools()
+        let mut tools: Vec<Tool> = frozen_tools()
             .into_iter()
             .map(|ft| {
                 let annotations = ToolAnnotations::new()
@@ -249,7 +252,11 @@ impl LtmrsFrontend {
                 }
                 tool
             })
-            .collect()
+            .collect();
+        tools.push(native_backup_create_tool());
+        tools.push(native_backup_preview_tool());
+        tools.push(native_backup_restore_tool());
+        tools
     }
 }
 
@@ -289,6 +296,9 @@ pub fn route_tool(
         "conflict_scan" => ToolArgs::ConflictScan(parse_conflict_scan(&args)?),
         "proactive_analysis" => ToolArgs::ProactiveAnalysis(parse_proactive_analysis(&args)?),
         "project_analytics" => ToolArgs::ProjectAnalytics(parse_project_analytics(&args)?),
+        "backup_create" => ToolArgs::BackupCreate(parse_backup_create(&args)?),
+        "backup_preview" => ToolArgs::BackupPreview(parse_backup_preview(&args)?),
+        "backup_restore" => ToolArgs::BackupRestore(parse_backup_restore(&args)?),
         other => {
             return Err(McpError::invalid_params(
                 format!("unknown tool: {other}"),
@@ -643,6 +653,100 @@ fn parse_project_analytics(args: &Map<String, Value>) -> Result<ProjectAnalytics
     })
 }
 
+/// Parse backup_preview args (`path` optional at the wire level, required
+/// at execution).
+fn parse_backup_preview(args: &Map<String, Value>) -> Result<BackupPreviewArgs, McpError> {
+    Ok(BackupPreviewArgs {
+        path: str_field(args, "path").map(|s| s.to_string()),
+    })
+}
+
+/// Parse backup_restore args (both optional at the wire level; execution
+/// requires an unused token plus explicit confirmation).
+fn parse_backup_restore(args: &Map<String, Value>) -> Result<BackupRestoreArgs, McpError> {
+    Ok(BackupRestoreArgs {
+        confirmation_token: str_field(args, "confirmation_token").map(|s| s.to_string()),
+        confirm: args.get("confirm").and_then(|v| v.as_bool()),
+    })
+}
+
+/// Parse backup_create args. `directory` is optional at the wire level;
+/// execution requires it (ltmrs invents no default backup location).
+fn parse_backup_create(args: &Map<String, Value>) -> Result<BackupCreateArgs, McpError> {
+    Ok(BackupCreateArgs {
+        directory: str_field(args, "directory").map(|s| s.to_string()),
+    })
+}
+
+/// A native (non-frozen) tool definition: same shape as frozen entries,
+/// clearly marked so tools/list consumers can tell parity from extension.
+fn native_tool(
+    name: &'static str,
+    description: &'static str,
+    properties: serde_json::Value,
+) -> Tool {
+    let schema: Map<String, Value> = serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false,
+    })
+    .as_object()
+    .expect("native schema is an object")
+    .clone();
+    Tool::new(name, description, Arc::new(schema)).with_annotations(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(false),
+    )
+}
+
+fn native_backup_create_tool() -> Tool {
+    native_tool(
+        "backup_create",
+        "Back up the canonical store (memories, relations, guides, feedback, suggestions, sessions) to one portable .ltmrs-backup file and verify it. NATIVE ltmrs tool (not a verbatim Lemma port): output shapes follow ltmrs conventions.",
+        serde_json::json!({
+            "directory": {
+                "type": "string",
+                "description": "Destination directory for the .ltmrs-backup file (created when missing). Required: ltmrs invents no default backup location.",
+            },
+        }),
+    )
+}
+
+/// Native backup_preview definition (readiness + single-use token).
+fn native_backup_preview_tool() -> Tool {
+    native_tool(
+        "backup_preview",
+        "Validate an ltmrs backup, compare record counts, and check cooperating connections without replacing anything. Also reports unknown (future-producer) top-level keys the restore would drop (counted, not restored). NATIVE ltmrs tool: on readiness, returns a single-use confirmation token (10-minute TTL, bound to file digest, store generation and channel); closing other connections may be required first.",
+        serde_json::json!({
+            "path": {
+                "type": "string",
+                "description": "Absolute path to the .ltmrs-backup file on this computer.",
+            },
+        }),
+    )
+}
+
+/// Native backup_restore definition (explicit confirmation, replace semantics).
+fn native_backup_restore_tool() -> Tool {
+    native_tool(
+        "backup_restore",
+        "Restore a previewed ltmrs backup, REPLACING the live store (never merging). NATIVE ltmrs tool: requires the single-use confirmation_token from backup_preview plus explicit confirm=true. A safety backup is written first; active sessions are abandoned. The report includes quarantined references and dropped unknown-key counts for manual repair.",
+        serde_json::json!({
+            "confirmation_token": {
+                "type": "string",
+                "description": "Single-use token from backup_preview.",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true: acknowledges replacement semantics.",
+            },
+        }),
+    )
+}
+
 impl ServerHandler for LtmrsFrontend {
     fn get_info(&self) -> InitializeResult {
         // Static teaching template always present; the dynamic memory index is
@@ -801,7 +905,11 @@ mod tests {
     #[test]
     fn serves_all_frozen_tools() {
         let tools = LtmrsFrontend::tools();
-        assert_eq!(tools.len(), 26, "must serve all 26 frozen tools");
+        assert_eq!(
+            tools.len(),
+            29,
+            "26 frozen-verbatim + 3 native (backup_create/preview/restore)"
+        );
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert!(names.contains(&"memory_read".to_string()));
         assert!(names.contains(&"semantic_search".to_string()));
@@ -829,7 +937,21 @@ mod tests {
                 })
                 .collect();
         let served = LtmrsFrontend::tools();
-        assert_eq!(served.len(), frozen.len());
+        // Frozen-verbatim prefix first, native extensions after. The native
+        // tail is pinned by name below (count-agnostic if more land later).
+        assert!(
+            served.len() >= frozen.len(),
+            "served tools must cover the frozen set"
+        );
+        let native: Vec<&str> = served[frozen.len()..]
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect();
+        assert_eq!(
+            native,
+            vec!["backup_create", "backup_preview", "backup_restore"]
+        );
+        let served = &served[..frozen.len()];
         for (tool, (name, desc, ro, de, id, ow, has_os)) in served.iter().zip(frozen.iter()) {
             assert_eq!(tool.name.as_ref(), name, "tool name drift");
             assert_eq!(
@@ -1007,6 +1129,20 @@ mod tests {
     #[test]
     fn unknown_tool_rejected() {
         assert!(route_tool("nonexistent", &None).is_err());
+    }
+
+    /// The native backup tools route by name like every frozen tool (their
+    /// descriptions and schemas are ltmrs-native, marked in tools/list).
+    #[test]
+    fn native_backup_tools_route() {
+        assert!(route_tool("backup_create", &None).is_ok());
+        let mut with_path = serde_json::Map::new();
+        with_path.insert(
+            "path".to_string(),
+            serde_json::Value::String("/tmp/x.ltmrs-backup".to_string()),
+        );
+        assert!(route_tool("backup_preview", &Some(with_path)).is_ok());
+        assert!(route_tool("backup_restore", &None).is_ok());
     }
 
     /// Tool routing depends only on the tool name: every frozen

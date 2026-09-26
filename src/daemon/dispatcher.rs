@@ -30,6 +30,9 @@ pub struct Dispatcher {
     /// The search backend for semantic retrieval (WP-08). None disables dense
     /// search (lexical/FTS still works if the table is present).
     search: Option<Arc<SearchBackend>>,
+    /// Restore preview registry (WP-11): single-use TTL tokens bound to
+    /// backup digest + live store generation. Daemon-lifetime state.
+    restore: Mutex<crate::interchange::restore::RestoreCoordinator>,
 }
 
 impl Dispatcher {
@@ -43,6 +46,7 @@ impl Dispatcher {
             registry: Mutex::new(registry),
             clock,
             search: None,
+            restore: Mutex::new(crate::interchange::restore::RestoreCoordinator::default()),
         }
     }
 
@@ -233,6 +237,13 @@ impl Dispatcher {
     /// Access the search backend (WP-08 semantic retrieval), if attached.
     pub fn search(&self) -> Option<&SearchBackend> {
         self.search.as_deref()
+    }
+
+    /// Access the restore preview registry (lock briefly; never hold across IO).
+    pub fn restore_coordinator(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::interchange::restore::RestoreCoordinator> {
+        self.restore.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Access the clock (for tool execution timestamps).

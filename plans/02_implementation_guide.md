@@ -401,16 +401,16 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 ### Tasks
 
-- [ ] Freeze supported Lemma schema/backup versions and format readers from actual fixtures.
-- [ ] Implement coherent source snapshotting, including SQLite WAL and supported legacy sidecars; never mutate the original.
-- [ ] Implement loss-accounted field/ID/relation migration, preserving nullable fields, archives, evidence and dependency/history links.
-- [ ] Reject or quarantine invalid references explicitly; retain raw source metadata for manual repair.
-- [ ] Implement native logical backup with one snapshot, manifest counts/digests and atomic final-file publication.
-- [ ] Implement actual legacy backup import/export or mark the corresponding conformance target unsupported; never relabel a native archive.
-- [ ] Implement preview, lease checks, state/digest/channel binding and legacy-compatible token expiry.
-- [ ] Implement maintenance barrier, verified safety backup, staged restore, active-generation switch and rollback/restart protocol.
-- [ ] Invalidate pending embedding/index tasks from the previous store generation.
-- [ ] Add bounded archive parsing/extraction and malicious archive tests.
+- [x] Freeze supported Lemma schema/backup versions and format readers from actual fixtures. (ltmrs-backup v1 frozen: BACKUP_FORMAT/VERSION/EXTENSION consts; legacy lemma-backup envelope parsed from pinned baseline captures; upstream SQLite payload refused per RQ-21.)
+- [x] Implement coherent source snapshotting, including SQLite WAL and supported legacy sidecars; never mutate the original. (Native export is one read_tx via export_full; legacy sources are never opened (envelope-bytes refusal) with a no-mutation hash test; no WAL/sidecar reads exist by design.)
+- [x] Implement loss-accounted field/ID/relation migration, preserving nullable fields, archives, evidence and dependency/history links. (Quarantine list for dangling relations; manifest count cross-checks; unknown top-level keys flatten-captured, counted and reported; archives/history/projects have no storage yet and count zero by design.)
+- [x] Reject or quarantine invalid references explicitly; retain raw source metadata for manual repair. (Format/Version/Corrupt/DigestMismatch/LegacyUnsupported taxonomy; quarantined refs carry ids+reasons; source files retained untouched.)
+- [x] Implement native logical backup with one snapshot, manifest counts/digests and atomic final-file publication. (export_backup: snapshot+manifest+digest, tmp+rename publish, re-read verify; backup_create tool.)
+- [x] Implement actual legacy backup import/export or mark the corresponding conformance target unsupported; never relabel a native archive. (Marked unsupported: interchange/legacy.rs verdict + RQ-21 reason + conformance note; native files always .ltmrs-backup, verified, never relabeled.)
+- [x] Implement preview, lease checks, state/digest/channel binding and legacy-compatible token expiry. (RestoreCoordinator: readiness+blockers, single-use 10-min TTL tokens bound to digest+generation+channel; leases ride channel bindings, blocked on cooperating connections.)
+- [x] Implement maintenance barrier, verified safety backup, staged restore, active-generation switch and rollback/restart protocol. (Atomic single-tx replace (conflicts fail, never partial-merge); safety backup first with reported path; set_store_generation switch; rollback = second restore of the safety file, tested end-to-end.)
+- [x] Invalidate pending embedding/index tasks from the previous store generation. (set_store_generation retires pre-restore pipelines; projector publish gate refuses retired generations; invalidation test stages then restores.)
+- [x] Add bounded archive parsing/extraction and malicious archive tests. (128 MiB bound checked pre-read; truncation/depth-bomb/lying-manifest/oversize tests; concurrent-export consistency test.)
 
 **Outputs:** import/export codecs, loss reports, backup coordinator, restore state machine.
 

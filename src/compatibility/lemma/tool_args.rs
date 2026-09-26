@@ -41,6 +41,9 @@ pub enum ToolName {
     ConflictScan,
     ProactiveAnalysis,
     ProjectAnalytics,
+    BackupCreate,
+    BackupPreview,
+    BackupRestore,
 }
 
 impl ToolName {
@@ -73,6 +76,9 @@ impl ToolName {
             Self::ConflictScan => "conflict_scan",
             Self::ProactiveAnalysis => "proactive_analysis",
             Self::ProjectAnalytics => "project_analytics",
+            Self::BackupCreate => "backup_create",
+            Self::BackupPreview => "backup_preview",
+            Self::BackupRestore => "backup_restore",
         }
     }
 
@@ -233,6 +239,27 @@ pub struct MemoryLibraryArgs {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub response_format: Option<ResponseFormat>,
+}
+
+/// backup_create arguments (ltmrs-native tool; directory is required because
+/// ltmrs invents no default backup location).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackupCreateArgs {
+    pub directory: Option<String>,
+}
+
+/// backup_preview arguments (ltmrs-native tool).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackupPreviewArgs {
+    pub path: Option<String>,
+}
+
+/// backup_restore arguments (ltmrs-native tool; single-use token plus
+/// explicit confirmation — restore replaces, never merges).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackupRestoreArgs {
+    pub confirmation_token: Option<String>,
+    pub confirm: Option<bool>,
 }
 
 /// semantic_search arguments.
@@ -408,6 +435,9 @@ pub enum ToolArgs {
     ConflictScan(ConflictScanArgs),
     ProactiveAnalysis(ProactiveAnalysisArgs),
     ProjectAnalytics(ProjectAnalyticsArgs),
+    BackupCreate(BackupCreateArgs),
+    BackupPreview(BackupPreviewArgs),
+    BackupRestore(BackupRestoreArgs),
 }
 
 impl ToolArgs {
@@ -440,6 +470,9 @@ impl ToolArgs {
             Self::ConflictScan(_) => ToolName::ConflictScan,
             Self::ProactiveAnalysis(_) => ToolName::ProactiveAnalysis,
             Self::ProjectAnalytics(_) => ToolName::ProjectAnalytics,
+            Self::BackupCreate(_) => ToolName::BackupCreate,
+            Self::BackupPreview(_) => ToolName::BackupPreview,
+            Self::BackupRestore(_) => ToolName::BackupRestore,
         }
     }
 }

@@ -13,12 +13,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compatibility::lemma::privacy;
 use crate::compatibility::lemma::tool_args::{
-    ConflictScanArgs, GuideCreateArgs, GuideDistillArgs, GuideForgetArgs, GuideGetArgs,
-    GuideMergeArgs, GuidePracticeArgs, GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs,
-    MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs,
-    MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs, ProactiveAnalysisArgs,
-    ProjectAnalyticsArgs, ResponseFormat, SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs,
-    SessionStartArgs, SessionStatsArgs, SuggestionRespondArgs, ToolArgs,
+    BackupCreateArgs, BackupPreviewArgs, BackupRestoreArgs, ConflictScanArgs, GuideCreateArgs,
+    GuideDistillArgs, GuideForgetArgs, GuideGetArgs, GuideMergeArgs, GuidePracticeArgs,
+    GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs, MemoryFeedbackArgs, MemoryForgetArgs,
+    MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs,
+    MemoryUpdateArgs, ProactiveAnalysisArgs, ProjectAnalyticsArgs, ResponseFormat,
+    SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs, SessionStartArgs, SessionStatsArgs,
+    SuggestionRespondArgs, ToolArgs,
 };
 use crate::daemon::dispatcher::Dispatcher;
 use crate::daemon::envelope::{DomainPayload, IpcEnvelope};
@@ -68,6 +69,9 @@ pub fn execute_tool(
         ToolArgs::ConflictScan(args) => exec_conflict_scan(disp, args),
         ToolArgs::ProactiveAnalysis(args) => exec_proactive_analysis(disp, args),
         ToolArgs::ProjectAnalytics(args) => exec_project_analytics(disp, args),
+        ToolArgs::BackupCreate(args) => exec_backup_create(disp, args),
+        ToolArgs::BackupPreview(args) => exec_backup_preview(disp, envelope, args),
+        ToolArgs::BackupRestore(args) => exec_backup_restore(disp, envelope, args),
     }
 }
 
@@ -4463,6 +4467,267 @@ fn exec_proactive_analysis(
 
 // ---- project_analytics ----
 
+// ---- backup_create (WP-11a; native tool) ----
+
+/// Back up the canonical store plus registry sessions to one verified
+/// native archive. `directory` is required (Usage-style soft error when
+/// absent — ltmrs invents no default backup location, unlike the upstream
+/// default; recorded in the native tool description).
+fn exec_backup_create(disp: &Dispatcher, args: &BackupCreateArgs) -> DomainResult<DomainPayload> {
+    let dir = match args.directory.as_deref().map(str::trim) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => {
+            return Ok(err_result(
+                "backup_create requires a destination `directory` (created when missing)",
+            ));
+        }
+    };
+    let now = disp.clock().now_millis();
+    let sessions = disp.registry().all_sessions_owned();
+    let report = crate::interchange::backup::export_backup(
+        disp.repo(),
+        &sessions,
+        std::path::Path::new(&dir),
+        "ltmrs",
+        now,
+    )
+    .map_err(|e| {
+        crate::domain::command::DomainError::new(
+            crate::domain::command::DomainErrorCode::Validation,
+            format!("backup failed: {e}"),
+        )
+    })?;
+    let count = |key: &str| report.counts.get(key).copied().unwrap_or(0);
+    let text = format!(
+        "Backed up {} memories, {} guides ({} sessions) to {}\nDigest: {}",
+        count("memories"),
+        count("guides"),
+        count("sessions"),
+        report.path.display(),
+        report.digest,
+    );
+    Ok(ok_result(
+        text,
+        serde_json::json!({
+            "path": report.path.to_string_lossy(),
+            "digest": report.digest,
+            "counts": report.counts,
+        }),
+    ))
+}
+
+/// Live per-collection counts in manifest shape (for preview comparison).
+fn live_counts(disp: &Dispatcher) -> DomainResult<BTreeMap<String, u64>> {
+    let export = disp.repo().export_full()?;
+    let sessions = disp.registry().all_sessions_owned();
+    let count = |n: usize| n as u64;
+    Ok(BTreeMap::from([
+        ("memories".to_string(), count(export.memories.len())),
+        ("relations".to_string(), count(export.relations.len())),
+        ("guides".to_string(), count(export.guides.len())),
+        ("sessions".to_string(), count(sessions.len())),
+        ("feedback".to_string(), count(export.feedback.len())),
+        ("suggestions".to_string(), count(export.suggestions.len())),
+        ("projects".to_string(), count(export.projects.len())),
+        ("archives".to_string(), count(export.archives.len())),
+        ("history".to_string(), count(export.history.len())),
+    ]))
+}
+
+// ---- backup_preview / backup_restore (WP-11b; native tools) ----
+
+/// Preview a native backup without replacing anything: verify the file,
+/// compare counts, check cooperating connections, and on readiness issue a
+/// single-use TTL-bound token (bound to file digest, store generation and
+/// channel, mirroring the upstream readiness contract).
+fn exec_backup_preview(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &BackupPreviewArgs,
+) -> DomainResult<DomainPayload> {
+    use crate::interchange::backup::{MAX_BACKUP_BYTES, verify_backup_file};
+    let path = match args.path.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            return Ok(err_result(
+                "backup_preview requires a `path` to a .ltmrs-backup file",
+            ));
+        }
+    };
+    let verified =
+        verify_backup_file(std::path::Path::new(&path), MAX_BACKUP_BYTES).map_err(|e| {
+            crate::domain::command::DomainError::new(
+                crate::domain::command::DomainErrorCode::Validation,
+                format!("backup preview failed: {e}"),
+            )
+        })?;
+    let live = live_counts(disp)?;
+    let generation = disp
+        .repo()
+        .store_generation()
+        .map_err(|e| {
+            crate::domain::command::DomainError::new(
+                crate::domain::command::DomainErrorCode::Validation,
+                format!("backup preview failed: {}", e.message),
+            )
+        })?
+        .as_u64();
+    let now = disp.clock().now_millis();
+    let channels = disp.registry().channel_count();
+    let channel = envelope.channel_id.as_uuid().to_string();
+    let preview = disp
+        .restore_coordinator()
+        .preview(crate::interchange::restore::PreviewRequest {
+            backup: &verified,
+            source_path: std::path::Path::new(&path),
+            channel: &channel,
+            live_counts: &live,
+            live_generation: generation,
+            active_channels: channels,
+            now_millis: now,
+        });
+    let text = if preview.ready {
+        format!(
+            "Restore preview: READY. {}\nConfirm replaces the live store (never merges): call backup_restore with the confirmation token and confirm=true.",
+            preview.message
+        )
+    } else {
+        format!(
+            "Restore preview: BLOCKED. {}\nKeep this connection open and preview again after other connections close.",
+            preview.message
+        )
+    };
+    Ok(ok_result(
+        text,
+        serde_json::json!({
+            "readiness": {"status": if preview.ready { "ready" } else { "blocked" }, "message": preview.message},
+            "unknown_top_level": preview.unknown_top_level,
+            "confirmation_token": preview.confirmation_token,
+            "expires_at": preview.expires_at,
+        }),
+    ))
+}
+
+/// Restore a previewed backup (REPLACE, never merge): re-verify the file,
+/// consume the single-use token, write a safety backup first, replace the
+/// records, bump the generation (invalidating pre-restore pipelines) and
+/// abandon live sessions. Rollback is a second restore of the safety file.
+fn exec_backup_restore(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &BackupRestoreArgs,
+) -> DomainResult<DomainPayload> {
+    use crate::domain::command::{DomainError, DomainErrorCode};
+    use crate::interchange::backup::{
+        MAX_BACKUP_BYTES, encode_backup, export_backup_to, verify_backup_file,
+    };
+    use crate::interchange::restore::{RestoreError, restore_verified, safety_backup_path};
+    let fail = |message: String| DomainError::new(DomainErrorCode::Validation, message);
+    let token = match args.confirmation_token.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => {
+            return Ok(err_result(
+                "backup_restore requires the `confirmation_token` from backup_preview (preview again for a fresh one)",
+            ));
+        }
+    };
+    if args.confirm != Some(true) {
+        return Ok(err_result(
+            "backup_restore replaces the live store (never merges). Pass confirm=true to acknowledge, or preview again.",
+        ));
+    }
+    let now = disp.clock().now_millis();
+    let channel = envelope.channel_id.as_uuid().to_string();
+    let source = match disp.restore_coordinator().source_path(&token) {
+        Some(p) => p,
+        None => {
+            return Ok(err_result(
+                "unknown confirmation token (preview again for a fresh one)",
+            ));
+        }
+    };
+    let verified = verify_backup_file(&source, MAX_BACKUP_BYTES)
+        .map_err(|e| fail(format!("backup restore failed: {e}")))?;
+    let live_generation = disp
+        .repo()
+        .store_generation()
+        .map_err(|e| fail(format!("backup restore failed: {}", e.message)))?
+        .as_u64();
+    disp.restore_coordinator()
+        .confirm(
+            &token,
+            true,
+            &verified.digest,
+            live_generation,
+            &channel,
+            now,
+        )
+        .map_err(|e| match e {
+            RestoreError::InvalidToken
+            | RestoreError::Expired
+            | RestoreError::AlreadyUsed
+            | RestoreError::NeedsConfirm => fail(format!(
+                "backup restore refused: {e} (preview again for a fresh token)"
+            )),
+            other => fail(format!("backup restore refused: {other}")),
+        })?;
+    // Safety backup of the live store first (rollback source on failure).
+    let safety_path = safety_backup_path(&source, now);
+    let mut live_export = disp
+        .repo()
+        .export_full()
+        .map_err(|e| fail(format!("safety backup failed: {}", e.message)))?;
+    live_export.sessions = disp.registry().all_sessions_owned();
+    let (safety_bytes, _, _) = encode_backup(&live_export, live_generation, now)
+        .map_err(|e| fail(format!("safety backup failed: {e}")))?;
+    export_backup_to(&safety_path, &safety_bytes)
+        .map_err(|e| fail(format!("safety backup failed: {e}")))?;
+    // Replace, bump, abandon.
+    let new_generation = crate::domain::id::StoreGeneration::new(live_generation + 1);
+    let report = restore_verified(disp.repo(), &verified, new_generation)
+        .map_err(|e| fail(format!("backup restore failed: {e}")))?;
+    let abandoned = disp.registry().abandon_all_sessions(now);
+    let quarantined = report
+        .quarantined
+        .iter()
+        .map(|q| format!("{} (missing {})", q.relation, q.missing))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let text = format!(
+        "Restored {} memories, {} guides from {}\nGeneration {} active; {} live sessions abandoned; safety backup at {}.{}{}",
+        report.restored.get("memories").copied().unwrap_or(0),
+        report.restored.get("guides").copied().unwrap_or(0),
+        source.display(),
+        report.generation,
+        abandoned,
+        safety_path.display(),
+        if quarantined.is_empty() {
+            String::new()
+        } else {
+            format!("\nQuarantined (skipped, kept for repair): {quarantined}")
+        },
+        if report.unknown_top_level == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n{} unknown top-level key(s) dropped (counted, not restored).",
+                report.unknown_top_level
+            )
+        },
+    );
+    Ok(ok_result(
+        text,
+        serde_json::json!({
+            "restored": report.restored,
+            "quarantined": report.quarantined,
+            "unknown_top_level": report.unknown_top_level,
+            "generation": report.generation,
+            "safety_backup": safety_path.to_string_lossy(),
+            "abandoned_sessions": abandoned,
+        }),
+    ))
+}
+
 fn exec_project_analytics(
     disp: &Dispatcher,
     args: &ProjectAnalyticsArgs,
@@ -7213,6 +7478,307 @@ mod tests {
         assert!(
             !text.contains("beta"),
             "beta must stay absent without dense:\n{text}"
+        );
+    }
+
+    /// backup_create backs up through the tool surface and verifies the
+    /// archive; a missing directory fails explicitly (never invented).
+    /// backup_preview reports readiness with a token; missing path fails.
+    #[test]
+    fn backup_preview_reports_ready_with_token() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Preview Me\n\n### Context\nPreview fixture.");
+        let out = tempfile::tempdir().unwrap();
+        let create = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(2, create.clone()), &create);
+        assert!(!result_is_error(&result));
+        let path = result_structured(&result).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(path.clone()),
+        });
+        let result = run(&disp, &tool_call(3, preview.clone()), &preview);
+        assert!(!result_is_error(&result));
+        let text = result_text(&result);
+        assert!(text.contains("READY"), "got: {text}");
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(structured["readiness"]["status"], "ready");
+        let token = structured["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!token.is_empty());
+        assert!(structured["expires_at"].as_u64().unwrap() > 0);
+
+        // Missing path fails explicitly.
+        let missing = ToolArgs::BackupPreview(BackupPreviewArgs { path: None });
+        let result = run(&disp, &tool_call(4, missing.clone()), &missing);
+        assert!(result_is_error(&result));
+    }
+
+    /// Loss accounting through the tool surface: an evolved backup carrying
+    /// a future top-level snapshot key reports the unknown count at preview
+    /// (before the destructive step) and again in the restore report.
+    #[test]
+    fn backup_preview_and_restore_report_unknown_keys() {
+        use crate::domain::export::CanonicalExport;
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Evolve Me\n\n### Context\nLoss fixture.");
+        let out = tempfile::tempdir().unwrap();
+        let create = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(2, create.clone()), &create);
+        assert!(!result_is_error(&result));
+        let path = result_structured(&result).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Future-producer simulation: extra snapshot key, manifest re-signed.
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        v["snapshot"]["future_collection"] = serde_json::json!([{"kept": true}]);
+        let evolved_snap: CanonicalExport = serde_json::from_value(v["snapshot"].clone()).unwrap();
+        v["manifest"]["digest"] = serde_json::Value::String(evolved_snap.digest());
+        let evolved = out.path().join("evolved.ltmrs-backup");
+        std::fs::write(&evolved, serde_json::to_vec(&v).unwrap()).unwrap();
+
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(evolved.to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(3, preview.clone()), &preview);
+        assert!(
+            !result_is_error(&result),
+            "preview failed: {}",
+            result_text(&result)
+        );
+        let text = result_text(&result);
+        assert!(text.contains("1 unknown"), "got: {text}");
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["unknown_top_level"].as_u64(),
+            Some(1),
+            "preview must surface the count"
+        );
+        let token = structured["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token),
+            confirm: Some(true),
+        });
+        let result = run(&disp, &tool_call(4, restore.clone()), &restore);
+        assert!(
+            !result_is_error(&result),
+            "restore failed: {}",
+            result_text(&result)
+        );
+        let text = result_text(&result);
+        assert!(text.contains("1 unknown"), "got: {text}");
+        assert_eq!(
+            result_structured(&result).unwrap()["unknown_top_level"].as_u64(),
+            Some(1),
+            "restore report must surface the count"
+        );
+    }
+
+    /// Full restore cycle with rollback through the safety file: alpha live,
+    /// backup alpha, add beta, restore (beta gone), restore safety (beta back).
+    /// Generation advances on every restore; sessions are abandoned.
+    #[test]
+    fn backup_restore_end_to_end_with_rollback() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(
+            &disp,
+            1,
+            "## Restore Alpha\n\n### Context\nPre-restore content.",
+        );
+        let out = tempfile::tempdir().unwrap();
+        let create = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(2, create.clone()), &create);
+        let backup_path = result_structured(&result).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let gen_before = disp.repo().store_generation().unwrap().as_u64();
+        add_fragment(
+            &disp,
+            3,
+            "## Restore Beta\n\n### Context\nPost-backup content.",
+        );
+
+        // Preview + restore the backup (beta disappears).
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(backup_path.clone()),
+        });
+        let result = run(&disp, &tool_call(4, preview.clone()), &preview);
+        let token = result_structured(&result).unwrap()["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token),
+            confirm: Some(true),
+        });
+        let result = run(&disp, &tool_call(5, restore.clone()), &restore);
+        assert!(
+            !result_is_error(&result),
+            "restore failed: {}",
+            result_text(&result)
+        );
+        let text = result_text(&result);
+        assert!(text.contains("Restored 1 memories"), "got: {text}");
+        assert!(text.contains("safety backup at"), "got: {text}");
+        let structured = result_structured(&result).unwrap();
+        let safety = structured["safety_backup"].as_str().unwrap().to_string();
+        assert!(
+            std::path::Path::new(&safety).exists(),
+            "safety file published"
+        );
+        assert_eq!(
+            disp.repo().store_generation().unwrap().as_u64(),
+            gen_before + 1
+        );
+        let titles: Vec<String> = disp
+            .repo()
+            .export_full()
+            .unwrap()
+            .memories
+            .iter()
+            .map(|m| m.title.clone())
+            .collect();
+        assert!(
+            !titles.iter().any(|t| t.contains("Beta")),
+            "got: {titles:?}"
+        );
+
+        // Rollback: preview + restore the safety file (beta returns).
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(safety.clone()),
+        });
+        let result = run(&disp, &tool_call(6, preview.clone()), &preview);
+        assert!(!result_is_error(&result));
+        let token = result_structured(&result).unwrap()["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token),
+            confirm: Some(true),
+        });
+        let result = run(&disp, &tool_call(7, restore.clone()), &restore);
+        assert!(
+            !result_is_error(&result),
+            "rollback failed: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            disp.repo().store_generation().unwrap().as_u64(),
+            gen_before + 2
+        );
+        let titles: Vec<String> = disp
+            .repo()
+            .export_full()
+            .unwrap()
+            .memories
+            .iter()
+            .map(|m| m.title.clone())
+            .collect();
+        assert!(titles.iter().any(|t| t.contains("Beta")), "got: {titles:?}");
+    }
+
+    /// Restore demands an unused token plus explicit confirmation; a
+    /// refused confirm does not burn the token.
+    #[test]
+    fn backup_restore_requires_confirmation() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Confirm Me\n\n### Context\nConfirm fixture.");
+        let out = tempfile::tempdir().unwrap();
+        let create = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(2, create.clone()), &create);
+        let path = result_structured(&result).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs { path: Some(path) });
+        let result = run(&disp, &tool_call(3, preview.clone()), &preview);
+        let token = result_structured(&result).unwrap()["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Unknown token rejected.
+        let bad = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some("nope".to_string()),
+            confirm: Some(true),
+        });
+        let result = run(&disp, &tool_call(4, bad.clone()), &bad);
+        assert!(result_is_error(&result));
+
+        // Missing confirmation explains REPLACE without consuming the token.
+        let unconfirmed = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token.clone()),
+            confirm: None,
+        });
+        let result = run(&disp, &tool_call(5, unconfirmed.clone()), &unconfirmed);
+        assert!(result_is_error(&result));
+        assert!(result_text(&result).contains("confirm=true"));
+
+        // The same token still works after the refused confirm.
+        let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token),
+            confirm: Some(true),
+        });
+        let result = run(&disp, &tool_call(6, restore.clone()), &restore);
+        assert!(!result_is_error(&result), "got: {}", result_text(&result));
+    }
+
+    #[test]
+    fn backup_create_tool_backs_up_and_verifies() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Backup One\n\n### Context\nFirst.");
+        add_fragment(&disp, 2, "## Backup Two\n\n### Context\nSecond.");
+        let out = tempfile::tempdir().unwrap();
+        let args = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let env = tool_call(3, args.clone());
+        let result = run(&disp, &env, &args);
+        assert!(!result_is_error(&result));
+        let text = result_text(&result);
+        assert!(text.contains("Backed up 2 memories"), "got: {text}");
+        assert!(text.contains("Digest: "), "got: {text}");
+        let structured = result_structured(&result).unwrap();
+        let path = structured["path"].as_str().unwrap().to_string();
+        assert!(path.ends_with(".ltmrs-backup"), "got: {path}");
+        assert!(std::path::Path::new(&path).exists());
+        // Re-verify the produced file through the library boundary.
+        let verified = crate::interchange::backup::verify_backup_file(
+            std::path::Path::new(&path),
+            crate::interchange::backup::MAX_BACKUP_BYTES,
+        )
+        .unwrap();
+        assert_eq!(verified.counts["memories"], 2);
+
+        // Missing directory fails explicitly.
+        let missing = ToolArgs::BackupCreate(BackupCreateArgs { directory: None });
+        let env = tool_call(4, missing.clone());
+        let result = run(&disp, &env, &missing);
+        assert!(result_is_error(&result));
+        assert!(
+            result_text(&result).contains("requires"),
+            "got: {}",
+            result_text(&result)
         );
     }
 
