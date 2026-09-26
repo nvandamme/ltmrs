@@ -7,21 +7,6 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
 
 ## Unreleased Commit
 
-### Whole-learning-workflow trace (WP-09 leftover, uncommitted)
-
-- `src/daemon/tools.rs::whole_learning_workflow_recall_act_persist`: one
-  test through the public tool surface covering recall (start preload +
-  read), act (explicit attempt), persist (add linked to session), practice
-  (create + practice with outcome), record/end — asserting cross-tool
-  attribution from canonical state (tracked reads/creates, attempt,
-  guide usage, terminal status, persisted session link).
-- Reviews (formal + functional): double PASS (six stages, canonical
-  reads, no hidden reasoning, determinism, vacuity per stage).
-- WP-09 checkbox stays OPEN: this is a behavioral workflow trace, not a
-  differential upstream replay (deferred as recorded).
-  (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test`: 420 passed, 0 failed.)
-
 ### WP-10a CLI parser + help/version + real -lib (uncommitted)
 
 - `src/cli.rs` (new, lib): two-phase parser — help/version short-circuit

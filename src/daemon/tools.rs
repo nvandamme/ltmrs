@@ -7049,6 +7049,139 @@ mod tests {
         assert!(text_contains(&result3, "ended: success"));
     }
 
+    /// Whole learning workflow (S6/WP-09 trace): recall, act, persist,
+    /// practice a guide, record attempts and end — with correct cross-tool
+    /// attribution through the public tool surface (no hidden reasoning).
+    #[test]
+    fn whole_learning_workflow_recall_act_persist() {
+        let (disp, _dir) = test_dispatcher();
+        // Seed: one task-relevant memory, one unrelated.
+        let rust_id = add_fragment(
+            &disp,
+            1,
+            "## Rust Async\n\n### Context\nUse tokio spawn_blocking for blocking work.",
+        );
+        add_fragment(
+            &disp,
+            2,
+            "## Sourdough\n\n### Context\nBake bread at 240C with steam.",
+        );
+
+        // RECALL: start a session; the relevant memory is pre-loaded.
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string(), "tokio".to_string()],
+            initial_approach: Some("read the code".to_string()),
+        });
+        let result = run(&disp, &tool_call(10, start.clone()), &start);
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let preloaded: Vec<String> = structured["preloaded_memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(
+            preloaded.contains(&rust_id),
+            "task-relevant memory must preload, got: {preloaded:?}"
+        );
+        let session_id = structured["session_id"].as_str().unwrap().to_string();
+
+        // RECALL: read the preloaded memory (access recorded).
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(rust_id.clone()),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(11, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        // The explicit read leaves its own observable mark (access count):
+        // one from the preload boost plus one from this read.
+        let read_eid = disp.repo().resolve_id(&rust_id).unwrap();
+        let read_mem = disp
+            .repo()
+            .get_memories(&[read_eid])
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            read_mem.access_count, 2,
+            "explicit read must record access on top of the preload boost"
+        );
+
+        // ACT: record a rejected attempt explicitly.
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: "guess from prose".to_string(),
+            outcome: "rejected".to_string(),
+            critique: Some("no evidence".to_string()),
+            rationale: None,
+            related_memory_id: Some(rust_id.clone()),
+        });
+        let result = run(&disp, &tool_call(12, attempt.clone()), &attempt);
+        assert!(!result_is_error(&result));
+
+        // PERSIST: save the lesson; it links to the active session.
+        let new_id = add_fragment(
+            &disp,
+            13,
+            "## Blocking Lessons\n\n### Context\nNever block Tokio core workers; use spawn_blocking.",
+        );
+
+        // PRACTICE: create + practice a guide for the session.
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "tokio-discipline".to_string(),
+            category: "dev-tool".to_string(),
+            description: "## Tokio Discipline\n\n### Protocol\nSpawn blocking.".to_string(),
+            contexts: vec!["async".to_string()],
+            learnings: vec![],
+        });
+        let result = run(&disp, &tool_call(14, create.clone()), &create);
+        assert!(!result_is_error(&result));
+        let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "tokio-discipline".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec!["async".to_string()],
+            learnings: vec!["spawn_blocking reviewed".to_string()],
+            outcome: Some("success".to_string()),
+        });
+        let result = run(&disp, &tool_call(15, practice.clone()), &practice);
+        assert!(!result_is_error(&result));
+
+        // END: close the session; cross-tool attribution must hold.
+        let end = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "success".to_string(),
+            final_approach: Some("spawn_blocking everywhere".to_string()),
+            lessons: vec!["verify before claiming".to_string()],
+        });
+        let result = run(&disp, &tool_call(16, end.clone()), &end);
+        assert!(!result_is_error(&result));
+
+        // Coherence across the loop, read back from canonical state.
+        let handle =
+            crate::domain::id::SessionHandle::new(uuid::Uuid::parse_str(&session_id).unwrap());
+        let session = disp.registry().session(handle).unwrap().clone();
+        assert!(session.memories_read.contains(&rust_id));
+        assert!(session.memories_created.contains(&new_id));
+        assert_eq!(session.attempts.len(), 1);
+        assert!(
+            session
+                .guides_used
+                .contains(&"tokio-discipline".to_string())
+        );
+        assert!(session.status.is_terminal(), "session must be ended");
+        let guide = disp.repo().get_guide("tokio-discipline").unwrap().unwrap();
+        // Create seeds usage at 1; the explicit practice adds exactly one more.
+        assert_eq!(guide.usage_count, 2);
+        let eid = disp.repo().resolve_id(&new_id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert_eq!(
+            mems[0].session_id.as_deref(),
+            Some(session_id.as_str()),
+            "persisted memory links the session"
+        );
+    }
+
     #[test]
     fn session_stats_reports_active_completed_and_empty() {
         let stats = |disp: &Dispatcher, op: u64| {

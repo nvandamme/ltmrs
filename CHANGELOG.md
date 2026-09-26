@@ -5,6 +5,9 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2a72460 (2026-09-26) — whole-learning-workflow trace through tool handlers
+
+
 ## 5e5dbc9 (2026-09-26) — dense memory preload at session start
 
 
