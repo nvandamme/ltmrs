@@ -5,6 +5,9 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 5e5dbc9 (2026-09-26) — dense memory preload at session start
+
+
 ## ad6d3a3 (2026-09-26) — per-channel virtual sessions for session-less calls
 
 

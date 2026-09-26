@@ -3659,26 +3659,17 @@ fn exec_session_start(
     let suggestions = suggest_guides(&task_desc, &guides);
     let formatted_suggestions = format_guide_suggestions(&suggestions);
 
-    // Pre-load relevant memories (bounded lexical recall).
-    let export = repo.export_snapshot()?;
-    let mut relevant: Vec<&Memory> = export
-        .memories
-        .iter()
-        .filter(|m| m.lifecycle.is_recallable())
-        .filter(|m| {
-            project
-                .as_deref()
-                .map(|p| m.project.as_deref() == Some(p) || m.project.is_none())
-                .unwrap_or(true)
-        })
-        .collect();
-    let q = task_desc.to_lowercase();
-    relevant.sort_by(|a, b| {
-        relevance(b, &q)
-            .partial_cmp(&relevance(a, &q))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    // Pre-load relevant memories: dense-ranked recall when a search
+    // backend is attached, identical lexical fallback otherwise.
+    // recall_browse owns both paths (engine ranking + snapshot scan),
+    // so preload never diverges from browse recall.
+    let browse_args = MemoryReadArgs {
+        query: Some(task_desc.clone()),
+        project: None,
+        all: true,
+        ..Default::default()
+    };
+    let mut relevant: Vec<Memory> = recall_browse(disp, &browse_args)?;
     relevant.truncate(3);
 
     // Boost pre-loaded memories (upstream boostConfidence 0.02).
@@ -4931,6 +4922,103 @@ mod tests {
             get(&second).session_id.as_deref(),
             Some(traced.as_uuid().to_string()).as_deref(),
             "traced session must shadow the virtual one"
+        );
+    }
+
+    /// Dense preload: with a backend attached, a memory with zero lexical
+    /// overlap but a perfect dense match is proposed at session start,
+    /// while pure lexical ranking would truncate it away.
+    #[tokio::test]
+    async fn session_start_preload_uses_dense_when_attached() {
+        use crate::embeddings::e5_small::E5_SMALL_FINGERPRINT;
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::projector::{FixedEmbedder, Projector, render_text};
+        use crate::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+
+        // Three lexically strong memories plus one zero-overlap tail.
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        for (n, title, frag) in [
+            (1, "Rust Async", "tokio runtime task spawn"),
+            (2, "Rust Errors", "result option unwrap expect"),
+            (3, "Rust Tests", "cargo test assert module"),
+        ] {
+            add_fragment(&seed, n, &format!("## {title}\n\n### Context\n{frag}."));
+        }
+        let tail_id = add_fragment(
+            &seed,
+            4,
+            "## Tail Memory\n\n### Context\nQuantum bananas orbit pluto.",
+        );
+
+        // Project all four with fixed vectors (no FTS index: lexical leg
+        // stays empty, dense decides alone).
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let mut proj = Projector::new(
+            Arc::clone(&repo),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 384 }),
+            E5_SMALL_FINGERPRINT,
+            crate::domain::id::StoreGeneration::FIRST,
+        );
+        proj.run_until_idle().await.unwrap();
+
+        // Query embedder returns the tail row's exact vector whatever the
+        // task text is: dense similarity 1.0 for the tail only.
+        use crate::search::projector::Embedder as _;
+        let mut fx = FixedEmbedder { dim: 384 };
+        let tail_vec = fx
+            .embed(&render_text("Tail Memory", "Quantum bananas orbit pluto."))
+            .unwrap();
+        let embedder = Arc::new(ClosureEmbedder::new(move |_| Ok(tail_vec.clone())));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string()],
+            initial_approach: None,
+        });
+        let env = tool_call(10, start.clone());
+        // Same sync-context rule as the dispatcher: bridge from blocking code.
+        let result = tokio::task::spawn_blocking(move || run(&disp, &env, &start))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let preloaded: Vec<String> = structured["preloaded_memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(
+            preloaded.contains(&tail_id),
+            "dense perfect match must be proposed, got: {preloaded:?}"
         );
     }
 

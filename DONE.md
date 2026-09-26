@@ -7,25 +7,6 @@ Content before `---` is instructions — do not modify. Add entries after `## Un
 
 ## Unreleased Commit
 
-### Dense memory preload at session start (WP-09 leftover, uncommitted)
-
-- `src/daemon/tools.rs::exec_session_start`: preload routes through
-  `recall_browse` (dense-ranked when a backend is attached, byte-identical
-  lexical fallback otherwise — comparator, filters, truncate(3), boost
-  (+0.02) and track-read side effects all preserved).
-- Accepted divergence (reviewed, intended): attached path ranks from the
-  engine pool instead of the unbounded lexical scan — that IS the
-  dense-proposal task.
-- Reviews (formal + functional): double PASS (parity field-by-field,
-  side effects, sync-context degradation, scoping).
-- Tests: zero-overlap tail with exact-vector match is proposed (lexical
-  truncation would drop it); existing lifecycle/boost tests pin fallback.
-- WP-09 checkbox stays OPEN: guide-catalog dense matching needs a vector
-  index (guides have none); suggest_guides remains token-based upstream
-  parity (documented follow-up).
-  (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test`: 415 passed, 0 failed.)
-
 ### Whole-learning-workflow trace (WP-09 leftover, uncommitted)
 
 - `src/daemon/tools.rs::whole_learning_workflow_recall_act_persist`: one
