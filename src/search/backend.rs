@@ -65,6 +65,31 @@ impl SearchBackend {
         handle.block_on(async move { engine.retrieve(req, embedder.as_ref()).await })
     }
 
+    /// Embed one query-role vector synchronously (bridges async via
+    /// block_on, same runtime contract as `retrieve_sync`).
+    pub fn embed_query_sync(&self, text: &str) -> DomainResult<Vec<f32>> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|e| {
+            crate::domain::command::DomainError::new(
+                crate::domain::command::DomainErrorCode::Validation,
+                format!("no tokio runtime for search: {e}"),
+            )
+        })?;
+        handle.block_on(self.embedder.embed_query(text))
+    }
+
+    /// Embed passage-role vectors synchronously (one bridge for the batch;
+    /// embedders without passage support report unsupported and callers
+    /// fall back to the token path).
+    pub fn embed_passages_sync(&self, texts: &[String]) -> DomainResult<Vec<Vec<f32>>> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|e| {
+            crate::domain::command::DomainError::new(
+                crate::domain::command::DomainErrorCode::Validation,
+                format!("no tokio runtime for search: {e}"),
+            )
+        })?;
+        handle.block_on(self.embedder.embed_passages(texts))
+    }
+
     /// Whether the FTS index is ready (for readiness reporting).
     pub fn fts_ready(&self) -> DomainResult<bool> {
         let handle = tokio::runtime::Handle::try_current().map_err(|e| {
@@ -273,6 +298,39 @@ impl QueryEmbedder for ServiceQueryEmbedder {
                 };
                 DomainError::new(DomainErrorCode::Validation, message)
             })
+        })
+    }
+
+    /// Passage-role batch embed over the bounded worker (one round-trip for
+    /// the whole catalog; error mapping mirrors the query path, including
+    /// the `busy:` backpressure prefix).
+    fn embed_passages<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> crate::retrieval::engine::PassageVectorsFuture<'a> {
+        let service = self.service.clone();
+        let inputs: Vec<crate::embeddings::e5_small::EmbedInput> = texts
+            .iter()
+            .map(|text| crate::embeddings::e5_small::EmbedInput {
+                text: text.clone(),
+                role: Role::Passage,
+            })
+            .collect();
+        Box::pin(async move {
+            service
+                .embed_batch(inputs)
+                .await
+                .map(|seqs| seqs.into_iter().map(|s| s.vector).collect())
+                .map_err(|e| {
+                    let message = e.to_string();
+                    let message = match &e {
+                        crate::embeddings::worker::ServiceError::Busy => {
+                            format!("busy: {message}")
+                        }
+                        _ => format!("passage embedding failed: {message}"),
+                    };
+                    DomainError::new(DomainErrorCode::Validation, message)
+                })
         })
     }
 }

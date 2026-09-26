@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::domain::command::{DomainResult, Scope};
+use crate::domain::command::{DomainError, DomainErrorCode, DomainResult, Scope};
 use crate::domain::id::{EntityId, ModelFingerprint, StoreGeneration};
 use crate::domain::memory::Memory;
 use crate::domain::relation::Relation;
@@ -32,6 +32,11 @@ use crate::retrieval::scope::EffectiveScope;
 use crate::search::row::SearchRow;
 use crate::search::table::SearchTable;
 
+/// Boxed future resolving to one vector per passage input.
+/// Module-level alias: the nested result type trips `type_complexity` inline.
+pub type PassageVectorsFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = DomainResult<Vec<Vec<f32>>>> + Send + 'a>>;
+
 /// The query embedder seam: the engine never blocks on inference; the daemon
 /// provides an async embedding service behind this trait.
 pub trait QueryEmbedder: Send + Sync {
@@ -39,6 +44,21 @@ pub trait QueryEmbedder: Send + Sync {
         &'a self,
         query: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DomainResult<Vec<f32>>> + Send + 'a>>;
+
+    /// Embed catalog texts with the Passage (document) role for dense
+    /// candidate proposal (guide ranking). Defaults to unsupported so
+    /// query-only embedders keep compiling; the token fallback covers them.
+    /// Role separation is load-bearing: passages must never go through the
+    /// Query-role seam above.
+    fn embed_passages<'a>(&'a self, texts: &'a [String]) -> PassageVectorsFuture<'a> {
+        let _ = texts;
+        Box::pin(async move {
+            Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "passage embedding unsupported by this embedder",
+            ))
+        })
+    }
 }
 
 /// Retrieval request.

@@ -1,0 +1,164 @@
+{
+ "provenance": {
+  "tool": "tools/capture_workflow.mjs + tools/normalize_workflow.mjs",
+  "upstream": "xenitV1/lemma@d30a816632d0bc5d92907cbc51c1dc1010111986",
+  "captured_at": "2026-09-26T16:55:44.342Z",
+  "content": "synthetic fixture fragments authored in the capture script; no private data",
+  "normalization": "m-hex ids->$Mn (appearance order), sc/sf session ids->$SID, vs_*->$VSID, ISO datetimes->$TS, upstream project->$PROJ, seed_*->$SEED",
+  "upstream_seed_fragments": 4,
+  "regen": [
+   "node tools/capture_workflow.mjs --server node --args dist/index.js --cwd tmp/upstream-lemma --home /tmp/uphome --out /tmp/workflow_raw.json",
+   "node tools/normalize_workflow.mjs --in /tmp/workflow_raw.json --out tests/compat/lemma_0_21_0/workflow_fixture.json --repo xenitV1/lemma --commit d30a816632d0bc5d92907cbc51c1dc1010111986 --seeds 4"
+  ]
+ },
+ "steps": [
+  {
+   "tool": "session_start",
+   "args": {
+    "task_type": "research",
+    "technologies": [
+     "rust"
+    ]
+   },
+   "text": "Session started: $SID (research)\nTechnologies: rust\n\nPre-loaded memories:\n  [$SEED] [global] Modern Clean Code (Agentic Era) (1.00)\n    Updated clean code for AI-assisted dev. SRP as context isolation, pragmatic DRY, LOB, type safety.\n\n=== GUIDE SUGGESTIONS ===\nFound 3 relevant guides (1 tracked, 2 new)\n\nTRACKED (you have experience):\n  ✓ [dev-tool] debugging (0x, last: $TS)\n      💡 Binary search the code: halve the suspicious range with each test\n      💡 Check the logs before adding console.log — the answer is often already there\n      💡 Reproduce the bug first — never debug from assumptions\n      ... and 2 more learnings\n\nSUGGESTED (not tracked yet):\n  + [data-storage] elasticsearch\n      keywords: elastic, search, index\n  + [programming-language] rust\n      keywords: rust, rustlang\n\n========================\n\n---\n**[Lemma] Session started** ($VSID). When you finish this task, call session_end with outcome and lessons. Use memory_add to persist insights, guide_practice to track skill usage.",
+   "structured": {
+    "session_id": "$SID",
+    "guides": [
+     "debugging",
+     "elasticsearch",
+     "rust",
+     "debugging"
+    ],
+    "preloaded_memories": [
+     "$SEED"
+    ]
+   }
+  },
+  {
+   "tool": "memory_add",
+   "args": {
+    "fragment": "## Workflow Probe Alpha\n\n### Context\nFirst synthetic fragment for the conformance workflow."
+   },
+   "text": "Added fragment [$M1] (project: $PROJ): \"## Workflow Probe Alpha\n\n### Context\nFir...\"\nSummary: ## Workflow Probe Alpha...",
+   "structured": {
+    "success": true,
+    "id": "$M1",
+    "conflicts": []
+   }
+  },
+  {
+   "tool": "memory_add",
+   "args": {
+    "fragment": "## Harbor Crane Schedules\n\n### Context\nSecond synthetic record for the conformance workflow probe: harbor crane maintenance windows."
+   },
+   "text": "Added fragment [$M2] (project: $PROJ): \"## Harbor Crane Schedules\n\n### Context\nS...\"\nSummary: ## Harbor Crane Schedules...\n\nRelated memories (auto-linked to strongest match):\n  [$M1] \"## Workflow Probe Alpha\n\n### Context\nFir...\" (1.00) — AUTO-LINKED",
+   "structured": {
+    "success": true,
+    "id": "$M2",
+    "conflicts": []
+   }
+  },
+  {
+   "tool": "memory_read",
+   "args": {
+    "query": "workflow probe"
+   },
+   "text": "## Memory Fragments ($PROJ)\n---\n[$M1] [$PROJ] ## Workflow Probe Alpha\n\n### Context\nFir... — ## Workflow Probe Alpha...\n[$M2] [$PROJ] ## Harbor Crane Schedules\n\n### Context\nS... — ## Harbor Crane Schedules...\n[$SEED] [global] Task Complexity Assessment — Evaluate complexity before acting. Simple: execute directly. Complex: plan → evaluate → execute.\n---\nAuto-linked 1 co-read fragments with related_to relations.",
+   "structured": {
+    "count": 3,
+    "total": 3,
+    "fragments": [
+     {
+      "id": "$M1",
+      "title": "## Workflow Probe Alpha\n\n### Context\nFir...",
+      "description": "## Workflow Probe Alpha...",
+      "type": "fact",
+      "confidence": 1,
+      "project": "$PROJ"
+     },
+     {
+      "id": "$M2",
+      "title": "## Harbor Crane Schedules\n\n### Context\nS...",
+      "description": "## Harbor Crane Schedules...",
+      "type": "fact",
+      "confidence": 1,
+      "project": "$PROJ"
+     },
+     {
+      "id": "$SEED",
+      "title": "Task Complexity Assessment",
+      "description": "Evaluate complexity before acting. Simple: execute directly. Complex: plan → evaluate → execute.",
+      "type": "pattern",
+      "confidence": 0.998,
+      "project": null
+     }
+    ],
+    "has_more": false,
+    "next_offset": null
+   }
+  },
+  {
+   "tool": "guide_create",
+   "args": {
+    "guide": "workflow-probe",
+    "category": "test",
+    "description": "## Workflow Probe\n\n### Protocol\nFollow the scripted steps."
+   },
+   "text": "Created new guide \"workflow-probe\" (test) with a detailed manual.",
+   "structured": {
+    "success": true,
+    "guide": "workflow-probe"
+   }
+  },
+  {
+   "tool": "guide_practice",
+   "args": {
+    "guide": "workflow-probe",
+    "category": "test",
+    "contexts": [
+     "conformance"
+    ],
+    "learnings": [
+     "scripted replay works"
+    ]
+   },
+   "text": "Updated guide \"workflow-probe\" (test): 2x usage, 1 learnings, 1 contexts",
+   "structured": {
+    "success": true,
+    "guide": "workflow-probe",
+    "usage_count": 2
+   }
+  },
+  {
+   "tool": "session_end",
+   "args": {
+    "outcome": "success"
+   },
+   "text": "Session $SID ended: success\nTask: research | Duration: $TS → $TS\n\nSESSION REVIEW:\n  Memories created: [$M1], [$M2]\n  Guides used: workflow-probe\nAuto-detected technologies: rust, conformance\n\nSUGGESTED ACTIONS:\n- If any created memories represent reusable skills, call guide_distill to promote them.\n\n---\n**[Lemma] Session ended** ($VSID)\nProject: $PROJ | Tool calls: 6\nTechnologies: rust, conformance\nMemories created: 2\nGuides: workflow-probe\n\nSynthesize this conversation: call memory_add with a concise summary of what was discussed, decided, or accomplished. Use type \"context\" and project \"$PROJ\".",
+   "structured": {
+    "outcome_recorded": true,
+    "suggestions": [
+     "If any created memories represent reusable skills, call guide_distill to promote them."
+    ]
+   }
+  },
+  {
+   "tool": "memory_stats",
+   "args": {},
+   "text": "## Memory Stats\nTotal: 6 fragments | Avg confidence: 0.9993333333333334\nHigh confidence (>0.8): 6 | Low (<0.3): 0\nSources: ai: 6\nProjects: (global): 4, $PROJ: 2\n\n\n---\n**[Lemma] Session started** ($VSID). When you finish this task, call session_end with outcome and lessons. Use memory_add to persist insights, guide_practice to track skill usage.",
+   "structured": {
+    "total": 6,
+    "avg_confidence": 0.9993333333333334,
+    "by_source": {
+     "ai": 6
+    },
+    "by_project": {
+     "(global)": 4,
+     "$PROJ": 2
+    },
+    "low_confidence": 0,
+    "high_confidence": 6
+   }
+  }
+ ]
+}

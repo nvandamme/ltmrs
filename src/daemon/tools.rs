@@ -2703,6 +2703,82 @@ fn has_token_match(text: &str, target: &str) -> bool {
     false
 }
 
+/// Max dense-only guides appended after the token matches (heuristic cap:
+/// tail cosine candidates are noise; pinned by tests).
+pub const DENSE_GUIDE_APPEND_CAP: usize = 5;
+
+/// Render a guide as passage-role embedding input: catalog text only.
+/// Usage counters and timestamps are deliberately excluded — they are not
+/// relevance signals.
+fn guide_catalog_text(guide: &Guide) -> String {
+    let mut parts = vec![guide.name.clone(), guide.description.clone()];
+    parts.extend(guide.contexts.iter().cloned());
+    parts.extend(guide.learnings.iter().cloned());
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Dense candidate proposal over the guide catalog (WP-09): cosine-rank the
+/// task (Query role) against each guide (Passage role) and return up to
+/// `DENSE_GUIDE_APPEND_CAP` positively-similar guides not already
+/// suggested. Scores propose candidates only — they are never displayed
+/// nor treated as proof of anything. Returns empty when the task is blank,
+/// the catalog is empty, dimensions mismatch, or any embedding fails, so
+/// callers fall back to the token-only suggestions byte-identically.
+fn suggest_guides_dense(
+    backend: &crate::search::backend::SearchBackend,
+    task: &str,
+    existing: &[Guide],
+    seen: &std::collections::BTreeSet<String>,
+) -> Vec<GuideSuggestion> {
+    if task.trim().is_empty() || existing.is_empty() {
+        return Vec::new();
+    }
+    let task_vec = match backend.embed_query_sync(task) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let texts: Vec<String> = existing.iter().map(guide_catalog_text).collect();
+    let guide_vecs = match backend.embed_passages_sync(&texts) {
+        Ok(v) if v.len() == existing.len() => v,
+        _ => return Vec::new(),
+    };
+    let mut ranked: Vec<(usize, f64)> = guide_vecs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !seen.contains(&existing[*i].name))
+        .map(|(i, g)| {
+            (
+                i,
+                crate::retrieval::ranking::cosine(Some(&task_vec), Some(g)),
+            )
+        })
+        .filter(|(_, score)| *score > 0.0)
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked
+        .into_iter()
+        .take(DENSE_GUIDE_APPEND_CAP)
+        .map(|(i, _)| {
+            let g = &existing[i];
+            GuideSuggestion {
+                guide: g.name.clone(),
+                category: g.category.clone(),
+                keywords: g.contexts.clone(),
+                tracked: true,
+                usage_count: g.usage_count,
+                last_used: g.last_used.map(|t| date_only(t.as_millis())),
+                learnings: g.learnings.clone(),
+                contexts: g.contexts.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Suggest guides for a task description (upstream guides.suggestGuides).
 fn suggest_guides(task_description: &str, existing_guides: &[Guide]) -> Vec<GuideSuggestion> {
     let mut suggestions: Vec<GuideSuggestion> = Vec::new();
@@ -2961,7 +3037,15 @@ fn exec_guide_get(disp: &Dispatcher, args: &GuideGetArgs) -> DomainResult<Domain
 
     // Task-based suggestions.
     if let Some(task) = &args.task {
-        let suggestions = suggest_guides(task, &guides);
+        let mut suggestions = suggest_guides(task, &guides);
+        // Dense candidate proposal (WP-09): appends positively-similar
+        // catalog guides the token path missed. Any dense failure adds
+        // nothing, keeping the token-only output byte-identical.
+        if let Some(backend) = disp.search() {
+            let seen: std::collections::BTreeSet<String> =
+                suggestions.iter().map(|s| s.guide.clone()).collect();
+            suggestions.extend(suggest_guides_dense(backend, task, &guides, &seen));
+        }
         let text = format_guide_suggestions(&suggestions);
         let data = json!({
             "count": suggestions.len(),
@@ -6120,6 +6204,279 @@ mod tests {
         }
     }
 
+    /// Normalize a replayed text the same way the fixture was normalized:
+    /// m-hex ids -> $Mn (appearance order in `ids`), UUIDs and upstream
+    /// session ids -> $SID, datetimes -> $TS, projects -> $PROJ shape.
+    fn wf_normalize(text: &str, ids: &mut Vec<String>) -> String {
+        let mid = regex::Regex::new(r"\bm[0-9a-f]{12}\b").unwrap();
+        let mut out = mid
+            .replace_all(text, |caps: &regex::Captures| {
+                let hit = caps[0].to_string();
+                let pos = match ids.iter().position(|id| *id == hit) {
+                    Some(i) => i + 1,
+                    None => {
+                        ids.push(hit);
+                        ids.len()
+                    }
+                };
+                format!("$M{pos}")
+            })
+            .into_owned();
+        let uuid =
+            regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+                .unwrap();
+        out = uuid.replace_all(&out, "$$SID").into_owned();
+        let sess = regex::Regex::new(r"\bs[a-z][0-9a-f]{11}\b").unwrap();
+        out = sess.replace_all(&out, "$$SID").into_owned();
+        // Any 4-digit year: replay runs under a frozen test clock (1970).
+        let ts = regex::Regex::new(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?").unwrap();
+        out = ts.replace_all(&out, "$$TS").into_owned();
+        out = out.replace("upstream-lemma", "$PROJ");
+        // Project attribution differs by design (cwd-derived vs explicit):
+        // compare the segment shape, not the project name.
+        out = out.replace("(global)", "(project: $PROJ)");
+        out
+    }
+
+    fn wf_normalize_value(value: &Value, ids: &mut Vec<String>) -> Value {
+        match value {
+            Value::String(s) => Value::String(wf_normalize(s, ids)),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|v| wf_normalize_value(v, ids)).collect())
+            }
+            Value::Object(map) => Value::Object(
+                // Keys pass through untouched: the text-only project-shape
+                // rule would otherwise rewrite aggregation buckets like
+                // `(global)` (the fixture keeps them verbatim too).
+                map.iter()
+                    .map(|(k, v)| (k.clone(), wf_normalize_value(v, ids)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    /// Differential workflow replay (WP-09 remaining task): the 8-step
+    /// recall -> act -> persist script from workflow_fixture.json (captured
+    /// from pinned upstream lemma 0.21.0) replayed through the public tool
+    /// handlers. Exact text+shape where parity is claimed; structural
+    /// sets/deltas with declared divergences everywhere else:
+    /// - upstream ships 4 seed fragments (counts, preload, read hits);
+    /// - upstream appends coaching blocks (`**[Lemma] ...**`) to session
+    ///   lifecycle and stats texts;
+    /// - memory_read relevance order differs (sets compared, not order);
+    /// - upstream auto-detects technologies and suggests distill on end;
+    /// - project attribution is cwd-derived upstream, explicit here.
+    #[test]
+    fn differential_workflow_replay_matches_upstream() {
+        let raw = std::fs::read_to_string(fixture_path("workflow_fixture.json"))
+            .expect("workflow_fixture.json must exist");
+        let fixture: Value = serde_json::from_str(&raw).expect("valid fixture");
+        let steps = fixture["steps"].as_array().expect("steps array");
+        assert_eq!(steps.len(), 8, "fixture must hold the 8-step workflow");
+        let seed_count = fixture["provenance"]["upstream_seed_fragments"]
+            .as_u64()
+            .expect("seed count") as usize;
+
+        let (disp, _dir) = test_dispatcher();
+        let mut op = 1u64;
+        let mut run_tool = |args: ToolArgs| -> DomainPayload {
+            let env = tool_call(op, args.clone());
+            op += 1;
+            run(&disp, &env, &args)
+        };
+        // Replay the fixture args verbatim (same calls both sides).
+        let mut replayed: Vec<(String, String, Value)> = Vec::new();
+        for step in steps {
+            let tool = step["tool"].as_str().unwrap();
+            // Arguments come from the fixture (same calls both sides);
+            // shapes absent from the capture stay None/defaulted.
+            let str_vec = |key: &str| -> Vec<String> {
+                step["args"][key]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let req_str = |key: &str| -> String {
+                step["args"][key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("fixture args lack {key}"))
+                    .to_string()
+            };
+            let args = match tool {
+                "session_start" => ToolArgs::SessionStart(SessionStartArgs {
+                    task_type: req_str("task_type"),
+                    technologies: str_vec("technologies"),
+                    initial_approach: None,
+                }),
+                "memory_add" => ToolArgs::MemoryAdd(MemoryAddArgs {
+                    fragment: req_str("fragment"),
+                    ..Default::default()
+                }),
+                "memory_read" => ToolArgs::MemoryRead(MemoryReadArgs {
+                    query: Some(req_str("query")),
+                    ..Default::default()
+                }),
+                "guide_create" => ToolArgs::GuideCreate(GuideCreateArgs {
+                    guide: req_str("guide"),
+                    category: req_str("category"),
+                    description: req_str("description"),
+                    // Absent from the captured call: empty on both sides.
+                    contexts: Vec::new(),
+                    learnings: Vec::new(),
+                }),
+                "guide_practice" => ToolArgs::GuidePractice(GuidePracticeArgs {
+                    guide: req_str("guide"),
+                    category: req_str("category"),
+                    contexts: str_vec("contexts"),
+                    learnings: str_vec("learnings"),
+                    ..Default::default()
+                }),
+                "session_end" => ToolArgs::SessionEnd(SessionEndArgs {
+                    outcome: req_str("outcome"),
+                    ..Default::default()
+                }),
+                "memory_stats" => ToolArgs::MemoryStats(MemoryStatsArgs {
+                    ..Default::default()
+                }),
+                other => panic!("fixture holds an unexpected tool: {other}"),
+            };
+            let result = run_tool(args);
+            assert!(
+                !result_is_error(&result),
+                "{tool} must succeed in replay: {}",
+                result_text(&result)
+            );
+            let structured = result_structured(&result).unwrap_or(Value::Null);
+            replayed.push((tool.to_string(), result_text(&result), structured));
+        }
+
+        // Normalize our side globally (same rules as the fixture).
+        let mut ids: Vec<String> = Vec::new();
+        let ours: Vec<(String, String, Value)> = replayed
+            .into_iter()
+            .map(|(tool, text, structured)| {
+                (
+                    tool,
+                    wf_normalize(&text, &mut ids),
+                    wf_normalize_value(&structured, &mut ids),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "exactly the two added fragments take $M ids, got: {ids:?}"
+        );
+
+        // Step 0 session_start: same session line, techs and new guides;
+        // seeds/coaching/tracked-debugging are declared divergences.
+        assert!(ours[0].1.contains("Session started: $SID (research)"));
+        assert!(ours[0].1.contains("Technologies: rust"));
+        assert_eq!(ours[0].2["session_id"], Value::String("$SID".to_string()));
+        assert_eq!(
+            ours[0].2["guides"],
+            serde_json::json!(["elasticsearch", "rust"])
+        );
+        let fx_guides: Vec<String> = steps[0]["structured"]["guides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|g| g != "debugging")
+            .collect();
+        assert_eq!(
+            fx_guides,
+            vec!["elasticsearch".to_string(), "rust".to_string()],
+            "upstream new-guide suggestions match ours (tracked debugging excluded)"
+        );
+        assert_eq!(ours[0].2["preloaded_memories"], Value::Array(vec![]));
+        assert_eq!(
+            steps[0]["structured"]["preloaded_memories"][0],
+            Value::String("$SEED".to_string())
+        );
+
+        // Steps 1-2 memory_add: exact normalized parity (text + shape).
+        for i in [1usize, 2] {
+            assert_eq!(
+                ours[i].1,
+                steps[i]["text"].as_str().unwrap(),
+                "add text parity"
+            );
+            assert_eq!(ours[i].2, steps[i]["structured"], "add shape parity");
+        }
+
+        // Step 3 memory_read: same added-fragment set (order differs by
+        // design); upstream additionally hits one seed.
+        let ours_ids: std::collections::BTreeSet<String> = ours[3].2["fragments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ours_ids,
+            std::collections::BTreeSet::from(["$M1".to_string(), "$M2".to_string()])
+        );
+        let fx_ids: std::collections::BTreeSet<String> = steps[3]["structured"]["fragments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            fx_ids,
+            std::collections::BTreeSet::from([
+                "$M1".to_string(),
+                "$M2".to_string(),
+                "$SEED".to_string()
+            ])
+        );
+        assert_eq!(ours[3].2["count"], serde_json::json!(2));
+        assert_eq!(steps[3]["structured"]["count"], serde_json::json!(3));
+
+        // Steps 4-5 guide_create/practice: exact normalized parity.
+        for i in [4usize, 5] {
+            assert_eq!(
+                ours[i].1,
+                steps[i]["text"].as_str().unwrap(),
+                "guide text parity"
+            );
+            assert_eq!(ours[i].2, steps[i]["structured"], "guide shape parity");
+        }
+
+        // Step 6 session_end: ours equals the upstream text minus the
+        // coaching tail; same memories/guides attribution.
+        let fx_end = steps[6]["text"].as_str().unwrap();
+        let (fx_head, _) = fx_end
+            .split_once("\nAuto-detected technologies:")
+            .expect("upstream end carries auto-detected techs");
+        assert_eq!(ours[6].1, fx_head, "end text parity before coaching tail");
+        assert_eq!(ours[6].2["outcome_recorded"], Value::Bool(true));
+        assert_eq!(ours[6].2["suggestions"], Value::Array(vec![]));
+        assert!(
+            steps[6]["structured"]["suggestions"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1,
+            "upstream suggests distill on end (declared divergence)"
+        );
+
+        // Step 7 memory_stats: totals differ by exactly the seed count.
+        let fx_total = steps[7]["structured"]["total"].as_u64().unwrap() as usize;
+        let ours_total = ours[7].2["total"].as_u64().unwrap() as usize;
+        assert_eq!(fx_total - ours_total, seed_count);
+        assert_eq!(ours_total, 2, "our two adds, no seeds");
+        assert_eq!(ours[7].2["by_source"]["ai"], serde_json::json!(2));
+        assert_eq!(ours[7].2["by_project"]["(global)"], serde_json::json!(2));
+        assert_eq!(ours[7].2["avg_confidence"], serde_json::json!(1.0));
+        assert!(ours[7].1.contains("Total: 2 fragments"));
+    }
+
     #[test]
     fn differential_summary_matches_upstream_wire() {
         let raw = std::fs::read_to_string(fixture_path("rendering_fixture.json"))
@@ -6591,6 +6948,273 @@ mod tests {
     }
 
     // ---- WP-09: guide tools ----
+
+    /// Biased passage double: task text maps to TASK_VEC; guide catalog
+    /// texts map by guide-name substring (beta ~= task, everything else
+    /// orthogonal). Query role always returns the task vector.
+    struct BiasedGuideEmbedder {
+        fail_passages: bool,
+    }
+
+    impl crate::retrieval::engine::QueryEmbedder for BiasedGuideEmbedder {
+        fn embed_query<'a>(
+            &'a self,
+            _query: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = crate::domain::command::DomainResult<Vec<f32>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(vec![1.0f32, 0.0, 0.0]) })
+        }
+
+        fn embed_passages<'a>(
+            &'a self,
+            texts: &'a [String],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::domain::command::DomainResult<Vec<Vec<f32>>>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let fail = self.fail_passages;
+            Box::pin(async move {
+                if fail {
+                    return Err(crate::domain::command::DomainError::new(
+                        crate::domain::command::DomainErrorCode::Validation,
+                        "boom".to_string(),
+                    ));
+                }
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        if t.to_lowercase().contains("beta") {
+                            vec![1.0f32, 0.0, 0.0]
+                        } else {
+                            vec![0.0f32, 1.0, 0.0]
+                        }
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    fn dense_alpha_guide() -> Guide {
+        Guide {
+            name: "alpha".into(),
+            category: "test".into(),
+            description: "Alpha rendering protocols".into(),
+            contexts: vec!["alpha pixels".into()],
+            learnings: vec!["alpha compositing".into()],
+            usage_count: 0,
+            last_used: None,
+            success_count: 0,
+            failure_count: 0,
+            anti_patterns: vec![],
+            pitfalls: vec![],
+            depends_on: vec![],
+            enables: vec![],
+            source_memories: vec![],
+            validated_by: vec![],
+            superseded_by: None,
+            deprecated: false,
+            entity_revision: crate::domain::id::EntityRevision::new(1),
+            created_at: crate::domain::memory::Instant::new(0),
+            updated_at: crate::domain::memory::Instant::new(0),
+        }
+    }
+
+    fn dense_beta_guide() -> Guide {
+        let mut g = dense_alpha_guide();
+        g.name = "beta".into();
+        g.description = "Beta estimation protocols".into();
+        g.contexts = vec!["covariance matrices".into()];
+        g.learnings = vec!["kalman gain tuning".into()];
+        g
+    }
+
+    async fn dense_test_backend(
+        fail_passages: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::search::backend::SearchBackend,
+    ) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let repo = std::sync::Arc::new(
+            crate::service::repository::CanonicalRepository::open(
+                store_dir.path().join("store").to_str().unwrap(),
+            )
+            .unwrap(),
+        );
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = crate::search::table::SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let backend = crate::search::backend::SearchBackend::new(
+            repo,
+            table,
+            std::sync::Arc::new(BiasedGuideEmbedder { fail_passages }),
+        );
+        (store_dir, lance_dir, backend)
+    }
+
+    /// Dense leg appends the token-missed guide (beta ~= task) while
+    /// leaving the already-suggested alpha out.
+    #[tokio::test]
+    async fn dense_guide_leg_appends_token_missed_guide() {
+        let (_s, _l, backend) = dense_test_backend(false).await;
+        let guides = vec![dense_alpha_guide(), dense_beta_guide()];
+        let seen = std::collections::BTreeSet::from(["alpha".to_string()]);
+        let out = tokio::task::spawn_blocking(move || {
+            suggest_guides_dense(&backend, "alpha zonkblat", &guides, &seen)
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 1, "only beta is dense-new, got: {out:?}");
+        assert_eq!(out[0].guide, "beta");
+        assert!(out[0].tracked, "dense additions come from the catalog");
+    }
+
+    /// A blank task proposes nothing dense (no noise vectors).
+    #[tokio::test]
+    async fn dense_guide_leg_ignores_blank_task() {
+        let (_s, _l, backend) = dense_test_backend(false).await;
+        let guides = vec![dense_beta_guide()];
+        let seen = std::collections::BTreeSet::new();
+        let out = tokio::task::spawn_blocking(move || {
+            suggest_guides_dense(&backend, "   ", &guides, &seen)
+        })
+        .await
+        .unwrap();
+        assert!(out.is_empty(), "blank task must stay token-only");
+    }
+
+    /// Embedding failure degrades to no dense candidates (the caller
+    /// keeps the token-only suggestions byte-identically).
+    #[tokio::test]
+    async fn dense_guide_errors_fall_back_silently() {
+        let (_s, _l, backend) = dense_test_backend(true).await;
+        let guides = vec![dense_beta_guide()];
+        let seen = std::collections::BTreeSet::new();
+        let out = tokio::task::spawn_blocking(move || {
+            suggest_guides_dense(&backend, "alpha zonkblat", &guides, &seen)
+        })
+        .await
+        .unwrap();
+        assert!(out.is_empty(), "failed dense leg must add nothing");
+    }
+
+    /// Build a dispatcher with the biased dense backend attached.
+    async fn dense_wiring_dispatcher() -> (tempfile::TempDir, tempfile::TempDir, Dispatcher) {
+        let dir = tempfile::tempdir().unwrap();
+        let clock: std::sync::Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            std::sync::Arc::new(FrozenClock::new(1000));
+        let repo = std::sync::Arc::new(
+            crate::service::repository::CanonicalRepository::open_with_clock(
+                dir.path().to_str().unwrap(),
+                std::sync::Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        let disp = Dispatcher::new(
+            std::sync::Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            std::sync::Arc::clone(&clock),
+        );
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = crate::search::table::SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let backend = std::sync::Arc::new(crate::search::backend::SearchBackend::new(
+            std::sync::Arc::clone(&repo),
+            table,
+            std::sync::Arc::new(BiasedGuideEmbedder {
+                fail_passages: false,
+            }),
+        ));
+        let disp = disp.with_search(backend);
+        (dir, lance_dir, disp)
+    }
+
+    fn create_alpha_beta(disp: &Dispatcher) {
+        for (op, name, desc, ctx, learn) in [
+            (
+                1u64,
+                "alpha",
+                "Alpha rendering protocols",
+                "alpha pixels",
+                "alpha compositing",
+            ),
+            (
+                2u64,
+                "beta",
+                "Beta estimation protocols",
+                "covariance matrices",
+                "kalman gain tuning",
+            ),
+        ] {
+            let args = ToolArgs::GuideCreate(GuideCreateArgs {
+                guide: name.to_string(),
+                category: "test".to_string(),
+                description: desc.to_string(),
+                contexts: vec![ctx.to_string()],
+                learnings: vec![learn.to_string()],
+            });
+            let env = tool_call(op, args.clone());
+            let result = run(disp, &env, &args);
+            assert!(!result_is_error(&result), "guide {name} must create");
+        }
+    }
+
+    fn suggest_task_text(disp: &Dispatcher) -> String {
+        let args = ToolArgs::GuideGet(GuideGetArgs {
+            task: Some("alpha zonkblat".to_string()),
+            ..Default::default()
+        });
+        let env = tool_call(9, args.clone());
+        let result = run(disp, &env, &args);
+        assert!(!result_is_error(&result));
+        result_text(&result)
+    }
+
+    /// End to end: token path finds alpha, dense leg appends beta after it.
+    #[tokio::test]
+    async fn dense_guide_wiring_appends_after_token() {
+        let (_d, _l, disp) = dense_wiring_dispatcher().await;
+        // run() bridges onto the runtime (block_on), so the whole flow must
+        // execute off the async worker like the recall_browse tests.
+        let text = tokio::task::spawn_blocking(move || {
+            create_alpha_beta(&disp);
+            suggest_task_text(&disp)
+        })
+        .await
+        .unwrap();
+        let alpha = text.find("alpha").expect("alpha must be suggested");
+        let beta = text.find("beta").expect("beta must be dense-suggested");
+        assert!(
+            alpha < beta,
+            "token match first, dense addition after:\n{text}"
+        );
+    }
+
+    /// Without a backend the same catalog stays token-only (beta absent):
+    /// the dense leg changes nothing when unavailable.
+    #[tokio::test]
+    async fn token_only_without_backend() {
+        let (disp, _dir) = test_dispatcher();
+        create_alpha_beta(&disp);
+        let text = suggest_task_text(&disp);
+        assert!(text.contains("alpha"), "alpha must be suggested:\n{text}");
+        assert!(
+            !text.contains("beta"),
+            "beta must stay absent without dense:\n{text}"
+        );
+    }
 
     #[test]
     fn guide_create_then_get_roundtrip() {
