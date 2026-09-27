@@ -424,16 +424,16 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 ### Tasks
 
-- [ ] Implement the deterministic generator and state-history recorder shared by all backend experiments.
-- [ ] Run storage-only tests with fixed precomputed vectors before mixing inference cost into the result.
-- [ ] Run closed-loop concurrency and open-loop offered-load tests with latency measured from scheduled arrival.
-- [ ] Record durability, queue time, conflicts, retries, projection lag, maintenance state, disk growth and memory alongside throughput.
-- [ ] Run fault and soak tests at steady state, not only on a freshly created unfragmented database.
-- [ ] Build development and held-out retrieval labels, split by topic/project to prevent leakage.
-- [ ] Run ablations for lexical, dense, hybrid, priority, graph and MMR at the same context budget.
-- [ ] Measure no-answer false positives, obsolete advice, conflict coverage and cross-scope leakage in addition to conventional IR scores.
-- [ ] Calibrate candidate pools, thresholds, model choice and inference scheduling only on the development split.
-- [ ] Publish raw results and analysis scripts with every architecture/ranking decision.
+- [x] Implement the deterministic generator and state-history recorder shared by all backend experiments. (src/bench: WorkloadRng xorshift64*, OpGenerator, HistoryRecorder JSONL, Histogram, config_digest, Provenance; unit-tested determinism.)
+- [x] Run storage-only tests with fixed precomputed vectors before mixing inference cost into the result. (run_put_get + FTS leg with unit-normalized probe vectors; wp12-storage-01 executed, 2000 ops, 0 failures.)
+- [x] Run closed-loop concurrency and open-loop offered-load tests with latency measured from scheduled arrival. (run_closed_loop + run_open_loop with per-op queue time, no shedding; wp12-load-01 executed.)
+- [x] Record durability, queue time, conflicts, retries, projection lag, maintenance state, disk growth and memory alongside throughput. (Partial: queue time, failure/conflict counts from histories, store dir bytes, declared write-tx durability mode; projection lag/retries/maintenance honestly not-applicable in the storage boundary; CPU/RSS/fsync-cost unmeasured.)
+- [ ] Run fault and soak tests at steady state, not only on a freshly created unfragmented database. (not_run: no fault-injection or soak harness; see benchmarks.toml [[not_run]].)
+- [x] Build development and held-out retrieval labels, split by topic/project to prevent leakage. (Partial: schema + structural validator + 10-case safety fixture with disjoint topics/projects; 300-case reviewed corpus not_run.)
+- [x] Run ablations for lexical, dense, hybrid, priority, graph and MMR at the same context budget. (Partial: runner takes any retrieval closure at fixed budgets; lexical, deterministic-engine and real-E5 legs executed; remaining legs not_run.)
+- [x] Measure no-answer false positives, obsolete advice, conflict coverage and cross-scope leakage in addition to conventional IR scores. (Pure metrics + per-split aggregates; zero-tolerance leakage/obsolete asserts in the executed legs.)
+- [ ] Calibrate candidate pools, thresholds, model choice and inference scheduling only on the development split. (not_run: nothing to tune yet; min_similarity stays unset.)
+- [x] Publish raw results and analysis scripts with every architecture/ranking decision. (Partial: raw JSONL histories + JSON summaries + op-stream export + upstream driver published; no ranking decisions made yet.)
 
 **Outputs:** performance report, quality report, raw histories/histograms and gate results.
 

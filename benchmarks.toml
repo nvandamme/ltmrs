@@ -1,0 +1,83 @@
+# benchmarks.toml — versioned workload specifications for WP-12 experiments.
+#
+# Each [[workload]] is a seed-pinned workload the src/bench harness executes
+# deterministically (same seed ⇒ same op stream and probe vectors). This file
+# specifies workloads only; it carries no results. Raw evidence (JSONL
+# histories + JSON summaries with provenance) lives under reports/<name>/
+# (gitignored) and is produced by `cargo test -- --ignored
+# storage_experiment_reference_run` (and later runners). Only workloads with
+# real evidence are listed here — no aspirations.
+
+harness_version = 2
+
+[[workload]]
+name = "wp12-storage-01"
+description = "Storage-only baseline: Fjall canonical put/get plus Lance FTS lexical search over embedding-free rows. No model inference inside the measured boundary."
+seed = 7
+ops = 2000
+puts_per_1000 = 600
+key_space = 500
+value_bytes = 256
+top_k = 10
+backends = ["fjall-canonical", "lance-fts"]
+evidence = "reports/wp12-storage-01/"
+
+[[workload]]
+name = "wp12-load-01"
+description = "Load legs over the same put/get stream (seed 11, 1000 ops, 600 puts/1000, key space 500): closed-loop with 4 workers plus open-loop Poisson 200/s arrivals with 2 workers, per-op queue time measured from scheduled arrival. Search ops skipped (single-threaded FTS leg only)."
+seed = 11
+ops = 1000
+puts_per_1000 = 600
+key_space = 500
+value_bytes = 256
+top_k = 10
+backends = ["fjall-canonical"]
+evidence = "reports/wp12-load-01/"
+
+# Cross-implementation comparisons reference a workload stream above and
+# record both sides' evidence plus per-op-kind comparability verdicts.
+# A verdict of NOT COMPARABLE with a named reason is a result, not a gap.
+
+[[comparison]]
+name = "wp12-lemma-01"
+stream = "wp12-storage-01"
+sides = ["ltmrs", "lemma-0.21.0"]
+evidence = "reports/wp12-lemma-01/"
+verdict = "put/search not comparable (dedup-gate refusal cascade diverged the corpus); get miss-latency comparable as operation shape only (811us vs 32us p50, error-vs-ok semantics differ)"
+
+# Explicit not_run ledger (plan acceptance: unrun tests are `not_run` with a
+# named reason, never zero-filled or silently omitted).
+# Tail percentiles in executed summaries carry an indicative-only note below
+# TAIL_SAMPLE_FLOOR (see OpStats.note); they are not strong evidence.
+
+[[not_run]]
+name = "fault-soak-steady-state"
+reason = "No fault-injection or soak run exists; all bench stores are freshly created tempdirs. Disk-growth trends, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
+
+[[not_run]]
+name = "quality-corpus-300"
+reason = "Reviewed corpus target (§8.1, ≥300 cases) not built; the 10-case safety fixture pins mechanics, not retrieval quality. Held-out split (2 cases) is insufficient evidence for RQ-24."
+
+[[not_run]]
+name = "ablation-dense-hybrid-priority-graph-mmr-upstream"
+reason = "Ablation runner takes any retrieval closure, but only the lexical, deterministic-engine and real-E5 legs are executed. DenseExact/HybridRrf/Priority/Graph/Mmr/UpstreamReference legs have no implementation behind them."
+
+[[not_run]]
+name = "ann-vs-exact"
+reason = "No ANN index configuration evaluated (§8.3 orders exact search first; T-QUALITY-02)."
+
+[[not_run]]
+name = "dev-calibration"
+reason = "No thresholds, candidate pools or model choices tuned (nothing to tune yet); min_similarity stays unset. Calibration must use the dev split only when it happens (task 9)."
+
+[[not_run]]
+name = "contended-write-mix"
+reason = "Workload puts blind-upsert by key, so write conflicts and read-modify-write retries never occur; conflict/retry telemetry paths unexercised."
+
+[[not_run]]
+name = "search-load-legs"
+reason = "Closed/open-loop runners take put/get only; the FTS leg stays single-threaded until the table proves thread-safe publication under load."
+
+[[not_run]]
+name = "lemma-unique-content-variant"
+reason = "Follow-up to wp12-lemma-01: per-seq salted put content defeating the upstream dedup gate, for a pure write-path comparison (see comparison.json follow_up_not_run)."

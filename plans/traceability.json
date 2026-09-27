@@ -505,7 +505,8 @@
         "T-BENCH-02",
         "T-BENCH-03"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "T-BENCH-01: seed-pinned harness (src/bench) + storage-only reference run wp12-storage-01 (fjall put/get, lance FTS, 2000 ops, raw histories+provenance in reports/) + lemma-0.21.0 comparison wp12-lemma-01 with per-kind comparability verdicts (put/search not comparable by named reasons; get miss-latency shape only). T-BENCH-02: closed-loop (4 workers) + open-loop Poisson 200/s legs in wp12-load-01 with per-op queue-from-arrival latency, 0 failures. T-BENCH-03: not_run (no fault/soak at steady state; see benchmarks.toml [[not_run]]). Cross-backend matched-trace comparison not_run."
     },
     {
       "id": "RQ-24",
@@ -516,7 +517,8 @@
         "T-QUALITY-01",
         "T-QUALITY-02"
       ],
-      "status": "specified_not_executed"
+      "status": "executed_partial",
+      "evidence": "T-QUALITY-01 scaffolding executed: label schema + split-integrity validation + pure IR/safety metrics + ablation runner (src/bench/quality.rs); 10-case safety fixture (experiments/quality/safety-cases.json, dev+heldout, disjoint topics/projects) passes through the lexical leg (8 cases), the deterministic engine leg (7 cases incl. non-vacuous obsolete exclusion) and the real-E5 leg (French cross-lang retrieves English doc). T-QUALITY-02: not_run (no ANN configuration evaluated). 300-case reviewed corpus, remaining ablation legs, dev calibration: not_run (see benchmarks.toml [[not_run]])."
     },
     {
       "id": "RQ-25",

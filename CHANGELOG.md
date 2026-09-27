@@ -5,6 +5,48 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 23010e3 (2026-09-27) — WP-12 bench harness, first runs, lemma comparison, quality legs
+
+### WP-12 bench harness + first runs + lemma comparison + quality legs
+
+- Harness `src/bench/` (lib `bench`): seeded xorshift generator + op mix,
+  unit-normalized fixed probe vectors, JSONL history recorder with readback,
+  exact nearest-rank histograms, config digests, hardware provenance
+  (HARNESS_VERSION 2; tail percentiles carry indicative-only notes below
+  TAIL_SAMPLE_FLOOR). No new dependencies.
+- Storage experiment: put/get driver + async FTS leg (embedding-free rows,
+  index-presence guard, probe identity preserved), pure summarize.
+  Reference run wp12-storage-01 (seed 7, 2000 ops) for real: fjall put p50
+  80us/p99 148us, get p50 32us/p99 70us; lance FTS (500 rows) p50 6.3ms;
+  0 failures. Evidence in reports/ (gitignored), spec in benchmarks.toml.
+- Load runners: closed-loop (scoped threads) + open-loop (paced scheduler,
+  per-op queue from scheduled arrival, no shedding) sharing one executor
+  (payloads built pre-timer). Reference run wp12-load-01 (seed 11, 1000
+  ops): closed 4 workers, open Poisson 200/s, queue p99 157us, 0 failures.
+  Telemetry observes store bytes (Fjall 64MB preallocation absorbs unit
+  runs); projection/maintenance honestly not-applicable.
+- Lemma comparison wp12-lemma-01 (user-requested, twice): identical 2000-op
+  stream through pinned upstream 0.21.0 via tools/bench_against_lemma.mjs
+  (HOME-isolated, timeouts, arg validation). Verdicts: put/search NOT
+  COMPARABLE (dedup-gate refusal cascade diverged the corpus); get
+  miss-latency shape only (811us vs 32us p50, error-vs-ok semantics differ).
+- Quality: label schema + split-integrity validator + pure IR/safety metrics
+  + ablation runner; 10-case safety fixture passes through the lexical leg
+  (8), the deterministic engine leg (7, non-vacuous obsolete exclusion) and
+  the real-E5 leg (French cross-lang retrieves English doc, 11s,
+  skip-guarded). Correction: Lance is the vector table, E5 is the embedding
+  engine; relational judgment needs no model.
+- Reviews: formal (plans-coverage) + functional (bug hunt) passes; findings
+  fixed (load-summary failure derivation, probe identity, timer placement,
+  release-mode asserts, fresh-dir reference runs, driver timeouts/cleanup,
+  E5 single load, tail notes, not_run ledger, harness version).
+- Explicit not_run (benchmarks.toml [[not_run]]): fault/soak, 300-case
+  corpus, 4+ ablation legs, ANN, dev calibration, contended writes,
+  search-load legs, lemma unique-content variant.
+- Validation: `cargo fmt -- --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test` (524 lib passed + 3 ignored reference runs + 2
+  smoke, 0 failed).
+
 ## 20dbcb7 (2026-09-26) — WP-11 native backup restore and legacy verdict
 
 ### WP-11 native backup/restore + legacy verdict

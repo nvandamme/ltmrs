@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "documents": [
+    {"id": "g1", "topic": "garden", "project": "home", "text": "Rose pruning happens in late winter before bud break.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "g2", "topic": "garden", "project": "home", "text": "Tomato seedlings need full sun and consistent watering.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "g3", "topic": "garden", "project": "allotment", "text": "Allotment compost bins must stay rodent-proof.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "g4", "topic": "garden", "project": "home", "text": "Treat aphids with nicotine spray.", "obsolete": true, "created_at_millis": 1000},
+    {"id": "g5", "topic": "garden", "project": "home", "text": "Treat aphids with insecticidal soap; nicotine sprays are banned.", "obsolete": false, "created_at_millis": 2000},
+    {"id": "g6", "topic": "garden", "project": "home", "text": "Copper fungicide is safe for organic certification.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "g7", "topic": "garden", "project": "home", "text": "Copper fungicide exceeds organic limits and is restricted.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "g8", "topic": "garden", "project": "home", "text": "Garden diary: planted potatoes.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "g9", "topic": "garden", "project": "home", "text": "Garden diary: harvested potatoes.", "obsolete": false, "created_at_millis": 2000},
+    {"id": "h1", "topic": "harbor", "project": "work", "text": "Harbor mooring fees are due on the first of April.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "h2", "topic": "harbor", "project": "work", "text": "The north pier lighthouse flashes twice every ten seconds.", "obsolete": false, "created_at_millis": 1000},
+    {"id": "h3", "topic": "harbor", "project": "work", "text": "Knot guide: bowline for fixed loops, cleat hitch for docks.", "obsolete": false, "created_at_millis": 1000}
+  ],
+  "cases": [
+    {"id": "exact-g1", "kind": "exact", "topic": "garden", "project": "home", "split": "dev", "query": "rose pruning winter", "relevant": ["g1"], "must_include": ["g1"], "must_exclude": [], "obsolete_ids": [], "top_k": 5, "no_answer": false, "after_millis": null, "before_millis": null},
+    {"id": "para-g2", "kind": "paraphrase", "topic": "garden", "project": "home", "split": "dev", "query": "tomato seedlings sun watering", "relevant": ["g2"], "must_include": ["g2"], "must_exclude": [], "obsolete_ids": [], "top_k": 5, "no_answer": false, "after_millis": null, "before_millis": null},
+    {"id": "noanswer-g", "kind": "no_answer", "topic": "garden", "project": "home", "split": "dev", "query": "lunar regolith mining", "relevant": [], "must_include": [], "must_exclude": [], "obsolete_ids": [], "top_k": 5, "no_answer": true, "after_millis": null, "before_millis": null},
+    {"id": "scope-g3", "kind": "scope_trap", "topic": "garden", "project": "home", "split": "dev", "query": "compost rodent-proof", "relevant": [], "must_include": [], "must_exclude": ["g3"], "obsolete_ids": [], "top_k": 5, "no_answer": false, "after_millis": null, "before_millis": null},
+    {"id": "obsolete-g", "kind": "obsolete", "topic": "garden", "project": "home", "split": "dev", "query": "aphid treatment spray", "relevant": ["g5"], "must_include": ["g5"], "must_exclude": [], "obsolete_ids": ["g4"], "top_k": 5, "no_answer": false, "after_millis": null, "before_millis": null},
+    {"id": "conflict-g", "kind": "conflict", "topic": "garden", "project": "home", "split": "dev", "query": "copper fungicide organic", "relevant": ["g6", "g7"], "must_include": ["g6", "g7"], "must_exclude": [], "obsolete_ids": [], "top_k": 5, "no_answer": false, "after_millis": null, "before_millis": null},
+    {"id": "time-g9", "kind": "time_filter", "topic": "garden", "project": "home", "split": "dev", "query": "potatoes", "relevant": ["g9"], "must_include": ["g9"], "must_exclude": ["g8"], "obsolete_ids": [], "top_k": 5, "no_answer": false, "after_millis": 1500, "before_millis": null},
+    {"id": "cross-g1", "kind": "cross_language", "topic": "garden", "project": "home", "split": "dev", "query": "taille des rosiers", "relevant": ["g1"], "must_include": ["g1"], "must_exclude": [], "obsolete_ids": [], "top_k": 5, "no_answer": false, "after_millis": null, "before_millis": null},
+    {"id": "exact-h1", "kind": "exact", "topic": "harbor", "project": "work", "split": "heldout", "query": "mooring fees April", "relevant": ["h1"], "must_include": ["h1"], "must_exclude": [], "obsolete_ids": [], "top_k": 5, "no_answer": false, "after_millis": null, "before_millis": null},
+    {"id": "noanswer-h", "kind": "no_answer", "topic": "harbor", "project": "work", "split": "heldout", "query": "neutrino oscillation", "relevant": [], "must_include": [], "must_exclude": [], "obsolete_ids": [], "top_k": 5, "no_answer": true, "after_millis": null, "before_millis": null}
+  ]
+}
