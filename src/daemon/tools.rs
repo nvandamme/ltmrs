@@ -152,27 +152,17 @@ fn new_legacy_id(envelope: &IpcEnvelope) -> String {
 /// Canonical project key: trimmed + lowercased, path collapsed to basename.
 /// "global" (case-insensitive) maps to None.
 fn normalize_project(raw: &str) -> Option<String> {
-    let mut p = raw.trim().to_string();
-    if p.is_empty() {
-        return None;
-    }
-    p = p.replace('\\', "/");
-    p = p.trim_end_matches('/').to_string();
-    if p.contains('/') {
-        p = p.rsplit('/').next().unwrap_or("").to_string();
-    }
-    p = p.trim().to_lowercase();
-    if p.is_empty() || p == "global" {
-        None
-    } else {
-        Some(p)
-    }
+    crate::compatibility::lemma::tool_args::normalize_project(raw)
 }
 
 /// Auto-title: first 40 chars (truncated with "...") or the fragment itself.
+/// Char-boundary truncation: byte slicing would panic on multi-byte titles.
+/// Compat nuance: upstream JS substring counts UTF-16 units, so astral-plane
+/// chars (emoji/CJK-ext) count 1 here vs 2 there — strictly better than
+/// panicking, and titles are display hints, not protocol.
 fn generate_title(fragment: &str) -> String {
-    if fragment.len() > 40 {
-        format!("{}...", &fragment[..40])
+    if fragment.chars().count() > 40 {
+        format!("{}...", fragment.chars().take(40).collect::<String>())
     } else {
         fragment.to_string()
     }
@@ -1141,6 +1131,26 @@ fn exec_memory_add(
         })
         .unwrap_or_default();
 
+    // Resolve the session link BEFORE building the record so attribution
+    // lands in the single AddMemory apply: the channel's traced session
+    // when present, else its virtual session — session-less calls are
+    // attributed per channel, never silently dropped (DEV-003: no
+    // daemon-global session). A two-step link would blind-overwrite a
+    // concurrent change with no revision check and no receipt.
+    let (session_handle, session_task_type) = {
+        let mut reg = disp.registry();
+        let handle = reg.ensure_virtual_session(
+            envelope.frontend_id,
+            envelope.channel_id,
+            disp.clock().now_millis(),
+        );
+        let task_type = reg
+            .session(handle)
+            .and_then(|s| s.task_type.clone())
+            .unwrap_or_default();
+        (handle, task_type)
+    };
+
     // Build the memory.
     let legacy_id = new_legacy_id(envelope);
     let eid = EntityId::new(uuid::Uuid::new_v5(
@@ -1165,8 +1175,8 @@ fn exec_memory_add(
         relations: Vec::new(),
         parent_id: None,
         child_ids: Vec::new(),
-        session_id: None,
-        task_type: None,
+        session_id: Some(session_handle.as_uuid().to_string()),
+        task_type: Some(session_task_type),
         related_guides: Vec::new(),
         evidence,
         access_count: 0,
@@ -1193,49 +1203,15 @@ fn exec_memory_add(
     let ctx = sub_command_ctx(envelope, 0)?;
     disp.repo().apply(&ctx, &cmd)?;
 
-    // Link the created memory to session context (upstream memory_add
-    // session_link): the channel's traced session when present, else its
-    // virtual session — session-less calls are attributed per channel,
-    // never silently dropped (DEV-003: no daemon-global session).
+    // Attribute the created memory to the session in the registry. The
+    // canonical record already carries the link (set before AddMemory);
+    // this is registry-side bookkeeping only.
     {
         let mut reg = disp.registry();
-        let handle = reg.ensure_virtual_session(
-            envelope.frontend_id,
-            envelope.channel_id,
-            disp.clock().now_millis(),
-        );
-        let task_type = reg
-            .session(handle)
-            .and_then(|s| s.task_type.clone())
-            .unwrap_or_default();
-        if let Some(s) = reg.session_mut(handle)
+        if let Some(s) = reg.session_mut(session_handle)
             && !s.memories_created.contains(&legacy_id)
         {
             s.memories_created.push(legacy_id.clone());
-        }
-        let mut linked = memory.clone();
-        linked.session_id = Some(handle.as_uuid().to_string());
-        linked.task_type = Some(task_type);
-        linked.advance_document();
-        if repo.put_memory_direct(&linked).is_ok() {
-            // The link bump advances the document revision; re-point the
-            // pending job so the worker projects the linked revision
-            // instead of stalling on the pre-link one forever. Unconditional:
-            // a worker may have acknowledged the old job in between, in
-            // which case seq restarts (mirroring record_pending_projection).
-            let seq = repo
-                .projection_job(memory.id)
-                .ok()
-                .flatten()
-                .map(|j| j.seq + 1)
-                .unwrap_or(1);
-            if let Err(e) =
-                repo.enqueue_projection_job(memory.id, linked.document_revision, seq, false)
-            {
-                eprintln!("ltmrs: failed to re-point projection job: {}", e.message);
-            }
-        } else {
-            eprintln!("ltmrs: failed to persist session-linked memory");
         }
     }
 
@@ -2254,7 +2230,11 @@ fn exec_semantic_search(
 
     // Use the search backend when available.
     let mut scored: Vec<(Memory, f64)> = Vec::new();
+    let mut engine_explanation: Option<crate::retrieval::explain::RetrievalExplanation> = None;
     if let Some(sb) = disp.search() {
+        // hybrid:false forces lexical-only (upstream parity on demand);
+        // absent/true runs the hybrid engine when a backend is attached.
+        let use_dense = args.hybrid != Some(false);
         let req = crate::retrieval::engine::RetrievalRequest {
             query: args.query.clone(),
             scope: crate::domain::command::Scope {
@@ -2264,7 +2244,11 @@ fn exec_semantic_search(
             },
             // Dense leg in the pinned E5 space when a backend is attached;
             // no backend (or no dense hits) falls back to lexical below.
-            model_fingerprint: Some(crate::embeddings::e5_small::E5_SMALL_FINGERPRINT),
+            model_fingerprint: if use_dense {
+                Some(crate::embeddings::e5_small::E5_SMALL_FINGERPRINT)
+            } else {
+                None
+            },
             result_limit: top_k + offset,
             ..Default::default()
         };
@@ -2280,6 +2264,39 @@ fn exec_semantic_search(
                     .unwrap_or(0.5);
                 scored.push((r.memory, s));
             }
+            engine_explanation = Some(result.explanation);
+        }
+    }
+
+    /// Explain how the answer was produced when requested: the effective
+    /// mode (hybrid only when the dense leg ran) plus engine readiness,
+    /// or the fallback mode otherwise. The fallback candidate count is
+    /// threaded in (the engine arm reports its own examined pool).
+    fn explain_search(
+        explanation: &Option<crate::retrieval::explain::RetrievalExplanation>,
+        fallback_candidates: usize,
+    ) -> serde_json::Value {
+        match explanation {
+            Some(exp) => serde_json::json!({
+                "mode": if exp.model_fingerprint.is_some() { "hybrid" } else { "lexical" },
+                "dense_ready": exp.dense_ready,
+                "fts_ready": exp.fts_ready,
+                "partial": exp.partial,
+                "no_match": exp.no_match,
+                "candidates": exp.candidates.len(),
+                "conflict_notice": exp.conflict_notice,
+            }),
+            None => serde_json::json!({
+                "mode": "lexical-fallback",
+                "dense_ready": false,
+                // Substring scan over a canonical snapshot, not the FTS
+                // index: never claim FTS readiness here.
+                "fts_ready": false,
+                "partial": false,
+                "no_match": false,
+                "candidates": fallback_candidates,
+                "conflict_notice": null,
+            }),
         }
     }
 
@@ -2307,6 +2324,13 @@ fn exec_semantic_search(
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
         scored = candidates;
+        // The served rows come from the substring fallback, not the engine:
+        // drop the engine explanation so explain:true reports the effective
+        // fallback mode instead of a hybrid that produced nothing. (When the
+        // fallback also finds nothing, the engine no-match is preserved.)
+        if !scored.is_empty() {
+            engine_explanation = None;
+        }
     }
 
     let total = scored.len();
@@ -2324,13 +2348,16 @@ fn exec_semantic_search(
             "No semantically similar memories found for: \"{}\"",
             args.query
         );
-        let data = json!({
+        let mut data = json!({
             "count": 0,
             "total": total,
             "results": [],
             "has_more": has_more,
             "next_offset": if has_more { Some(next_offset) } else { None },
         });
+        if args.explain {
+            data["explanation"] = explain_search(&engine_explanation, scored.len());
+        }
         return Ok(format_result(text, data, format));
     }
 
@@ -2362,13 +2389,16 @@ fn exec_semantic_search(
         ));
     }
 
-    let data = json!({
+    let mut data = json!({
         "count": page.len(),
         "total": total,
         "results": results_json,
         "has_more": has_more,
         "next_offset": if has_more { Some(next_offset) } else { None },
     });
+    if args.explain {
+        data["explanation"] = explain_search(&engine_explanation, scored.len());
+    }
     Ok(format_result(text, data, format))
 }
 
@@ -3126,6 +3156,14 @@ fn exec_guide_practice(
     if args.guide.trim().is_empty() || args.category.trim().is_empty() {
         return Ok(err_result("'guide' and 'category' parameters are required"));
     }
+    // Like the sibling tools (session_attempt/session_end): an unrecognized
+    // outcome errors instead of silently dropping the signal.
+    if let Some(outcome) = args.outcome.as_deref()
+        && outcome != "success"
+        && outcome != "failure"
+    {
+        return Ok(err_result("'outcome' must be one of: success, failure."));
+    }
     let now = disp.clock().now_millis();
     let existing = repo.get_guide(&args.guide)?;
     let mut updated = match existing {
@@ -3672,7 +3710,13 @@ fn rename_guide_in_memories(
                     }
                 })
                 .collect();
-            updated.advance_document();
+            // No advance_document: related_guides is not indexed text, so a
+            // revision bump without a projection job would skew the
+            // canonical revision ahead of the projection indefinitely.
+            // Entity-only advance preserves the established non-content
+            // contract: a stale writer holding the old entity revision
+            // conflicts instead of silently overwriting the rename.
+            updated.entity_revision = updated.entity_revision.next();
             let _ = repo.put_memory_direct(&updated);
         }
     }
@@ -3701,7 +3745,10 @@ fn remove_guide_from_memories(
                 .filter(|g| !g.eq_ignore_ascii_case(&normalized))
                 .cloned()
                 .collect();
-            updated.advance_document();
+            // No advance_document: see rename_guide_in_memories.
+            // Entity-only advance preserves the non-content conflict
+            // contract without skewing the projection.
+            updated.entity_revision = updated.entity_revision.next();
             let _ = repo.put_memory_direct(&updated);
         }
     }
@@ -4575,6 +4622,12 @@ fn exec_backup_preview(
     let now = disp.clock().now_millis();
     let channels = disp.registry().channel_count();
     let channel = envelope.channel_id.as_uuid().to_string();
+    let live_op_seq = disp.repo().op_seq().map_err(|e| {
+        crate::domain::command::DomainError::new(
+            crate::domain::command::DomainErrorCode::Validation,
+            format!("backup preview failed: {}", e.message),
+        )
+    })?;
     let preview = disp
         .restore_coordinator()
         .preview(crate::interchange::restore::PreviewRequest {
@@ -4585,6 +4638,7 @@ fn exec_backup_preview(
             live_generation: generation,
             active_channels: channels,
             now_millis: now,
+            live_op_seq,
         });
     let text = if preview.ready {
         format!(
@@ -4653,15 +4707,28 @@ fn exec_backup_restore(
         .store_generation()
         .map_err(|e| fail(format!("backup restore failed: {}", e.message)))?
         .as_u64();
-    disp.restore_coordinator()
-        .confirm(
-            &token,
-            true,
-            &verified.digest,
+    // Re-check the preview lease: a connection that arrived after the
+    // preview may hold acknowledged writes the replace would drain unseen.
+    // Writes that landed anyway (same channel, transient writers) are
+    // counted, not refused: the replace drains them, so the report must
+    // acknowledge the delta (recoverable from the safety backup).
+    let active_channels = disp.registry().channel_count();
+    let live_op_seq = disp
+        .repo()
+        .op_seq()
+        .map_err(|e| fail(format!("backup restore failed: {}", e.message)))?;
+    let (_, live_writes_since_preview) = disp
+        .restore_coordinator()
+        .confirm(crate::interchange::restore::ConfirmRequest {
+            token: &token,
+            confirm: true,
+            digest: &verified.digest,
             live_generation,
-            &channel,
-            now,
-        )
+            channel: &channel,
+            active_channels,
+            now_millis: now,
+            live_op_seq,
+        })
         .map_err(|e| match e {
             RestoreError::InvalidToken
             | RestoreError::Expired
@@ -4694,7 +4761,7 @@ fn exec_backup_restore(
         .collect::<Vec<_>>()
         .join("; ");
     let text = format!(
-        "Restored {} memories, {} guides from {}\nGeneration {} active; {} live sessions abandoned; safety backup at {}.{}{}",
+        "Restored {} memories, {} guides from {}\nGeneration {} active; {} live sessions abandoned; safety backup at {}.{}{}{}",
         report.restored.get("memories").copied().unwrap_or(0),
         report.restored.get("guides").copied().unwrap_or(0),
         source.display(),
@@ -4714,6 +4781,13 @@ fn exec_backup_restore(
                 report.unknown_top_level
             )
         },
+        if live_writes_since_preview == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n{live_writes_since_preview} live write(s) landed after the preview and were replaced (recoverable from the safety backup)."
+            )
+        },
     );
     Ok(ok_result(
         text,
@@ -4724,6 +4798,7 @@ fn exec_backup_restore(
             "generation": report.generation,
             "safety_backup": safety_path.to_string_lossy(),
             "abandoned_sessions": abandoned,
+            "live_writes_since_preview": live_writes_since_preview,
         }),
     ))
 }
@@ -4820,6 +4895,27 @@ mod tests {
     }
     fn ch(n: u64) -> ChannelId {
         ChannelId::new(Uuid::from_u128(n as u128))
+    }
+
+    /// Auto-title truncates by characters, never by bytes (multi-byte input
+    /// must not panic at the boundary).
+    #[test]
+    fn generate_title_truncates_by_chars() {
+        assert_eq!(generate_title("short"), "short");
+        let long_ascii = "a".repeat(41);
+        assert_eq!(
+            generate_title(&long_ascii),
+            format!("{}...", "a".repeat(40))
+        );
+        // Emoji past the char boundary: byte slicing would panic.
+        let emoji = "😀".repeat(41);
+        let titled = generate_title(&emoji);
+        assert_eq!(titled.chars().count(), 43, "40 chars + ellipsis");
+        assert!(titled.ends_with("..."));
+        // Byte-boundary only (20 emoji = 20 chars): no truncation, no panic.
+        let short_emoji = "😀".repeat(20);
+        assert!(short_emoji.len() > 40, "fixture crosses the byte boundary");
+        assert_eq!(generate_title(&short_emoji), short_emoji);
     }
 
     fn test_dispatcher() -> (Dispatcher, tempfile::TempDir) {
@@ -6152,7 +6248,7 @@ mod tests {
             project: None,
             top_k: None,
             offset: None,
-            hybrid: false,
+            hybrid: None,
             explain: false,
             response_format: None,
         };
@@ -6175,6 +6271,348 @@ mod tests {
         );
     }
 
+    /// hybrid:false is honored as lexical-only: the dense leg never runs,
+    /// and lexical results still answer (upstream parity on demand).
+    #[tokio::test]
+    async fn semantic_search_hybrid_false_skips_dense_leg() {
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::table::SearchTable;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Lexical Only\n\n### Context\nDense must stay silent.",
+        );
+
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder = Arc::new(ClosureEmbedder::new({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![0.0; 384])
+            }
+        }));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+        let args = SemanticSearchArgs {
+            query: "lexical silent".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: Some(false),
+            explain: false,
+            response_format: None,
+        };
+        let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+        let tool = ToolArgs::SemanticSearch(args);
+        let result = tokio::task::spawn_blocking(move || run(&disp, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "hybrid:false must not invoke the embedder"
+        );
+        let structured = result_structured(&result).unwrap();
+        assert!(
+            structured["count"].as_u64().unwrap() >= 1,
+            "lexical results must answer"
+        );
+    }
+
+    /// Publish one projection row directly (no worker): lets explain tests
+    /// drive the engine instead of falling through to the substring
+    /// fallback on an empty table.
+    async fn publish_search_row(
+        repo: &CanonicalRepository,
+        table: &crate::search::table::SearchTable,
+        lexical_text: &str,
+        fingerprint: crate::domain::id::ModelFingerprint,
+    ) {
+        use crate::domain::id::{ChunkId, DocumentRevision, StoreGeneration};
+        let memory_id = repo.export_snapshot().unwrap().memories[0].id;
+        table
+            .publish_rows(&[crate::search::row::SearchRow {
+                store_generation: StoreGeneration::FIRST,
+                memory_id,
+                document_revision: DocumentRevision::new(1),
+                model_fingerprint: fingerprint,
+                chunk_id: ChunkId::new(0),
+                chunker_version: "v1".to_string(),
+                lexical_text: lexical_text.to_string(),
+                char_start: 0,
+                char_end: lexical_text.len() as u64,
+                project: None,
+                fragment_type: "fact".to_string(),
+                created_at_millis: 1000,
+                confidence: 0.9,
+                updated_at_millis: 1000,
+                embedding: Some(vec![0.0; 384]),
+            }])
+            .await
+            .unwrap();
+    }
+
+    /// explain:true reports how the answer was produced: engine readiness
+    /// when the backend ran, fallback mode otherwise.
+    #[tokio::test]
+    async fn semantic_search_explain_reports_engine_explanation() {
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Explained Search\n\n### Context\nRecall with reasons.",
+        );
+
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        // Publish one row so the engine (not the fallback) answers.
+        publish_search_row(
+            &repo,
+            &table,
+            "explained reasons recall",
+            crate::embeddings::e5_small::E5_SMALL_FINGERPRINT,
+        )
+        .await;
+        table.create_fts_index().await.unwrap();
+        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+        let args = SemanticSearchArgs {
+            query: "explained reasons".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: None,
+            explain: true,
+            response_format: None,
+        };
+        let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+        let tool = ToolArgs::SemanticSearch(args);
+        let result = tokio::task::spawn_blocking(move || run(&disp, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["explanation"]["mode"], "hybrid",
+            "backend path must report hybrid mode"
+        );
+        assert!(
+            structured["explanation"]["dense_ready"].is_boolean(),
+            "readiness must be reported"
+        );
+    }
+
+    /// explain:true with hybrid:false reports the lexical mode actually
+    /// run, not hybrid: the mode names the effective legs, and the
+    /// no-backend fallback does not claim a ready FTS index it never used.
+    #[tokio::test]
+    async fn semantic_search_explain_reports_effective_mode() {
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Explained Search\n\n### Context\nRecall with reasons.",
+        );
+
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        // Publish one row so the engine serves lexically (hybrid:false
+        // skips the dense leg): the mode must name the effective legs.
+        publish_search_row(
+            &repo,
+            &table,
+            "explained reasons recall",
+            crate::embeddings::e5_small::E5_SMALL_FINGERPRINT,
+        )
+        .await;
+        table.create_fts_index().await.unwrap();
+        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+        let args = SemanticSearchArgs {
+            query: "explained reasons".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: Some(false),
+            explain: true,
+            response_format: None,
+        };
+        let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+        let tool = ToolArgs::SemanticSearch(args);
+        let result = tokio::task::spawn_blocking(move || run(&disp, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["explanation"]["mode"], "lexical",
+            "hybrid:false must report the lexical mode actually run"
+        );
+    }
+
+    /// explain:true with an empty engine result served by the substring
+    /// fallback reports the fallback mode (never a hybrid that produced
+    /// nothing) and never claims FTS readiness for a scan that used no
+    /// index.
+    #[tokio::test]
+    async fn semantic_search_explain_reports_fallback_mode() {
+        use crate::search::backend::{ClosureEmbedder, SearchBackend};
+        use crate::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::daemon::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Explained Search\n\n### Context\nRecall with reasons.",
+        );
+
+        // Empty table: the engine finds nothing, the substring fallback
+        // serves from the canonical snapshot.
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(crate::search::backend::QueryEmbedderAdapter::new(embedder)),
+        ));
+        let disp = Dispatcher::new(
+            repo,
+            crate::daemon::registry::FrontendRegistry::new(),
+            clock,
+        )
+        .with_search(backend);
+        let args = SemanticSearchArgs {
+            query: "explained reasons".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: None,
+            explain: true,
+            response_format: None,
+        };
+        let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+        let tool = ToolArgs::SemanticSearch(args);
+        let result = tokio::task::spawn_blocking(move || run(&disp, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert!(
+            structured["count"].as_u64().unwrap() >= 1,
+            "fallback must serve the snapshot row"
+        );
+        assert_eq!(
+            structured["explanation"]["mode"], "lexical-fallback",
+            "fallback-served rows must not report hybrid"
+        );
+        assert_eq!(
+            structured["explanation"]["fts_ready"], false,
+            "substring scan must not claim FTS readiness"
+        );
+        assert_eq!(
+            structured["explanation"]["candidates"], structured["total"],
+            "fallback candidates must match the examined pool"
+        );
+    }
+
     #[test]
     fn semantic_search_finds_relevant() {
         let (disp, _dir) = test_dispatcher();
@@ -6193,7 +6631,7 @@ mod tests {
             project: None,
             top_k: None,
             offset: None,
-            hybrid: false,
+            hybrid: None,
             explain: false,
             response_format: None,
         };
@@ -6222,7 +6660,7 @@ mod tests {
             project: None,
             top_k: None,
             offset: None,
-            hybrid: false,
+            hybrid: None,
             explain: false,
             response_format: None,
         };
@@ -6925,7 +7363,7 @@ mod tests {
             associated_with: Vec::new(),
             relations: Vec::new(),
             parent_id: None,
-            child_ids: Vec::new(),
+            child_ids: vec![],
             session_id: None,
             task_type: None,
             related_guides: Vec::new(),
@@ -7624,6 +8062,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        // A write lands between preview and confirm (same channel): the
+        // replace drains it, so the report must acknowledge the delta
+        // instead of dropping it silently.
+        add_fragment(
+            &disp,
+            6,
+            "## Restore Gamma\n\n### Context\nMid-window content.",
+        );
         let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
             confirmation_token: Some(token),
             confirm: Some(true),
@@ -7638,6 +8084,16 @@ mod tests {
         assert!(text.contains("Restored 1 memories"), "got: {text}");
         assert!(text.contains("safety backup at"), "got: {text}");
         let structured = result_structured(&result).unwrap();
+        // Gamma's add plus its topical auto-link both executed mid-window:
+        // every executed write counts, each would have been drained.
+        assert!(
+            structured["live_writes_since_preview"].as_u64().unwrap() >= 1,
+            "mid-window writes must be acknowledged, got: {structured:?}"
+        );
+        assert!(
+            text.contains("live write(s) landed after the preview"),
+            "report must name the delta, got: {text}"
+        );
         let safety = structured["safety_backup"].as_str().unwrap().to_string();
         assert!(
             std::path::Path::new(&safety).exists(),
@@ -7828,6 +8284,83 @@ mod tests {
         let text2 = result_text(&result2);
         assert!(text2.contains("=== GUIDE: react ==="));
         assert!(text2.contains("useCallback prevents re-renders"));
+    }
+
+    /// Guide renames rewrite references without churning revisions:
+    /// related_guides is not indexed text, so the document revision must
+    /// stay put (a bump without a projection job would skew canonical
+    /// ahead of the projection with no refresh coming).
+    #[test]
+    fn guide_rename_keeps_document_revision() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Linked\n\n### Context\nbody");
+        let repo = disp.repo();
+        let mut m = repo.export_snapshot().unwrap().memories.remove(0);
+        m.related_guides = vec!["old".to_string()];
+        repo.put_memory_direct(&m).unwrap();
+        let rev = m.document_revision;
+        let rev_entity = m.entity_revision;
+        rename_guide_in_memories(repo, "old", "new");
+        let after = repo.get_memories(&[m.id]).unwrap().remove(0);
+        assert_eq!(after.related_guides, vec!["new".to_string()]);
+        assert_eq!(
+            after.document_revision, rev,
+            "unindexed rename must not churn the revision"
+        );
+        assert_eq!(
+            after.entity_revision,
+            rev_entity.next(),
+            "entity revision still advances for conflict detection"
+        );
+    }
+
+    /// Guide removal rewrites references the same way: no document churn,
+    /// entity revision advance preserved.
+    #[test]
+    fn guide_remove_keeps_document_revision() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Linked\n\n### Context\nbody");
+        let repo = disp.repo();
+        let mut m = repo.export_snapshot().unwrap().memories.remove(0);
+        m.related_guides = vec!["old".to_string()];
+        repo.put_memory_direct(&m).unwrap();
+        let rev = m.document_revision;
+        let rev_entity = m.entity_revision;
+        remove_guide_from_memories(repo, "old");
+        let after = repo.get_memories(&[m.id]).unwrap().remove(0);
+        assert!(after.related_guides.is_empty());
+        assert_eq!(
+            after.document_revision, rev,
+            "unindexed remove must not churn the revision"
+        );
+        assert_eq!(
+            after.entity_revision,
+            rev_entity.next(),
+            "entity revision still advances for conflict detection"
+        );
+    }
+
+    /// An unrecognized practice outcome errors like the sibling tools
+    /// (session_attempt/session_end): silently dropping it would lose the
+    /// signal and skew the success hook.
+    #[test]
+    fn guide_practice_rejects_unknown_outcome() {
+        let (disp, _dir) = test_dispatcher();
+        let args = GuidePracticeArgs {
+            guide: "git".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec![],
+            learnings: vec!["x".to_string()],
+            outcome: Some("maybe".to_string()),
+        };
+        let env = tool_call(1, ToolArgs::GuidePractice(args.clone()));
+        let result = run(&disp, &env, &ToolArgs::GuidePractice(args));
+        assert!(
+            result_is_error(&result),
+            "unknown outcome must error, got: {}",
+            result_text(&result)
+        );
     }
 
     #[test]
@@ -8679,5 +9212,31 @@ mod tests {
 
     fn text_contains(p: &DomainPayload, needle: &str) -> bool {
         result_text(p).contains(needle)
+    }
+
+    /// Session linkage lands in the single AddMemory apply: no blind second
+    /// write (no clobber window), no document bump, one projection job.
+    #[test]
+    fn memory_add_links_session_in_single_apply() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(&disp, 1, "## Linked\n\n### Context\nSession link fixture.");
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        let stored = disp.repo().get_memories(&[eid]).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0].session_id.is_some(),
+            "session link must be stored on the record"
+        );
+        assert_eq!(
+            stored[0].document_revision.as_u64(),
+            0,
+            "single apply performs no link bump"
+        );
+        let job = disp
+            .repo()
+            .projection_job(eid)
+            .unwrap()
+            .expect("add enqueues one pending job");
+        assert_eq!(job.seq, 1, "single enqueue, no re-point");
     }
 }

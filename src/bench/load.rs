@@ -91,6 +91,11 @@ pub struct MeasuredOp {
 /// rejected here and belong to the single-threaded FTS leg). Returns
 /// (elapsed micros, ok, detail). Payloads are constructed BEFORE the timer
 /// starts so allocation/formatting never inflates store latency.
+///
+/// Scope: load runners drive `put_memory_direct`, which bypasses the command
+/// gateway (no receipts, aliases, revision checks or projection jobs).
+/// Point them at throwaway benchmark stores only — never at a live store,
+/// where blind overwrites at fixed revisions would clobber real state.
 pub fn execute_storage_op(repo: &CanonicalRepository, op: &WorkloadOp) -> (u64, bool, String) {
     use crate::bench::experiment::workload_memory;
     use crate::domain::id::EntityId;

@@ -5,7 +5,7 @@
 //! step. This prevents the class of bugs where filters are applied only after
 //! retrieval or are lost during graph expansion (RV-13).
 
-use crate::domain::command::Scope;
+use crate::domain::command::{DomainError, DomainErrorCode, DomainResult, Scope};
 use crate::domain::id::EntityId;
 use crate::domain::memory::{FragmentType, Memory};
 
@@ -31,17 +31,30 @@ impl EffectiveScope {
     /// Resolve the effective scope from the raw request scope.
     ///
     /// This is the single entry point — every retrieval call resolves its
-    /// scope exactly once here and threads the result through.
-    pub fn resolve(raw: &Scope) -> Self {
+    /// scope exactly once here and threads the result through. A
+    /// non-finite min_confidence (only constructible natively; JSON has no
+    /// NaN/inf literals) is rejected: it must never reach a filter, where
+    /// NaN comparisons would silently match nothing. (The struct fields
+    /// stay constructible for tests; production code must go through
+    /// here.)
+    pub fn resolve(raw: &Scope) -> DomainResult<Self> {
+        if let Some(min) = raw.min_confidence
+            && !min.is_finite()
+        {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "min_confidence must be finite",
+            ));
+        }
         // Project + global inheritance is deliberate (design §6.3): global
         // (project-less) memories are always inherited by any scope. This is
         // not "all projects" — a project scope still excludes other projects.
-        Self {
+        Ok(Self {
             includes_global: true,
             project: raw.project.clone(),
             all_projects: raw.all_projects,
             raw: raw.clone(),
-        }
+        })
     }
 
     /// Whether a memory's project field is in scope.
@@ -143,6 +156,15 @@ impl EffectiveScope {
             parts.push(format!("created_at_millis <= {before}"));
         }
 
+        // Confidence pre-filter at the source (RV-13): without it,
+        // candidate-limit truncation happens before eligibility checks and
+        // eligible rows are silently lost. resolve() rejects non-finite
+        // bounds, so this interpolation only ever carries finite numbers;
+        // the projection column is non-null Float64.
+        if let Some(min) = self.raw.min_confidence {
+            parts.push(format!("confidence >= {min}"));
+        }
+
         if parts.is_empty() {
             None
         } else {
@@ -164,7 +186,13 @@ impl EffectiveScope {
 /// filter expression. DataFusion follows SQL string-literal rules, so a
 /// single quote is escaped by doubling it. Prevents a malicious or
 /// accidental project name from breaking or injecting into the predicate.
-fn sql_quote(s: &str) -> String {
+///
+/// CENTRAL RULE: every string interpolated into a DataFusion filter anywhere
+/// in the codebase must go through this function (integers and UUIDs are
+/// safe by construction and need no quoting). New string columns re-audit
+/// against this rule; bind parameters do not exist in the Lance query API
+/// used here, so this function IS the injection boundary.
+pub(crate) fn sql_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -229,7 +257,8 @@ mod tests {
         let scope = EffectiveScope::resolve(&Scope {
             project: Some("app".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(scope.project_includes(Some("app")));
         assert!(scope.project_includes(None)); // global inheritance
         assert!(!scope.project_includes(Some("other")));
@@ -237,7 +266,7 @@ mod tests {
 
     #[test]
     fn no_project_scope_only_global() {
-        let scope = EffectiveScope::resolve(&Scope::default());
+        let scope = EffectiveScope::resolve(&Scope::default()).unwrap();
         assert!(scope.project_includes(None));
         assert!(!scope.project_includes(Some("app")));
     }
@@ -247,7 +276,8 @@ mod tests {
         let scope = EffectiveScope::resolve(&Scope {
             all_projects: true,
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(scope.project_includes(Some("app")));
         assert!(scope.project_includes(Some("other")));
         assert!(scope.project_includes(None));
@@ -258,7 +288,8 @@ mod tests {
         let scope = EffectiveScope::resolve(&Scope {
             fragment_types: Some(vec![FragmentType::Warning]),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(scope.type_includes(&FragmentType::Warning));
         assert!(!scope.type_includes(&FragmentType::Fact));
     }
@@ -269,7 +300,8 @@ mod tests {
             after: Some(500),
             before: Some(1500),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(scope.date_includes(1000));
         assert!(!scope.date_includes(400));
         assert!(!scope.date_includes(1600));
@@ -280,7 +312,8 @@ mod tests {
         let scope = EffectiveScope::resolve(&Scope {
             min_confidence: Some(0.7),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(scope.confidence_includes(0.8));
         assert!(!scope.confidence_includes(0.5));
     }
@@ -292,7 +325,8 @@ mod tests {
             fragment_types: Some(vec![FragmentType::Fact]),
             min_confidence: Some(0.5),
             ..Default::default()
-        });
+        })
+        .unwrap();
 
         let in_scope = memory(eid(1), Some("app"), FragmentType::Fact, 0.6);
         let wrong_project = memory(eid(2), Some("other"), FragmentType::Fact, 0.6);
@@ -310,7 +344,8 @@ mod tests {
         let scope = EffectiveScope::resolve(&Scope {
             project: Some("app".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let filter = scope.to_lance_filter().unwrap();
         assert!(filter.contains("project = 'app'"));
         assert!(filter.contains("project IS NULL"));
@@ -321,7 +356,8 @@ mod tests {
         let scope = EffectiveScope::resolve(&Scope {
             all_projects: true,
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(scope.to_lance_filter().is_none());
     }
 
@@ -332,7 +368,8 @@ mod tests {
         let scope = EffectiveScope::resolve(&Scope {
             project: Some("o'brien".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let filter = scope.to_lance_filter().unwrap();
         assert!(
             filter.contains("project = 'o''brien'"),
@@ -341,6 +378,41 @@ mod tests {
         assert!(
             !filter.contains("o'brien' OR"),
             "unescaped quote must not terminate the literal early: {filter}"
+        );
+    }
+
+    /// The central quoting rule, pinned: doubling, empty passthrough,
+    /// backslashes untouched (literal in DataFusion, not escapes).
+    #[test]
+    fn sql_quote_doubles_only_quotes() {
+        assert_eq!(sql_quote("plain"), "plain");
+        assert_eq!(sql_quote(""), "");
+        assert_eq!(sql_quote("o'brien"), "o''brien");
+        assert_eq!(sql_quote("'''"), "''''''");
+        assert_eq!(sql_quote("a\\b"), "a\\b");
+        assert_eq!(sql_quote("x'; DROP TABLE t;--"), "x''; DROP TABLE t;--");
+    }
+
+    /// A non-finite min_confidence (only constructible natively) is
+    /// rejected at the single entry point, never interpolated into a
+    /// filter where NaN would silently match nothing.
+    #[test]
+    fn non_finite_min_confidence_is_rejected() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = EffectiveScope::resolve(&Scope {
+                min_confidence: Some(bad),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert_eq!(err.code, DomainErrorCode::Validation);
+        }
+        // Finite bounds still resolve.
+        assert!(
+            EffectiveScope::resolve(&Scope {
+                min_confidence: Some(0.5),
+                ..Default::default()
+            })
+            .is_ok()
         );
     }
 }

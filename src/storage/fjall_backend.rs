@@ -101,8 +101,13 @@ impl FjallBackend {
                     Ok(Ok(())) => return Ok(value),
                     Ok(Err(_conflict)) => {
                         if attempt == MAX_RETRIES - 1 {
+                            // Same transient-contention contract as the
+                            // service layer (see exhausted_contention):
+                            // exhaustion is retryable, never fatal.
+                            // (Legacy backend: no production callers, but
+                            // the contract is uniform.)
                             return Err(DomainError::new(
-                                DomainErrorCode::Validation,
+                                DomainErrorCode::Contention,
                                 "max transaction retries exceeded",
                             ));
                         }

@@ -2,7 +2,7 @@
 name = "ltmrs"
 version = "0.1.0"
 edition = "2024"
-description = "Local MCP memory service for LLM agents (Lemma 0.21.0-compatible)."
+description = "Local MCP memory service for LLM agents (Lemma 0.21.0 API/workflow target; compatibility gated on release qualification)."
 license = "MIT OR Apache-2.0"
 
 # WP-00 candidate dependency set (AD-02). Pinned for the backend comparison
@@ -36,6 +36,10 @@ tokenizers = { version = "0.22.2" }
 # Artifact fetch (model downloads). rustls-tls only — pure Rust, no native TLS.
 # Already in the graph via lancedb `remote`; making it explicit keeps RQ-21 honest.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# OS CSPRNG for the per-boot visualizer access token (no std equivalent;
+# DefaultHasher has fixed keys and is brute-forceable from /proc + port scan).
+getrandom = "0.3"
 
 # OS-level primitives: singleton lock (flock), socket/permission control.
 libc = "0.2"

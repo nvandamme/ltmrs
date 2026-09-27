@@ -67,6 +67,90 @@
       "test": "T-RANK-01, T-RANK-02; differential tests calculate_quality_score_matches_upstream, injection_score_matches_upstream",
       "release_wording": "Enhanced native ranking; upstream quality/injection formulas preserved as frozen reference oracles, not native behavior.",
       "approval": "pending"
+    },
+    {
+      "id": "DEV-006",
+      "class": "compatibility",
+      "tool": "session_start, memory_add",
+      "upstream_behavior": "Project attribution auto-detected from client working directory.",
+      "ltmrs_behavior": "Project is explicit per call; sessions are project-less (the daemon does not observe client cwd).",
+      "reason": "Daemon-side cwd observation is unavailable and spoofable; explicit attribution is auditable.",
+      "user_visible_impact": "Calls without an explicit project are unattributed; no silent cwd-derived projects.",
+      "test": "T-MCP-02",
+      "release_wording": "Project scope is explicit; no cwd-derived attribution.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-007",
+      "class": "compatibility",
+      "tool": "memory_add",
+      "upstream_behavior": "Fuzzy duplicate refusal on near-identical adds (plus auto-link on add).",
+      "ltmrs_behavior": "Duplicate detection via 0.80 word-overlap threshold; auto-link behavior differs (see workflow notes).",
+      "reason": "Deterministic, testable duplicate policy independent of upstream heuristics.",
+      "user_visible_impact": "Near-duplicate adds may be refused or linked differently than upstream.",
+      "test": "T-MCP-02",
+      "release_wording": "Duplicate handling follows documented ltmrs thresholds, not upstream heuristics.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-008",
+      "class": "workflow",
+      "tool": "session_start, session_end, memory_read",
+      "upstream_behavior": "Ships 4 seed fragments; appends coaching blocks to session output; auto-detects technologies; suggests distill on session end; read ordering differs.",
+      "ltmrs_behavior": "No seed fragments; no coaching blocks; no technology auto-detection; no distill suggestion; canonical read ordering.",
+      "reason": "Instructional content and catalog seeding are host/model concerns, not canonical store behavior.",
+      "user_visible_impact": "Fresh stores start empty; session output contains no coaching text.",
+      "test": "T-MCP-02",
+      "release_wording": "No seeded content or coaching output; workflow activation is host-driven.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-009",
+      "class": "hosts",
+      "tool": "skill installation",
+      "upstream_behavior": "Per-host skill paths with verified host behavior.",
+      "ltmrs_behavior": "Mechanism-based host recipes; entries are documented recipes, not verified per-host behavior.",
+      "reason": "Host matrix verification requires tested host versions not yet exercised.",
+      "user_visible_impact": "Install recipes may need adaptation per host version.",
+      "test": "T-HOST-01",
+      "release_wording": "Host support is recipe-based; per-host verification pending.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-010",
+      "class": "compatibility",
+      "tool": "backup_create, backup_restore",
+      "upstream_behavior": "Reads/writes .lemma-backup SQLite archives.",
+      "ltmrs_behavior": "Legacy .lemma-backup payloads refused explicitly (RQ-21: no C++ database engine); native .ltmrs-backup is the supported interchange path.",
+      "reason": "Opening SQLite requires a C database engine excluded by the audited native-code policy.",
+      "user_visible_impact": "Legacy backups cannot be imported; they are refused with a reason, never converted silently.",
+      "test": "T-IMPORT-02",
+      "release_wording": "Legacy backup import unsupported; native backup/restore only.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-011",
+      "class": "retrieval",
+      "tool": "semantic_search",
+      "upstream_behavior": "hybrid flag Default: false (pure TF-IDF); absent means lexical-only.",
+      "ltmrs_behavior": "hybrid is Option<bool>: absent means hybrid when a dense backend is attached (current default); Some(false) forces lexical-only (upstream parity on demand); Some(true) is hybrid.",
+      "reason": "Dense backend is the calibrated default path; explicit opt-out preserves parity (Part I 11.2).",
+      "user_visible_impact": "Absent hybrid returns dense-enriched results where upstream returns TF-IDF-only; pass hybrid:false for upstream-identical behavior.",
+      "test": "hybrid absent/explicit unit tests in frontend::mcp (I8)",
+      "release_wording": "semantic_search runs hybrid retrieval by default; hybrid:false restores pure lexical parity.",
+      "approval": "pending"
+    },
+    {
+      "id": "DEV-012",
+      "class": "observability",
+      "tool": "semantic_search",
+      "upstream_behavior": "No explain output shape.",
+      "ltmrs_behavior": "explain:true emits an ltmrs-native explanation object (engine readiness / dense-fallback mode, scope filter, partial flags) with no upstream counterpart.",
+      "reason": "Readiness/partial transparency required by design 10.x; additive field, no wire regression.",
+      "user_visible_impact": "Extra explanation object only when explain:true is passed; default responses unchanged.",
+      "test": "explain readiness unit tests in frontend::mcp (I8)",
+      "release_wording": "semantic_search accepts explain:true for a native readiness/partial explanation.",
+      "approval": "pending"
     }
   ]
 }

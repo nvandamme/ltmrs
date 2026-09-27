@@ -98,18 +98,46 @@ pub fn assemble_context(
         ..Default::default()
     };
 
-    // Reserve space for a potential conflict notice header.
+    // The budget binds assembled items. The conflict notice (when one
+    // fires) rides alongside as required warning metadata on ContextResult
+    // and the explanation — never silently dropped to fit, and never
+    // counted against item bytes. Model-facing bytes can therefore exceed
+    // max_bytes by exactly the notice length when a bundle splits.
     let mut used = 0usize;
 
     for memory in memories {
-        let text = serialize_memory(memory);
-        let bytes = text.len();
+        let mut text = serialize_memory(memory);
+        let mut bytes = text.len();
 
-        // Budget check: if adding this item exceeds the budget, stop.
+        // Budget check: if adding this item exceeds the budget, skip it
+        // (later smaller items still pack). The first item is truncated to
+        // fit (with a disclosed marker) instead of blowing the budget: the
+        // budget binds every item.
         if used + bytes > budget.max_bytes && !result.items.is_empty() {
             result.truncated = true;
             result.excluded.push(memory.id);
             continue;
+        }
+        if result.items.is_empty() && bytes > budget.max_bytes {
+            const MARKER: &str = "…[truncated]";
+            // A budget smaller than the marker itself cannot disclose: emit
+            // a bare cut (still flagged truncated).
+            text = if budget.max_bytes > MARKER.len() {
+                let keep = budget.max_bytes - MARKER.len();
+                let mut end = keep.min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}{MARKER}", &text[..end])
+            } else {
+                let mut end = budget.max_bytes.min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text[..end].to_string()
+            };
+            bytes = text.len();
+            result.truncated = true;
         }
 
         result.items.push(ContextItem {
@@ -253,5 +281,48 @@ mod tests {
         let budget = ContextBudget::default();
         let result = assemble_context(&memories, &protected, &budget);
         assert!(result.items[0].protected);
+    }
+
+    /// An oversized first item is truncated to the budget (with a marker),
+    /// never blown past it: the budget binds every item including the first.
+    #[test]
+    fn oversized_first_item_truncated_to_budget() {
+        let memories = vec![memory(eid(1), &"x".repeat(100))];
+        let budget = ContextBudget {
+            max_bytes: 20,
+            has_tokenizer: false,
+        };
+        let result = assemble_context(&memories, &BTreeSet::new(), &budget);
+        assert_eq!(result.items.len(), 1, "recall beats emptiness");
+        assert!(
+            result.total_bytes <= 20,
+            "budget binds the first item too, got {}",
+            result.total_bytes
+        );
+        assert!(result.truncated);
+        assert!(
+            result.items[0].text.ends_with("…[truncated]"),
+            "truncation must be disclosed"
+        );
+    }
+
+    /// A budget smaller than the marker itself still truncates (bare cut,
+    /// flagged truncated): absurd budgets degrade to disclosed absence of
+    /// marker, never panic on char boundaries or exceed the budget.
+    #[test]
+    fn tiny_budget_first_item_bare_cut() {
+        let memories = vec![memory(eid(1), &"x".repeat(100))];
+        let budget = ContextBudget {
+            max_bytes: 5,
+            has_tokenizer: false,
+        };
+        let result = assemble_context(&memories, &BTreeSet::new(), &budget);
+        assert_eq!(result.items.len(), 1);
+        assert!(result.truncated);
+        assert!(
+            result.total_bytes <= 5,
+            "budget binds the first item too, got {}",
+            result.total_bytes
+        );
     }
 }

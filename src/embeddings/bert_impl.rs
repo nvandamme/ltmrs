@@ -31,19 +31,71 @@ impl BertConfig {
             candle_core::Error::Msg(format!("Invalid JSON in {}: {}", path.display(), e))
         })?;
 
-        Ok(Self {
-            vocab_size: cfg["vocab_size"].as_u64().unwrap() as usize,
-            hidden_size: cfg["hidden_size"].as_u64().unwrap() as usize,
-            num_hidden_layers: cfg["num_hidden_layers"].as_u64().unwrap() as usize,
-            num_attention_heads: cfg["num_attention_heads"].as_u64().unwrap() as usize,
-            intermediate_size: cfg["intermediate_size"].as_u64().unwrap() as usize,
-            max_position_embeddings: cfg["max_position_embeddings"].as_u64().unwrap() as usize,
-            type_vocab_size: cfg["type_vocab_size"].as_u64().unwrap() as usize,
-            layer_norm_eps: cfg
-                .get("layer_norm_eps")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1e-12),
-        })
+        let field = |name: &str| -> Result<usize, candle_core::Error> {
+            match cfg.get(name) {
+                None => Err(candle_core::Error::Msg(format!(
+                    "Missing required field {name:?} in {}",
+                    path.display()
+                ))),
+                Some(v) => v.as_u64().map(|v| v as usize).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "Field {name:?} in {} must be a positive integer, got {v}",
+                        path.display()
+                    ))
+                }),
+            }
+        };
+        let eps = match cfg.get("layer_norm_eps") {
+            None => 1e-12,
+            Some(v) => v.as_f64().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "Field \"layer_norm_eps\" in {} must be a number, got {v}",
+                    path.display()
+                ))
+            })?,
+        };
+
+        let loaded = Self {
+            vocab_size: field("vocab_size")?,
+            hidden_size: field("hidden_size")?,
+            num_hidden_layers: field("num_hidden_layers")?,
+            num_attention_heads: field("num_attention_heads")?,
+            intermediate_size: field("intermediate_size")?,
+            max_position_embeddings: field("max_position_embeddings")?,
+            type_vocab_size: field("type_vocab_size")?,
+            layer_norm_eps: eps,
+        };
+        loaded.validate(path)?;
+        Ok(loaded)
+    }
+
+    /// Reject present-but-impossible values (a zero head count panics as
+    /// division-by-zero downstream; foreign configs must error instead).
+    pub fn validate(&self, path: &std::path::Path) -> Result<(), candle_core::Error> {
+        let bad =
+            |what: &str| candle_core::Error::Msg(format!("Invalid {what} in {}", path.display()));
+        if self.vocab_size == 0 {
+            return Err(bad("vocab_size 0"));
+        }
+        if self.num_attention_heads == 0 {
+            return Err(bad("num_attention_heads 0"));
+        }
+        if self.hidden_size == 0 || !self.hidden_size.is_multiple_of(self.num_attention_heads) {
+            return Err(bad("hidden_size not divisible by num_attention_heads"));
+        }
+        if self.num_hidden_layers == 0 {
+            return Err(bad("num_hidden_layers 0"));
+        }
+        if self.intermediate_size == 0 {
+            return Err(bad("intermediate_size 0"));
+        }
+        if self.max_position_embeddings == 0 {
+            return Err(bad("max_position_embeddings 0"));
+        }
+        if self.type_vocab_size == 0 {
+            return Err(bad("type_vocab_size 0"));
+        }
+        Ok(())
     }
 
     fn attention_head_size(&self) -> usize {
@@ -299,5 +351,47 @@ impl BertModel {
         }
 
         Ok(hidden_states)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A malformed artifact config must error, never panic (foreign config
+    /// files must not crash daemon startup).
+    #[test]
+    fn malformed_config_errors_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"hidden_size": 384}"#).unwrap();
+        let err = BertConfig::load_from_config_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("vocab_size"),
+            "must name the missing field, got: {err}"
+        );
+        // Present-but-zero is invalid, not defaulted (downstream div-by-zero).
+        std::fs::write(&path, r#"{"vocab_size": 100, "hidden_size": 12, "num_hidden_layers": 1, "num_attention_heads": 0, "intermediate_size": 8, "max_position_embeddings": 16, "type_vocab_size": 2}"#).unwrap();
+        let err = BertConfig::load_from_config_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("num_attention_heads"),
+            "must name the invalid field, got: {err}"
+        );
+        // Zero layer/intermediate/position/type dims are equally impossible.
+        for field in [
+            "num_hidden_layers",
+            "intermediate_size",
+            "max_position_embeddings",
+            "type_vocab_size",
+        ] {
+            let mut cfg = serde_json::json!({"vocab_size": 100, "hidden_size": 12, "num_hidden_layers": 1, "num_attention_heads": 2, "intermediate_size": 8, "max_position_embeddings": 16, "type_vocab_size": 2});
+            cfg[field] = serde_json::json!(0);
+            std::fs::write(&path, serde_json::to_string(&cfg).unwrap()).unwrap();
+            let err = BertConfig::load_from_config_file(&path).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "must name the invalid field, got: {err}"
+            );
+        }
     }
 }

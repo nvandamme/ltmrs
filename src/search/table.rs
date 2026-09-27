@@ -71,6 +71,10 @@ pub fn search_schema(dim: u32) -> SchemaRef {
             true,
         ),
         Field::new("chunker_version", DataType::Utf8, false),
+        // Confidence rides last for the same positional-stability reason:
+        // it enables pre-filtering at the source (RV-13), and tables
+        // predating it rebuild from canonical like chunker_version did.
+        Field::new("confidence", DataType::Float64, false),
     ]))
 }
 
@@ -182,7 +186,11 @@ impl SearchTable {
             let kept_key = (*generation, memory_id.clone(), *fingerprint);
             let kept: Vec<String> = versions
                 .get(&kept_key)
-                .map(|vers| vers.iter().map(|v| format!("'{v}'")).collect())
+                .map(|vers| {
+                    vers.iter()
+                        .map(|v| format!("'{}'", crate::retrieval::scope::sql_quote(v)))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !kept.is_empty() {
                 let filter = format!(
@@ -213,7 +221,7 @@ impl SearchTable {
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        Ok(batches_to_rows(&batches))
+        batches_to_rows(&batches)
     }
 
     pub async fn count_rows(&self, filter: Option<&str>) -> DomainResult<u64> {
@@ -255,7 +263,7 @@ impl SearchTable {
                     stream.try_collect::<Vec<_>>().await.map_err(|e| {
                         DomainError::new(DomainErrorCode::Validation, e.to_string())
                     })?;
-                Ok(batches_to_rows(&batches))
+                batches_to_rows(&batches)
             }
             Err(e) => {
                 // If no FTS index exists, return empty results gracefully.
@@ -309,7 +317,7 @@ impl SearchTable {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let rows = batches_to_rows(std::slice::from_ref(batch));
+            let rows = batches_to_rows(std::slice::from_ref(batch))?;
             let dist = batch
                 .column_by_name("_distance")
                 .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
@@ -502,6 +510,24 @@ fn require_chunker_version(schema: &SchemaRef) -> DomainResult<()> {
             "search table has an incompatible chunker_version column; rebuild the projection",
         ));
     }
+    let confidence = schema.field_with_name("confidence").map_err(|_| {
+        DomainError::new(
+            DomainErrorCode::Validation,
+            "search table predates confidence pre-filtering; rebuild the projection",
+        )
+    })?;
+    let at_slot = schema.index_of("confidence").map_err(|_| {
+        DomainError::new(
+            DomainErrorCode::Validation,
+            "search table predates confidence pre-filtering; rebuild the projection",
+        )
+    })?;
+    if at_slot != 14 || confidence.data_type() != &DataType::Float64 || confidence.is_nullable() {
+        return Err(DomainError::new(
+            DomainErrorCode::Validation,
+            "search table has an incompatible confidence column; rebuild the projection",
+        ));
+    }
     Ok(())
 }
 
@@ -591,90 +617,144 @@ fn row_batch(rows: &[SearchRow], schema: &SchemaRef) -> DomainResult<arrow_array
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|r| r.chunker_version.clone()),
             )),
+            Arc::new(arrow_array::Float64Array::from_iter_values(
+                rows.iter().map(|r| r.confidence),
+            )),
         ],
     )
     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
 }
 
-fn batches_to_rows(batches: &[arrow_array::RecordBatch]) -> Vec<SearchRow> {
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt32Array};
+fn batches_to_rows(batches: &[arrow_array::RecordBatch]) -> DomainResult<Vec<SearchRow>> {
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, Float64Array, UInt32Array};
+    let corrupt = |row: usize, column: &str| {
+        DomainError::new(
+            DomainErrorCode::Validation,
+            format!("corrupt search row {row}: column {column} has an unexpected type or value"),
+        )
+    };
     let mut out = Vec::new();
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
+        // Resolve columns by name once per batch: positional reads silently
+        // misalign when the schema evolves (appended _distance/_score today,
+        // anything tomorrow). A missing column fails the read loudly.
+        let schema = batch.schema();
+        let col = |row: usize, name: &'static str| -> DomainResult<usize> {
+            schema.index_of(name).map_err(|_| corrupt(row, name))
+        };
+        let c_store_generation = col(0, "store_generation")?;
+        let c_memory_id = col(0, "memory_id")?;
+        let c_document_revision = col(0, "document_revision")?;
+        let c_model_fingerprint = col(0, "model_fingerprint")?;
+        let c_chunk_id = col(0, "chunk_id")?;
+        let c_lexical_text = col(0, "lexical_text")?;
+        let c_char_start = col(0, "char_start")?;
+        let c_char_end = col(0, "char_end")?;
+        let c_project = col(0, "project")?;
+        let c_fragment_type = col(0, "fragment_type")?;
+        let c_created_at = col(0, "created_at_millis")?;
+        let c_updated_at = col(0, "updated_at_millis")?;
+        let c_embedding = col(0, "embedding")?;
+        let c_chunker_version = col(0, "chunker_version")?;
+        let c_confidence = col(0, "confidence")?;
         for i in 0..batch.num_rows() {
-            let s = |idx: usize| -> String {
-                batch
+            let s = |idx: usize, name: &'static str| -> DomainResult<String> {
+                Ok(batch
                     .column(idx)
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .unwrap()
+                    .ok_or_else(|| corrupt(i, name))?
                     .value(i)
-                    .to_string()
+                    .to_string())
             };
-            let u64c = |idx: usize| -> u64 {
-                batch
+            let u64c = |idx: usize, name: &'static str| -> DomainResult<u64> {
+                Ok(batch
                     .column(idx)
                     .as_any()
                     .downcast_ref::<UInt64Array>()
-                    .unwrap()
-                    .value(i)
+                    .ok_or_else(|| corrupt(i, name))?
+                    .value(i))
             };
 
-            let embedding = match batch.column(12).data_type() {
+            let embedding = match batch.column(c_embedding).data_type() {
                 DataType::FixedSizeList(_, size) => {
                     let list = batch
-                        .column(12)
+                        .column(c_embedding)
                         .as_any()
                         .downcast_ref::<FixedSizeListArray>()
-                        .unwrap();
+                        .ok_or_else(|| corrupt(i, "embedding"))?;
                     if list.is_null(i) {
                         None
                     } else {
+                        // The child buffer concatenates every row: offset by
+                        // this row's start, or every row reads row 0's slice.
                         let flat = Float32Array::from(list.values().to_data());
-                        Some((0..*size as usize).map(|k| flat.value(k)).collect())
+                        let base = list.value_offset(i) as usize;
+                        Some((0..*size as usize).map(|k| flat.value(base + k)).collect())
                     }
                 }
                 _ => None,
             };
 
+            let memory_id = EntityId::new(
+                Uuid::parse_str(&s(c_memory_id, "memory_id")?)
+                    .map_err(|_| corrupt(i, "memory_id"))?,
+            );
+            let project = if batch
+                .column(c_project)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| corrupt(i, "project"))?
+                .is_null(i)
+            {
+                None
+            } else {
+                Some(s(c_project, "project")?)
+            };
             out.push(SearchRow {
-                store_generation: StoreGeneration::new(u64c(0)),
-                memory_id: EntityId::new(Uuid::parse_str(&s(1)).unwrap()),
-                document_revision: DocumentRevision::new(u64c(2)),
-                model_fingerprint: ModelFingerprint::new(u64c(3)),
+                store_generation: StoreGeneration::new(u64c(
+                    c_store_generation,
+                    "store_generation",
+                )?),
+                memory_id,
+                document_revision: DocumentRevision::new(u64c(
+                    c_document_revision,
+                    "document_revision",
+                )?),
+                model_fingerprint: ModelFingerprint::new(u64c(
+                    c_model_fingerprint,
+                    "model_fingerprint",
+                )?),
                 chunk_id: ChunkId::new(
                     batch
-                        .column(4)
+                        .column(c_chunk_id)
                         .as_any()
                         .downcast_ref::<UInt32Array>()
-                        .unwrap()
+                        .ok_or_else(|| corrupt(i, "chunk_id"))?
                         .value(i),
                 ),
-                lexical_text: s(5),
-                char_start: u64c(6),
-                char_end: u64c(7),
-                project: if batch
-                    .column(8)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-                    .is_null(i)
-                {
-                    None
-                } else {
-                    Some(s(8))
-                },
-                fragment_type: s(9),
-                created_at_millis: u64c(10),
-                updated_at_millis: u64c(11),
+                lexical_text: s(c_lexical_text, "lexical_text")?,
+                char_start: u64c(c_char_start, "char_start")?,
+                char_end: u64c(c_char_end, "char_end")?,
+                project,
+                fragment_type: s(c_fragment_type, "fragment_type")?,
+                created_at_millis: u64c(c_created_at, "created_at_millis")?,
+                updated_at_millis: u64c(c_updated_at, "updated_at_millis")?,
                 embedding,
-                chunker_version: s(13),
+                chunker_version: s(c_chunker_version, "chunker_version")?,
+                confidence: batch
+                    .column(c_confidence)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| corrupt(i, "confidence"))?
+                    .value(i),
             });
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -703,6 +783,7 @@ mod tests {
             project: Some("ltmrs".into()),
             fragment_type: "fact".into(),
             created_at_millis: 1000,
+            confidence: 0.5,
             updated_at_millis: 2000,
             embedding,
         }
@@ -757,8 +838,9 @@ mod tests {
     #[test]
     fn schema_appends_chunker_version_last() {
         let schema = search_schema(EMBEDDING_DIM);
-        assert_eq!(schema.fields().len(), 14);
+        assert_eq!(schema.fields().len(), 15);
         assert_eq!(schema.fields()[13].name(), "chunker_version");
+        assert_eq!(schema.fields()[14].name(), "confidence");
     }
 
     /// Same-revision policy migration converges: republishing a revision
@@ -806,13 +888,13 @@ mod tests {
         );
     }
 
-    /// Opening a table that predates chunker versioning fails fast with a
-    /// rebuild directive instead of misreading shifted columns.
+    /// Opening a table that predates confidence pre-filtering fails fast
+    /// with a rebuild directive instead of misreading shifted columns.
     #[tokio::test]
-    async fn open_rejects_table_without_chunker_version() {
+    async fn open_rejects_table_without_confidence() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap().to_string();
-        // Craft a pre-versioning table: current schema minus the last column.
+        // Craft a pre-confidence table: current schema minus the last column.
         let full = search_schema(EMBEDDING_DIM);
         let old = Arc::new(arrow_schema::Schema::new(
             full.fields()[..full.fields().len() - 1].to_vec(),
@@ -826,12 +908,43 @@ mod tests {
         drop(db);
 
         let err = match SearchTable::open(&uri).await {
-            Ok(_) => panic!("opening a pre-versioning table must fail"),
+            Ok(_) => panic!("opening a pre-confidence table must fail"),
             Err(e) => e,
         };
         assert!(
             err.message.contains("rebuild"),
             "must direct a rebuild, got: {}",
+            err.message
+        );
+    }
+
+    /// Opening a table that predates chunker versioning (missing the
+    /// chunker_version column itself) fails with the chunker-specific
+    /// rebuild directive.
+    #[tokio::test]
+    async fn open_rejects_table_without_chunker_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        // Craft a pre-versioning table: columns up to (not incl.) embedding's
+        // successor — no chunker_version, no confidence.
+        let full = search_schema(EMBEDDING_DIM);
+        let slot = full.index_of("chunker_version").unwrap();
+        let old = Arc::new(arrow_schema::Schema::new(full.fields()[..slot].to_vec()));
+        let db = lancedb::connect(&uri).execute().await.unwrap();
+        db.create_empty_table(SEARCH_TABLE, old)
+            .mode(lancedb::database::CreateTableMode::exist_ok(|req| req))
+            .execute()
+            .await
+            .unwrap();
+        drop(db);
+
+        let err = match SearchTable::open(&uri).await {
+            Ok(_) => panic!("opening a pre-versioning table must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("chunker versioning"),
+            "must name the missing chunker versioning, got: {}",
             err.message
         );
     }
@@ -905,6 +1018,67 @@ mod tests {
         let rows = tbl.rows_where("embedding IS NOT NULL").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].embedding.as_ref().unwrap()[0], 1.0);
+    }
+
+    /// Vector search never returns embedding-free rows: after a stalled
+    /// embedder, lexical-only rows must not inflate dense ranks.
+    #[tokio::test]
+    async fn vector_query_skips_null_vector_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let tbl = SearchTable::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let mut va = vec![0.0f32; 384];
+        va[0] = 1.0;
+        tbl.publish_rows(&[row(1, "alpha", 0, Some(va)), row(2, "beta", 0, None)])
+            .await
+            .unwrap();
+
+        let hits = tbl
+            .vector_query(&vec![1.0f32; 384], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the embedded row may hit, got {}",
+            hits.len()
+        );
+        assert_eq!(hits[0].0.memory_id, eid(1));
+    }
+
+    /// Multi-row reads must return each row's OWN embedding (the child
+    /// buffer is batch-concatenated; row 0's slice must not leak into
+    /// every row or MMR diversity is computed on falsified vectors).
+    #[tokio::test]
+    async fn multi_row_reads_return_per_row_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let tbl = SearchTable::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let mut va = vec![0.0f32; 384];
+        va[0] = 1.0;
+        let mut vb = vec![0.0f32; 384];
+        vb[1] = 1.0;
+        tbl.publish_rows(&[row(1, "first", 0, Some(va)), row(2, "second", 0, Some(vb))])
+            .await
+            .unwrap();
+
+        let rows = tbl.rows_where("embedding IS NOT NULL").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let by_text: std::collections::BTreeMap<&str, &[f32]> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.lexical_text.as_str(),
+                    r.embedding.as_ref().unwrap().as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(by_text["first"][0], 1.0, "first row keeps its vector");
+        assert_eq!(by_text["first"][1], 0.0, "first row keeps its vector");
+        assert_eq!(by_text["second"][0], 0.0, "second row keeps its vector");
+        assert_eq!(by_text["second"][1], 1.0, "second row keeps its vector");
     }
 
     #[tokio::test]
@@ -1084,5 +1258,175 @@ mod tests {
         let gen1 = reader.rows_where("model_fingerprint = 1").await.unwrap();
         assert_eq!(gen1.len(), 1);
         assert_eq!(gen1[0].lexical_text, "gen1");
+    }
+
+    /// Corrupt rows fail the read instead of panicking the daemon: a
+    /// malformed memory id errors with row identity, never unwraps.
+    #[test]
+    fn corrupt_rows_error_instead_of_panicking() {
+        use arrow_array::{Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
+        use std::sync::Arc;
+        let dim = 2;
+        let schema = search_schema(dim);
+        let embedding_type = arrow_schema::DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                arrow_schema::DataType::Float32,
+                true,
+            )),
+            dim as i32,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["not-a-uuid"])),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["text"])),
+                Arc::new(UInt64Array::from(vec![0])),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec!["fact"])),
+                Arc::new(UInt64Array::from(vec![0])),
+                Arc::new(UInt64Array::from(vec![0])),
+                arrow_array::new_null_array(&embedding_type, 1),
+                Arc::new(StringArray::from(vec!["v1"])),
+                Arc::new(Float64Array::from(vec![0.5])),
+            ],
+        )
+        .unwrap();
+        let err = batches_to_rows(&[batch]).unwrap_err();
+        assert!(
+            err.message.contains("memory_id"),
+            "must identify the corrupt column, got: {err:?}"
+        );
+    }
+
+    /// Pre-confidence tables fail loudly: a batch without the appended
+    /// confidence column errors naming the missing column (rebuild
+    /// directive) instead of defaulting confidence or misaligning fields.
+    #[test]
+    fn pre_confidence_schema_errors_naming_confidence() {
+        use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
+        use std::sync::Arc;
+        let dim = 2;
+        let full = search_schema(dim);
+        // All columns except the trailing confidence one.
+        let fields: Vec<_> = full.fields()[..full.fields().len() - 1].to_vec();
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let embedding_type = arrow_schema::DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                arrow_schema::DataType::Float32,
+                true,
+            )),
+            dim as i32,
+        );
+        let id = "12345678-1234-1234-1234-123456789012";
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![id])),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["text"])),
+                Arc::new(UInt64Array::from(vec![0])),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec!["fact"])),
+                Arc::new(UInt64Array::from(vec![0])),
+                Arc::new(UInt64Array::from(vec![0])),
+                arrow_array::new_null_array(&embedding_type, 1),
+                Arc::new(StringArray::from(vec!["v1"])),
+            ],
+        )
+        .unwrap();
+        let err = batches_to_rows(&[batch]).unwrap_err();
+        assert!(
+            err.message.contains("confidence"),
+            "must name the missing column, got: {err:?}"
+        );
+    }
+
+    /// Column resolution is by name, not position: a reordered schema (as
+    /// produced by appended `_distance`/`_score` extras or upgrades) parses
+    /// to identical rows instead of silently misattributing fields.
+    #[test]
+    fn reordered_columns_parse_by_name() {
+        use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
+        use std::sync::Arc;
+        // Same fields as search_schema(2) with lexical_text and fragment_type
+        // swapped in position.
+        let fields = vec![
+            arrow_schema::Field::new("store_generation", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("memory_id", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("document_revision", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("model_fingerprint", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("chunk_id", arrow_schema::DataType::UInt32, false),
+            arrow_schema::Field::new("fragment_type", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("char_start", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("char_end", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("project", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("lexical_text", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("created_at_millis", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new("updated_at_millis", arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(
+                "embedding",
+                arrow_schema::DataType::FixedSizeList(
+                    Arc::new(arrow_schema::Field::new(
+                        "item",
+                        arrow_schema::DataType::Float32,
+                        true,
+                    )),
+                    2,
+                ),
+                true,
+            ),
+            arrow_schema::Field::new("chunker_version", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("confidence", arrow_schema::DataType::Float64, false),
+        ];
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let id = "12345678-1234-1234-1234-123456789012";
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![7])),
+                Arc::new(StringArray::from(vec![id])),
+                Arc::new(UInt64Array::from(vec![3])),
+                Arc::new(UInt64Array::from(vec![5])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["fact"])),
+                Arc::new(UInt64Array::from(vec![0])),
+                Arc::new(UInt64Array::from(vec![9])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec!["hello world"])),
+                Arc::new(UInt64Array::from(vec![100])),
+                Arc::new(UInt64Array::from(vec![200])),
+                arrow_array::new_null_array(
+                    &arrow_schema::DataType::FixedSizeList(
+                        Arc::new(arrow_schema::Field::new(
+                            "item",
+                            arrow_schema::DataType::Float32,
+                            true,
+                        )),
+                        2,
+                    ),
+                    1,
+                ),
+                Arc::new(StringArray::from(vec!["v1"])),
+                Arc::new(arrow_array::Float64Array::from(vec![0.5])),
+            ],
+        )
+        .unwrap();
+        let rows = batches_to_rows(&[batch]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].lexical_text, "hello world");
+        assert_eq!(rows[0].fragment_type, "fact");
+        assert_eq!(rows[0].store_generation.as_u64(), 7);
+        assert_eq!(rows[0].created_at_millis, 100);
     }
 }

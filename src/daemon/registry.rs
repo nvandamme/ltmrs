@@ -619,7 +619,9 @@ impl FrontendRegistry {
     }
 
     /// Persist the registry state (sessions, channel bindings, leases) to a
-    /// JSON file so a daemon restart restores durable history.
+    /// JSON file so a daemon restart restores durable history. Atomic
+    /// tmp+rename: a crash mid-write leaves the previous file intact (never
+    /// a torn sessions.json that fails the next load).
     pub fn persist(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         let snapshot = RegistrySnapshot {
             handle_gen: self.handle_gen.load(Ordering::SeqCst),
@@ -643,7 +645,9 @@ impl FrontendRegistry {
         };
         let json = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(path, json)
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, path)
     }
 
     /// Load the registry state from a JSON file. A missing file yields an

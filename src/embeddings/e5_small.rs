@@ -307,16 +307,25 @@ impl E5SmallAdapter {
                 } else {
                     // Oversized unit: disclosed hard split at the tokenizer limit
                     // (RQ-10). Each slice is verbatim and fits when prefixed.
-                    let budget = max_tokens - self.raw_tokenize(&prefix).len();
-                    if budget == 0 {
-                        // Pathological prefix alone fills the window; disclose as-is.
+                    // A prefix that alone fills or overflows the window discloses
+                    // as-is (checked_sub: usize underflow would panic in debug,
+                    // wrap to a huge budget in release).
+                    let Some(budget) = max_tokens
+                        .checked_sub(self.raw_tokenize(&prefix).len())
+                        .filter(|b| *b > 0)
+                    else {
+                        // Pathological prefix fills the window; disclose as-is.
                         chunks.push(Chunk {
                             text: alone.to_string(),
                             char_start: *s,
                             char_end: *e,
                             token_count: 0, // filled below after prefixing
                         });
-                    } else {
+                        continue;
+                    };
+                    // The filter above guarantees budget > 0: the budget-0
+                    // case is handled by the disclose-as-is branch.
+                    {
                         let mut os = *s;
                         loop {
                             if self
@@ -1064,6 +1073,15 @@ mod tests {
             return;
         }
         let mut adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
+
+        // A title whose prefix alone overflows the window must disclose,
+        // never underflow the token budget (usize panic in debug).
+        let huge_title = "word ".repeat(600);
+        let chunks = adapter.chunk_passage(&huge_title, "small body");
+        assert!(
+            !chunks.is_empty(),
+            "oversized prefix must still disclose content"
+        );
 
         // Short passage fits in one chunk covering the whole fragment.
         let frag = "alpha\nbeta\ngamma";

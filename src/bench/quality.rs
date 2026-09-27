@@ -525,7 +525,9 @@ mod tests {
                 before: case.before_millis,
                 ..Default::default()
             };
-            let filter = crate::retrieval::scope::EffectiveScope::resolve(&scope).to_lance_filter();
+            let filter = crate::retrieval::scope::EffectiveScope::resolve(&scope)
+                .unwrap()
+                .to_lance_filter();
             let hits = table
                 .fts_query(&case.query, case.top_k, filter.as_deref())
                 .await
@@ -592,13 +594,7 @@ mod tests {
 
     impl HashQueryEmbedder {
         fn hash_vec(text: &str) -> Vec<f32> {
-            (0..BENCH_EMBED_DIM)
-                .map(|i| {
-                    ((text.bytes().fold(0u64, |a, b| a.wrapping_add(b as u64)) >> (i % 64))
-                        ^ i as u64) as f32
-                        / 1e9
-                })
-                .collect()
+            crate::search::projector::hash_embed_vec(text, BENCH_EMBED_DIM)
         }
     }
 
@@ -879,6 +875,25 @@ mod tests {
                 .map(|seq| seq.vector)
                 .map_err(|e| format!("{e:?}"))
         }
+
+        /// Production chunking verbatim (same code path as the daemon
+        /// projector): the cross-lang verdict covers multi-chunk documents.
+        fn chunk_text(
+            &self,
+            title: &str,
+            fragment: &str,
+        ) -> Vec<crate::search::projector::TextChunk> {
+            let chunks = self
+                .adapter
+                .lock()
+                .expect("embedder alive")
+                .chunk_passage(title, fragment);
+            crate::search::backend::e5_chunks_to_text_chunks(title, &chunks)
+        }
+
+        fn chunker_version(&self) -> String {
+            crate::search::backend::E5_CHUNK_VERSION.to_string()
+        }
     }
 
     impl crate::retrieval::engine::QueryEmbedder for E5SharedEmbedder {
@@ -1060,5 +1075,118 @@ mod tests {
                 "case {case_id} missed mandatory ids (ranked {ranked:?})"
             );
         }
+    }
+
+    /// The harness must project through production chunking, not single-chunk
+    /// override: a long document yields multiple rows (greedy units).
+    #[tokio::test]
+    async fn e5_leg_uses_production_chunking() {
+        use crate::domain::command::{CommandContext, DomainCommand, Scope};
+        use crate::domain::id::{
+            ChannelId, DocumentRevision, EligibilityRevision, EntityId, EntityRevision, FrontendId,
+            ModelFingerprint, OperationId, StoreGeneration,
+        };
+        use crate::domain::memory::{
+            FragmentType, Instant as DomainInstant, Memory, MemoryLifecycle, MemorySource,
+        };
+        use crate::search::projector::Projector;
+        use crate::search::table::SearchTable;
+        use crate::service::repository::CanonicalRepository;
+
+        let artifacts_dir = crate::bench::crate_root().join("tmp/e5-artifacts");
+        let artifacts = artifacts_dir.as_path();
+        if !artifacts.join("model.safetensors").exists() {
+            eprintln!("SKIP real-E5 leg: tmp/e5-artifacts absent (CI without network)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let clock = std::sync::Arc::new(crate::domain::clock::FrozenClock::new(1000));
+        let repo =
+            CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
+                .unwrap();
+        repo.issue_namespace(FrontendId::new(uuid::Uuid::from_u128(1)), 1000)
+            .unwrap();
+        let repo = std::sync::Arc::new(repo);
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::embeddings::e5_small::E5SmallAdapter::load_verified(artifacts)
+                .expect("pinned artifacts load"),
+        ));
+        let mut projector = Projector::new(
+            repo.clone(),
+            table.clone(),
+            Box::new(E5SharedEmbedder {
+                adapter: shared.clone(),
+            }),
+            ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+        let id = EntityId::new(uuid::Uuid::from_u128(77));
+        repo.apply(
+            &CommandContext {
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: FrontendId::new(uuid::Uuid::from_u128(1)),
+                channel_id: ChannelId::new(uuid::Uuid::from_u128(2)),
+                session: None,
+                operation_id: OperationId::new(uuid::Uuid::from_u128(3)),
+                request_digest: "e5-chunk".to_string(),
+                deadline_millis: None,
+                scope: Scope::default(),
+                retry_epoch: 1,
+            },
+            &DomainCommand::AddMemory {
+                memory: Memory {
+                    id,
+                    external_alias: None,
+                    title: "Long doc".to_string(),
+                    fragment: "word ".repeat(600),
+                    description: String::new(),
+                    fragment_type: FragmentType::Fact,
+                    project: None,
+                    source: MemorySource::Ai,
+                    confidence: 1.0,
+                    quality_score: None,
+                    lifecycle: MemoryLifecycle::Live,
+                    tags: vec![],
+                    associated_with: vec![],
+                    relations: vec![],
+                    parent_id: None,
+                    child_ids: vec![],
+                    session_id: None,
+                    task_type: None,
+                    related_guides: vec![],
+                    evidence: vec![],
+                    access_count: 0,
+                    last_accessed_at: None,
+                    positive_feedback: 0,
+                    negative_feedback: 0,
+                    negative_hits: 0,
+                    refinement_count: 0,
+                    distill_candidate: false,
+                    entity_revision: EntityRevision::new(1),
+                    document_revision: DocumentRevision::new(1),
+                    eligibility_revision: EligibilityRevision::new(1),
+                    created_at: DomainInstant::new(1000),
+                    updated_at: DomainInstant::new(1000),
+                    raw_created: None,
+                    unknown_fields: std::collections::BTreeMap::new(),
+                },
+                session: None,
+            },
+        )
+        .unwrap();
+        projector.run_until_idle().await.unwrap();
+        let rows = table
+            .rows_where(&format!("memory_id = '{}'", id.as_uuid()))
+            .await
+            .unwrap();
+        assert!(
+            rows.len() > 1,
+            "long document must project to multiple chunks, got {}",
+            rows.len()
+        );
     }
 }

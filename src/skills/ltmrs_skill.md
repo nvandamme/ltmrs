@@ -31,6 +31,8 @@ workflows; record each guide use with its outcome.
 
 ## Multilingual recall
 
-Memory fragments are stored in English for retrieval. Queries in French,
-German or Dutch match through multilingual recall; identifiers, paths and
-code tokens match verbatim regardless of language.
+Memory fragments are stored in English for retrieval. Queries in French
+match through multilingual recall (E5-small, evidenced on a French→English
+fixture case); German, Dutch and other languages are untested objectives,
+not supported claims. Identifiers, paths and
+code tokens are designed to match verbatim regardless of language.

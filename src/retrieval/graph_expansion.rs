@@ -155,16 +155,17 @@ pub fn expand(
             if !traversable(etype, policy) {
                 continue;
             }
-            traversed += 1;
-
             if visited.contains(&other) {
                 continue;
             }
             // Scope is enforced on EVERY graph step (RV-13): an out-of-scope
-            // neighbor is never traversed, even if it is a hub.
+            // neighbor is never traversed, even if it is a hub. Skipped
+            // neighbors consume no budget: only actually traversed nodes
+            // count, so eligible nodes are never starved by skipped ones.
             if !is_in_scope(other) {
                 continue;
             }
+            traversed += 1;
             visited.insert(other);
 
             if result.nodes.len() >= policy.max_nodes {
@@ -406,10 +407,42 @@ mod tests {
         assert_eq!(graph_contribution(&exp, eid(1)), 0.0);
     }
 
+    /// Skipped neighbors must not consume the fan-out budget: a hub whose
+    /// low-ID neighbors are out of scope still reaches the eligible one.
+    #[test]
+    fn skipped_neighbors_do_not_consume_fan_out() {
+        use std::collections::BTreeMap;
+        let edges: BTreeMap<EntityId, Vec<Relation>> = BTreeMap::from([(
+            eid(1),
+            vec![
+                rel(10, eid(1), eid(2), RelationType::Supports),
+                rel(11, eid(1), eid(3), RelationType::Supports),
+                rel(12, eid(1), eid(4), RelationType::Supports),
+            ],
+        )]);
+        let policy = GraphPolicy {
+            max_fan_out: 2,
+            ..Default::default()
+        };
+        let in_scope = |id: EntityId| id == eid(1) || id == eid(4);
+        let exp = expand(
+            &[eid(1)],
+            &|id| edges.get(&id).cloned().unwrap_or_default(),
+            &in_scope,
+            &policy,
+        );
+        assert!(
+            exp.nodes.contains_key(&eid(4)),
+            "eligible neighbor must be reached despite skipped ones"
+        );
+        assert!(!exp.nodes.contains_key(&eid(2)));
+        assert!(!exp.nodes.contains_key(&eid(3)));
+    }
+
     #[allow(dead_code)]
     fn _scope_predicate_helper() {
         // Verify the helper compiles and is usable.
-        let scope = EffectiveScope::resolve(&Scope::default());
+        let scope = EffectiveScope::resolve(&Scope::default()).unwrap();
         let memories: BTreeMap<EntityId, Memory> = BTreeMap::new();
         let pred = scope_predicate(&scope, &memories);
         assert!(!pred(eid(1)));

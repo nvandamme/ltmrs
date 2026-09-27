@@ -28,6 +28,10 @@ pub struct SearchRow {
     pub fragment_type: String,
     pub created_at_millis: u64,
     pub updated_at_millis: u64,
+    /// Canonical confidence at publish time. Enables confidence pre-filtering
+    /// at the source (RV-13): without it, candidate-limit truncation happens
+    /// before eligibility checks and eligible rows are silently lost.
+    pub confidence: f64,
     /// Null until the embedding worker fills it (lexical-ready rows have none).
     pub embedding: Option<Vec<f32>>,
 }
@@ -56,6 +60,7 @@ mod tests {
             project: Some("ltmrs".into()),
             fragment_type: "fact".into(),
             created_at_millis: 1000,
+            confidence: 0.5,
             updated_at_millis: 2000,
             embedding: None,
         };
@@ -78,6 +83,7 @@ mod tests {
             project: Some("ltmrs".into()),
             fragment_type: "fact".into(),
             created_at_millis: 1000,
+            confidence: 0.5,
             updated_at_millis: 2000,
             embedding: None,
         };
@@ -108,6 +114,7 @@ mod tests {
             project: None,
             fragment_type: "fact".into(),
             created_at_millis: 0,
+            confidence: 0.5,
             updated_at_millis: 0,
             embedding: None,
         };

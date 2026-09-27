@@ -79,8 +79,10 @@ pub struct RetrievalRequest {
     /// How many candidates to fetch per leg.
     pub candidate_limit: usize,
     /// Minimum cosine similarity for the dense leg (no-answer rule, RQ-14).
-    /// None means no threshold (all nearest rows are candidates). A threshold
-    /// is a calibration input (WP-12), never a universal truth gate.
+    /// `None` means no threshold (all nearest rows are candidates, including
+    /// anti-correlated noise — explicit opt-out for calibration runs).
+    /// A threshold is a calibration input (WP-12), never a universal truth
+    /// gate. Real calibration on held-out labels is still open (task 9).
     pub min_similarity: Option<f64>,
     /// How many final results to return.
     pub result_limit: usize,
@@ -92,6 +94,13 @@ pub struct RetrievalRequest {
     pub graph_policy: GraphPolicy,
 }
 
+/// Default dense floor: anti-correlated rows (negative cosine) are never
+/// candidates. This is a principled floor, not a calibration: genuinely
+/// similar content scores at or above zero, while uncalibrated nearest
+/// noise below it is cut. Real thresholds calibrate on held-out labels
+/// (WP-12 task 9, still open) and override this via `min_similarity`.
+pub const DEFAULT_MIN_SIMILARITY: f64 = 0.0;
+
 impl Default for RetrievalRequest {
     fn default() -> Self {
         Self {
@@ -101,7 +110,7 @@ impl Default for RetrievalRequest {
             store_generation: None,
             model_fingerprint: None,
             candidate_limit: 50,
-            min_similarity: None,
+            min_similarity: Some(DEFAULT_MIN_SIMILARITY),
             result_limit: 10,
             context_budget: ContextBudget::default(),
             mmr_config: MmrConfig::default(),
@@ -159,14 +168,28 @@ impl Engine {
         embedder: &dyn QueryEmbedder,
     ) -> DomainResult<RetrievalResult> {
         // Stage 1: resolve the effective scope ONCE.
-        let scope = EffectiveScope::resolve(&req.scope);
+        let scope = EffectiveScope::resolve(&req.scope)?;
         // Unpinned requests follow the active pointer per call so a cutover
         // takes effect on the next query; pinned requests stay put. A
         // repository error propagates (never masked as generation 1).
-        let store_gen = match req.store_generation {
-            Some(g) => g,
-            None => self.repo.store_generation()?,
-        };
+        // A retired pin fails loudly: canonical rows carry no generation
+        // stamp, so serving current data under an old pin would lie about
+        // what was read. Generation-scoped history needs versioned storage
+        // first (recorded as future work, not silently faked here).
+        let live = self.repo.store_generation()?;
+        if let Some(pinned) = req.store_generation
+            && pinned != live
+        {
+            return Err(DomainError::new(
+                DomainErrorCode::StaleGeneration,
+                format!(
+                    "pinned generation {} is retired (live is {}): unpin or re-pin to live",
+                    pinned.as_u64(),
+                    live.as_u64()
+                ),
+            ));
+        }
+        let store_gen = req.store_generation.unwrap_or(live);
 
         // Stage 2: direct-ID routing (bypasses the ranker entirely).
         if !req.direct_ids.is_empty() {
@@ -194,33 +217,56 @@ impl Engine {
             .fts_query(&req.query, req.candidate_limit, cf)
             .await?;
 
-        let dense_rows: Vec<SearchRow> = if let Some(fp) = req.model_fingerprint {
-            // AD-04: never mix vectors from different model spaces. The dense
-            // leg is constrained to the requested model fingerprint so a
-            // blue-green deployment never compares incompatible embeddings.
-            let dense_filter = match cf {
-                Some(f) => format!("{f} AND model_fingerprint = {}", fp.as_u64()),
-                None => format!("model_fingerprint = {}", fp.as_u64()),
+        let (dense_rows, dense_failed): (Vec<SearchRow>, bool) =
+            if let Some(fp) = req.model_fingerprint {
+                // AD-04: never mix vectors from different model spaces. The dense
+                // leg is constrained to the requested model fingerprint so a
+                // blue-green deployment never compares incompatible embeddings.
+                // Embedding-free rows are excluded explicitly: newer Lance
+                // versions skip NULL vectors, but the invariant belongs to
+                // the query, not to engine-version luck.
+                let dense_filter = match cf {
+                    Some(f) => format!(
+                        "{f} AND model_fingerprint = {} AND embedding IS NOT NULL",
+                        fp.as_u64()
+                    ),
+                    None => format!(
+                        "model_fingerprint = {} AND embedding IS NOT NULL",
+                        fp.as_u64()
+                    ),
+                };
+                // Graceful degradation: a failing dense leg (backpressure,
+                // shutdown race, misconfigured embedder) falls back to
+                // lexical-only with partial=true instead of failing recall
+                // that already won lexical results.
+                match embedder.embed_query(&req.query).await {
+                    Ok(qvec) => match self
+                        .table
+                        .vector_query(&qvec, req.candidate_limit, Some(&dense_filter))
+                        .await
+                    {
+                        Ok(hits) => (
+                            hits.into_iter()
+                                .filter(|(_row, distance)| match req.min_similarity {
+                                    // No-answer rule (RQ-14): nearest-neighbor rank
+                                    // is not proof of relevance. When a threshold
+                                    // is configured, drop rows whose cosine
+                                    // similarity falls below it (Lance cosine
+                                    // distance = 1 - similarity).
+                                    Some(min) => (1.0 - *distance as f64) >= min,
+                                    None => true,
+                                })
+                                .map(|(row, _d)| row)
+                                .collect(),
+                            false,
+                        ),
+                        Err(_) => (vec![], true),
+                    },
+                    Err(_) => (vec![], true),
+                }
+            } else {
+                (vec![], false)
             };
-            let qvec = embedder.embed_query(&req.query).await?;
-            let hits = self
-                .table
-                .vector_query(&qvec, req.candidate_limit, Some(&dense_filter))
-                .await?;
-            // No-answer rule (RQ-14): nearest-neighbor rank is not proof of
-            // relevance. When a threshold is configured, drop rows whose
-            // cosine similarity falls below it (Lance cosine distance =
-            // 1 - similarity).
-            hits.into_iter()
-                .filter(|(_row, distance)| match req.min_similarity {
-                    Some(min) => (1.0 - *distance as f64) >= min,
-                    None => true,
-                })
-                .map(|(row, _d)| row)
-                .collect()
-        } else {
-            vec![]
-        };
 
         // Stage 5: canonical hydration + eligibility validation.
         //
@@ -294,7 +340,9 @@ impl Engine {
         });
 
         if rrf_order.is_empty() {
-            return self.no_answer_result(&scope, store_gen, req).await;
+            return self
+                .no_answer_result(&scope, store_gen, req, dense_failed)
+                .await;
         }
 
         // Stage 7: supersession/conflict bundles (protected context).
@@ -378,11 +426,7 @@ impl Engine {
             .map(|(id, sc)| MmrCandidate {
                 id: *id,
                 score: sc.native_score,
-                vector: memories_map
-                    .get(id)
-                    .and_then(|_| row_for(&lexical_rows, *id))
-                    .or_else(|| row_for(&dense_rows, *id))
-                    .and_then(|r| r.embedding.clone()),
+                vector: mean_vector(&lexical_rows, &dense_rows, *id, req.model_fingerprint),
             })
             .collect();
         let mmr = mmr::mmr_select(&mmr_candidates, &bundles.protected, &req.mmr_config);
@@ -406,7 +450,7 @@ impl Engine {
             }
         }
 
-        let context = context::assemble_context(
+        let mut context = context::assemble_context(
             &results.iter().map(|r| r.memory.clone()).collect::<Vec<_>>(),
             &bundles.protected,
             &req.context_budget,
@@ -414,11 +458,13 @@ impl Engine {
 
         // A conflict notice is required when a complete conflict bundle cannot
         // fit in the FINAL budgeted context (design §10.4): never silently show
-        // only one side. Check the assembled results, not just MMR selection.
-        let result_ids: BTreeSet<EntityId> = results.iter().map(|r| r.memory.id).collect();
+        // only one side. Check the assembled items, not pre-budget selection:
+        // a pair straddling the budget cutoff must still warn.
+        let item_ids: BTreeSet<EntityId> =
+            context.items.iter().map(|item| item.memory_id).collect();
         let conflict_notice = bundles.conflicts.iter().find_map(|b| match b {
             Bundle::Conflict { members, .. } => {
-                let all_in = members.iter().all(|m| result_ids.contains(m));
+                let all_in = members.iter().all(|m| item_ids.contains(m));
                 if all_in {
                     None
                 } else {
@@ -427,6 +473,7 @@ impl Engine {
             }
             _ => None,
         });
+        context.conflict_notice = conflict_notice.clone();
 
         let explanation = build_explanation(&ExplanationInputs {
             scope: &scope,
@@ -445,12 +492,16 @@ impl Engine {
         let mut explanation = explanation;
         let readiness = self.readiness(req, store_gen).await?;
         explanation.fts_ready = readiness.fts_ready;
-        explanation.dense_ready = readiness.dense_ready;
+        explanation.dense_ready = readiness.dense_ready && !dense_failed;
         explanation.projection_lag = readiness.projection_lag;
-        // A non-empty query with pending projections, or a requested-but-missing
-        // dense leg, is a PARTIAL result: recall may be incomplete.
+        // A non-empty query with pending projections, a requested-but-missing
+        // dense leg, a failed dense leg, or an unready lexical leg is a
+        // PARTIAL result: recall may be incomplete. (This stage only runs
+        // for non-empty queries; empty queries return via list mode above.)
         explanation.partial = readiness.projection_lag > 0
-            || (req.model_fingerprint.is_some() && !readiness.dense_ready);
+            || (req.model_fingerprint.is_some() && !readiness.dense_ready)
+            || dense_failed
+            || !readiness.fts_ready;
 
         Ok(RetrievalResult {
             results,
@@ -519,6 +570,11 @@ impl Engine {
         explanation.fts_ready = readiness.fts_ready;
         explanation.dense_ready = readiness.dense_ready;
         explanation.projection_lag = readiness.projection_lag;
+        // Direct reads bypass the ranker, but pending projections still
+        // mean canonical state the call cannot see: flag it uniformly.
+        // The leg flags are informational here (legs are unused); only
+        // the lag drives partial on this path, deliberately.
+        explanation.partial = readiness.projection_lag > 0;
         Ok(RetrievalResult {
             results,
             context,
@@ -558,6 +614,14 @@ impl Engine {
         let context = context::assemble_context(&eligible, &BTreeSet::new(), &req.context_budget);
         let mut explanation = RetrievalExplanation::new(store_gen, req.model_fingerprint);
         explanation.empty_query = true;
+        // List reads bypass the legs, but pending projections still mean
+        // the listing may be incomplete: flag it like every other path.
+        // fts_ready/dense_ready stay at their defaults here: leg
+        // readiness is meaningless for canonical-snapshot reads (never
+        // false-completeness, since partial carries the lag).
+        let lag = self.repo.projection_lag()?;
+        explanation.projection_lag = lag;
+        explanation.partial = lag > 0;
         Ok(RetrievalResult {
             results,
             context,
@@ -571,18 +635,23 @@ impl Engine {
         scope: &EffectiveScope,
         store_gen: StoreGeneration,
         req: &RetrievalRequest,
+        dense_failed: bool,
     ) -> DomainResult<RetrievalResult> {
         let mut explanation = RetrievalExplanation::new(store_gen, req.model_fingerprint);
         explanation.no_match = true;
         explanation.scope_filter = scope.to_lance_filter();
         let readiness = self.readiness(req, store_gen).await?;
         explanation.fts_ready = readiness.fts_ready;
-        explanation.dense_ready = readiness.dense_ready;
+        explanation.dense_ready = readiness.dense_ready && !dense_failed;
         explanation.projection_lag = readiness.projection_lag;
-        // A no-match with pending projections or a missing dense leg is partial:
-        // the absence of hits may be a projection gap, not a true no-answer.
+        // Same degraded-leg rule as the ranked path: a no-match with
+        // pending projections, a missing dense leg, a failed dense leg, or
+        // an unready lexical leg is partial — the absence of hits may be a
+        // gap, not a true no-answer.
         explanation.partial = readiness.projection_lag > 0
-            || (req.model_fingerprint.is_some() && !readiness.dense_ready);
+            || (req.model_fingerprint.is_some() && !readiness.dense_ready)
+            || dense_failed
+            || !readiness.fts_ready;
         Ok(RetrievalResult {
             results: vec![],
             context: context::ContextResult::default(),
@@ -701,8 +770,76 @@ fn span_for(rows: &[SearchRow], id: EntityId) -> Option<(u64, u64)> {
 }
 
 /// Find a row for a memory (for its embedding).
-fn row_for(rows: &[SearchRow], id: EntityId) -> Option<&SearchRow> {
-    rows.iter().find(|r| r.memory_id == id)
+/// Mean embedding over a memory's rows that carry one, unioned across both
+/// legs and scoped to a single model space (AD-04: never mix vector
+/// spaces). With an explicit fingerprint only that space averages; without
+/// one (lexical-only requests) the dominant space wins (most rows, ties to
+/// the smallest fingerprint) so blue-green windows still average coherently
+/// instead of mixing. MMR diversity must see the whole document, not just
+/// the first chunk: near-duplicate tails survive nothing otherwise. Lexical
+/// rows come first so a chunk present in both legs counts once (deduped by
+/// chunk id); rows outside the chosen space are skipped.
+///
+/// Two disclosed approximations: the election counts rows while the mean
+/// dedupes chunks (asymmetric leg duplication can flip a close election
+/// versus a per-chunk count), and each memory elects independently, so MMR
+/// cosines across memories can span spaces mid-migration. Both degrade
+/// ordering only, never safety: the fallback is still a real document
+/// vector, never a zero placeholder.
+fn mean_vector(
+    lexical_rows: &[SearchRow],
+    dense_rows: &[SearchRow],
+    id: EntityId,
+    fingerprint: Option<ModelFingerprint>,
+) -> Option<Vec<f32>> {
+    let fingerprint = fingerprint.or_else(|| {
+        // Dominant space among this memory's embedded rows: count per
+        // fingerprint over both legs, ties to the smallest (deterministic).
+        let mut counts: BTreeMap<ModelFingerprint, usize> = BTreeMap::new();
+        for row in lexical_rows.iter().chain(dense_rows.iter()) {
+            if row.memory_id == id && row.embedding.is_some() {
+                *counts.entry(row.model_fingerprint).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by(|(fa, ca), (fb, cb)| ca.cmp(cb).then(fb.cmp(fa)))
+            .map(|(fp, _)| fp)
+    });
+    let fingerprint = fingerprint?;
+    let mut sum: Option<Vec<f32>> = None;
+    let mut count = 0usize;
+    let mut seen_chunks = BTreeSet::new();
+    for row in lexical_rows.iter().chain(dense_rows.iter()) {
+        if row.memory_id != id || row.embedding.is_none() {
+            continue;
+        }
+        if row.model_fingerprint != fingerprint {
+            continue;
+        }
+        let vector = row.embedding.as_ref().expect("checked above");
+        let entry = sum.get_or_insert_with(|| vec![0.0; vector.len()]);
+        // Mixed widths cannot average: keep the first width found.
+        if entry.len() != vector.len() {
+            continue;
+        }
+        // Same chunk in both legs counts once (lexical rows come first).
+        if !seen_chunks.insert(row.chunk_id) {
+            continue;
+        }
+        for (acc, v) in entry.iter_mut().zip(vector.iter()) {
+            *acc += *v;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let mut mean = sum.expect("counted vector exists");
+    for acc in mean.iter_mut() {
+        *acc /= count as f32;
+    }
+    Some(mean)
 }
 
 /// Priority P(d) in [0,1]: feedback balance plus a small confidence term.
@@ -792,13 +929,7 @@ mod tests {
 
     impl TestQueryEmbedder {
         fn hash_vec(text: &str) -> Vec<f32> {
-            (0..384)
-                .map(|i| {
-                    ((text.bytes().fold(0u64, |a, b| a.wrapping_add(b as u64)) >> (i % 64))
-                        ^ i as u64) as f32
-                        / 1e9
-                })
-                .collect()
+            crate::search::projector::hash_embed_vec(text, 384)
         }
     }
 
@@ -810,6 +941,25 @@ mod tests {
         {
             let text = format!("{}{}", self.prefix, query);
             Box::pin(async move { Ok(Self::hash_vec(&text)) })
+        }
+    }
+
+    /// An embedder under backpressure: every query fails (overloaded worker).
+    struct FailingEmbedder;
+
+    impl QueryEmbedder for FailingEmbedder {
+        fn embed_query<'a>(
+            &'a self,
+            query: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DomainResult<Vec<f32>>> + Send + 'a>>
+        {
+            let _ = query;
+            Box::pin(async move {
+                Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "embedder overloaded",
+                ))
+            })
         }
     }
 
@@ -889,6 +1039,116 @@ mod tests {
         assert!(result.explanation.no_match);
     }
 
+    /// A genuine complete no-answer: all legs ready, unrelated query —
+    /// empty, flagged no-match, and NOT partial (partial is reserved for
+    /// degraded legs, never a hedge on a true no-answer).
+    #[tokio::test]
+    async fn complete_no_answer_when_all_legs_ready() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "rust async", "tokio runtime details", None);
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+
+        let req = RetrievalRequest {
+            query: "zzqqxx completely unrelated terms".into(),
+            // Zero-overlap pin (T-RANK-04): hash-vector noise must not
+            // turn a true no-answer into spurious hits.
+            min_similarity: Some(1.0),
+            ..base_req()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert!(result.results.is_empty());
+        assert!(result.explanation.no_match);
+        assert!(result.explanation.fts_ready);
+        assert!(
+            !result.explanation.partial,
+            "ready legs with no hits is complete, not partial"
+        );
+    }
+
+    /// A pinned retired generation fails loudly: the store keeps no
+    /// versioned canonical rows, so serving current data under an old pin
+    /// would lie. Unpinned requests (and pins matching live) work normally.
+    #[tokio::test]
+    async fn pinned_retired_generation_fails_loudly() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "gen one", "first generation body", None);
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+        repo.set_store_generation(crate::domain::id::StoreGeneration::new(2))
+            .unwrap();
+
+        let stale = RetrievalRequest {
+            query: "generation".into(),
+            store_generation: Some(crate::domain::id::StoreGeneration::FIRST),
+            ..base_req()
+        };
+        let err = Engine::new(repo.clone(), table.clone())
+            .retrieve(&stale, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::StaleGeneration
+        );
+
+        let live = RetrievalRequest {
+            query: "generation".into(),
+            store_generation: Some(crate::domain::id::StoreGeneration::new(2)),
+            ..base_req()
+        };
+        assert!(
+            Engine::new(repo, table)
+                .retrieve(&live, &TestQueryEmbedder { prefix: "" })
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The retired-pin gate precedes all routing: direct-ID and list reads
+    /// under a retired pin fail loudly too, never serve current data.
+    #[tokio::test]
+    async fn non_ranked_paths_with_retired_pin_fail_loudly() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "gen one", "first generation body", None);
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+        repo.set_store_generation(crate::domain::id::StoreGeneration::new(2))
+            .unwrap();
+
+        let stale_pin = Some(crate::domain::id::StoreGeneration::FIRST);
+        let direct = RetrievalRequest {
+            query: "generation".into(),
+            direct_ids: vec![eid(1)],
+            store_generation: stale_pin,
+            ..base_req()
+        };
+        let err = Engine::new(repo.clone(), table.clone())
+            .retrieve(&direct, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::StaleGeneration
+        );
+        let list = RetrievalRequest {
+            query: "   ".into(),
+            store_generation: stale_pin,
+            ..base_req()
+        };
+        let err = Engine::new(repo, table)
+            .retrieve(&list, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::StaleGeneration
+        );
+    }
+
     /// Cutover readers: a request without a pinned generation reads the
     /// active pointer per call; an explicit generation stays pinned
     /// (rollback reads). Uses the ranked path: list mode reads canonical
@@ -933,17 +1193,19 @@ mod tests {
             .unwrap();
         assert_eq!(post.results.len(), 1, "active pointer must resolve");
 
-        // Explicit pin to the old generation sees nothing projected there.
+        // Explicit pin to the old generation fails loudly (no versioned
+        // canonical rows exist to serve it): stability through refusal,
+        // not through silently current data.
         let pinned = RetrievalRequest {
             query: "generation".into(),
             store_generation: Some(StoreGeneration::FIRST),
             ..Default::default()
         };
-        let result = Engine::new(repo, table)
+        let err = Engine::new(repo, table)
             .retrieve(&pinned, &TestQueryEmbedder { prefix: "" })
             .await
-            .unwrap();
-        assert!(result.results.is_empty(), "pinned old generation is stable");
+            .unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::StaleGeneration);
     }
 
     /// T-SEARCH-02: exact technical identifiers (flags, paths, underscores)
@@ -1228,6 +1490,49 @@ mod tests {
         assert_eq!(result.results.len(), 2);
     }
 
+    /// List reads bypass the legs but not the lag rule: with a pending
+    /// projection the listing may be incomplete, so it reports partial
+    /// like every other path (never a false-complete listing).
+    #[tokio::test]
+    async fn list_with_pending_projection_is_partial() {
+        let (repo, table, _proj, _guard) = env().await;
+        add(&repo, 1, "a", "alpha", None);
+
+        let req = RetrievalRequest {
+            query: "   ".into(),
+            ..Default::default()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert!(result.explanation.empty_query);
+        assert!(result.explanation.partial, "pending job must flag partial");
+        assert!(result.explanation.projection_lag > 0);
+    }
+
+    /// Direct reads bypass the ranker but not the lag rule: with a pending
+    /// projection the direct hit may be stale, so it reports partial like
+    /// every other path.
+    #[tokio::test]
+    async fn direct_with_pending_projection_is_partial() {
+        let (repo, table, _proj, _guard) = env().await;
+        add(&repo, 1, "a", "alpha", None);
+
+        let req = RetrievalRequest {
+            query: "a".into(),
+            direct_ids: vec![eid(1)],
+            ..Default::default()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert!(result.explanation.partial, "pending job must flag partial");
+        assert!(result.explanation.projection_lag > 0);
+    }
+
     /// Semantic recall: a query identical to a document's text retrieves it.
     #[tokio::test]
     async fn semantic_recall_finds_identical_text() {
@@ -1289,6 +1594,7 @@ mod tests {
             project: None,
             fragment_type: "fact".into(),
             created_at_millis: 100,
+            confidence: 0.5,
             updated_at_millis: 100,
             embedding: Some(TestQueryEmbedder::hash_vec(
                 "t1\nthe quick brown fox jumps over the lazy dog",
@@ -1526,6 +1832,7 @@ mod tests {
             project: None,
             fragment_type: "fact".into(),
             created_at_millis: 100,
+            confidence: 0.5,
             updated_at_millis: 100,
             embedding: Some(vec![1.0f32; 384]),
         };
@@ -1642,6 +1949,102 @@ mod tests {
         assert!(!result.explanation.dense_ready);
     }
 
+    /// A failing dense leg degrades to lexical-only instead of failing the
+    /// whole recall: won lexical results survive, flagged partial.
+    #[tokio::test]
+    async fn dense_failure_degrades_to_lexical_partial() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "rust async", "tokio runtime details", None);
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+
+        let req = RetrievalRequest {
+            query: "tokio runtime".into(),
+            model_fingerprint: Some(ModelFingerprint::new(1)),
+            ..Default::default()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &FailingEmbedder)
+            .await
+            .unwrap();
+        assert!(
+            !result.results.is_empty(),
+            "lexical hits must survive dense failure"
+        );
+        assert!(
+            result.explanation.partial,
+            "degraded recall must be flagged partial"
+        );
+        assert!(
+            !result.explanation.dense_ready,
+            "failed dense leg must not report ready"
+        );
+    }
+
+    /// Query embedder returning the negation of the passage hash: cosine
+    /// against any FixedEmbedder passage is strictly negative (both sides
+    /// are non-negative by construction).
+    struct NegatedEmbedder;
+
+    impl QueryEmbedder for NegatedEmbedder {
+        fn embed_query<'a>(
+            &'a self,
+            query: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DomainResult<Vec<f32>>> + Send + 'a>>
+        {
+            let text = query.to_string();
+            Box::pin(async move {
+                Ok(crate::search::projector::hash_embed_vec(&text, 384)
+                    .into_iter()
+                    .map(|v| -v)
+                    .collect())
+            })
+        }
+    }
+
+    /// The default request filters anti-correlated dense noise: a query with
+    /// no lexical overlap and strictly negative dense similarity returns
+    /// nothing, while explicit opt-out (`None`) still admits it.
+    #[tokio::test]
+    async fn default_threshold_filters_negative_dense_noise() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "rust async", "tokio runtime details", None);
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+
+        let gibberish = "zzqqxx unrelated terms".to_string();
+        let default_req = RetrievalRequest {
+            query: gibberish.clone(),
+            ..base_req()
+        };
+        let default_result = Engine::new(repo.clone(), table.clone())
+            .retrieve(&default_req, &NegatedEmbedder)
+            .await
+            .unwrap();
+        assert!(
+            default_result.results.is_empty(),
+            "default floor must filter anti-correlated noise, got {:?}",
+            default_result
+                .results
+                .iter()
+                .map(|r| r.memory.id.as_uuid().to_string())
+                .collect::<Vec<_>>()
+        );
+        let unfiltered_req = RetrievalRequest {
+            query: gibberish,
+            min_similarity: None,
+            ..base_req()
+        };
+        let unfiltered_result = Engine::new(repo, table)
+            .retrieve(&unfiltered_req, &NegatedEmbedder)
+            .await
+            .unwrap();
+        assert!(
+            !unfiltered_result.results.is_empty(),
+            "explicit opt-out must still admit nearest noise"
+        );
+    }
+
     /// Task 10: once the projection converges, the same query is complete.
     #[tokio::test]
     async fn complete_after_projection_converges() {
@@ -1665,6 +2068,427 @@ mod tests {
         );
         assert!(result.explanation.dense_ready);
         assert!(result.explanation.fts_ready);
+    }
+
+    /// A conflict pair split by the context budget must emit a conflict
+    /// notice naming both sides (never silently show only one claim). The
+    /// notice is computed on the FINAL budgeted context, not pre-budget
+    /// selection — and it is populated on the context itself.
+    #[tokio::test]
+    async fn conflict_notice_fires_when_budget_splits_pair() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "claim one", "the timeout is 30 seconds", None);
+        add(&repo, 2, "claim two", "the timeout is 60 seconds", None);
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+
+        repo.apply(
+            &ctx(10),
+            &DomainCommand::Relate {
+                relation: crate::domain::relation::Relation::new(
+                    eid(100),
+                    eid(1),
+                    eid(2),
+                    crate::domain::relation::RelationType::Contradicts,
+                    None,
+                    crate::domain::memory::Instant::new(1),
+                ),
+            },
+        )
+        .unwrap();
+
+        let req = RetrievalRequest {
+            query: "timeout seconds".into(),
+            context_budget: crate::retrieval::context::ContextBudget {
+                max_bytes: 10,
+                has_tokenizer: false,
+            },
+            ..base_req()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        let notice = result.context.conflict_notice.as_deref().unwrap_or("");
+        assert!(
+            notice.contains(&eid(1).as_uuid().to_string())
+                && notice.contains(&eid(2).as_uuid().to_string()),
+            "budget-split conflict must name both sides, got context items {:?} notice {notice:?}",
+            result.context.items.len()
+        );
+    }
+
+    /// A missing FTS index degrades lexical to empty: a non-empty query must
+    /// still be flagged partial, never presented as complete no-match.
+    #[tokio::test]
+    async fn missing_fts_index_is_partial_not_complete() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "rust async", "tokio runtime details", None);
+        proj.run_until_idle().await.unwrap();
+        // Deliberately no FTS index: lexical degrades to [].
+
+        let req = RetrievalRequest {
+            query: "tokio runtime".into(),
+            ..base_req()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert!(
+            result.explanation.partial,
+            "unready lexical leg must flag partial"
+        );
+        assert!(!result.explanation.fts_ready);
+    }
+
+    /// The no-answer path must apply the same degraded-leg rule as the
+    /// ranked path: lexical-only with a missing FTS index is partial, not
+    /// a complete no-match.
+    #[tokio::test]
+    async fn no_answer_with_unready_lexical_leg_is_partial() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "rust async", "tokio runtime details", None);
+        proj.run_until_idle().await.unwrap();
+        // No FTS index and lexical-only: both legs empty -> no-answer path.
+
+        let req = RetrievalRequest {
+            query: "zzqqxx completely unrelated terms".into(),
+            model_fingerprint: None,
+            ..Default::default()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        assert!(result.results.is_empty());
+        assert!(
+            result.explanation.partial,
+            "no-answer on an unready lexical leg must flag partial"
+        );
+        assert!(!result.explanation.fts_ready);
+    }
+
+    /// The no-answer path must flag a failed dense leg: with no lexical
+    /// hits either, the empty result may be degradation, not true absence.
+    #[tokio::test]
+    async fn no_answer_with_failed_dense_leg_is_partial() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "rust async", "tokio runtime details", None);
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+
+        let req = RetrievalRequest {
+            query: "zzqqxx completely unrelated terms".into(),
+            model_fingerprint: Some(ModelFingerprint::new(1)),
+            ..Default::default()
+        };
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &FailingEmbedder)
+            .await
+            .unwrap();
+        assert!(result.results.is_empty());
+        assert!(
+            result.explanation.partial,
+            "no-answer with a failed dense leg must flag partial"
+        );
+        assert!(!result.explanation.dense_ready);
+    }
+
+    /// MMR diversity must see the whole document: the candidate vector is
+    /// the mean over all embedded chunks (lexical rows first), not the
+    /// first chunk alone.
+    #[test]
+    fn mean_vector_aggregates_all_chunks() {
+        use crate::domain::id::ChunkId;
+        fn row(id: u64, chunk: u32, embedding: Option<Vec<f32>>) -> SearchRow {
+            SearchRow {
+                store_generation: crate::domain::id::StoreGeneration::FIRST,
+                memory_id: eid(id),
+                document_revision: crate::domain::id::DocumentRevision::new(1),
+                model_fingerprint: crate::domain::id::ModelFingerprint::new(1),
+                chunk_id: ChunkId::new(chunk),
+                chunker_version: "v1".to_string(),
+                lexical_text: "t".to_string(),
+                char_start: 0,
+                char_end: 1,
+                project: None,
+                fragment_type: "fact".to_string(),
+                created_at_millis: 0,
+                confidence: 0.5,
+                updated_at_millis: 0,
+                embedding,
+            }
+        }
+        // Two embedded chunks + one embedding-free row: mean over the two.
+        let lexical = vec![
+            row(1, 0, Some(vec![1.0, 0.0])),
+            row(1, 1, Some(vec![0.0, 1.0])),
+            row(1, 2, None),
+        ];
+        assert_eq!(
+            mean_vector(&lexical, &[], eid(1), Some(ModelFingerprint::new(1))),
+            Some(vec![0.5, 0.5])
+        );
+        // No lexical rows: fall back to dense rows.
+        let dense = vec![row(1, 0, Some(vec![0.0, 4.0]))];
+        assert_eq!(
+            mean_vector(&[], &dense, eid(1), Some(ModelFingerprint::new(1))),
+            Some(vec![0.0, 4.0])
+        );
+        // Nothing embedded anywhere: no vector (MMR zero-placeholder).
+        assert_eq!(mean_vector(&[], &[], eid(1), None), None);
+        let bare = vec![row(1, 0, None)];
+        assert_eq!(mean_vector(&bare, &[], eid(1), None), None);
+        // Other memories' rows never leak in.
+        let mixed = vec![row(2, 0, Some(vec![9.0, 9.0]))];
+        assert_eq!(mean_vector(&mixed, &[], eid(1), None), None);
+    }
+
+    /// Union across legs: disjoint chunks in lexical and dense average
+    /// together; a chunk present in both counts once.
+    #[test]
+    fn mean_vector_unions_legs_without_double_counting() {
+        use crate::domain::id::ChunkId;
+        fn row_chunk(id: u64, chunk: u32, embedding: Option<Vec<f32>>) -> SearchRow {
+            SearchRow {
+                store_generation: crate::domain::id::StoreGeneration::FIRST,
+                memory_id: eid(id),
+                document_revision: crate::domain::id::DocumentRevision::new(1),
+                model_fingerprint: crate::domain::id::ModelFingerprint::new(1),
+                chunk_id: ChunkId::new(chunk),
+                chunker_version: "v1".to_string(),
+                lexical_text: "t".to_string(),
+                char_start: 0,
+                char_end: 1,
+                project: None,
+                fragment_type: "fact".to_string(),
+                created_at_millis: 0,
+                confidence: 0.5,
+                updated_at_millis: 0,
+                embedding,
+            }
+        }
+        let fp = Some(ModelFingerprint::new(1));
+        // Chunk 0 lexical-only, chunk 1 dense-only: mean over both.
+        let lexical = vec![row_chunk(1, 0, Some(vec![1.0, 0.0]))];
+        let dense = vec![row_chunk(1, 1, Some(vec![0.0, 1.0]))];
+        assert_eq!(
+            mean_vector(&lexical, &dense, eid(1), fp),
+            Some(vec![0.5, 0.5])
+        );
+        // Same chunk in both legs: counted once, not averaged with itself.
+        let lexical = vec![row_chunk(1, 0, Some(vec![2.0, 0.0]))];
+        let dense = vec![row_chunk(1, 0, Some(vec![2.0, 0.0]))];
+        assert_eq!(
+            mean_vector(&lexical, &dense, eid(1), fp),
+            Some(vec![2.0, 0.0])
+        );
+    }
+
+    /// Fingerprint scoping (AD-04): rows outside the requested model space
+    /// never enter the mean, even when they are the only embedded rows.
+    #[test]
+    fn mean_vector_filters_foreign_fingerprints() {
+        use crate::domain::id::ChunkId;
+        fn row_fp(id: u64, fp: u64, embedding: Option<Vec<f32>>) -> SearchRow {
+            SearchRow {
+                store_generation: crate::domain::id::StoreGeneration::FIRST,
+                memory_id: eid(id),
+                document_revision: crate::domain::id::DocumentRevision::new(1),
+                model_fingerprint: crate::domain::id::ModelFingerprint::new(fp),
+                chunk_id: ChunkId::new(0),
+                chunker_version: "v1".to_string(),
+                lexical_text: "t".to_string(),
+                char_start: 0,
+                char_end: 1,
+                project: None,
+                fragment_type: "fact".to_string(),
+                created_at_millis: 0,
+                confidence: 0.5,
+                updated_at_millis: 0,
+                embedding,
+            }
+        }
+        let lexical = vec![row_fp(1, 2, Some(vec![9.0, 9.0]))];
+        let dense = vec![row_fp(1, 1, Some(vec![1.0, 1.0]))];
+        assert_eq!(
+            mean_vector(&lexical, &dense, eid(1), Some(ModelFingerprint::new(1))),
+            Some(vec![1.0, 1.0]),
+            "foreign-fingerprint rows must not pollute the mean"
+        );
+        assert_eq!(
+            mean_vector(&lexical, &[], eid(1), Some(ModelFingerprint::new(1))),
+            None,
+            "foreign-only rows yield no vector, not a mixed-space mean"
+        );
+    }
+
+    /// Without a requested fingerprint the dominant space wins (most rows,
+    /// ties to the smallest): blue-green windows average coherently instead
+    /// of mixing vector spaces.
+    #[test]
+    fn mean_vector_without_fingerprint_uses_dominant_space() {
+        use crate::domain::id::ChunkId;
+        fn row_fp_chunk(id: u64, fp: u64, chunk: u32, embedding: Option<Vec<f32>>) -> SearchRow {
+            SearchRow {
+                store_generation: crate::domain::id::StoreGeneration::FIRST,
+                memory_id: eid(id),
+                document_revision: crate::domain::id::DocumentRevision::new(1),
+                model_fingerprint: crate::domain::id::ModelFingerprint::new(fp),
+                chunk_id: ChunkId::new(chunk),
+                chunker_version: "v1".to_string(),
+                lexical_text: "t".to_string(),
+                char_start: 0,
+                char_end: 1,
+                project: None,
+                fragment_type: "fact".to_string(),
+                created_at_millis: 0,
+                confidence: 0.5,
+                updated_at_millis: 0,
+                embedding,
+            }
+        }
+        // Two fp-1 chunks beat one fp-2 chunk: mean over fp-1 only.
+        let rows = vec![
+            row_fp_chunk(1, 1, 0, Some(vec![1.0, 1.0])),
+            row_fp_chunk(1, 1, 1, Some(vec![3.0, 3.0])),
+            row_fp_chunk(1, 2, 2, Some(vec![9.0, 9.0])),
+        ];
+        assert_eq!(mean_vector(&rows, &[], eid(1), None), Some(vec![2.0, 2.0]));
+        // Tie breaks to the smallest fingerprint, deterministically.
+        let rows = vec![
+            row_fp_chunk(1, 2, 0, Some(vec![8.0, 8.0])),
+            row_fp_chunk(1, 1, 1, Some(vec![2.0, 2.0])),
+        ];
+        assert_eq!(mean_vector(&rows, &[], eid(1), None), Some(vec![2.0, 2.0]));
+    }
+
+    /// Election counts rows, mean dedupes chunks: fp-2 chunk 0 in both
+    /// legs (2 votes) beats fp-1 chunk 1 in one (1 vote) even though the
+    /// chunk race is tied 1-1. Row-vote semantics pinned (matches docs).
+    #[test]
+    fn mean_vector_election_counts_rows_not_chunks() {
+        use crate::domain::id::ChunkId;
+        fn row_fp_chunk2(id: u64, fp: u64, chunk: u32, embedding: Option<Vec<f32>>) -> SearchRow {
+            SearchRow {
+                store_generation: crate::domain::id::StoreGeneration::FIRST,
+                memory_id: eid(id),
+                document_revision: crate::domain::id::DocumentRevision::new(1),
+                model_fingerprint: crate::domain::id::ModelFingerprint::new(fp),
+                chunk_id: ChunkId::new(chunk),
+                chunker_version: "v1".to_string(),
+                lexical_text: "t".to_string(),
+                char_start: 0,
+                char_end: 1,
+                project: None,
+                fragment_type: "fact".to_string(),
+                created_at_millis: 0,
+                confidence: 0.5,
+                updated_at_millis: 0,
+                embedding,
+            }
+        }
+        let lexical = vec![
+            row_fp_chunk2(1, 2, 0, Some(vec![4.0, 4.0])),
+            row_fp_chunk2(1, 1, 1, Some(vec![1.0, 1.0])),
+        ];
+        let dense = vec![row_fp_chunk2(1, 2, 0, Some(vec![4.0, 4.0]))];
+        assert_eq!(
+            mean_vector(&lexical, &dense, eid(1), None),
+            Some(vec![4.0, 4.0]),
+            "row votes (fp2 x2) beat chunk tie"
+        );
+    }
+
+    /// Confidence pre-filters at the source: a low-confidence row that
+    /// ranks top lexically is excluded before candidate-limit truncation
+    /// can crowd out eligible rows. (Post-filtering alone cannot save this:
+    /// with limit 1 the top hit is dropped after truncation, leaving
+    /// nothing — the eligible row never enters the pool. Dense disabled
+    /// here to isolate the lexical pre-filter; both legs share the predicate.
+    /// No ANN index exists today, so both legs exact-scan with the filter
+    /// applied before top-k: adding an ANN index requires a dense-leg
+    /// crowding variant of this test.)
+    #[tokio::test]
+    async fn confidence_prefilters_at_source() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "alpha beta", &"alpha beta ".repeat(10), None);
+        add(&repo, 2, "alpha beta", "alpha beta delta", None);
+        // Demote the lexical winner below the filter floor.
+        {
+            let mut low = repo.get_memories(&[eid(1)]).unwrap().remove(0);
+            low.confidence = 0.1;
+            repo.put_memory_direct(&low).unwrap();
+            let mut high = repo.get_memories(&[eid(2)]).unwrap().remove(0);
+            high.confidence = 0.9;
+            repo.put_memory_direct(&high).unwrap();
+        }
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+
+        let mut req = RetrievalRequest {
+            query: "alpha beta".into(),
+            candidate_limit: 1,
+            model_fingerprint: None,
+            ..base_req()
+        };
+        req.scope.min_confidence = Some(0.5);
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        let ids: Vec<EntityId> = result.results.iter().map(|r| r.memory.id).collect();
+        assert_eq!(
+            ids,
+            vec![eid(2)],
+            "pre-filter must admit the eligible row, got {ids:?}"
+        );
+    }
+
+    /// Post-convergence confidence drift heals through the worker: a
+    /// negative-feedback demotion (0.5 -> 0.48) enqueues a refresh, so the
+    /// next projection carries the lowered confidence and the source
+    /// pre-filter excludes the row — no silent stale-high reads.
+    #[tokio::test]
+    async fn feedback_drift_refreshes_projection() {
+        let (repo, table, mut proj, _guard) = env().await;
+        add(&repo, 1, "alpha beta", &"alpha beta ".repeat(10), None);
+        add(&repo, 2, "alpha beta", "alpha beta delta", None);
+        // Converge first: the rows publish at 0.5. The demotion below
+        // lands post-convergence, so only a refresh heals the projection
+        // (a pre-convergence write would publish fresh trivially).
+        proj.run_until_idle().await.unwrap();
+        // Demote the lexical winner below the filter floor via feedback
+        // (not a direct write): this must enqueue a projection refresh.
+        repo.apply(
+            &ctx(50),
+            &DomainCommand::Feedback {
+                memory_id: eid(1),
+                useful: false,
+            },
+        )
+        .unwrap();
+        proj.run_until_idle().await.unwrap();
+        table.create_fts_index().await.unwrap();
+
+        let mut req = RetrievalRequest {
+            query: "alpha beta".into(),
+            candidate_limit: 1,
+            model_fingerprint: None,
+            ..base_req()
+        };
+        req.scope.min_confidence = Some(0.5);
+        let result = Engine::new(repo, table)
+            .retrieve(&req, &TestQueryEmbedder { prefix: "" })
+            .await
+            .unwrap();
+        let ids: Vec<EntityId> = result.results.iter().map(|r| r.memory.id).collect();
+        assert_eq!(
+            ids,
+            vec![eid(2)],
+            "refreshed projection must exclude the demoted row, got {ids:?}"
+        );
     }
 
     /// Task 10: finite-score validation. Every returned candidate's score

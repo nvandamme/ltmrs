@@ -23,3 +23,9 @@
 *.ltmrs-backup
 /models-cache/
 /prompt impl.md
+/.agentbridge/
+/.codex/
+/opencode.json
+/SENTINEL_CWD_TEST.txt
+/.ai/
+/.idea/

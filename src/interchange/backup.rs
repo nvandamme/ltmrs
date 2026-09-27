@@ -98,13 +98,10 @@ pub fn export_backup(
     };
     // One coherent cut: the full domain export comes from a single read
     // transaction; registry sessions ride along verbatim.
-    let mut export = repo
-        .export_full()
+    let (mut export, generation) = repo
+        .export_full_with_generation()
         .map_err(|e| BackupError::Store(e.message))?;
     export.sessions = sessions.to_vec();
-    let generation = repo
-        .store_generation()
-        .map_err(|e| BackupError::Store(e.message))?;
     let (bytes, _digest, _counts) = encode_backup(&export, generation.as_u64(), created_at_millis)?;
     std::fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
     let name = format!(

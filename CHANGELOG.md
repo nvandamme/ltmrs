@@ -5,7 +5,73 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 23010e3 (2026-09-27) — WP-12 bench harness, first runs, lemma comparison, quality legs
+## 2026-09-27 — WP-13 review fix pass over WP-12
+
+### WP-13 review fix pass (retrieval, surface, durability)
+
+- Full formal + functional reviews across all plans (3 parallel slices:
+  retrieval+search, surface, durability+plans-consistency) returned NOT
+  READY x3; every Critical/Important finding fixed TDD-first (RED observed),
+  cheap Minors folded in, 3 deferred with rationale.
+- Critical: established frontend connections bricked after restore (stale
+  epoch, no re-handshake path). New `roundtrip_with_rehandshake` (forget
+  epoch, re-handshake adopting live generation, single retry with fresh op
+  id); `ensure_handshaked` connects when needed.
+  (`established_connection_rehandshakes_on_stale_generation`)
+- Important: no-answer degraded-leg parity (`dense_failed` threaded through,
+  2 tests); visualizer token now 128-bit getrandom 0.3 (was fixed-key
+  DefaultHasher over pid/time/counter); reference oracle parity restored
+  (absolute-only revision advance, non-Live reject, relate id-reuse,
+  merge alias check+register; 4 oracle tests); relation ids bound to full
+  input (note/created_at); typed `DomainErrorCode::Contention` with
+  handshake retry + Busy/daemon_busy wire mapping; N10 stale pins fail
+  loudly; I3 confidence column + source pre-filter + gate; plan/ledger
+  drift fixed (02 min_similarity, RQ-04/06/13/18/19 evidence, DEV-011/012,
+  README absolutes incl. decided AD-01 Option B).
+- Minor: RESTOREDBG print, e5 dead branch, chunker_version sql_quote,
+  strict confirm/symbol parsers, bert zero-dim validation, context comment
+  contract, NaN min_confidence rejected at resolve, refcounted quota slots,
+  loud registry persist failures, ANN-caveat note. Deferred: restore-test
+  5ms margin, barrier Validation code, frontend Busy-retry.
+- Queue batches under review: MMR mean vectors, named-column resolution,
+  DomainResult rows, dense IS NOT NULL leg, E5 chunking bridge, strict
+  parsers + allowlist, project normalization, registry tmp+rename persist,
+  hybrid Option + explain, per-boot token auth, session-link single apply,
+  atomic restore_replace (9 keyspaces), preview TTL + lease re-check,
+  safety backup/rollback, persist barriers, namespace atomicity.
+- Re-review (second full pass, same 3 slices): retrieval READY; surface +
+  durability NOT READY — all fixed TDD-first, no new deferrals.
+  - Channel binding: frames were frontend-bound only; same-frontend
+    cross-channel frames executed in sibling sessions (RQ-05). Handshake
+    channel now captured, mismatches refused (`channel_mismatch`).
+    (`channel_spoofed_frames_are_rejected`, raw socket pair)
+  - Sticky dead streams x2: generic handshake rejection kept a
+    dead-but-connected stream; transport failures never forgot the epoch.
+    Both now close/forget; the next call reconnects.
+    (`rejected_handshake_closes_dead_stream` via fake rejecting server,
+    `transport_failure_forgets_handshake` via dead-pair swap)
+  - GC + counters: `gc_expired` and `mark_build_dirty` collect-then-write;
+    multi-receipt GC test, corrupt-epoch-bytes test, restore unwritten
+    categories report 0 with reason, `client_count` sums holders,
+    `explain_search` reports the effective mode (hybrid iff dense ran)
+    with honest fallback flags.
+  - Retrieval minors: confidence/chunker gate tests split + named,
+    genuine complete-no-answer pinned, direct/list stale-pin tests,
+    tiny-budget bare-cut test, transitive out-of-scope bundle test with
+    documented scope-purity tradeoff.
+  - Tracker hygiene: `deviations.json` + `traceability.json` restored to
+    native 2-space indent (diffs purely additive); WP-00 entries merged
+    under `edd09a7` (history squash proof); all 31 headers resolve in
+    history.
+- Validation: `cargo fmt -- --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test` (600 lib + 2 smoke, 0 failed),
+  `cargo build --release` (45s; sha256
+  9f0b384d5e3e5ddfd3eec99824f1c3d92277a4799823957652eb46daa88918bb;
+  getrandom native-code policy ACCEPTABLE). NO RELEASE yet (evidence
+  remainder: offline install, migration/rollback docs, matrices, SBOM,
+  version labeling).
+
+## 75169fe (2026-09-27) — WP-12 bench harness, first runs, lemma comparison, quality legs
 
 ### WP-12 bench harness + first runs + lemma comparison + quality legs
 
@@ -47,7 +113,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   warnings`, `cargo test` (524 lib passed + 3 ignored reference runs + 2
   smoke, 0 failed).
 
-## 20dbcb7 (2026-09-26) — WP-11 native backup restore and legacy verdict
+## 435035e (2026-09-26) — WP-11 native backup restore and legacy verdict
 
 ### WP-11 native backup/restore + legacy verdict
 
@@ -86,7 +152,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   `cargo clippy --all-targets -- -D warnings` clean, `cargo test`:
   492 lib + stdio_smoke (1) + vis_smoke (1) passed, 0 failed.
 
-## f09b2c8 (2026-09-26) — WP-09 dense guide candidates and differential workflow replay
+## d263d8e (2026-09-26) — WP-09 dense guide candidates and differential workflow replay
 
 ### WP-09 remainings: dense guide candidates + differential workflow replay
 
@@ -119,7 +185,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   476 lib + stdio_smoke (1) + vis_smoke (1) passed, 0 failed.
 
 
-## 7f9bbe3 (2026-09-26) — WP-10 CLI skills stdio visualizer hosts shim and server names
+## 9815501 (2026-09-26) — WP-10 CLI skills stdio visualizer hosts shim and server names
 
 ### WP-10b managed skill installer
 
@@ -229,16 +295,16 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 
 
-## 3956c3b (2026-09-26) — WP-10a CLI parser with help/version and real library output
+## 2a07449 (2026-09-26) — WP-10a CLI parser with help/version and real library output
 
 
-## 2a72460 (2026-09-26) — whole-learning-workflow trace through tool handlers
+## cdc0bac (2026-09-26) — whole-learning-workflow trace through tool handlers
 
 
-## 5e5dbc9 (2026-09-26) — dense memory preload at session start
+## a11c946 (2026-09-26) — dense memory preload at session start
 
 
-## ad6d3a3 (2026-09-26) — per-channel virtual sessions for session-less calls
+## 0258341 (2026-09-26) — per-channel virtual sessions for session-less calls
 
 
 ## 0427c3a (2026-09-26) — IPC hardening: peer-cred, deadline, quotas, idle-exit, wire fix
@@ -474,7 +540,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (356 passed, 0 failed).
 
-## 3a31362 (2026-09-24) — complete WP-09 guides, sessions and intelligence
+## a46a111 (2026-09-24) — WP-09 guides, sessions and intelligence (7/10 tasks)
 
 - `src/compatibility/lemma/tools_lemma_0_21_0.json`: 15 new frozen tool schemas
   (7 guide, 5 session/suggestion, 3 intelligence) added to the 26-tool surface.
@@ -535,7 +601,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   differential replay for the 15 WP-09 tools deferred (behavioral tests encode
   the contract instead).
 
-## 339fa58 (2026-09-23) — complete WP-08 memory MCP contract and differential wire harness
+## 339fa58 (2026-09-23) — WP-08 memory handlers and differential wire harness (8/9 tasks)
 
 - `src/daemon/tools.rs`: all 11 WP-08 tool handlers executing against the
   canonical repository + search backend, shaping the frozen Lemma 0.21.0 wire
@@ -614,7 +680,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   harness against upstream captures (task 9) — captures used as reference,
   contract encoded in behavioral tests, but no replay harness yet.
 
-## 89f7e58 (2026-09-20) — complete WP-07 retrieval, graph context and explanations
+## 89f7e58 (2026-09-20) — WP-07 retrieval, graph context and explanations
 
 - `src/retrieval/engine.rs`: the recall engine composing all stages — direct-ID
   and empty-query routing (separate from ranked search), lexical + dense legs
@@ -661,7 +727,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (275 passed, 0 failed).
 
-## dcc2e99 (2026-09-18) — complete WP-06 Candle embedding service and model qualification
+## dcc2e99 (2026-09-18) — WP-06 Candle embedding service and model qualification
 
 - `src/embeddings/manifest.rs`: pinned E5-small artifact set (revision, per-file SHA-256
   digests, license) plus the `ModelRecipe` (query/passage prefixes, max_tokens=512,
@@ -703,7 +769,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (207 passed, 0 failed).
 
-## 7cf7aff (2026-09-17) — complete WP-05 versioned Lance search projection
+## 7cf7aff (2026-09-17) — WP-05 versioned Lance search projection
 
 - `src/domain/projection.rs`: durable desired-state job types (`ProjectionJob` with
   monotonic per-memory seq as the compare-and-clear token; tombstone flag).
@@ -748,7 +814,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (187 passed, 0 failed).
 
-## dcdb257 (2026-09-17) — complete WP-04 singleton daemon, IPC and session routing
+## dcdb257 (2026-09-17) — WP-04 singleton daemon, IPC and session routing
 
 - `src/daemon/envelope.rs`: typed IPC envelope (protocol version, store
   generation, frontend/channel IDs, operation ID, session, retry epoch,
@@ -821,7 +887,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (143 passed, 0 failed).
 
-## d5e8d40 (2026-09-16) — complete WP-03 canonical repository hardening
+## d5e8d40 (2026-09-16) — WP-03 canonical repository hardening
 
 - `CanonicalRepository` over Fjall (`src/service/`): single `apply(ctx, cmd)`
   gateway centralizing command application, precondition validation and atomic
@@ -887,21 +953,10 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test --lib` (37 passed, 0 failed).
 
-## dd0be90 (2026-09-16) — close WP-00 gaps from plan review
+## edd09a7 (2026-09-16) — WP-00 baseline capture, dependency lock and gap closure (S0)
 
-- Added static tool-definition snapshot (`static/tools_static.json`), kept
-  separate from the live `tools/list` (dynamic description injection).
-- Recorded DB schema version (8) and static/live snapshot refs in
-  `upstream-lock.json`.
-- Added behavior classification (schema-documented / handler-defined /
-  side-effect / apparent-defect) to the behavior inventory.
-- Documented `tools/list_changed` notification; captured real error
-  responses (unknown tool, bad argument) for the T-MCP-03 baseline.
-- Aligned `tokenizers` to 0.22.2 (candle-core's version) to remove a
-  duplicate from the dependency graph (593 -> 590 packages).
-- Extended the native-code audit (F-05, model-license deferral).
-
-## e75b963 (2026-09-16) — WP-00 baseline capture and dependency lock (S0)
+(single entry: history squash collapsed the baseline capture and the plan-
+review gap closure into edd09a7; bodies preserved below.)
 
 - `baseline/lemma-0.21.0/`: live MCP wire capture (initialize, tools/list 29
   tools, tools/call), `upstream-lock.json`, provenance, behavior inventory,
@@ -915,6 +970,12 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   avoidance (F-02).
 - `src/lib.rs` (library target); TODO/DONE/CHANGELOG trackers; AGENTS.md
   tracking rules; README S0 status.
+- Gap closure from plan review: static tool-definition snapshot
+  (`static/tools_static.json`) kept separate from the live `tools/list`;
+  DB schema version (8) and snapshot refs in `upstream-lock.json`; behavior
+  classification in the inventory; `tools/list_changed` documented with real
+  error captures; tokenizers aligned to 0.22.2 (593 -> 590 packages);
+  native-code audit extended (F-05, model-license deferral).
 
 ## 9614885 (2026-09-16) — initial repository with implementation plans
 

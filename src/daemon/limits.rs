@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::domain::id::FrontendId;
+use crate::domain::id::{ChannelId, FrontendId};
 
 /// Resource budgets for the daemon.
 #[derive(Debug, Clone, Copy)]
@@ -50,8 +50,11 @@ pub struct QuotaTracker {
     limits: ResourceLimits,
     /// Per-client queued job counts.
     queued: Mutex<HashMap<FrontendId, usize>>,
-    /// Registered clients.
-    clients: Mutex<Vec<FrontendId>>,
+    /// Registered clients: connection count per (frontend, channel) key.
+    /// A key can hold several connections during a rapid reconnect; the
+    /// slot frees only when the last holder disconnects, so a stale
+    /// sibling can never free a live connection's slot early.
+    clients: Mutex<HashMap<(FrontendId, ChannelId), usize>>,
     /// In-flight storage operations.
     in_flight: Mutex<usize>,
 }
@@ -61,29 +64,45 @@ impl QuotaTracker {
         Self {
             limits,
             queued: Mutex::new(HashMap::new()),
-            clients: Mutex::new(Vec::new()),
+            clients: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(0),
         }
     }
 
-    /// Register a client. Fails if the client limit is reached.
-    pub fn register_client(&self, frontend_id: FrontendId) -> Result<(), QuotaError> {
+    /// Register a connection. Slots are per connection (frontend, channel):
+    /// two channels of one frontend consume two slots, so a disconnect
+    /// frees exactly the connection that ended. A duplicate key only bumps
+    /// the holder count (rapid reconnect); it never consumes a new slot.
+    pub fn register_client(
+        &self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+    ) -> Result<(), QuotaError> {
         let mut clients = self.clients.lock().unwrap();
-        if clients.contains(&frontend_id) {
+        let key = (frontend_id, channel_id);
+        if let Some(holders) = clients.get_mut(&key) {
+            *holders += 1;
             return Ok(());
         }
         if clients.len() >= self.limits.max_clients {
             return Err(QuotaError::TooManyClients);
         }
-        clients.push(frontend_id);
+        clients.insert(key, 1);
         Ok(())
     }
 
-    /// Unregister a client, freeing its slot. Absent IDs are a no-op so a
-    /// disconnect guard can run unconditionally at connection end.
-    pub fn unregister_client(&self, frontend_id: FrontendId) {
+    /// Unregister a connection, freeing its slot when the last holder on
+    /// the key disconnects. Absent IDs are a no-op so a disconnect guard
+    /// can run unconditionally at connection end.
+    pub fn unregister_client(&self, frontend_id: FrontendId, channel_id: ChannelId) {
         let mut clients = self.clients.lock().unwrap();
-        clients.retain(|c| c != &frontend_id);
+        let key = (frontend_id, channel_id);
+        if let Some(holders) = clients.get_mut(&key) {
+            *holders = holders.saturating_sub(1);
+            if *holders == 0 {
+                clients.remove(&key);
+            }
+        }
     }
 
     /// Try to enqueue a job for a client. Fails if the per-client queue is full.
@@ -129,9 +148,10 @@ impl QuotaTracker {
         bytes <= self.limits.max_response_bytes
     }
 
-    /// Number of registered clients (for health).
+    /// Number of registered clients (for health): total live connections
+    /// across keys, so duplicate-key holders are counted, not hidden.
     pub fn client_count(&self) -> usize {
-        self.clients.lock().unwrap().len()
+        self.clients.lock().unwrap().values().sum()
     }
 
     /// Total queued jobs across clients (for health).
@@ -160,20 +180,69 @@ mod tests {
         FrontendId::new(Uuid::from_u128(n as u128))
     }
 
+    fn ch(n: u64) -> crate::domain::id::ChannelId {
+        crate::domain::id::ChannelId::new(Uuid::from_u128(n as u128))
+    }
+
     #[test]
     fn client_limit_enforced() {
         let tracker = QuotaTracker::new(ResourceLimits {
             max_clients: 2,
             ..Default::default()
         });
-        assert!(tracker.register_client(fe(1)).is_ok());
-        assert!(tracker.register_client(fe(2)).is_ok());
+        assert!(tracker.register_client(fe(1), ch(1)).is_ok());
+        assert!(tracker.register_client(fe(2), ch(1)).is_ok());
         assert_eq!(
-            tracker.register_client(fe(3)),
+            tracker.register_client(fe(3), ch(1)),
             Err(QuotaError::TooManyClients)
         );
-        // Re-registering an existing client is fine.
-        assert!(tracker.register_client(fe(1)).is_ok());
+        // Re-registering an existing connection is fine.
+        assert!(tracker.register_client(fe(1), ch(1)).is_ok());
+    }
+
+    /// Slots are per connection, not per frontend: two channels of one
+    /// frontend hold two slots, and freeing one keeps the other.
+    #[test]
+    fn slots_are_per_connection() {
+        let tracker = QuotaTracker::new(ResourceLimits {
+            max_clients: 1,
+            ..Default::default()
+        });
+        assert!(tracker.register_client(fe(1), ch(1)).is_ok());
+        assert_eq!(
+            tracker.register_client(fe(1), ch(2)),
+            Err(QuotaError::TooManyClients),
+            "second channel must not share the slot"
+        );
+        tracker.unregister_client(fe(1), ch(1));
+        assert!(tracker.register_client(fe(1), ch(2)).is_ok());
+    }
+
+    /// A duplicate connection on the same key (rapid reconnect) must not
+    /// let the first disconnect free the slot while the sibling is still
+    /// active: the slot is freed only when the last holder disconnects.
+    #[test]
+    fn duplicate_key_disconnect_keeps_sibling_slot() {
+        let tracker = QuotaTracker::new(ResourceLimits {
+            max_clients: 2,
+            ..Default::default()
+        });
+        assert!(tracker.register_client(fe(1), ch(1)).is_ok());
+        assert!(tracker.register_client(fe(2), ch(1)).is_ok());
+        // Second connection on the same key (rapid reconnect).
+        assert!(tracker.register_client(fe(1), ch(1)).is_ok());
+        // Health counts live connections, not distinct keys.
+        assert_eq!(tracker.client_count(), 3);
+        // First sibling disconnects: the slot stays held.
+        tracker.unregister_client(fe(1), ch(1));
+        assert_eq!(tracker.client_count(), 2);
+        assert_eq!(
+            tracker.register_client(fe(3), ch(1)),
+            Err(QuotaError::TooManyClients)
+        );
+        // Last holder disconnects: the slot frees.
+        tracker.unregister_client(fe(1), ch(1));
+        assert!(tracker.register_client(fe(3), ch(1)).is_ok());
     }
 
     #[test]
@@ -218,16 +287,16 @@ mod tests {
             max_clients: 1,
             ..Default::default()
         });
-        tracker.register_client(fe(1)).unwrap();
+        tracker.register_client(fe(1), ch(1)).unwrap();
         assert_eq!(
-            tracker.register_client(fe(2)),
+            tracker.register_client(fe(2), ch(1)),
             Err(QuotaError::TooManyClients)
         );
-        tracker.unregister_client(fe(1));
-        assert!(tracker.register_client(fe(2)).is_ok());
+        tracker.unregister_client(fe(1), ch(1));
+        assert!(tracker.register_client(fe(2), ch(1)).is_ok());
         assert_eq!(tracker.client_count(), 1);
         // Unregistering an absent client is a no-op.
-        tracker.unregister_client(fe(99));
+        tracker.unregister_client(fe(99), ch(9));
         assert_eq!(tracker.client_count(), 1);
     }
 }

@@ -229,8 +229,13 @@ impl Daemon {
     /// in the store and survive independently; this ensures session state and
     /// background jobs are cleaned up so a restart restores history and leaks no workers.
     pub fn shutdown(&mut self) {
-        if let Some(p) = &self.sessions_path {
-            let _ = self.dispatcher.registry().persist(p);
+        if let Some(p) = &self.sessions_path
+            && let Err(e) = self.dispatcher.registry().persist(p)
+        {
+            // Loud, not silent: session history since start is lost, but
+            // the previous file stays intact (tmp+rename), so the loss is
+            // bounded to this run's sessions.
+            eprintln!("ltmrs: failed to persist session history at shutdown: {e:?}");
         }
         if let Some(svc) = self.embedding.take() {
             svc.shutdown();
@@ -362,6 +367,17 @@ impl Daemon {
                 Err(_) => {
                     let t = tracker.lock().unwrap();
                     if t.should_exit(wall_now_millis(), self.idle_timeout_millis) {
+                        // Persist session history before the idle exit: the
+                        // alternative silently discards everything since start.
+                        // A failure is loud (previous file intact via
+                        // tmp+rename: loss bounded to this run's sessions).
+                        if let Some(p) = &self.sessions_path
+                            && let Err(e) = self.dispatcher.registry().persist(p)
+                        {
+                            eprintln!(
+                                "ltmrs: failed to persist session history at idle exit: {e:?}"
+                            );
+                        }
                         return Ok(());
                     }
                 }
@@ -421,12 +437,17 @@ pub async fn handle_connection(
     let _client_guard: Option<ClientGuard>;
     // Handshake-authenticated frontend; every later frame must carry it.
     let authed: Option<crate::domain::id::FrontendId>;
+    // Handshake-authenticated channel; every later frame must carry it.
+    // Frontend-only binding would let one channel's frames reach another
+    // channel's session (RQ-05).
+    let authed_channel: Option<crate::domain::id::ChannelId>;
 
     // ---- Handshake: the first frame on every connection ----
     let first = read_wire_frame(&mut stream, &mut buf).await?;
     match first {
         WireMessage::Handshake(req) => {
             let frontend = req.frontend_id;
+            let channel = req.channel_id;
             let dispatcher = Arc::clone(&dispatcher);
             let result = tokio::task::spawn_blocking(move || dispatcher.handle_handshake(&req))
                 .await
@@ -435,7 +456,7 @@ pub async fn handle_connection(
                 Ok(hs) => {
                     // Admit the client to the quota table; a full table
                     // rejects instead of over-admitting (RQ-22).
-                    if let Err(qe) = quotas.register_client(frontend) {
+                    if let Err(qe) = quotas.register_client(frontend, channel) {
                         let err = WireError {
                             kind: "client_limit_reached".into(),
                             message: qe.to_string(),
@@ -443,20 +464,28 @@ pub async fn handle_connection(
                         write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
                         return Ok(());
                     }
-                    // Free the client's quota slot at connection end on every
-                    // path below. Bound to the handshake-authenticated ID, not
-                    // request-claimed ones; parallel connections of one
-                    // frontend share a slot (approximate by design: the first
-                    // disconnect frees it while a sibling is still active).
-                    _client_guard = Some(ClientGuard::new(Arc::clone(&quotas), frontend));
+                    // Free the connection's quota slot at connection end on
+                    // every path below. Bound to the handshake-authenticated
+                    // (frontend, channel), not request-claimed ones: each
+                    // connection holds exactly one slot.
+                    _client_guard = Some(ClientGuard::new(Arc::clone(&quotas), frontend, channel));
                     authed = Some(frontend);
+                    authed_channel = Some(channel);
                     let reply = WireReply::Handshake(hs);
                     write_reply(&mut stream, &reply, &quotas).await?;
                 }
                 Err(e) => {
-                    // Rejected handshake: send a wire error and close.
+                    // Rejected handshake: send a wire error and close. A
+                    // generation mismatch keeps a machine-readable kind so
+                    // the frontend can adopt the live generation and retry
+                    // instead of bricking new clients after a restore.
+                    let kind = match &e {
+                        IpcError::GenerationMismatch { .. } => "generation_mismatch",
+                        IpcError::Busy(_) => "daemon_busy",
+                        _ => "handshake_rejected",
+                    };
                     let err = WireError {
-                        kind: "handshake_rejected".into(),
+                        kind: kind.into(),
                         message: e.to_string(),
                     };
                     write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
@@ -499,12 +528,22 @@ pub async fn handle_connection(
             }
         };
         // Bind every frame to the handshake identity (RQ-05): a frame
-        // claiming another frontend is a protocol violation, never routed
-        // into its session namespace or quota bucket.
+        // claiming another frontend OR another channel is a protocol
+        // violation, never routed into its session namespace or quota
+        // bucket. Channel is bound too: same-frontend frames must not
+        // reach a sibling channel's session.
         if Some(envelope.frontend_id) != authed {
             let err = WireError {
                 kind: "frontend_mismatch".into(),
                 message: "frame frontend differs from handshake identity".into(),
+            };
+            write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+            continue;
+        }
+        if Some(envelope.channel_id) != authed_channel {
+            let err = WireError {
+                kind: "channel_mismatch".into(),
+                message: "frame channel differs from handshake identity".into(),
             };
             write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
             continue;
@@ -560,17 +599,26 @@ pub async fn handle_connection(
 struct ClientGuard {
     quotas: Arc<QuotaTracker>,
     frontend: crate::domain::id::FrontendId,
+    channel: crate::domain::id::ChannelId,
 }
 
 impl ClientGuard {
-    fn new(quotas: Arc<QuotaTracker>, frontend: crate::domain::id::FrontendId) -> Self {
-        Self { quotas, frontend }
+    fn new(
+        quotas: Arc<QuotaTracker>,
+        frontend: crate::domain::id::FrontendId,
+        channel: crate::domain::id::ChannelId,
+    ) -> Self {
+        Self {
+            quotas,
+            frontend,
+            channel,
+        }
     }
 }
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
-        self.quotas.unregister_client(self.frontend);
+        self.quotas.unregister_client(self.frontend, self.channel);
     }
 }
 
@@ -663,6 +711,96 @@ mod tests {
         assert!(check_peer_cred(&a).is_ok());
     }
 
+    /// Channel binding (RQ-05): frames must carry the handshake channel as
+    /// well as the frontend. A same-frontend frame naming another channel
+    /// is rejected, never routed into that channel's session.
+    #[tokio::test]
+    async fn channel_spoofed_frames_are_rejected() {
+        use crate::daemon::envelope::{
+            HandshakeRequest, PROTOCOL_VERSION, WireMessage, WireReply, read_response_payload,
+        };
+        use crate::service::repository::CanonicalRepository;
+        use tokio::io::AsyncWriteExt;
+
+        async fn write_frame(stream: &mut tokio::net::UnixStream, msg: &WireMessage) {
+            let payload = serde_json::to_vec(msg).unwrap();
+            stream
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&payload).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+        async fn read_reply(stream: &mut tokio::net::UnixStream) -> WireReply {
+            let bytes = read_response_payload(stream).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: std::sync::Arc<dyn crate::domain::clock::Clock + Send + Sync> =
+            std::sync::Arc::new(FrozenClock::new(1000));
+        let repo = std::sync::Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock.clone())
+                .unwrap(),
+        );
+        let dispatcher = std::sync::Arc::new(Dispatcher::new(repo, FrontendRegistry::new(), clock));
+        let quotas = std::sync::Arc::new(QuotaTracker::default());
+        let (server_end, mut client_end) = tokio::net::UnixStream::pair().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = handle_connection(server_end, dispatcher, quotas).await;
+        });
+
+        let fe = FrontendId::new(Uuid::from_u128(1));
+        write_frame(
+            &mut client_end,
+            &WireMessage::Handshake(HandshakeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: fe,
+                channel_id: ChannelId::new(Uuid::from_u128(2)),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(read_reply(&mut client_end).await, WireReply::Handshake(_)),
+            "handshake must succeed first"
+        );
+        // Same frontend, another channel: must be rejected, not routed.
+        let mut seq = 100u128;
+        let mut spoofed = || {
+            seq += 1;
+            IpcEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: fe,
+                channel_id: ChannelId::new(Uuid::from_u128(99)),
+                operation_id: OperationId::new(Uuid::from_u128(seq)),
+                session: None,
+                retry_epoch: 1,
+                deadline_millis: None,
+                scope: Scope::default(),
+                body: DomainRequest::ListMemories,
+            }
+        };
+        write_frame(&mut client_end, &WireMessage::Request(Box::new(spoofed()))).await;
+        match read_reply(&mut client_end).await {
+            WireReply::Error(err) => assert_eq!(
+                err.kind, "channel_mismatch",
+                "spoofed channel must be refused as channel_mismatch, got {}: {}",
+                err.kind, err.message
+            ),
+            other => panic!("spoofed channel frame must not be routed, got {other:?}"),
+        }
+        // The bound channel still works on the same connection.
+        let mut legit = spoofed();
+        legit.channel_id = ChannelId::new(Uuid::from_u128(2));
+        write_frame(&mut client_end, &WireMessage::Request(Box::new(legit))).await;
+        assert!(
+            matches!(read_reply(&mut client_end).await, WireReply::Response(_)),
+            "handshake channel must keep working"
+        );
+        server_handle.abort();
+    }
     /// The maintenance worker spawns when a search path is configured and is
     /// aborted on shutdown (task 10 scheduling integration).
     #[tokio::test]
@@ -802,7 +940,10 @@ mod tests {
         }));
         // Fill the single slot with another frontend.
         quotas
-            .register_client(FrontendId::new(Uuid::from_u128(99)))
+            .register_client(
+                FrontendId::new(Uuid::from_u128(99)),
+                crate::domain::id::ChannelId::new(Uuid::from_u128(98)),
+            )
             .unwrap();
         let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
 
@@ -1046,6 +1187,32 @@ mod tests {
             .await
             .expect("serve must exit on idle timeout, not hang")
             .unwrap();
+    }
+
+    /// Idle exit persists session history instead of discarding it: the
+    /// sessions file must exist and parse after the exit.
+    #[tokio::test]
+    async fn serve_persists_sessions_on_idle_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "idle-store");
+        let sessions = dir.path().join("sessions.json");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            sessions_path: sessions.to_str().unwrap().to_string(),
+            idle_timeout_millis: 50,
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), daemon.serve())
+            .await
+            .expect("serve must exit on idle timeout, not hang")
+            .unwrap();
+        let raw = std::fs::read_to_string(&sessions).expect("sessions file must exist");
+        let snapshot: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            snapshot.get("sessions").is_some(),
+            "persisted snapshot must carry sessions"
+        );
     }
 
     // ---- Cancellation / receipt-survives-connection-loss (T-CONC-04) ----

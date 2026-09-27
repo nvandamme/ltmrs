@@ -32,18 +32,24 @@ use crate::compatibility::lemma::tool_args::{
     SuggestionRespondArgs, ToolArgs,
 };
 use crate::daemon::client::IpcClient;
-use crate::daemon::envelope::{DomainRequest, HandshakeRequest, IpcEnvelope, PROTOCOL_VERSION};
-use crate::domain::command::Scope;
+use crate::daemon::envelope::{
+    DomainRequest, HandshakeRequest, IpcEnvelope, IpcError, IpcResponse, IpcResult,
+    PROTOCOL_VERSION,
+};
+use crate::domain::command::{DomainErrorCode, Scope};
 use crate::domain::id::{ChannelId, FrontendId, OperationId, StoreGeneration};
 use crate::domain::memory::Memory;
 use uuid::Uuid;
 
-/// The frontend's identity, fixed per process/channel.
-#[derive(Debug, Clone)]
+/// The frontend's identity, fixed per process/channel except the store
+/// generation, which tracks the daemon across restores (a restore bumps
+/// the generation; a frontend that never adopts it bricks on its next
+/// handshake).
+#[derive(Debug)]
 pub struct FrontendIdentity {
     pub frontend_id: FrontendId,
     pub channel_id: ChannelId,
-    pub store_generation: StoreGeneration,
+    store_generation: std::sync::Mutex<StoreGeneration>,
 }
 
 impl FrontendIdentity {
@@ -51,7 +57,25 @@ impl FrontendIdentity {
         Self {
             frontend_id,
             channel_id,
-            store_generation: StoreGeneration::FIRST,
+            store_generation: std::sync::Mutex::new(StoreGeneration::FIRST),
+        }
+    }
+
+    pub fn generation(&self) -> StoreGeneration {
+        *self.store_generation.lock().unwrap()
+    }
+
+    fn set_generation(&self, generation: StoreGeneration) {
+        *self.store_generation.lock().unwrap() = generation;
+    }
+}
+
+impl Clone for FrontendIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            frontend_id: self.frontend_id,
+            channel_id: self.channel_id,
+            store_generation: std::sync::Mutex::new(self.generation()),
         }
     }
 }
@@ -175,12 +199,71 @@ impl LtmrsFrontend {
         *self.snapshot.lock().unwrap() = Some(memories);
     }
 
+    /// Ensure the daemon handshake, adopting the live store generation. A
+    /// restore bumps the generation; a first-attempt mismatch adopts the
+    /// daemon generation and retries once instead of bricking new clients.
+    async fn ensure_handshaked(&self) -> Result<(), McpError> {
+        let mut client = self.client.lock().await;
+        if client.retry_epoch().is_some() {
+            return Ok(());
+        }
+        if !client.is_connected() {
+            client
+                .connect()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
+        let request = |generation: StoreGeneration| HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: generation,
+            frontend_id: self.identity.frontend_id,
+            channel_id: self.identity.channel_id,
+        };
+        match client.handshake(&request(self.identity.generation())).await {
+            Ok(hs) => {
+                self.identity.set_generation(hs.store_generation);
+            }
+            Err(IpcError::GenerationMismatch { daemon, .. }) => {
+                // The server closes a rejected handshake, so reconnect
+                // before retrying with the adopted generation.
+                let live = StoreGeneration::new(daemon);
+                self.identity.set_generation(live);
+                client
+                    .connect()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                // A second failure must not leave a dead-but-connected
+                // client: close so the next call reconnects fresh instead
+                // of erroring on a closed stream forever.
+                match client.handshake(&request(live)).await {
+                    Ok(hs) => self.identity.set_generation(hs.store_generation),
+                    Err(e) => {
+                        client.close();
+                        return Err(McpError::internal_error(e.to_string(), None));
+                    }
+                }
+            }
+            Err(e) => {
+                // The daemon closes rejected handshakes: drop our end too,
+                // or every later call reuses a dead-but-connected stream.
+                client.close();
+                return Err(McpError::internal_error(e.to_string(), None));
+            }
+        }
+        // Prefetch the memory snapshot for the dynamic instructions index.
+        // Best-effort: a failure leaves the empty-state instructions.
+        if let Ok(memories) = self.fetch_snapshot(&mut client).await {
+            self.set_snapshot(memories);
+        }
+        Ok(())
+    }
+
     /// Fetch all canonical memories via IPC (read-only, no receipt needed).
     async fn fetch_snapshot(&self, client: &mut IpcClient) -> Result<Vec<Memory>, McpError> {
         let op = OperationId::new(Uuid::now_v7());
         let env = IpcEnvelope {
             protocol_version: PROTOCOL_VERSION,
-            store_generation: self.identity.store_generation,
+            store_generation: self.identity.generation(),
             frontend_id: self.identity.frontend_id,
             channel_id: self.identity.channel_id,
             operation_id: op,
@@ -191,7 +274,7 @@ impl LtmrsFrontend {
             body: DomainRequest::ListMemories,
         };
         let resp = client
-            .roundtrip(&env)
+            .roundtrip_or_forget(&env)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match resp.result {
@@ -216,11 +299,18 @@ impl LtmrsFrontend {
         request: &CallToolRequestParams,
         retry_epoch: u64,
     ) -> Result<IpcEnvelope, McpError> {
-        let op = OperationId::new(Uuid::now_v7());
         let body = route_tool(&request.name, &request.arguments)?;
-        Ok(IpcEnvelope {
+        Ok(self.envelope_for(body, retry_epoch))
+    }
+
+    /// Envelope construction shared by tool calls and the resilient
+    /// round-trip: one operation id per attempt, never reused across the
+    /// re-handshake retry.
+    fn envelope_for(&self, body: DomainRequest, retry_epoch: u64) -> IpcEnvelope {
+        let op = OperationId::new(Uuid::now_v7());
+        IpcEnvelope {
             protocol_version: PROTOCOL_VERSION,
-            store_generation: self.identity.store_generation,
+            store_generation: self.identity.generation(),
             frontend_id: self.identity.frontend_id,
             channel_id: self.identity.channel_id,
             operation_id: op,
@@ -229,7 +319,55 @@ impl LtmrsFrontend {
             deadline_millis: None,
             scope: Scope::default(),
             body,
-        })
+        }
+    }
+
+    /// Round-trip with exactly one re-handshake retry: a restore can bump
+    /// the live generation between the handshake and the call, so an
+    /// established connection that draws StaleGeneration forgets its epoch,
+    /// re-handshakes (adopting the live generation), and retries once with
+    /// a fresh operation id. A second stale answer is returned as-is —
+    /// unbounded retry would mask a daemon that never converges.
+    async fn roundtrip_with_rehandshake(
+        &self,
+        body: DomainRequest,
+    ) -> Result<IpcResponse, McpError> {
+        let mut client = self.client.lock().await;
+        if !client.is_connected() {
+            client
+                .connect()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
+        if client.retry_epoch().is_none() {
+            drop(client);
+            self.ensure_handshaked().await?;
+            client = self.client.lock().await;
+        }
+        let epoch = client.retry_epoch().unwrap_or(0);
+        let resp = client
+            .roundtrip_or_forget(&self.envelope_for(body.clone(), epoch))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let stale = matches!(
+            resp.result,
+            IpcResult::Error {
+                code: DomainErrorCode::StaleGeneration,
+                ..
+            }
+        );
+        if !stale {
+            return Ok(resp);
+        }
+        client.forget_handshake();
+        drop(client);
+        self.ensure_handshaked().await?;
+        let mut client = self.client.lock().await;
+        let epoch = client.retry_epoch().unwrap_or(0);
+        client
+            .roundtrip_or_forget(&self.envelope_for(body, epoch))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     /// The tool list advertised to the host: the 26 frozen tools, served
@@ -269,6 +407,19 @@ pub fn route_tool(
     args: &Option<Map<String, Value>>,
 ) -> Result<DomainRequest, McpError> {
     let args = args.clone().unwrap_or_default();
+    // Unknown argument keys fail instead of silently dropping (a typo'd
+    // filter must never become "no filter"). The allowlist derives from the
+    // served schemas (frozen + native), so it cannot drift from them.
+    if let Some(allowed) = allowed_arguments(name) {
+        for key in args.keys() {
+            if !allowed.iter().any(|k| k == key) {
+                return Err(McpError::invalid_params(
+                    format!("unknown argument for {name}: {key}"),
+                    None,
+                ));
+            }
+        }
+    }
     let tool_args = match name {
         "memory_read" => ToolArgs::MemoryRead(parse_memory_read(&args)?),
         "memory_add" => ToolArgs::MemoryAdd(parse_memory_add(&args)?),
@@ -311,54 +462,211 @@ pub fn route_tool(
 
 // ---- Argument parsers (validate against the frozen schema) ----
 
-fn str_field<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    args.get(key).and_then(|v| v.as_str())
+/// Allowed argument keys per tool, derived from the served input schemas
+/// (frozen baseline + native tools). `route_tool` rejects anything else.
+static ALLOWED_ARGUMENTS: std::sync::LazyLock<std::collections::HashMap<String, Vec<String>>> =
+    std::sync::LazyLock::new(|| {
+        let mut map = std::collections::HashMap::new();
+        for tool in crate::compatibility::lemma::schemas::frozen_tools() {
+            let keys = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            map.insert(tool.name, keys);
+        }
+        map.insert("backup_create".to_string(), vec!["directory".to_string()]);
+        map.insert("backup_preview".to_string(), vec!["path".to_string()]);
+        map.insert(
+            "backup_restore".to_string(),
+            vec!["confirmation_token".to_string(), "confirm".to_string()],
+        );
+        map
+    });
+
+fn allowed_arguments(name: &str) -> Option<Vec<String>> {
+    ALLOWED_ARGUMENTS.get(name).cloned()
 }
 
-fn bool_field(args: &Map<String, Value>, key: &str) -> bool {
-    args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+// Explicit nulls are absent (lenient: hosts send null for "not set").
+// Any other present-but-wrong-typed value is an error, never a silent
+// default: a string limit must not become "unbounded".
+fn str_field<'a>(args: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be a string"),
+            None,
+        )),
+    }
 }
 
-fn usize_field(args: &Map<String, Value>, key: &str) -> Option<usize> {
-    args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
+fn bool_field(args: &Map<String, Value>, key: &str) -> Result<bool, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be a boolean"),
+            None,
+        )),
+    }
 }
 
-fn f64_field(args: &Map<String, Value>, key: &str) -> Option<f64> {
-    args.get(key).and_then(|v| v.as_f64())
+fn usize_field(args: &Map<String, Value>, key: &str) -> Result<Option<usize>, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(v) => Ok(Some(v as usize)),
+            None => Err(McpError::invalid_params(
+                format!("{key} must be an integer"),
+                None,
+            )),
+        },
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be an integer"),
+            None,
+        )),
+    }
 }
 
-fn response_format_field(args: &Map<String, Value>, key: &str) -> Option<ResponseFormat> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .and_then(ResponseFormat::parse)
+fn f64_field(args: &Map<String, Value>, key: &str) -> Result<Option<f64>, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => match n.as_f64() {
+            Some(v) => Ok(Some(v)),
+            None => Err(McpError::invalid_params(
+                format!("{key} must be a number"),
+                None,
+            )),
+        },
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be a number"),
+            None,
+        )),
+    }
+}
+
+fn response_format_field(
+    args: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<ResponseFormat>, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(ResponseFormat::parse(s).ok_or_else(|| {
+            McpError::invalid_params(format!("{key} must be a known response format"), None)
+        })?)),
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be a string"),
+            None,
+        )),
+    }
 }
 
 fn require_str(args: &Map<String, Value>, key: &str) -> Result<String, McpError> {
-    str_field(args, key)
+    str_field(args, key)?
         .map(|s| s.to_string())
         .ok_or_else(|| McpError::invalid_params(format!("{key} is required"), None))
 }
 
+/// Optional boolean: absent/null means unset (caller default applies);
+/// present values must be booleans.
+fn opt_bool_field(args: &Map<String, Value>, key: &str) -> Result<Option<bool>, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be a boolean"),
+            None,
+        )),
+    }
+}
+
+/// Project scope normalized at the parse boundary (trimmed, basename,
+/// lowercased): reads and writes meet on the canonical form instead of
+/// comparing raw input against normalized storage.
+fn project_field(args: &Map<String, Value>, key: &str) -> Result<Option<String>, McpError> {
+    Ok(match str_field(args, key)? {
+        None => None,
+        Some(raw) => crate::compatibility::lemma::tool_args::normalize_project(raw),
+    })
+}
+
 fn parse_memory_read(args: &Map<String, Value>) -> Result<MemoryReadArgs, McpError> {
     Ok(MemoryReadArgs {
-        project: str_field(args, "project").map(|s| s.to_string()),
-        query: str_field(args, "query").map(|s| s.to_string()),
-        id: str_field(args, "id").map(|s| s.to_string()),
-        context: str_field(args, "context").map(|s| s.to_string()),
-        all: bool_field(args, "all"),
-        ids: args.get("ids").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        }),
-        min_confidence: f64_field(args, "minConfidence"),
-        after_date: str_field(args, "afterDate").map(|s| s.to_string()),
-        before_date: str_field(args, "beforeDate").map(|s| s.to_string()),
-        limit: usize_field(args, "limit"),
-        offset: usize_field(args, "offset"),
-        response_format: response_format_field(args, "response_format"),
-        expand_graph: bool_field(args, "expand_graph"),
-        explain: bool_field(args, "explain"),
+        project: project_field(args, "project")?,
+        query: str_field(args, "query")?.map(|s| s.to_string()),
+        id: str_field(args, "id")?.map(|s| s.to_string()),
+        context: str_field(args, "context")?.map(|s| s.to_string()),
+        all: bool_field(args, "all")?,
+        ids: match args.get("ids") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(a)) => Some(
+                a.iter()
+                    .map(|x| {
+                        x.as_str()
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| McpError::invalid_params("ids must be strings", None))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    "ids must be an array of strings",
+                    None,
+                ));
+            }
+        },
+        min_confidence: f64_field(args, "minConfidence")?,
+        after_date: str_field(args, "afterDate")?.map(|s| s.to_string()),
+        before_date: str_field(args, "beforeDate")?.map(|s| s.to_string()),
+        limit: usize_field(args, "limit")?,
+        offset: usize_field(args, "offset")?,
+        response_format: response_format_field(args, "response_format")?,
+        expand_graph: bool_field(args, "expand_graph")?,
+        explain: bool_field(args, "explain")?,
+    })
+}
+
+/// Parse the frozen evidence sub-object (memory_add): closed shape —
+/// unknown keys error like top-level args instead of silently dropping
+/// hints; wrong-typed fields name the field instead of defaulting.
+fn parse_evidence_object(
+    o: &Map<String, Value>,
+) -> Result<crate::compatibility::lemma::tool_args::MemoryEvidence, McpError> {
+    for key in o.keys() {
+        if !matches!(key.as_str(), "file" | "symbol" | "snippet") {
+            return Err(McpError::invalid_params(
+                format!("unknown evidence field: {key}"),
+                None,
+            ));
+        }
+    }
+    let file = o
+        .get("file")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| McpError::invalid_params("evidence.file is required", None))?
+        .to_string();
+    let snippet = o
+        .get("snippet")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| McpError::invalid_params("evidence.snippet is required", None))?
+        .to_string();
+    let symbol = match o.get("symbol") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.to_string()),
+        Some(_) => {
+            return Err(McpError::invalid_params(
+                "evidence.symbol must be a string",
+                None,
+            ));
+        }
+    };
+    Ok(crate::compatibility::lemma::tool_args::MemoryEvidence {
+        file,
+        symbol,
+        snippet,
     })
 }
 
@@ -366,36 +674,21 @@ fn parse_memory_add(args: &Map<String, Value>) -> Result<MemoryAddArgs, McpError
     let fragment = require_str(args, "fragment")?;
     let evidence = args
         .get("evidence")
-        .and_then(|v| v.as_object())
-        .map(|o| {
-            let file = o
-                .get("file")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| McpError::invalid_params("evidence.file is required", None))?
-                .to_string();
-            let snippet = o
-                .get("snippet")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| McpError::invalid_params("evidence.snippet is required", None))?
-                .to_string();
-            Ok(crate::compatibility::lemma::tool_args::MemoryEvidence {
-                file,
-                symbol: o
-                    .get("symbol")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                snippet,
-            })
+        .map(|v| match v {
+            Value::Null => Ok(None),
+            Value::Object(o) => parse_evidence_object(o).map(Some),
+            _ => Err(McpError::invalid_params("evidence must be an object", None)),
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
     Ok(MemoryAddArgs {
         fragment,
-        title: str_field(args, "title").map(|s| s.to_string()),
-        description: str_field(args, "description").map(|s| s.to_string()),
-        project: str_field(args, "project").map(|s| s.to_string()),
-        source: str_field(args, "source").map(|s| s.to_string()),
-        confirm: bool_field(args, "confirm"),
-        fragment_type: str_field(args, "type").map(|s| s.to_string()),
+        title: str_field(args, "title")?.map(|s| s.to_string()),
+        description: str_field(args, "description")?.map(|s| s.to_string()),
+        project: project_field(args, "project")?,
+        source: str_field(args, "source")?.map(|s| s.to_string()),
+        confirm: bool_field(args, "confirm")?,
+        fragment_type: str_field(args, "type")?.map(|s| s.to_string()),
         evidence,
     })
 }
@@ -403,17 +696,25 @@ fn parse_memory_add(args: &Map<String, Value>) -> Result<MemoryAddArgs, McpError
 fn parse_memory_update(args: &Map<String, Value>) -> Result<MemoryUpdateArgs, McpError> {
     Ok(MemoryUpdateArgs {
         id: require_str(args, "id")?,
-        title: str_field(args, "title").map(|s| s.to_string()),
-        fragment: str_field(args, "fragment").map(|s| s.to_string()),
-        confidence: f64_field(args, "confidence"),
+        title: str_field(args, "title")?.map(|s| s.to_string()),
+        fragment: str_field(args, "fragment")?.map(|s| s.to_string()),
+        confidence: f64_field(args, "confidence")?,
     })
 }
 
 fn parse_memory_feedback(args: &Map<String, Value>) -> Result<MemoryFeedbackArgs, McpError> {
-    let useful = args
-        .get("useful")
-        .and_then(|v| v.as_bool())
-        .ok_or_else(|| McpError::invalid_params("useful is required", None))?;
+    // Absent/null and wrong-typed fail distinctly: "required" means the
+    // caller omitted it, "must be a boolean" means they sent garbage.
+    // (bool_field would silently default absent to false — wrong here.)
+    let useful = match args.get("useful") {
+        None | Some(Value::Null) => {
+            return Err(McpError::invalid_params("useful is required", None));
+        }
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(McpError::invalid_params("useful must be a boolean", None));
+        }
+    };
     Ok(MemoryFeedbackArgs {
         id: require_str(args, "id")?,
         useful,
@@ -423,8 +724,8 @@ fn parse_memory_feedback(args: &Map<String, Value>) -> Result<MemoryFeedbackArgs
 fn parse_memory_forget(args: &Map<String, Value>) -> Result<MemoryForgetArgs, McpError> {
     Ok(MemoryForgetArgs {
         id: require_str(args, "id")?,
-        consolidate: bool_field(args, "consolidate"),
-        invalidate: bool_field(args, "invalidate"),
+        consolidate: bool_field(args, "consolidate")?,
+        invalidate: bool_field(args, "invalidate")?,
     })
 }
 
@@ -444,8 +745,8 @@ fn parse_memory_merge(args: &Map<String, Value>) -> Result<MemoryMergeArgs, McpE
         ids,
         title: require_str(args, "title")?,
         fragment: require_str(args, "fragment")?,
-        project: str_field(args, "project").map(|s| s.to_string()),
-        consolidate: bool_field(args, "consolidate"),
+        project: project_field(args, "project")?,
+        consolidate: bool_field(args, "consolidate")?,
     })
 }
 
@@ -461,62 +762,69 @@ fn parse_memory_relate(args: &Map<String, Value>) -> Result<MemoryRelateArgs, Mc
         source_id: require_str(args, "sourceId")?,
         target_id: require_str(args, "targetId")?,
         relation_type,
-        note: str_field(args, "note").map(|s| s.to_string()),
+        note: str_field(args, "note")?.map(|s| s.to_string()),
     })
 }
 
 fn parse_memory_stats(args: &Map<String, Value>) -> Result<MemoryStatsArgs, McpError> {
     Ok(MemoryStatsArgs {
-        project: str_field(args, "project").map(|s| s.to_string()),
-        response_format: response_format_field(args, "response_format"),
+        project: project_field(args, "project")?,
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
 fn parse_memory_audit(args: &Map<String, Value>) -> Result<MemoryAuditArgs, McpError> {
     Ok(MemoryAuditArgs {
-        response_format: response_format_field(args, "response_format"),
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
 fn parse_memory_library(args: &Map<String, Value>) -> Result<MemoryLibraryArgs, McpError> {
     Ok(MemoryLibraryArgs {
-        project: str_field(args, "project").map(|s| s.to_string()),
-        focus: str_field(args, "focus").map(|s| s.to_string()),
-        limit: usize_field(args, "limit"),
-        offset: usize_field(args, "offset"),
-        response_format: response_format_field(args, "response_format"),
+        project: project_field(args, "project")?,
+        focus: str_field(args, "focus")?.map(|s| s.to_string()),
+        limit: usize_field(args, "limit")?,
+        offset: usize_field(args, "offset")?,
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
 fn parse_semantic_search(args: &Map<String, Value>) -> Result<SemanticSearchArgs, McpError> {
     Ok(SemanticSearchArgs {
         query: require_str(args, "query")?,
-        project: str_field(args, "project").map(|s| s.to_string()),
-        top_k: usize_field(args, "topK"),
-        offset: usize_field(args, "offset"),
-        hybrid: bool_field(args, "hybrid"),
-        explain: bool_field(args, "explain"),
-        response_format: response_format_field(args, "response_format"),
+        project: project_field(args, "project")?,
+        top_k: usize_field(args, "topK")?,
+        offset: usize_field(args, "offset")?,
+        hybrid: opt_bool_field(args, "hybrid")?,
+        explain: bool_field(args, "explain")?,
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
-fn str_array_field(args: &Map<String, Value>, key: &str) -> Vec<String> {
-    args.get(key)
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
+fn str_array_field(args: &Map<String, Value>, key: &str) -> Result<Vec<String>, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| McpError::invalid_params(format!("{key} must be strings"), None))
+            })
+            .collect(),
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be an array of strings"),
+            None,
+        )),
+    }
 }
 
 fn parse_guide_get(args: &Map<String, Value>) -> Result<GuideGetArgs, McpError> {
     Ok(GuideGetArgs {
-        category: str_field(args, "category").map(|s| s.to_string()),
-        guide: str_field(args, "guide").map(|s| s.to_string()),
-        task: str_field(args, "task").map(|s| s.to_string()),
-        response_format: response_format_field(args, "response_format"),
+        category: str_field(args, "category")?.map(|s| s.to_string()),
+        guide: str_field(args, "guide")?.map(|s| s.to_string()),
+        task: str_field(args, "task")?.map(|s| s.to_string()),
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
@@ -524,10 +832,10 @@ fn parse_guide_practice(args: &Map<String, Value>) -> Result<GuidePracticeArgs, 
     Ok(GuidePracticeArgs {
         guide: require_str(args, "guide")?,
         category: require_str(args, "category")?,
-        description: str_field(args, "description").map(|s| s.to_string()),
-        contexts: str_array_field(args, "contexts"),
-        learnings: str_array_field(args, "learnings"),
-        outcome: str_field(args, "outcome").map(|s| s.to_string()),
+        description: str_field(args, "description")?.map(|s| s.to_string()),
+        contexts: str_array_field(args, "contexts")?,
+        learnings: str_array_field(args, "learnings")?,
+        outcome: str_field(args, "outcome")?.map(|s| s.to_string()),
     })
 }
 
@@ -536,8 +844,8 @@ fn parse_guide_create(args: &Map<String, Value>) -> Result<GuideCreateArgs, McpE
         guide: require_str(args, "guide")?,
         category: require_str(args, "category")?,
         description: require_str(args, "description")?,
-        contexts: str_array_field(args, "contexts"),
-        learnings: str_array_field(args, "learnings"),
+        contexts: str_array_field(args, "contexts")?,
+        learnings: str_array_field(args, "learnings")?,
     })
 }
 
@@ -545,22 +853,22 @@ fn parse_guide_distill(args: &Map<String, Value>) -> Result<GuideDistillArgs, Mc
     Ok(GuideDistillArgs {
         memory_id: require_str(args, "memory_id")?,
         guide: require_str(args, "guide")?,
-        category: str_field(args, "category").map(|s| s.to_string()),
+        category: str_field(args, "category")?.map(|s| s.to_string()),
     })
 }
 
 fn parse_guide_update(args: &Map<String, Value>) -> Result<GuideUpdateArgs, McpError> {
     Ok(GuideUpdateArgs {
         guide: require_str(args, "guide")?,
-        new_name: str_field(args, "new_name").map(|s| s.to_string()),
-        category: str_field(args, "category").map(|s| s.to_string()),
-        description: str_field(args, "description").map(|s| s.to_string()),
-        add_anti_patterns: str_array_field(args, "add_anti_patterns"),
-        add_pitfalls: str_array_field(args, "add_pitfalls"),
-        add_depends_on: str_array_field(args, "add_depends_on"),
-        add_enables: str_array_field(args, "add_enables"),
-        superseded_by: str_field(args, "superseded_by").map(|s| s.to_string()),
-        deprecated: bool_field(args, "deprecated"),
+        new_name: str_field(args, "new_name")?.map(|s| s.to_string()),
+        category: str_field(args, "category")?.map(|s| s.to_string()),
+        description: str_field(args, "description")?.map(|s| s.to_string()),
+        add_anti_patterns: str_array_field(args, "add_anti_patterns")?,
+        add_pitfalls: str_array_field(args, "add_pitfalls")?,
+        add_depends_on: str_array_field(args, "add_depends_on")?,
+        add_enables: str_array_field(args, "add_enables")?,
+        superseded_by: str_field(args, "superseded_by")?.map(|s| s.to_string()),
+        deprecated: bool_field(args, "deprecated")?,
     })
 }
 
@@ -572,28 +880,58 @@ fn parse_guide_forget(args: &Map<String, Value>) -> Result<GuideForgetArgs, McpE
 
 fn parse_guide_merge(args: &Map<String, Value>) -> Result<GuideMergeArgs, McpError> {
     Ok(GuideMergeArgs {
-        guides: str_array_field(args, "guides"),
+        guides: str_array_field(args, "guides")?,
         guide: require_str(args, "guide")?,
         category: require_str(args, "category")?,
-        description: str_field(args, "description").map(|s| s.to_string()),
-        contexts: args.get("contexts").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        }),
-        learnings: args.get("learnings").and_then(|v| v.as_array()).map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        }),
+        description: str_field(args, "description")?.map(|s| s.to_string()),
+        contexts: {
+            match args.get("contexts") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(a)) => Some(
+                    a.iter()
+                        .map(|x| {
+                            x.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                                McpError::invalid_params("contexts must be strings", None)
+                            })
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                Some(_) => {
+                    return Err(McpError::invalid_params(
+                        "contexts must be an array of strings",
+                        None,
+                    ));
+                }
+            }
+        },
+        learnings: {
+            match args.get("learnings") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(a)) => Some(
+                    a.iter()
+                        .map(|x| {
+                            x.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                                McpError::invalid_params("learnings must be strings", None)
+                            })
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                Some(_) => {
+                    return Err(McpError::invalid_params(
+                        "learnings must be an array of strings",
+                        None,
+                    ));
+                }
+            }
+        },
     })
 }
 
 fn parse_session_start(args: &Map<String, Value>) -> Result<SessionStartArgs, McpError> {
     Ok(SessionStartArgs {
         task_type: require_str(args, "task_type")?,
-        technologies: str_array_field(args, "technologies"),
-        initial_approach: str_field(args, "initial_approach").map(|s| s.to_string()),
+        technologies: str_array_field(args, "technologies")?,
+        initial_approach: str_field(args, "initial_approach")?.map(|s| s.to_string()),
     })
 }
 
@@ -601,24 +939,24 @@ fn parse_session_attempt(args: &Map<String, Value>) -> Result<SessionAttemptArgs
     Ok(SessionAttemptArgs {
         approach: require_str(args, "approach")?,
         outcome: require_str(args, "outcome")?,
-        critique: str_field(args, "critique").map(|s| s.to_string()),
-        rationale: str_field(args, "rationale").map(|s| s.to_string()),
-        related_memory_id: str_field(args, "related_memory_id").map(|s| s.to_string()),
+        critique: str_field(args, "critique")?.map(|s| s.to_string()),
+        rationale: str_field(args, "rationale")?.map(|s| s.to_string()),
+        related_memory_id: str_field(args, "related_memory_id")?.map(|s| s.to_string()),
     })
 }
 
 fn parse_session_end(args: &Map<String, Value>) -> Result<SessionEndArgs, McpError> {
     Ok(SessionEndArgs {
         outcome: require_str(args, "outcome")?,
-        final_approach: str_field(args, "final_approach").map(|s| s.to_string()),
-        lessons: str_array_field(args, "lessons"),
+        final_approach: str_field(args, "final_approach")?.map(|s| s.to_string()),
+        lessons: str_array_field(args, "lessons")?,
     })
 }
 
 fn parse_session_stats(args: &Map<String, Value>) -> Result<SessionStatsArgs, McpError> {
     Ok(SessionStatsArgs {
-        count: usize_field(args, "count"),
-        response_format: response_format_field(args, "response_format"),
+        count: usize_field(args, "count")?,
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
@@ -634,22 +972,22 @@ fn parse_suggestion_respond(args: &Map<String, Value>) -> Result<SuggestionRespo
 
 fn parse_conflict_scan(args: &Map<String, Value>) -> Result<ConflictScanArgs, McpError> {
     Ok(ConflictScanArgs {
-        project: str_field(args, "project").map(|s| s.to_string()),
-        response_format: response_format_field(args, "response_format"),
+        project: project_field(args, "project")?,
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
 fn parse_proactive_analysis(args: &Map<String, Value>) -> Result<ProactiveAnalysisArgs, McpError> {
     Ok(ProactiveAnalysisArgs {
-        project: str_field(args, "project").map(|s| s.to_string()),
-        response_format: response_format_field(args, "response_format"),
+        project: project_field(args, "project")?,
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
 fn parse_project_analytics(args: &Map<String, Value>) -> Result<ProjectAnalyticsArgs, McpError> {
     Ok(ProjectAnalyticsArgs {
-        project: str_field(args, "project").map(|s| s.to_string()),
-        response_format: response_format_field(args, "response_format"),
+        project: project_field(args, "project")?,
+        response_format: response_format_field(args, "response_format")?,
     })
 }
 
@@ -657,7 +995,7 @@ fn parse_project_analytics(args: &Map<String, Value>) -> Result<ProjectAnalytics
 /// at execution).
 fn parse_backup_preview(args: &Map<String, Value>) -> Result<BackupPreviewArgs, McpError> {
     Ok(BackupPreviewArgs {
-        path: str_field(args, "path").map(|s| s.to_string()),
+        path: str_field(args, "path")?.map(|s| s.to_string()),
     })
 }
 
@@ -665,8 +1003,8 @@ fn parse_backup_preview(args: &Map<String, Value>) -> Result<BackupPreviewArgs, 
 /// requires an unused token plus explicit confirmation).
 fn parse_backup_restore(args: &Map<String, Value>) -> Result<BackupRestoreArgs, McpError> {
     Ok(BackupRestoreArgs {
-        confirmation_token: str_field(args, "confirmation_token").map(|s| s.to_string()),
-        confirm: args.get("confirm").and_then(|v| v.as_bool()),
+        confirmation_token: str_field(args, "confirmation_token")?.map(|s| s.to_string()),
+        confirm: opt_bool_field(args, "confirm")?,
     })
 }
 
@@ -674,7 +1012,7 @@ fn parse_backup_restore(args: &Map<String, Value>) -> Result<BackupRestoreArgs, 
 /// execution requires it (ltmrs invents no default backup location).
 fn parse_backup_create(args: &Map<String, Value>) -> Result<BackupCreateArgs, McpError> {
     Ok(BackupCreateArgs {
-        directory: str_field(args, "directory").map(|s| s.to_string()),
+        directory: str_field(args, "directory")?.map(|s| s.to_string()),
     })
 }
 
@@ -787,39 +1125,11 @@ impl ServerHandler for LtmrsFrontend {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        // The client is shared across calls; lock it for the round-trip.
-        let mut client = self.client.lock().await;
-        // Ensure the connection is established and handshaked.
-        if !client.is_connected() {
-            client
-                .connect()
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        }
-        if client.retry_epoch().is_none() {
-            let hs_req = HandshakeRequest {
-                protocol_version: PROTOCOL_VERSION,
-                store_generation: self.identity.store_generation,
-                frontend_id: self.identity.frontend_id,
-                channel_id: self.identity.channel_id,
-            };
-            client
-                .handshake(&hs_req)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            // Prefetch the memory snapshot for the dynamic instructions index.
-            // Best-effort: a failure leaves the empty-state instructions.
-            if let Ok(memories) = self.fetch_snapshot(&mut client).await {
-                self.set_snapshot(memories);
-            }
-        }
-        let retry_epoch = client.retry_epoch().unwrap_or(0);
-        let envelope = self.build_envelope(&request, retry_epoch)?;
-        let resp = client
-            .roundtrip(&envelope)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        drop(client);
+        // The client is shared across calls; the resilient round-trip owns
+        // the lock, (re-)handshakes as needed, and recovers once from a
+        // post-restore StaleGeneration on an established connection.
+        let body = route_tool(&request.name, &request.arguments)?;
+        let resp = self.roundtrip_with_rehandshake(body).await?;
 
         // Memory-mutating tools trigger a tools/list_changed notification
         // (upstream notifyMemoryChange). Best-effort; failures are silent.
@@ -846,7 +1156,8 @@ impl ServerHandler for LtmrsFrontend {
 }
 
 /// Tools that mutate canonical memory state (upstream calls notifyMemoryChange
-/// after these).
+/// after these). backup_restore replaces the whole store, so hosts must
+/// re-observe after it above all others.
 fn is_mutating_tool(name: &str) -> bool {
     matches!(
         name,
@@ -856,6 +1167,7 @@ fn is_mutating_tool(name: &str) -> bool {
             | "memory_forget"
             | "memory_merge"
             | "memory_relate"
+            | "backup_restore"
     )
 }
 
@@ -1043,6 +1355,8 @@ mod tests {
             "memory_forget",
             "memory_merge",
             "memory_relate",
+            // Whole-store replace: hosts must re-observe above all others.
+            "backup_restore",
         ] {
             assert!(is_mutating_tool(t), "{t} must be mutating");
         }
@@ -1068,6 +1382,256 @@ mod tests {
         let instructions = info.instructions.as_deref().unwrap();
         assert!(instructions.starts_with("# Lemma — Persistent Memory"));
         assert!(instructions.contains("RECALL: memory_read"));
+    }
+
+    /// Post-restore regression: a frontend constructed at generation FIRST
+    /// must handshake against a daemon at generation 2 by adopting the live
+    /// generation (not brick with GenerationMismatch).
+    #[tokio::test]
+    async fn handshake_adopts_live_generation_after_restore() {
+        use crate::daemon::runtime::RuntimePaths;
+        use crate::daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        // Simulate post-restore: the live generation moves to 2 while the
+        // frontend still believes FIRST.
+        daemon
+            .dispatcher_arc()
+            .repo()
+            .set_store_generation(crate::domain::id::StoreGeneration::new(2))
+            .unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let socket = dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let dispatcher = dispatcher.clone();
+                let quotas = quotas.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, dispatcher, quotas).await;
+                });
+            }
+        });
+
+        let mut client = IpcClient::new(socket);
+        client.connect().await.unwrap();
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        fe.ensure_handshaked().await.unwrap();
+        assert_eq!(
+            fe.identity.generation(),
+            crate::domain::id::StoreGeneration::new(2),
+            "frontend must adopt the live generation"
+        );
+
+        drop(daemon);
+        server_handle.abort();
+    }
+
+    /// Established-connection regression (review Critical): after a second
+    /// restore bumps the live generation, an already-handshaked frontend
+    /// must re-handshake and retry once instead of failing StaleGeneration
+    /// on every subsequent call.
+    #[tokio::test]
+    async fn established_connection_rehandshakes_on_stale_generation() {
+        use crate::daemon::runtime::RuntimePaths;
+        use crate::daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        daemon
+            .dispatcher_arc()
+            .repo()
+            .set_store_generation(crate::domain::id::StoreGeneration::new(2))
+            .unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let socket = dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let dispatcher = dispatcher.clone();
+                let quotas = quotas.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, dispatcher, quotas).await;
+                });
+            }
+        });
+
+        let mut client = IpcClient::new(socket);
+        client.connect().await.unwrap();
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        fe.ensure_handshaked().await.unwrap();
+        assert_eq!(
+            fe.identity.generation(),
+            crate::domain::id::StoreGeneration::new(2)
+        );
+        // Second restore while the connection is established.
+        daemon
+            .dispatcher_arc()
+            .repo()
+            .set_store_generation(crate::domain::id::StoreGeneration::new(3))
+            .unwrap();
+        let resp = fe
+            .roundtrip_with_rehandshake(DomainRequest::ListMemories)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                resp.result,
+                crate::daemon::envelope::IpcResult::Success { .. }
+            ),
+            "established connection must recover, got {:?}",
+            resp.result
+        );
+        assert_eq!(
+            fe.identity.generation(),
+            crate::domain::id::StoreGeneration::new(3),
+            "frontend must adopt the newest live generation"
+        );
+
+        drop(daemon);
+        server_handle.abort();
+    }
+
+    /// Sticky-stream regression: a generically rejected handshake must close
+    /// the (daemon-closed) stream instead of keeping a dead-but-connected
+    /// client that fails every later call on the same stream.
+    #[tokio::test]
+    async fn rejected_handshake_closes_dead_stream() {
+        use crate::daemon::envelope::{WireError, WireReply};
+        use tokio::io::AsyncReadExt;
+
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let mut server_end = server_end;
+            let mut len_buf = [0u8; 4];
+            if server_end.read_exact(&mut len_buf).await.is_err() {
+                return;
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            if server_end.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            let reply = WireReply::Error(WireError {
+                kind: "handshake_rejected".into(),
+                message: "boom".into(),
+            });
+            let payload = serde_json::to_vec(&reply).unwrap();
+            let _ =
+                crate::daemon::envelope::write_response_payload(&mut server_end, &payload).await;
+            // Daemon closes rejected handshakes: drop our end.
+        });
+
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_end);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        assert!(fe.ensure_handshaked().await.is_err());
+        assert!(
+            !fe.client.lock().await.is_connected(),
+            "rejected handshake must not leave a dead-but-connected stream"
+        );
+    }
+
+    /// Sticky-stream regression: a transport failure mid-call (broken pipe,
+    /// daemon restart) must forget the handshake so the next call
+    /// reconnects instead of failing on the dead stream forever.
+    #[tokio::test]
+    async fn transport_failure_forgets_handshake() {
+        use crate::daemon::runtime::RuntimePaths;
+        use crate::daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let socket = dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let dispatcher = dispatcher.clone();
+                let quotas = quotas.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, dispatcher, quotas).await;
+                });
+            }
+        });
+
+        let mut client = IpcClient::new(socket);
+        client.connect().await.unwrap();
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        fe.ensure_handshaked().await.unwrap();
+        assert!(fe.client.lock().await.retry_epoch().is_some());
+        // Simulate a dead stream: swap in a pair end whose peer is gone.
+        let (dead, peer) = tokio::net::UnixStream::pair().unwrap();
+        drop(peer);
+        fe.client.lock().await.set_stream(dead);
+        assert!(
+            fe.roundtrip_with_rehandshake(DomainRequest::ListMemories)
+                .await
+                .is_err()
+        );
+        assert!(
+            fe.client.lock().await.retry_epoch().is_none(),
+            "transport failure must forget the handshake epoch"
+        );
+        assert!(
+            !fe.client.lock().await.is_connected(),
+            "transport failure must drop the dead stream"
+        );
+
+        drop(daemon);
+        server_handle.abort();
     }
 
     #[test]
@@ -1099,6 +1663,70 @@ mod tests {
         assert!(route_tool("memory_add", &None).is_err());
     }
 
+    /// I2 strictness: a present-but-wrong-typed evidence.symbol errors
+    /// instead of silently dropping the hint.
+    #[test]
+    fn memory_add_rejects_non_string_evidence_symbol() {
+        let mut m = Map::new();
+        m.insert("fragment".into(), json!("hello world"));
+        m.insert(
+            "evidence".into(),
+            json!({"file": "a.rs", "snippet": "x", "symbol": 42}),
+        );
+        assert!(route_tool("memory_add", &args(m)).is_err());
+    }
+
+    /// I2 strictness: unknown evidence fields error like unknown top-level
+    /// args instead of silently dropping hints.
+    #[test]
+    fn memory_add_rejects_unknown_evidence_field() {
+        let mut m = Map::new();
+        m.insert("fragment".into(), json!("hello world"));
+        m.insert(
+            "evidence".into(),
+            json!({"file": "a.rs", "snippet": "x", "symobl": "f"}),
+        );
+        assert!(route_tool("memory_add", &args(m)).is_err());
+    }
+
+    /// I2 strictness: non-object evidence errors instead of storing the
+    /// memory with the evidence silently dropped.
+    #[test]
+    fn memory_add_rejects_non_object_evidence() {
+        for bad in [json!("a.rs"), json!(42), json!(["a.rs"])] {
+            let mut m = Map::new();
+            m.insert("fragment".into(), json!("hello world"));
+            m.insert("evidence".into(), bad);
+            assert!(
+                route_tool("memory_add", &args(m)).is_err(),
+                "non-object evidence must error"
+            );
+        }
+    }
+
+    /// Null evidence stays absent (lenient); boolean evidence errors like
+    /// every other wrong-typed value.
+    #[test]
+    fn memory_add_null_evidence_absent_bool_errors() {
+        let mut m = Map::new();
+        m.insert("fragment".into(), json!("hello world"));
+        m.insert("evidence".into(), Value::Null);
+        assert!(route_tool("memory_add", &args(m)).is_ok());
+        let mut m = Map::new();
+        m.insert("fragment".into(), json!("hello world"));
+        m.insert("evidence".into(), json!(true));
+        assert!(route_tool("memory_add", &args(m)).is_err());
+    }
+
+    /// I2 strictness: a present-but-wrong-typed backup_restore confirm
+    /// errors instead of silently becoming unset.
+    #[test]
+    fn backup_restore_rejects_non_boolean_confirm() {
+        let mut m = Map::new();
+        m.insert("confirm".into(), json!("yes"));
+        assert!(route_tool("backup_restore", &args(m)).is_err());
+    }
+
     #[test]
     fn routes_memory_read() {
         let req = route_tool("memory_read", &None).unwrap();
@@ -1110,6 +1738,27 @@ mod tests {
         let mut m = Map::new();
         m.insert("id".into(), json!("abc"));
         assert!(route_tool("memory_feedback", &args(m)).is_err());
+    }
+
+    /// Wrong-typed `useful` names the type problem instead of masquerading
+    /// as a missing parameter; absent stays "required".
+    #[test]
+    fn memory_feedback_wrong_typed_useful_names_type() {
+        let mut m = Map::new();
+        m.insert("id".into(), json!("abc"));
+        m.insert("useful".into(), json!("yes"));
+        let err = parse_memory_feedback(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("must be a boolean"),
+            "wrong type must name the type, got: {err}"
+        );
+        let mut m = Map::new();
+        m.insert("id".into(), json!("abc"));
+        let err = parse_memory_feedback(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("is required"),
+            "absent must stay required, got: {err}"
+        );
     }
 
     #[test]
@@ -1129,6 +1778,114 @@ mod tests {
     #[test]
     fn unknown_tool_rejected() {
         assert!(route_tool("nonexistent", &None).is_err());
+    }
+
+    /// Project arguments normalize at the parse boundary (trim, basename,
+    /// lowercase): reads and writes meet on the canonical form.
+    #[test]
+    fn project_args_normalize_at_parse() {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "project".to_string(),
+            serde_json::Value::String("  MyProj/ ".into()),
+        );
+        args.insert("query".to_string(), serde_json::Value::String("x".into()));
+        let req = route_tool("memory_read", &Some(args)).unwrap();
+        match req {
+            DomainRequest::ToolCall { tool } => match tool {
+                ToolArgs::MemoryRead(parsed) => assert_eq!(
+                    parsed.project,
+                    Some("myproj".to_string()),
+                    "parse must normalize"
+                ),
+                _ => panic!("wrong tool routed"),
+            },
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    /// Unknown argument keys fail instead of silently dropping (a typo'd
+    /// filter must never become "no filter").
+    #[test]
+    fn unknown_argument_keys_rejected() {
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "fragment".to_string(),
+            serde_json::Value::String("x".into()),
+        );
+        args.insert(
+            "fragmant".to_string(),
+            serde_json::Value::String("typo".into()),
+        );
+        let err = route_tool("memory_add", &Some(args)).unwrap_err();
+        assert!(
+            err.to_string().contains("fragmant"),
+            "must name the unknown key, got: {err}"
+        );
+        // Native tools are covered too.
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "path".to_string(),
+            serde_json::Value::String("/tmp/x".into()),
+        );
+        args.insert("bogus".to_string(), serde_json::Value::Bool(true));
+        let err = route_tool("backup_preview", &Some(args)).unwrap_err();
+        assert!(
+            err.to_string().contains("bogus"),
+            "must name the unknown key, got: {err}"
+        );
+    }
+
+    /// The allowlist covers every served tool (no silent gaps) and matches
+    /// the frozen schemas exactly (no drift between validation and docs).
+    #[test]
+    fn argument_allowlist_matches_served_schemas() {
+        for tool in LtmrsFrontend::tools() {
+            let allowed = allowed_arguments(&tool.name)
+                .unwrap_or_else(|| panic!("tool {} has no argument allowlist", tool.name));
+            let schema_props: Vec<String> = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            let mut allowed_sorted = allowed.clone();
+            allowed_sorted.sort();
+            let mut schema_sorted = schema_props.clone();
+            schema_sorted.sort();
+            assert_eq!(
+                allowed_sorted, schema_sorted,
+                "allowlist drift for tool {}",
+                tool.name
+            );
+        }
+    }
+
+    /// Wrong-typed values fail instead of coercing to defaults (a string
+    /// limit must never become "unbounded").
+    #[test]
+    fn wrong_typed_values_rejected() {
+        let mut args = serde_json::Map::new();
+        args.insert("limit".to_string(), serde_json::Value::String("10".into()));
+        let err = route_tool("memory_read", &Some(args)).unwrap_err();
+        assert!(err.to_string().contains("limit"), "got: {err}");
+        let mut args = serde_json::Map::new();
+        args.insert("all".to_string(), serde_json::Value::String("yes".into()));
+        let err = route_tool("memory_read", &Some(args)).unwrap_err();
+        assert!(err.to_string().contains("all"), "got: {err}");
+        // Explicit nulls stay absent (lenient), not errors.
+        let mut args = serde_json::Map::new();
+        args.insert("limit".to_string(), serde_json::Value::Null);
+        assert!(route_tool("memory_read", &Some(args)).is_ok());
+    }
+
+    /// String arrays reject non-string elements (no silent drops).
+    #[test]
+    fn string_array_elements_are_strict() {
+        let mut args = serde_json::Map::new();
+        args.insert("ids".to_string(), serde_json::json!(["a", 42]));
+        let err = route_tool("memory_read", &Some(args)).unwrap_err();
+        assert!(err.to_string().contains("ids"), "got: {err}");
     }
 
     /// The native backup tools route by name like every frozen tool (their

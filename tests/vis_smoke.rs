@@ -87,6 +87,15 @@ fn vis_background_detaches_and_serves() {
         first.contains(&format!("http://127.0.0.1:{port}/")),
         "parent reports the URL, got: {first}"
     );
+    // The URL carries the per-boot access token (?token=...); the smoke
+    // must present it (untokened requests are denied by design).
+    let token_path = first
+        .split_whitespace()
+        .find(|w| w.contains("127.0.0.1") && w.contains("token="))
+        .and_then(|url| url.split("127.0.0.1:").nth(1))
+        .and_then(|rest| rest.split('/').nth(1))
+        .map(|path| format!("/{path}"))
+        .unwrap_or_else(|| panic!("parent reports a token URL, got: {first}"));
     let pid: u32 = first
         .split("(pid ")
         .nth(1)
@@ -94,7 +103,7 @@ fn vis_background_detaches_and_serves() {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("parent reports the child pid, got: {first}"));
 
-    let index = get(port, "/");
+    let index = get(port, &token_path);
     assert!(index.starts_with("HTTP/1.1 200"), "got: {index}");
     assert!(index.contains("ltmrs library"), "got: {index}");
 

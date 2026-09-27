@@ -76,14 +76,23 @@ pub struct FixedEmbedder {
 
 impl Embedder for FixedEmbedder {
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
-        Ok((0..self.dim)
-            .map(|i| {
-                ((text.bytes().fold(0u64, |a, b| a.wrapping_add(b as u64)) >> (i % 64)) ^ i as u64)
-                    as f32
-                    / 1e9
-            })
-            .collect())
+        Ok(hash_embed_vec(text, self.dim))
     }
+}
+
+/// Deterministic test-vector derivation shared by FixedEmbedder and the
+/// test-only hash query embedders (engine tests, quality harness):
+/// query/passage spaces must align, so the formula lives in exactly one
+/// place. Non-negative by construction (cosine against a negated query is
+/// strictly negative — used by threshold tests).
+pub fn hash_embed_vec(text: &str, dim: usize) -> Vec<f32> {
+    (0..dim)
+        .map(|i| {
+            ((text.bytes().fold(0u64, |a, b| a.wrapping_add(b as u64)) >> (i % 64)) ^ i as u64)
+                as f32
+                / 1e9
+        })
+        .collect()
 }
 
 /// An embedder that always fails: models a stalled inference worker.
@@ -245,6 +254,7 @@ impl Projector {
                 fragment_type: memory.fragment_type.as_str().to_string(),
                 created_at_millis: memory.created_at.as_millis(),
                 updated_at_millis: memory.updated_at.as_millis(),
+                confidence: memory.confidence,
                 embedding: self.embedder.embed(&c.text).ok(),
             })
             .collect()
@@ -325,11 +335,13 @@ impl Projector {
 
     /// Table-measured convergence check (cutover watermark verification):
     /// true when every live recallable canonical memory has at least one
-    /// projected row in this generation. Lexical-only rows count (vectors
-    /// are a separate readiness dimension); deleted/invalidated memories are
-    /// excluded via the tombstone path, not required. The operator calls
-    /// this after the final build and before activation instead of trusting
-    /// the reported numerator alone.
+    /// projected row in this generation AND model space. Lexical-only rows
+    /// count (vectors are a separate readiness dimension); deleted/
+    /// invalidated memories are excluded via the tombstone path, not
+    /// required. The fingerprint scope matters: a wrong-space projector
+    /// must not report converged off another space's rows. The operator
+    /// calls this after the final build and before activation instead of
+    /// trusting the reported numerator alone.
     pub async fn verify_generation_converged(
         &self,
         generation: StoreGeneration,
@@ -345,7 +357,11 @@ impl Projector {
         if live.is_empty() {
             return Ok(true);
         }
-        let filter = format!("store_generation = {}", generation.as_u64());
+        let filter = format!(
+            "store_generation = {} AND model_fingerprint = {}",
+            generation.as_u64(),
+            self.fingerprint.as_u64()
+        );
         let rows = self.table.rows_where(&filter).await?;
         Ok(live
             .iter()
@@ -613,6 +629,7 @@ mod tests {
             project: None,
             fragment_type: "fact".into(),
             created_at_millis: 0,
+            confidence: 0.5,
             updated_at_millis: 0,
             embedding: Some(vec![0.0; 384]),
         };
@@ -647,6 +664,7 @@ mod tests {
             project: None,
             fragment_type: "fact".into(),
             created_at_millis: 0,
+            confidence: 0.5,
             updated_at_millis: 0,
             embedding: Some(vec![1.0; 384]),
         };
@@ -676,6 +694,7 @@ mod tests {
             project: None,
             fragment_type: "fact".into(),
             created_at_millis: 0,
+            confidence: 0.5,
             updated_at_millis: 0,
             embedding: Some(vec![1.0; 384]),
         };
@@ -1179,6 +1198,7 @@ mod tests {
             project: None,
             fragment_type: "fact".into(),
             created_at_millis: 0,
+            confidence: 0.5,
             updated_at_millis: 0,
             embedding: None,
         };
@@ -1542,6 +1562,37 @@ mod tests {
             p.verify_generation_converged(StoreGeneration::FIRST)
                 .await
                 .unwrap()
+        );
+    }
+
+    /// Convergence is scoped per model space: a projector for fingerprint
+    /// 2 must not report converged off fingerprint-1 rows (AD-04: never
+    /// mix vector spaces, including in watermarks).
+    #[tokio::test]
+    async fn verify_generation_is_fingerprint_scoped() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "one", "first body");
+
+        let mut p1 = projector(repo.clone(), table.clone());
+        p1.run_until_idle().await.unwrap();
+        assert!(
+            p1.verify_generation_converged(StoreGeneration::FIRST)
+                .await
+                .unwrap(),
+            "own space converged"
+        );
+        let p2 = Projector::new(
+            repo,
+            table,
+            Box::new(FixedEmbedder { dim: 384 }),
+            ModelFingerprint::new(2),
+            StoreGeneration::FIRST,
+        );
+        assert!(
+            !p2.verify_generation_converged(StoreGeneration::FIRST)
+                .await
+                .unwrap(),
+            "foreign-space rows must not count as converged"
         );
     }
 

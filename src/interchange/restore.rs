@@ -97,6 +97,10 @@ struct PreviewRecord {
     source: PathBuf,
     /// Channel the preview came from (confirm must arrive on it).
     channel: String,
+    /// Live mutation watermark at preview time (op_seq): writes landing
+    /// between preview and confirm are acknowledged at confirm, never
+    /// drained unseen.
+    op_seq: u64,
 }
 
 /// Preview inputs bundled (keeps the coordinator call under control).
@@ -108,6 +112,8 @@ pub struct PreviewRequest<'a> {
     pub live_generation: u64,
     pub active_channels: usize,
     pub now_millis: u64,
+    /// Live mutation watermark (repo op_seq) bound into the record.
+    pub live_op_seq: u64,
 }
 
 impl RestoreCoordinator {
@@ -145,6 +151,7 @@ impl RestoreCoordinator {
                 used: false,
                 source: req.source_path.to_path_buf(),
                 channel: req.channel.to_string(),
+                op_seq: req.live_op_seq,
             },
         );
         RestorePreview {
@@ -180,67 +187,91 @@ impl RestoreCoordinator {
         });
     }
 
-    /// Confirm a previewed restore. Returns the bound digest so the caller
-    /// re-verifies the file before replacing anything.
-    pub fn confirm(
-        &mut self,
-        token: &str,
-        confirm: bool,
-        digest: &str,
-        live_generation: u64,
-        channel: &str,
-        now_millis: u64,
-    ) -> Result<String, RestoreError> {
+    /// Confirm a previewed restore. Returns the bound digest (so the caller
+    /// re-verifies the file before replacing anything) plus the live writes
+    /// that landed between preview and confirm: the replace drains them, so
+    /// the caller must acknowledge the count (recoverable from the safety
+    /// backup) instead of dropping it silently. Refusing here would brick
+    /// restores for active hosts (their own channel writes mid-flow), so
+    /// the delta is reported, not refused. `active_channels` counts
+    /// cooperating connections including the caller: more than one
+    /// re-checks the preview lease (a connection that arrived after the
+    /// preview may hold acknowledged writes the replace would drain unseen).
+    /// Lease failures do NOT consume the token: close the others and
+    /// confirm again.
+    pub fn confirm(&mut self, req: ConfirmRequest<'_>) -> Result<(String, u64), RestoreError> {
+        let token = req.token;
         let rec = self
             .pending
             .get(token)
             .cloned()
             .ok_or(RestoreError::InvalidToken)?;
-        if now_millis > rec.created_at + RESTORE_PREVIEW_TTL_MILLIS {
+        if req.now_millis > rec.created_at + RESTORE_PREVIEW_TTL_MILLIS {
             self.pending.remove(token);
             return Err(RestoreError::Expired);
         }
         if rec.used {
             return Err(RestoreError::AlreadyUsed);
         }
-        if !confirm {
+        if !req.confirm {
             return Err(RestoreError::NeedsConfirm);
         }
-        if digest != rec.digest {
+        if req.digest != rec.digest {
             // The file changed under us: the preview is meaningless now.
             self.pending.remove(token);
             return Err(RestoreError::StaleSource {
                 expected: rec.digest,
-                actual: digest.to_string(),
+                actual: req.digest.to_string(),
             });
         }
-        if channel != rec.channel {
+        if req.channel != rec.channel {
             self.pending.remove(token);
             return Err(RestoreError::Blocked(format!(
                 "confirmation arrived on a different channel (previewed on {})",
                 rec.channel
             )));
         }
-        if live_generation != rec.generation {
+        if req.live_generation != rec.generation {
             self.pending.remove(token);
             return Err(RestoreError::GenerationChanged {
                 expected: rec.generation,
-                actual: live_generation,
+                actual: req.live_generation,
             });
+        }
+        if req.active_channels > 1 {
+            return Err(RestoreError::Blocked(format!(
+                "{} other connections are open; close them and confirm again (the token stays valid)",
+                req.active_channels - 1
+            )));
         }
         if let Some(stored) = self.pending.get_mut(token) {
             stored.used = true;
         }
-        Ok(rec.digest)
+        Ok((rec.digest, req.live_op_seq.saturating_sub(rec.op_seq)))
     }
 }
 
+/// Confirm inputs bundled (mirrors `PreviewRequest`; keeps the coordinator
+/// call under control as checks accumulate).
+pub struct ConfirmRequest<'a> {
+    pub token: &'a str,
+    pub confirm: bool,
+    pub digest: &'a str,
+    pub live_generation: u64,
+    pub channel: &'a str,
+    pub active_channels: usize,
+    pub now_millis: u64,
+    /// Live mutation watermark at confirm time (compared to the preview's).
+    pub live_op_seq: u64,
+}
+
 /// Atomically replace the store's domain records with the backup snapshot:
-/// dangling relations are quarantined (listed, skipped), everything else is
-/// written in one transaction, then the store generation advances (retiring
-/// pre-restore pipelines and their publish rights). Sessions are NOT
-/// resurrected here (the exec layer abandons live ones and reports the
-/// backup count as abandoned history).
+/// dangling relations are quarantined (listed, skipped); the store flips in
+/// ONE durable transaction covering data, operational keyspaces and the
+/// generation switch (see `restore_replace`), so a crash lands on the old
+/// store or the new one, never a mixture. Sessions are NOT resurrected here
+/// (the exec layer abandons live ones and reports the backup count as
+/// abandoned history).
 pub fn restore_verified(
     repo: &CanonicalRepository,
     backup: &crate::interchange::backup::VerifiedBackup,
@@ -271,16 +302,15 @@ pub fn restore_verified(
             });
         }
     }
-    repo.replace_domain(
+    repo.restore_replace(
         &backup.snapshot.memories,
         &kept,
         &backup.snapshot.guides,
         &backup.snapshot.feedback,
         &backup.snapshot.suggestions,
+        new_generation,
     )
     .map_err(|e| RestoreError::Store(e.message))?;
-    repo.set_store_generation(new_generation)
-        .map_err(|e| RestoreError::Store(e.message))?;
     let count = |n: usize| n as u64;
     let mut restored = BTreeMap::new();
     restored.insert(
@@ -289,10 +319,12 @@ pub fn restore_verified(
     );
     restored.insert("relations".to_string(), count(kept.len()));
     restored.insert("guides".to_string(), count(backup.snapshot.guides.len()));
-    restored.insert(
-        "sessions".to_string(),
-        count(backup.snapshot.sessions.len()),
-    );
+    // Replace semantics write exactly these five categories. Sessions are
+    // abandoned by design (never restored into the live store); projects,
+    // archives and history have no storage keyspace. Reporting intake
+    // counts here would claim restores that never happened, so these
+    // report 0 with the reason documented, not the snapshot lengths.
+    restored.insert("sessions".to_string(), 0);
     restored.insert(
         "feedback".to_string(),
         count(backup.snapshot.feedback.len()),
@@ -301,15 +333,9 @@ pub fn restore_verified(
         "suggestions".to_string(),
         count(backup.snapshot.suggestions.len()),
     );
-    restored.insert(
-        "projects".to_string(),
-        count(backup.snapshot.projects.len()),
-    );
-    restored.insert(
-        "archives".to_string(),
-        count(backup.snapshot.archives.len()),
-    );
-    restored.insert("history".to_string(), count(backup.snapshot.history.len()));
+    restored.insert("projects".to_string(), 0);
+    restored.insert("archives".to_string(), 0);
+    restored.insert("history".to_string(), 0);
     Ok(RestoreReport {
         restored,
         quarantined,
@@ -382,6 +408,37 @@ mod tests {
 
     fn open_repo(dir: &tempfile::TempDir) -> Arc<CanonicalRepository> {
         Arc::new(CanonicalRepository::open(dir.path().join("store").to_str().unwrap()).unwrap())
+    }
+
+    /// Gateway scaffolding: frozen clock + issued namespace so `apply`
+    /// writes receipts, aliases and projection jobs like production.
+    fn gateway_repo(dir: &tempfile::TempDir) -> Arc<CanonicalRepository> {
+        use crate::domain::clock::FrozenClock;
+        let clock = std::sync::Arc::new(FrozenClock::new(1000));
+        let repo =
+            CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
+                .unwrap();
+        repo.issue_namespace(
+            crate::domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            1000,
+        )
+        .unwrap();
+        Arc::new(repo)
+    }
+
+    fn gateway_ctx(op_num: u64) -> crate::domain::command::CommandContext {
+        use crate::domain::id::{ChannelId, FrontendId, OperationId};
+        crate::domain::command::CommandContext {
+            store_generation: crate::domain::id::StoreGeneration::FIRST,
+            frontend_id: FrontendId::new(uuid::Uuid::from_u128(1)),
+            channel_id: ChannelId::new(uuid::Uuid::from_u128(2)),
+            session: None,
+            operation_id: OperationId::new(uuid::Uuid::from_u128(op_num as u128)),
+            request_digest: format!("restore-test-{op_num}"),
+            deadline_millis: None,
+            scope: Default::default(),
+            retry_epoch: 1,
+        }
     }
 
     /// Export repo B (2 memories), verify, restore into empty repo A:
@@ -486,6 +543,7 @@ mod tests {
             live_generation: 1,
             active_channels: 3,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         assert!(!blocked.ready);
         assert!(blocked.confirmation_token.is_none());
@@ -499,25 +557,116 @@ mod tests {
             live_generation: 1,
             active_channels: 1,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         assert!(ready.ready);
         let token = ready.confirmation_token.clone().unwrap();
         assert_eq!(ready.expires_at, Some(1000 + RESTORE_PREVIEW_TTL_MILLIS));
         // Confirm=false asks explicitly; unknown token rejected.
         assert_eq!(
-            coord.confirm("nope", true, "abc", 1, "ch-1", 1000),
+            coord.confirm(crate::interchange::restore::ConfirmRequest {
+                token: "nope",
+                confirm: true,
+                digest: "abc",
+                live_generation: 1,
+                channel: "ch-1",
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
             Err(RestoreError::InvalidToken)
         );
         assert_eq!(
-            coord.confirm(&token, false, "abc", 1, "ch-1", 1000),
+            coord.confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: false,
+                digest: "abc",
+                live_generation: 1,
+                channel: "ch-1",
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
             Err(RestoreError::NeedsConfirm)
         );
         // First confirm consumes; second is reuse.
-        assert!(coord.confirm(&token, true, "abc", 1, "ch-1", 1000).is_ok());
+        assert!(
+            coord
+                .confirm(crate::interchange::restore::ConfirmRequest {
+                    token: &token,
+                    confirm: true,
+                    digest: "abc",
+                    live_generation: 1,
+                    channel: "ch-1",
+                    active_channels: 1,
+                    now_millis: 1000,
+                    live_op_seq: 0,
+                })
+                .is_ok()
+        );
         assert_eq!(
-            coord.confirm(&token, true, "abc", 1, "ch-1", 1000),
+            coord.confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: true,
+                digest: "abc",
+                live_generation: 1,
+                channel: "ch-1",
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
             Err(RestoreError::AlreadyUsed)
         );
+    }
+
+    /// Confirm binds the live data version: writes landing between
+    /// preview and confirm are counted (saturating) so the replace
+    /// acknowledges them instead of draining them unseen. Refusal would
+    /// brick restores for active hosts, so the delta is reported.
+    #[test]
+    fn confirm_reports_writes_since_preview() {
+        use crate::interchange::backup::VerifiedBackup;
+        let backup = VerifiedBackup {
+            digest: "abc".to_string(),
+            store_generation: 1,
+            counts: BTreeMap::new(),
+            snapshot: CanonicalExport::default(),
+            unknown_top_level: 0,
+        };
+        let live = BTreeMap::from([("memories".to_string(), 1)]);
+        let mut coord = RestoreCoordinator::default();
+        let cycle = |coord: &mut RestoreCoordinator, preview_seq: u64, confirm_seq: u64| {
+            let ready = coord.preview(crate::interchange::restore::PreviewRequest {
+                backup: &backup,
+                source_path: Path::new("/tmp/x.ltmrs-backup"),
+                channel: "ch-1",
+                live_counts: &live,
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: preview_seq,
+            });
+            let token = ready.confirmation_token.clone().unwrap();
+            coord
+                .confirm(crate::interchange::restore::ConfirmRequest {
+                    token: &token,
+                    confirm: true,
+                    digest: "abc",
+                    live_generation: 1,
+                    channel: "ch-1",
+                    active_channels: 1,
+                    now_millis: 1000,
+                    live_op_seq: confirm_seq,
+                })
+                .unwrap()
+        };
+        // Quiet store: zero delta.
+        let (digest, delta) = cycle(&mut coord, 5, 5);
+        assert_eq!(digest, "abc");
+        assert_eq!(delta, 0);
+        // Two writes landed mid-window: counted, saturating.
+        let (_, delta) = cycle(&mut coord, 5, 7);
+        assert_eq!(delta, 2);
     }
 
     /// Loss accounting reaches the caller before the destructive step: the
@@ -543,6 +692,7 @@ mod tests {
             live_generation: 1,
             active_channels: 1,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         assert!(ready.ready);
         assert_eq!(ready.unknown_top_level, 2);
@@ -561,6 +711,7 @@ mod tests {
             live_generation: 1,
             active_channels: 3,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         assert!(!blocked.ready);
         assert_eq!(blocked.unknown_top_level, 2);
@@ -586,10 +737,20 @@ mod tests {
             live_generation: 1,
             active_channels: 1,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         let token = ready.confirmation_token.unwrap();
         assert_eq!(
-            coord.confirm(&token, true, "CHANGED", 1, "ch-1", 1000),
+            coord.confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: true,
+                digest: "CHANGED",
+                live_generation: 1,
+                channel: "ch-1",
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
             Err(RestoreError::StaleSource {
                 expected: "abc".to_string(),
                 actual: "CHANGED".to_string(),
@@ -597,7 +758,16 @@ mod tests {
         );
         // Stale source invalidates the token outright.
         assert_eq!(
-            coord.confirm(&token, true, "abc", 1, "ch-1", 1000),
+            coord.confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: true,
+                digest: "abc",
+                live_generation: 1,
+                channel: "ch-1",
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
             Err(RestoreError::InvalidToken)
         );
         let ready = coord.preview(crate::interchange::restore::PreviewRequest {
@@ -608,10 +778,20 @@ mod tests {
             live_generation: 1,
             active_channels: 1,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         let token = ready.confirmation_token.unwrap();
         assert_eq!(
-            coord.confirm(&token, true, "abc", 2, "ch-1", 1000),
+            coord.confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: true,
+                digest: "abc",
+                live_generation: 2,
+                channel: "ch-1",
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
             Err(RestoreError::GenerationChanged {
                 expected: 1,
                 actual: 2,
@@ -626,17 +806,20 @@ mod tests {
             live_generation: 1,
             active_channels: 1,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         let token = ready.confirmation_token.unwrap();
         assert_eq!(
-            coord.confirm(
-                &token,
-                true,
-                "abc",
-                1,
-                "ch-1",
-                1000 + RESTORE_PREVIEW_TTL_MILLIS + 1,
-            ),
+            coord.confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: true,
+                digest: "abc",
+                live_generation: 1,
+                channel: "ch-1",
+                active_channels: 1,
+                now_millis: 1000 + RESTORE_PREVIEW_TTL_MILLIS + 1,
+                live_op_seq: 0,
+            }),
             Err(RestoreError::Expired)
         );
     }
@@ -661,12 +844,81 @@ mod tests {
             live_generation: 1,
             active_channels: 1,
             now_millis: 1000,
+            live_op_seq: 0,
         });
         let token = ready.confirmation_token.unwrap();
         let err = coord
-            .confirm(&token, true, "abc", 1, "ch-2", 1000)
+            .confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: true,
+                digest: "abc",
+                live_generation: 1,
+                channel: "ch-2",
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            })
             .unwrap_err();
         assert!(matches!(err, RestoreError::Blocked(_)), "got: {err:?}");
+    }
+
+    /// A connection that arrived after the preview re-checks the lease at
+    /// confirm: the token survives so the caller retries after closing the
+    /// other connection (its acknowledged writes must not be drained
+    /// unseen).
+    #[test]
+    fn confirm_rechecks_preview_lease() {
+        use crate::interchange::backup::VerifiedBackup;
+        let backup = VerifiedBackup {
+            digest: "abc".to_string(),
+            store_generation: 1,
+            counts: BTreeMap::new(),
+            snapshot: CanonicalExport::default(),
+            unknown_top_level: 0,
+        };
+        let mut coord = RestoreCoordinator::default();
+        let ready = coord.preview(crate::interchange::restore::PreviewRequest {
+            backup: &backup,
+            source_path: Path::new("/tmp/x.ltmrs-backup"),
+            channel: "ch-1",
+            live_counts: &BTreeMap::new(),
+            live_generation: 1,
+            active_channels: 1,
+            now_millis: 1000,
+            live_op_seq: 0,
+        });
+        let token = ready.confirmation_token.unwrap();
+        let err = coord
+            .confirm(crate::interchange::restore::ConfirmRequest {
+                token: &token,
+                confirm: true,
+                digest: "abc",
+                live_generation: 1,
+                channel: "ch-1",
+                active_channels: 3,
+                now_millis: 1000,
+                live_op_seq: 0,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, RestoreError::Blocked(_)),
+            "cooperating connections must block confirm, got: {err:?}"
+        );
+        // Token unconsumed: closing the others unblocks the same confirm.
+        assert!(
+            coord
+                .confirm(crate::interchange::restore::ConfirmRequest {
+                    token: &token,
+                    confirm: true,
+                    digest: "abc",
+                    live_generation: 1,
+                    channel: "ch-1",
+                    active_channels: 1,
+                    now_millis: 1000,
+                    live_op_seq: 0,
+                })
+                .is_ok()
+        );
     }
 
     /// Safety path lives next to the source backup with a distinct name.
@@ -834,5 +1086,212 @@ mod tests {
                 .unwrap(),
             "pre-restore pipeline must lose publish rights"
         );
+    }
+
+    /// Replace covers every durable keyspace, not just the five exported
+    /// collections: stale aliases must not block reuse, stale receipts must
+    /// not replay, namespaces must not survive, and projection jobs must be
+    /// re-enqueued for the restored memories (or search never converges).
+    #[test]
+    fn restore_replace_covers_all_keyspaces() {
+        use crate::domain::command::DomainCommand;
+        use crate::domain::id::ExternalAlias;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gateway_repo(&dir);
+        // Live state through the gateway: aliased memory + receipt + job.
+        let mut stale = test_memory(1, "Stale One");
+        stale.external_alias = Some(ExternalAlias::new("old-alias"));
+        repo.apply(
+            &gateway_ctx(5),
+            &DomainCommand::AddMemory {
+                memory: stale,
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo.resolve_id("old-alias").unwrap().as_uuid(),
+            uuid::Uuid::from_u128(1)
+        );
+        assert!(
+            repo.projection_job(EntityId::new(uuid::Uuid::from_u128(1)))
+                .unwrap()
+                .is_some()
+        );
+
+        // Backup carries a different memory with its own alias.
+        let mut fresh = test_memory(2, "Fresh Two");
+        fresh.external_alias = Some(ExternalAlias::new("new-alias"));
+        let snapshot = CanonicalExport {
+            memories: vec![fresh],
+            ..Default::default()
+        };
+        let backup = crate::interchange::backup::VerifiedBackup {
+            digest: snapshot.digest(),
+            store_generation: 1,
+            counts: BTreeMap::new(),
+            snapshot,
+            unknown_top_level: 0,
+        };
+        restore_verified(&repo, &backup, crate::domain::id::StoreGeneration::new(2)).unwrap();
+
+        // Data replaced.
+        let titles: Vec<String> = repo
+            .export_full()
+            .unwrap()
+            .memories
+            .iter()
+            .map(|m| m.title.clone())
+            .collect();
+        assert_eq!(titles, vec!["Fresh Two".to_string()]);
+        // Aliases rebuilt: old gone, new resolvable.
+        assert!(
+            repo.resolve_id("old-alias").is_err(),
+            "stale alias must not survive"
+        );
+        assert_eq!(
+            repo.resolve_id("new-alias").unwrap().as_uuid(),
+            uuid::Uuid::from_u128(2)
+        );
+        // Projection jobs re-enqueued for restored memories; the drained
+        // memory has no job until it is written again.
+        let job = repo
+            .projection_job(EntityId::new(uuid::Uuid::from_u128(2)))
+            .unwrap()
+            .expect("restored memory needs a projection job");
+        assert_eq!(job.desired_document_revision.as_u64(), 1);
+        assert!(
+            repo.projection_job(EntityId::new(uuid::Uuid::from_u128(1)))
+                .unwrap()
+                .is_none(),
+            "stale jobs must not resurrect drained memories"
+        );
+        // Namespaces drained: the pre-restore epoch is unknown now.
+        let err = repo
+            .apply(
+                &gateway_ctx(6),
+                &DomainCommand::AddMemory {
+                    memory: test_memory(3, "Nope"),
+                    session: None,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.message.contains("namespace"),
+            "stale namespace must be refused, got: {err:?}"
+        );
+        // Receipts drained: replaying op 5 with new content executes fresh
+        // instead of returning the stale receipt. A fresh namespace is
+        // issued first (the pre-restore epoch was drained with the rest).
+        repo.issue_namespace(
+            crate::domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            1000,
+        )
+        .unwrap();
+        let mut changed = test_memory(1, "Changed Content");
+        changed.external_alias = Some(ExternalAlias::new("old-alias"));
+        repo.apply(
+            &gateway_ctx(5),
+            &DomainCommand::AddMemory {
+                memory: changed,
+                session: None,
+            },
+        )
+        .unwrap();
+        let titles: Vec<String> = repo
+            .export_full()
+            .unwrap()
+            .memories
+            .iter()
+            .map(|m| m.title.clone())
+            .collect();
+        assert!(
+            titles.contains(&"Changed Content".to_string()),
+            "drained receipts must not replay stale results, got: {titles:?}"
+        );
+        // Single active generation at the new value.
+        assert_eq!(repo.store_generation().unwrap().as_u64(), 2);
+        let actives: Vec<_> = repo
+            .list_generations()
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    crate::domain::projection::GenerationStatus::Active
+                )
+            })
+            .collect();
+        assert_eq!(actives.len(), 1, "exactly one Active generation");
+        assert_eq!(actives[0].generation.as_u64(), 2);
+    }
+
+    /// A writer racing the replace can never tear it: with the barrier, a
+    /// racing write commits strictly before the drain (then drained) or
+    /// strictly after the commit (then present). A survivor whose commit
+    /// long predates the restore return tore the merge. The margin below is
+    /// load-bearing: a legitimate post-restore write can beat the t1 read
+    /// by microseconds (hot writer vs returning caller), so only survivors
+    /// older than the margin prove tearing; the fat backup keeps the replace
+    /// itself at millisecond scale, far above it.
+    #[test]
+    fn restore_racing_writer_never_tears() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir);
+        // Fat backup: 500 memories widen the replace window.
+        let memories: Vec<Memory> = (0..500u128)
+            .map(|i| test_memory(1000 + i, &format!("Bulk {i}")))
+            .collect();
+        let snapshot = CanonicalExport {
+            memories,
+            ..Default::default()
+        };
+        let backup = crate::interchange::backup::VerifiedBackup {
+            digest: snapshot.digest(),
+            store_generation: 1,
+            counts: BTreeMap::new(),
+            snapshot,
+            unknown_top_level: 0,
+        };
+        let repo2 = Arc::clone(&repo);
+        let writer = std::thread::spawn(move || {
+            let mut committed = Vec::new();
+            for i in 0..300u128 {
+                let m = test_memory(500_000 + i, &format!("Racer {i}"));
+                if repo2.put_memory_direct(&m).is_ok() {
+                    committed.push((500_000 + i, std::time::Instant::now()));
+                }
+            }
+            committed
+        });
+        restore_verified(&repo, &backup, crate::domain::id::StoreGeneration::new(2)).unwrap();
+        let t1 = std::time::Instant::now();
+        let committed = writer.join().unwrap();
+        assert_eq!(repo.store_generation().unwrap().as_u64(), 2);
+        let live: std::collections::BTreeSet<u128> = repo
+            .export_full()
+            .unwrap()
+            .memories
+            .iter()
+            .map(|m| m.id.as_uuid().as_u128())
+            .collect();
+        // All backup keys present (replace, not merge-with-loss).
+        for i in 0..500u128 {
+            assert!(live.contains(&(1000 + i)), "backup key {i} lost");
+        }
+        // Survivors older than the margin tore the merge; younger ones
+        // (and post-t1 commits) are legitimate post-restore writes.
+        let margin = std::time::Duration::from_millis(5);
+        for (key, at) in &committed {
+            if live.contains(key) {
+                match t1.checked_duration_since(*at) {
+                    None => {}
+                    Some(age) => assert!(
+                        age < margin,
+                        "writer key {key} committed {age:?} before restore return yet survived: torn merge"
+                    ),
+                }
+            }
+        }
     }
 }

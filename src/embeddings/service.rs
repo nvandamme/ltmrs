@@ -92,13 +92,10 @@ impl EmbeddingService {
     }
 
     /// Whether the service is still accepting work (for health checks).
+    /// Observes worker state only: never submits, never perturbs stats.
     #[allow(dead_code)] // used by daemon diagnostics in later WPs
     pub fn is_available(&self) -> bool {
-        match self.handle.submit(vec![]) {
-            Ok(_) => true,
-            Err(ServiceError::Closed) => false,
-            _ => true, // Busy still means available
-        }
+        self.handle.is_open()
     }
 
     /// Load the E5-small adapter from cache and spawn a service.
@@ -132,6 +129,21 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    /// Health checks observe worker state without submitting work: no queue
+    /// slots consumed, no stats perturbed.
+    #[tokio::test]
+    async fn availability_check_has_no_side_effects() {
+        let svc =
+            EmbeddingService::spawn(FastEmbedder { dim: 16 }, EmbeddingWorkerConfig::default());
+        assert!(svc.is_available());
+        assert!(svc.is_available());
+        let stats = svc.handle.stats();
+        assert_eq!(stats.processed_batches, 0, "health checks must not embed");
+        assert_eq!(stats.in_flight, 0, "health checks must not occupy slots");
+        svc.shutdown();
+        assert!(!svc.is_available(), "shutdown service is unavailable");
     }
 
     #[tokio::test]

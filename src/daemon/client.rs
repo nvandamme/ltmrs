@@ -13,6 +13,31 @@ use crate::daemon::envelope::{
     read_response_payload,
 };
 
+/// Parse a generation-mismatch wire error back into its typed form.
+/// Message shape (from `IpcError::GenerationMismatch`'s Display):
+/// "store generation mismatch: daemon {d}, client {c}".
+/// Parse a typed handshake rejection: generation mismatches (adoptable)
+/// and transient daemon-busy (retryable) survive the wire; anything else
+/// stays a generic rejection.
+fn parse_handshake_error(kind: &str, message: &str) -> Option<IpcError> {
+    if kind == "daemon_busy" {
+        let inner = message.strip_prefix("daemon busy: ").unwrap_or(message);
+        return Some(IpcError::Busy(inner.to_string()));
+    }
+    parse_generation_mismatch(kind, message)
+}
+
+fn parse_generation_mismatch(kind: &str, message: &str) -> Option<IpcError> {
+    if kind != "generation_mismatch" {
+        return None;
+    }
+    let (_, rest) = message.split_once("daemon ")?;
+    let (daemon, rest) = rest.split_once(", client ")?;
+    let daemon: u64 = daemon.trim().parse().ok()?;
+    let client: u64 = rest.trim().parse().ok()?;
+    Some(IpcError::GenerationMismatch { daemon, client })
+}
+
 /// A typed IPC client used by a frontend to talk to the daemon.
 pub struct IpcClient {
     /// The daemon socket path to connect to.
@@ -69,10 +94,13 @@ impl IpcClient {
             WireReply::Response(_) => Err(IpcError::InvalidJson(
                 "expected handshake reply, got response".into(),
             )),
-            WireReply::Error(err) => Err(IpcError::InvalidJson(format!(
-                "handshake rejected: {} — {}",
-                err.kind, err.message
-            ))),
+            WireReply::Error(err) => Err(parse_handshake_error(&err.kind, &err.message)
+                .unwrap_or_else(|| {
+                    IpcError::InvalidJson(format!(
+                        "handshake rejected: {} — {}",
+                        err.kind, err.message
+                    ))
+                })),
         }
     }
 
@@ -143,6 +171,14 @@ impl IpcClient {
     pub fn close(&mut self) {
         self.stream = None;
     }
+
+    /// Forget handshake state so the next call re-handshakes from scratch.
+    /// A stale store generation invalidates the epoch: without this, the
+    /// frontend would keep sending the dead epoch forever.
+    pub fn forget_handshake(&mut self) {
+        self.stream = None;
+        self.retry_epoch = None;
+    }
 }
 
 /// An error for when an operation requires a connection.
@@ -169,6 +205,22 @@ impl IpcClient {
             .await
             .map_err(ClientError::Ipc)?;
         self.read_ipc_response().await.map_err(ClientError::Ipc)
+    }
+
+    /// Round-trip, forgetting handshake state on transport failure so the
+    /// next call reconnects from scratch instead of failing on a dead
+    /// stream forever (broken pipe, daemon restart, rejected socket).
+    pub async fn roundtrip_or_forget(
+        &mut self,
+        envelope: &crate::daemon::envelope::IpcEnvelope,
+    ) -> Result<IpcResponse, ClientError> {
+        match self.roundtrip(envelope).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                self.forget_handshake();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -205,6 +257,46 @@ mod tests {
             frontend_id: FrontendId::new(Uuid::from_u128(1)),
             channel_id: ChannelId::new(Uuid::from_u128(2)),
         }
+    }
+
+    /// The mismatch recovery parses the live `Display` string: if anyone
+    /// rewords it, recovery must fail loudly here, not silently brick
+    /// frontends post-restore.
+    #[test]
+    fn generation_mismatch_parse_tracks_display() {
+        let err = crate::daemon::envelope::IpcError::GenerationMismatch {
+            daemon: 7,
+            client: 3,
+        };
+        let parsed = parse_generation_mismatch("generation_mismatch", &err.to_string()).unwrap();
+        assert!(
+            matches!(
+                parsed,
+                crate::daemon::envelope::IpcError::GenerationMismatch {
+                    daemon: 7,
+                    client: 3
+                }
+            ),
+            "round-trip failed for: {err}"
+        );
+        assert!(parse_generation_mismatch("handshake_rejected", &err.to_string()).is_none());
+        assert!(parse_generation_mismatch("generation_mismatch", "garbage").is_none());
+    }
+
+    /// The transient-busy kind must survive the wire (round-trip through
+    /// Display) so frontends can tell "retry" from "refused".
+    #[test]
+    fn daemon_busy_parse_tracks_display() {
+        let err = crate::daemon::envelope::IpcError::Busy("namespace contention".to_string());
+        let parsed = parse_handshake_error("daemon_busy", &err.to_string()).unwrap();
+        assert!(
+            matches!(
+                parsed,
+                crate::daemon::envelope::IpcError::Busy(ref m) if m == "namespace contention"
+            ),
+            "round-trip failed for: {err}"
+        );
+        assert!(parse_handshake_error("handshake_rejected", &err.to_string()).is_none());
     }
 
     #[tokio::test]
@@ -246,6 +338,28 @@ mod tests {
         let _ = server_handle.await;
     }
 
+    /// Transport failure forgets handshake state: a dead stream (peer
+    /// gone) errors the round-trip and resets epoch + connection, so the
+    /// next call reconnects instead of failing forever.
+    #[tokio::test]
+    async fn roundtrip_or_forget_resets_on_dead_stream() {
+        let (dead, peer) = tokio::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(dead);
+        client.retry_epoch = Some(7);
+        assert!(client.roundtrip_or_forget(&envelope(1)).await.is_err());
+        assert_eq!(
+            client.retry_epoch(),
+            None,
+            "transport failure must forget the epoch"
+        );
+        assert!(
+            !client.is_connected(),
+            "transport failure must drop the dead stream"
+        );
+    }
+
     #[tokio::test]
     async fn handshake_rejects_wrong_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -273,6 +387,47 @@ mod tests {
         assert!(
             result.is_err(),
             "handshake with wrong generation must be rejected"
+        );
+
+        client.close();
+        drop(daemon);
+        let _ = server_handle.await;
+    }
+
+    /// A generation rejection must stay typed across the wire (the frontend
+    /// adopts the daemon generation and retries; stringly errors brick it).
+    #[tokio::test]
+    async fn handshake_generation_mismatch_is_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = handle_connection(server_stream, dispatcher, quotas).await;
+        });
+
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_stream);
+
+        let mut bad = handshake_req();
+        bad.store_generation = StoreGeneration::new(99);
+        let err = client.handshake(&bad).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::daemon::envelope::IpcError::GenerationMismatch {
+                    daemon: 1,
+                    client: 99
+                }
+            ),
+            "mismatch must stay typed, got: {err:?}"
         );
 
         client.close();

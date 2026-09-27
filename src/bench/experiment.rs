@@ -294,6 +294,7 @@ pub fn search_row_for(key: u64, text: &str) -> crate::search::row::SearchRow {
         project: None,
         fragment_type: "fact".to_string(),
         created_at_millis: 1000,
+        confidence: 0.5,
         updated_at_millis: 1000,
         embedding: None,
     }

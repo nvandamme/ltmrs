@@ -11,8 +11,12 @@ never calls a remote model.
 
 ## Status
 
-**Baseline captured (WP-00); implementation not started.** No backend, model or
-conformance test has been executed yet. This repository currently contains:
+**Implementation through WP-12; release qualification (WP-13) in progress.**
+The `cargo test` gate (library + smoke suites) is green on the tracked tree;
+storage/load reference benchmarks and an upstream comparison have been
+executed (see `benchmarks.toml` and `CHANGELOG.md`); fault/soak suites, the
+300-case quality corpus, offline install validation and host-matrix
+verification remain `not_run`. This repository currently contains:
 
 - the reviewed implementation specification and test plan in [`plans/`](plans/),
 - the frozen Lemma 0.21.0 baseline in
@@ -34,9 +38,10 @@ ltmrs targets the complete supported tool/workflow surface of
 interchange, CLI aliases and skill workflow.
 
 Dense semantic search and graph-aware context are **intentional enhancements**.
-The honest release claim is therefore: *complete supported Lemma
+The release claim under qualification is therefore: *complete supported Lemma
 API/workflow surface with documented retrieval enhancements*, not byte-identical
-behavioral equivalence. Every deviation is tracked in an explicit ledger.
+behavioral equivalence — pending the WP-13 gates (approvals + checklist). Known deviations are tracked in an explicit ledger
+(`baseline/lemma-0.21.0/deviations.json`; approvals pending).
 
 ## Architecture (planned)
 
@@ -57,9 +62,9 @@ CLI / visualizer client -----------+                         |
 - One daemon owns one physical store; multiple frontends share it.
 - Canonical knowledge and derived search state are logically separated.
 - Embeddings are computed locally with Candle; retrieval with LanceDB.
-- Backend candidates under test: **A** LanceDB-only, **B** Fjall + LanceDB.
-  The decision (AD-01) is open and gated on hard correctness/atomicity tests,
-  not on feature lists or throughput scores.
+- Canonical backend is **B** Fjall + LanceDB (decided, AD-01
+  `plans/AD-01_canonical_backend.md`, gated on hard correctness/atomicity
+  tests — not on feature lists or throughput scores).
 
 ## Constraints
 

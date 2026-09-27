@@ -290,6 +290,7 @@ fn run_worker_loop(
                 // cancel_all() ran after submit; drop without running inference.
                 if req.generation != generation.load(Ordering::Acquire) {
                     stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+                    stats.in_flight.fetch_sub(1, Ordering::Relaxed);
                     let _ = req.reply.send(Err(ServiceError::Cancelled));
                     continue;
                 }
@@ -326,6 +327,16 @@ fn run_worker_loop(
                 }
                 stats.in_flight.fetch_sub(1, Ordering::Relaxed);
             }
+        }
+    }
+    // Shutdown (or close) with queued work outstanding: every waiting
+    // submitter resolves instead of hanging forever on a dead oneshot.
+    // A failed send means the caller already went away; the in-flight slot
+    // is released either way.
+    while let Some(msg) = queue.pop_timeout(Duration::ZERO) {
+        if let WorkerMessage::Request(req) = msg {
+            let _ = req.reply.send(Err(ServiceError::Closed));
+            stats.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -581,5 +592,111 @@ mod tests {
         });
 
         handle.shutdown();
+    }
+
+    /// Shutdown must resolve queued submitters (no hanging receivers):
+    /// requests still queued after the worker stops fail with `Closed`.
+    #[test]
+    fn shutdown_drains_queued_requests_with_closed() {
+        use std::sync::atomic::AtomicBool;
+        /// Adapter that blocks inside the first batch until released, so the
+        /// test knows deterministically when the worker picked up work.
+        struct GatedEmbedder {
+            entered: Arc<AtomicBool>,
+            gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl SyncEmbedder for GatedEmbedder {
+            fn embed_batch(
+                &mut self,
+                inputs: &[EmbedInput],
+            ) -> ArtifactResult<Vec<EmbeddedSequence>> {
+                if !self.entered.swap(true, Ordering::SeqCst) {
+                    // First batch: wait for the test's release signal.
+                    let _ = self.locked_gate().recv();
+                }
+                Ok(inputs
+                    .iter()
+                    .map(|_| EmbeddedSequence {
+                        vector: vec![1.0],
+                        input_ids: vec![],
+                        attention_mask: vec![],
+                    })
+                    .collect())
+            }
+        }
+        impl GatedEmbedder {
+            fn locked_gate(&self) -> std::sync::mpsc::Receiver<()> {
+                // Take the receiver out exactly once (first batch only).
+                self.gate.lock().unwrap().take().unwrap()
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (handle, _worker) = spawn_worker(
+            GatedEmbedder {
+                entered: Arc::clone(&entered),
+                gate: std::sync::Mutex::new(Some(release_rx)),
+            },
+            EmbeddingWorkerConfig {
+                max_batch_size: 1,
+                max_queue_depth: 8,
+            },
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (rx1, _) = handle
+                .submit(vec![EmbedInput {
+                    text: "a".into(),
+                    role: Role::Query,
+                }])
+                .unwrap();
+            // Wait until the worker picked up the first request (bounded:
+            // a worker that never starts is itself a failure).
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !entered.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker never picked up the first request"
+                );
+                tokio::task::yield_now().await;
+            }
+            // Two more queue behind the blocked first request.
+            let (rx2, _) = handle
+                .submit(vec![EmbedInput {
+                    text: "b".into(),
+                    role: Role::Query,
+                }])
+                .unwrap();
+            let (rx3, _) = handle
+                .submit(vec![EmbedInput {
+                    text: "c".into(),
+                    role: Role::Query,
+                }])
+                .unwrap();
+            handle.shutdown();
+            // Release the first request; it completes normally.
+            release_tx.send(()).unwrap();
+            let first = tokio::time::timeout(Duration::from_secs(5), rx1)
+                .await
+                .expect("in-flight request must resolve")
+                .expect("sender alive");
+            assert!(first.is_ok(), "in-flight request completes");
+            // Queued requests resolve (Closed) instead of hanging forever.
+            for (n, rx) in [rx2, rx3].into_iter().enumerate() {
+                let outcome = tokio::time::timeout(Duration::from_secs(5), rx)
+                    .await
+                    .unwrap_or_else(|_| panic!("queued request {n} hung across shutdown"));
+                assert!(
+                    matches!(outcome, Ok(Err(ServiceError::Closed))),
+                    "queued request must fail Closed, got: {outcome:?}"
+                );
+            }
+        });
+        assert_eq!(
+            handle.stats().in_flight,
+            0,
+            "drained requests must release their in-flight slots"
+        );
     }
 }

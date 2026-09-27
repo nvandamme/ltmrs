@@ -432,7 +432,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 - [x] Build development and held-out retrieval labels, split by topic/project to prevent leakage. (Partial: schema + structural validator + 10-case safety fixture with disjoint topics/projects; 300-case reviewed corpus not_run.)
 - [x] Run ablations for lexical, dense, hybrid, priority, graph and MMR at the same context budget. (Partial: runner takes any retrieval closure at fixed budgets; lexical, deterministic-engine and real-E5 legs executed; remaining legs not_run.)
 - [x] Measure no-answer false positives, obsolete advice, conflict coverage and cross-scope leakage in addition to conventional IR scores. (Pure metrics + per-split aggregates; zero-tolerance leakage/obsolete asserts in the executed legs.)
-- [ ] Calibrate candidate pools, thresholds, model choice and inference scheduling only on the development split. (not_run: nothing to tune yet; min_similarity stays unset.)
+- [ ] Calibrate candidate pools, thresholds, model choice and inference scheduling only on the development split. (not_run: nothing to tune yet; held-out calibration still open. Request default is 0.0 since WP-13 I6 — a model-independent anti-noise floor filtering anti-correlated rows, not a calibrated threshold; None remains the explicit opt-out for calibration runs. See DEFAULT_MIN_SIMILARITY + default_threshold_filters_negative_dense_noise.)
 - [x] Publish raw results and analysis scripts with every architecture/ranking decision. (Partial: raw JSONL histories + JSON summaries + op-stream export + upstream driver published; no ranking decisions made yet.)
 
 **Outputs:** performance report, quality report, raw histories/histograms and gate results.

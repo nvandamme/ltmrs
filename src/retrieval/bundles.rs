@@ -65,13 +65,24 @@ pub fn resolve_bundles(
 ) -> Bundles {
     let candidate_set: BTreeSet<EntityId> = candidates.iter().copied().collect();
 
-    // Supersession edges: source -> supersedes -> target (source is newer).
-    // Build the "who supersedes me" direction over the FULL relation graph so a
-    // stale candidate is caught even when its successor is not itself recalled.
+    // Supersession edges over the FULL relation graph so a stale candidate
+    // is caught even when its successor is not itself recalled. Both stored
+    // directions resolve identically: `Supersedes{source: new, target: old}`
+    // and `SupersededBy{source: old, target: new}` both mean old is
+    // superseded by new.
     let mut superseded_by: BTreeMap<EntityId, Vec<EntityId>> = BTreeMap::new();
     for r in relations {
-        if r.relation_type == RelationType::Supersedes && r.source != r.target {
-            superseded_by.entry(r.target).or_default().push(r.source);
+        if r.source == r.target {
+            continue;
+        }
+        match r.relation_type {
+            RelationType::Supersedes => {
+                superseded_by.entry(r.target).or_default().push(r.source);
+            }
+            RelationType::SupersededBy => {
+                superseded_by.entry(r.source).or_default().push(r.target);
+            }
+            _ => {}
         }
     }
 
@@ -79,27 +90,36 @@ pub fn resolve_bundles(
     let mut chains: BTreeMap<EntityId, Vec<EntityId>> = BTreeMap::new();
 
     for id in candidates {
-        // Walk forward to the current head of this candidate's chain.
+        // Bundles only matter for shown rows; an out-of-scope candidate can
+        // neither leak nor need protection.
+        if !is_in_scope(*id) {
+            continue;
+        }
+        // Walk forward to the current head of this candidate's chain,
+        // stopping at the nearest in-scope successor: walking past it to an
+        // out-of-scope terminal would either leak the terminal or silently
+        // re-promote the stale advice. Among several successors the
+        // smallest in-scope one wins (deterministic); an all-out-of-scope
+        // frontier truncates the walk.
         let mut head = *id;
         let mut seen = BTreeSet::new();
         while let Some(nexts) = superseded_by.get(&head) {
-            // Deterministic: take the smallest successor.
-            let next = *nexts.iter().min().unwrap();
-            if !seen.insert(next) || next == head {
+            let Some(next) = nexts.iter().filter(|n| is_in_scope(**n)).min() else {
+                break;
+            };
+            if !seen.insert(*next) || *next == head {
                 break;
             }
-            head = next;
+            head = *next;
         }
         if head == *id {
             // This candidate is already the current record.
             continue;
         }
-        // The candidate is superseded by `head`. The chain is actionable only if
-        // the current record is in scope; an out-of-scope replacement must not
-        // leak or silently re-promote the obsolete instruction.
-        if !is_in_scope(head) {
-            continue;
-        }
+        // The candidate is superseded by the in-scope `head`: mark it
+        // obsolete, protect the current record, and record the lineage.
+        // (`head` is in scope by construction — the walk above only
+        // advances through in-scope successors.)
         bundles.obsolete.insert(*id);
         bundles.protected.insert(head);
         chains.entry(head).or_default().push(*id);
@@ -198,6 +218,47 @@ mod tests {
         assert!(b.obsolete.is_empty());
     }
 
+    /// Cross-scope chains stop at the nearest in-scope successor: 1 <- 2
+    /// (in scope) <- 3 (out of scope) still obsoletes 1 via 2, even though
+    /// the terminal head is out of scope.
+    #[test]
+    fn cross_scope_chain_stops_at_nearest_in_scope_successor() {
+        let relations = vec![
+            rel(100, eid(2), eid(1), RelationType::Supersedes),
+            rel(101, eid(3), eid(2), RelationType::Supersedes),
+        ];
+        let in_scope = |id: EntityId| id == eid(1) || id == eid(2);
+        let b = resolve_bundles(&[eid(1), eid(2), eid(3)], &relations, &in_scope);
+        assert!(
+            b.obsolete.contains(&eid(1)),
+            "in-scope replacement 2 exists, 1 must be obsolete"
+        );
+        assert!(b.protected.contains(&eid(2)));
+        assert!(
+            !b.obsolete.contains(&eid(2)),
+            "out-of-scope head 3 must not obsolete 2"
+        );
+        assert!(!b.obsolete.contains(&eid(3)));
+        assert_eq!(b.supersessions.len(), 1);
+        assert_eq!(b.supersessions[0].current, eid(2));
+        assert_eq!(b.supersessions[0].superseded, vec![eid(1)]);
+    }
+
+    /// Forks prefer the in-scope successor: 1 superseded by out-of-scope 2
+    /// and in-scope 3 resolves through 3, not the smaller out-of-scope id.
+    #[test]
+    fn fork_prefers_in_scope_successor() {
+        let relations = vec![
+            rel(100, eid(2), eid(1), RelationType::Supersedes),
+            rel(101, eid(3), eid(1), RelationType::Supersedes),
+        ];
+        let in_scope = |id: EntityId| id == eid(1) || id == eid(3);
+        let b = resolve_bundles(&[eid(1), eid(2), eid(3)], &relations, &in_scope);
+        assert!(b.obsolete.contains(&eid(1)));
+        assert!(b.protected.contains(&eid(3)));
+        assert!(!b.protected.contains(&eid(2)));
+    }
+
     #[test]
     fn conflict_bundle_preserves_both_sides() {
         let relations = vec![rel(100, eid(1), eid(2), RelationType::Contradicts)];
@@ -236,5 +297,40 @@ mod tests {
         let b = resolve_bundles(&[eid(1)], &relations, &|_| true);
         assert!(b.supersessions.is_empty());
         assert!(b.obsolete.is_empty());
+    }
+
+    /// Stored `SupersededBy` edges resolve with direction: old=1 superseded
+    /// by new=2 obsoletes 1 and protects 2, exactly like `Supersedes`.
+    #[test]
+    fn superseded_by_direction_resolves() {
+        let relations = vec![rel(100, eid(1), eid(2), RelationType::SupersededBy)];
+        let b = resolve_bundles(&[eid(1), eid(2)], &relations, &|_| true);
+        assert!(b.obsolete.contains(&eid(1)), "old advice must be obsolete");
+        assert!(
+            b.protected.contains(&eid(2)),
+            "new advice must be protected"
+        );
+        assert!(!b.obsolete.contains(&eid(2)));
+        assert_eq!(b.supersessions.len(), 1);
+        assert_eq!(b.supersessions[0].current, eid(2));
+        assert_eq!(b.supersessions[0].superseded, vec![eid(1)]);
+    }
+
+    /// A supersession chain through an out-of-scope intermediate stops at
+    /// the boundary: 1 superseded-by 2 (out of scope) superseded-by 3 (in
+    /// scope) leaves 1 current. Walking past 2 to the out-of-scope terminal
+    /// would leak it; marking 1 obsolete via an invisible intermediary
+    /// would hide advice the scope still shows. Scope purity wins, pinned.
+    #[test]
+    fn transitive_chain_through_out_of_scope_stops() {
+        let relations = vec![
+            rel(100, eid(1), eid(2), RelationType::SupersededBy),
+            rel(101, eid(2), eid(3), RelationType::SupersededBy),
+        ];
+        let b = resolve_bundles(&[eid(1), eid(2), eid(3)], &relations, &|id| id != eid(2));
+        assert!(
+            !b.obsolete.contains(&eid(1)),
+            "walk stops at out-of-scope 2; 1 stays current"
+        );
     }
 }

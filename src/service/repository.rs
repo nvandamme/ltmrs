@@ -8,7 +8,8 @@
 //! receipt and the same operation key.
 
 use fjall::{
-    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, Readable,
+    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx,
+    PersistMode, Readable,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,11 @@ pub struct FaultInjector {
     commit_unknown_outcomes: std::sync::atomic::AtomicU32,
     /// Number of times to fail a migration step before succeeding.
     migration_failures: std::sync::atomic::AtomicU32,
+    /// Number of times to fail the durability barrier before succeeding.
+    /// When > 0, the next N barrier calls return an error instead of
+    /// persisting: callers must fail the ACK, never report success on
+    /// buffered-only data.
+    persist_failures: std::sync::atomic::AtomicU32,
 }
 
 impl FaultInjector {
@@ -80,6 +86,12 @@ impl FaultInjector {
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Configure N upcoming durability barriers to fail.
+    pub fn set_persist_failures(&self, n: u32) {
+        self.persist_failures
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Consume one unknown-outcome fault. Returns true if a fault was injected.
     pub fn inject_unknown_outcome(&self) -> bool {
         Self::consume(&self.commit_unknown_outcomes)
@@ -88,6 +100,11 @@ impl FaultInjector {
     /// Consume one migration fault. Returns true if a fault was injected.
     pub fn inject_migration_fault(&self) -> bool {
         Self::consume(&self.migration_failures)
+    }
+
+    /// Consume one durability-barrier fault. Returns true if injected.
+    pub fn inject_persist_failure(&self) -> bool {
+        Self::consume(&self.persist_failures)
     }
 
     /// Atomically consume one fault from a counter without underflow.
@@ -123,6 +140,14 @@ pub struct CanonicalRepository {
     suggestions: OptimisticTxKeyspace,
     fault_injector: std::sync::Arc<FaultInjector>,
     clock: std::sync::Arc<dyn crate::domain::clock::Clock + Send + Sync>,
+    /// Restore barrier: shared by every mutating entry point, exclusive to
+    /// the restore path. A restore drains and rewrites keyspaces no
+    /// concurrent writer may interleave with — optimistic SSI alone cannot
+    /// see brand-new keys, so mutual exclusion (not conflict detection)
+    /// closes the drain-then-write race. RULE: fence outermost public
+    /// entries only; internals and the restore path itself never re-fence
+    /// (a write guard is not re-entrant with a waiting writer).
+    restore_lock: std::sync::RwLock<()>,
 }
 
 impl CanonicalRepository {
@@ -195,6 +220,7 @@ impl CanonicalRepository {
             suggestions,
             fault_injector,
             clock,
+            restore_lock: std::sync::RwLock::new(()),
         })
     }
 
@@ -208,57 +234,138 @@ impl CanonicalRepository {
         &self.fault_injector
     }
 
+    /// Durability barrier (RQ-18): no ACK without it. Flushes through
+    /// fdatasync+metadata so a returned success means the write survives a
+    /// process crash and OS-level loss, not just process survival. Called by
+    /// every entry point that reports a mutation as successful; progress
+    /// bookkeeping with fail-closed loss semantics (projection acks, build
+    /// progress notes) documents its buffered mode instead.
+    fn persist_barrier(&self) -> DomainResult<()> {
+        if self.fault_injector.inject_persist_failure() {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "injected persist failure: durability barrier refused",
+            ));
+        }
+        self.db
+            .persist(fjall::PersistMode::SyncAll)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
+    }
+
     /// Issue a new retry namespace for a frontend with the default TTL.
-    /// Called by the daemon when a frontend authenticates.
+    /// Called by the daemon when a frontend authenticates. Epoch allocation
+    /// reads inside the write transaction (creating a read dependency), so
+    /// concurrent issuers conflict and retry instead of double-issuing the
+    /// same epoch. A corrupt epoch counter fails closed (epoch reuse would
+    /// confuse replays across channels).
     pub fn issue_namespace(
         &self,
         frontend_id: FrontendId,
         now_millis: u64,
     ) -> DomainResult<RetryNamespace> {
-        // Find the current epoch for this frontend.
-        let snapshot = self.db.read_tx();
+        let _restore_guard = self.restore_lock.read().unwrap();
         let key = namespace_key(frontend_id);
-        let current_epoch = match snapshot
-            .get(&self.namespaces, &key)
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let current_epoch = match tx
+                .get(&self.namespaces, &key)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                Some(raw) => {
+                    let bytes = raw.as_ref();
+                    if bytes.len() == 8 {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(bytes);
+                        u64::from_le_bytes(arr).checked_add(1).ok_or_else(|| {
+                            DomainError::new(
+                                DomainErrorCode::Validation,
+                                "namespace epoch counter exhausted",
+                            )
+                        })?
+                    } else {
+                        return Err(DomainError::new(
+                            DomainErrorCode::Validation,
+                            "corrupt namespace epoch counter",
+                        ));
+                    }
+                }
+                None => 1,
+            };
+
+            let ns = RetryNamespace::new(
+                frontend_id,
+                current_epoch,
+                now_millis,
+                DEFAULT_NAMESPACE_TTL_MILLIS,
+            );
+
+            // Persist the namespace and its fixed expiry.
+            tx.insert(&self.namespaces, &key, current_epoch.to_le_bytes());
+            let ns_raw = serde_json::to_vec(&ns)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.namespaces, ns_key(&ns), &ns_raw);
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(ns);
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+            }
+        }
+        Err(DomainError::new(
+            DomainErrorCode::Contention,
+            "namespace issue conflicted (transient write contention): retry the handshake",
+        ))
+    }
+
+    /// SSI-exhaustion signal (transient, safe to retry): every write
+    /// path that runs out of conflict budget reports Contention, never
+    /// Validation — callers and hosts must be able to tell "retry" from
+    /// "refused" (see `DomainErrorCode::Contention`). Each site keeps its
+    /// specific message; only the code is unified.
+    fn exhausted_contention(message: &str) -> DomainError {
+        DomainError::new(DomainErrorCode::Contention, message)
+    }
+
+    /// Advance the mutation watermark inside the caller's write
+    /// transaction (atomic with the mutation itself). Keys are per-writer
+    /// (`op_seq:{frontend}` for commands, `op_seq:direct` for the direct
+    /// primitives) so concurrent writers never collide on one global key —
+    /// a single shared counter would serialize every write under SSI and
+    /// collapse concurrent throughput. Shared by the command path and the
+    /// direct-write primitives (guides, suggestions, distill side-effects)
+    /// so every canonical write counts — the restore delta would otherwise
+    /// miss non-command writes. Operational bookkeeping (epochs, projection
+    /// jobs, generation lifecycle) does not bump it: only knowledge
+    /// records count.
+    fn bump_op_seq_tx(&self, tx: &mut OptimisticWriteTx, key: &str) -> DomainResult<()> {
+        let seq = match tx
+            .get(&self.namespaces, key)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
         {
             Some(raw) => {
                 let bytes = raw.as_ref();
-                if bytes.len() == 8 {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(bytes);
-                    u64::from_le_bytes(arr) + 1
-                } else {
-                    1
+                if bytes.len() != 8 {
+                    return Err(DomainError::new(
+                        DomainErrorCode::Validation,
+                        "corrupt op sequence counter",
+                    ));
                 }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(bytes);
+                u64::from_le_bytes(arr)
             }
-            None => 1,
+            None => 0,
         };
-
-        let ns = RetryNamespace::new(
-            frontend_id,
-            current_epoch,
-            now_millis,
-            DEFAULT_NAMESPACE_TTL_MILLIS,
-        );
-
-        // Persist the namespace and its fixed expiry.
-        let mut tx = self
-            .db
-            .write_tx()
-            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        tx.insert(&self.namespaces, &key, current_epoch.to_le_bytes());
-        let ns_raw = serde_json::to_vec(&ns)
-            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        tx.insert(&self.namespaces, ns_key(&ns), &ns_raw);
-        match tx.commit() {
-            Ok(Ok(())) => Ok(ns),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "namespace issue conflicted",
-            )),
-            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
-        }
+        let next = seq.checked_add(1).ok_or_else(|| {
+            DomainError::new(DomainErrorCode::Validation, "op sequence exhausted")
+        })?;
+        tx.insert(&self.namespaces, key, next.to_le_bytes());
+        Ok(())
     }
 
     /// Look up a retry namespace by frontend and epoch.
@@ -276,30 +383,96 @@ impl CanonicalRepository {
             .transpose()
     }
 
+    /// Monotonic mutation watermark: sum over per-writer counters
+    /// (`op_seq:{frontend}` + `op_seq:direct`). Restores bind
+    /// preview/confirm to it so writes landing between the two are
+    /// acknowledged, never drained unseen. Absent on old stores: reads as
+    /// 0. A malformed counter fails closed (storage trouble is never
+    /// silently skipped).
+    pub fn op_seq(&self) -> DomainResult<u64> {
+        let snapshot = self.db.read_tx();
+        let mut total = 0u64;
+        for kv in snapshot.iter(&self.namespaces) {
+            let (k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if !String::from_utf8_lossy(k.as_ref()).starts_with("op_seq:") {
+                continue;
+            }
+            let bytes = v.as_ref();
+            if bytes.len() != 8 {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "corrupt op sequence counter",
+                ));
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(bytes);
+            total = total.checked_add(u64::from_le_bytes(arr)).ok_or_else(|| {
+                DomainError::new(DomainErrorCode::Validation, "op sequence exhausted")
+            })?;
+        }
+        Ok(total)
+    }
+
     /// Garbage-collect expired namespaces and their receipts.
     /// Called periodically by the daemon. Returns the number of receipts removed.
     pub fn gc_expired(&self, now_millis: u64) -> DomainResult<usize> {
-        // Find expired namespaces on a read snapshot.
+        let _restore_guard = self.restore_lock.read().unwrap();
+        // Find expired namespaces on a read snapshot. Undecodable entries
+        // are corrupt (every reader fails closed on them): collect them
+        // for removal below so one bad record cannot leak forever while
+        // GC keeps skipping it. A corrupt namespace also orphans its
+        // receipts (matching needs the decoded value), so receipts for
+        // its frontend are collected too; other frontends are untouched.
+        // Malformed watermark keys heal the same way (otherwise op_seq
+        // fails closed forever and bricks preview/confirm).
         let snapshot = self.db.read_tx();
         let mut expired: Vec<RetryNamespace> = Vec::new();
+        let mut corrupt_keys: Vec<String> = Vec::new();
+        // (frontend, epoch) scopes for orphaned receipts. The epoch comes
+        // from the corrupt key itself (`ns:{fe}:{epoch}`): scoping to it
+        // keeps live epochs' receipts intact (RQ-06 replay). Unparseable
+        // keys heal key-only; their receipts strand until a valid same-
+        // scope record expires normally (documented residual).
+        let mut corrupt_scopes: Vec<(String, Option<String>)> = Vec::new();
         for kv in snapshot.iter(&self.namespaces) {
             let (k, v) = kv
                 .into_inner()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             let key_str = String::from_utf8_lossy(k.as_ref());
-            if key_str.starts_with("ns:")
-                && let Ok(ns) = decode::<RetryNamespace>(v.as_ref())
-                && !ns.is_valid_at(now_millis)
-            {
-                expired.push(ns);
+            if key_str.starts_with("ns:") {
+                match decode::<RetryNamespace>(v.as_ref()) {
+                    Ok(ns) if !ns.is_valid_at(now_millis) => expired.push(ns),
+                    Ok(_) => {}
+                    Err(_) => {
+                        corrupt_keys.push(key_str.to_string());
+                        // ns:{frontend}:{epoch}: scope the orphaned
+                        // receipts to this exact epoch so live epochs of
+                        // the same frontend keep their replay state.
+                        let scope = match key_str.split(':').collect::<Vec<_>>()[..] {
+                            [_, fe, epoch] => (fe.to_string(), Some(epoch.to_string())),
+                            _ => (String::new(), None),
+                        };
+                        corrupt_scopes.push(scope);
+                    }
+                }
+            } else if key_str.starts_with("op_seq:") && v.as_ref().len() != 8 {
+                // Malformed watermark: op_seq() fails closed on it, so GC
+                // heals it (accounting restarts; preview/confirm unblock).
+                corrupt_keys.push(key_str.to_string());
             }
         }
 
-        if expired.is_empty() {
+        if expired.is_empty() && corrupt_keys.is_empty() {
             return Ok(0);
         }
 
         // Remove expired namespaces and their receipts in one transaction.
+        // Keys are collected before removing (restore_replace precedent):
+        // removing while iterating the same keyspace risks skipping
+        // entries on iterators without snapshot isolation, orphaning
+        // receipts no future GC re-triggers for.
         let mut tx = self
             .db
             .write_tx()
@@ -307,26 +480,67 @@ impl CanonicalRepository {
         let mut removed = 0;
         for ns in &expired {
             // Remove all receipts issued under this retry_epoch.
+            let mut doomed = Vec::new();
             for kv in tx.iter(&self.receipts) {
                 let (k, _) = kv
                     .into_inner()
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
                 let key_str = String::from_utf8_lossy(k.as_ref()).to_string();
                 if receipt_matches_namespace(&key_str, ns) {
-                    tx.remove(&self.receipts, &key_str);
-                    removed += 1;
+                    doomed.push(key_str);
                 }
+            }
+            for key in doomed {
+                tx.remove(&self.receipts, &key);
+                removed += 1;
             }
             let ns_key = ns_key(ns);
             tx.remove(&self.namespaces, &ns_key);
         }
+        // Corrupt records are undecodable everywhere (all readers fail
+        // closed on them): removing heals the leak without changing any
+        // observable outcome. A corrupt namespace also strands its
+        // receipts (no trigger can ever match them again), so receipts
+        // for its exact (frontend, epoch) scope go too — live epochs keep
+        // their RQ-06 replay state; other frontends are untouched.
+        // Loud: silent healing would mask storage trouble.
+        if !corrupt_keys.is_empty() {
+            eprintln!(
+                "ltmrs: GC healing {} corrupt namespace/watermark record(s)",
+                corrupt_keys.len()
+            );
+        }
+        for key in &corrupt_keys {
+            tx.remove(&self.namespaces, key);
+        }
+        if !corrupt_scopes.is_empty() {
+            let mut doomed = Vec::new();
+            for kv in tx.iter(&self.receipts) {
+                let (k, _) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key_str = String::from_utf8_lossy(k.as_ref()).to_string();
+                let parts: Vec<&str> = key_str.split(':').collect();
+                if parts.len() == 4
+                    && corrupt_scopes.iter().any(|(fe, epoch)| {
+                        parts[1] == fe && epoch.as_deref().is_none_or(|e| parts[2] == e)
+                    })
+                {
+                    doomed.push(key_str);
+                }
+            }
+            for key in doomed {
+                tx.remove(&self.receipts, &key);
+                removed += 1;
+            }
+        }
 
         match tx.commit() {
-            Ok(Ok(())) => Ok(removed),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "gc conflicted",
-            )),
+            Ok(Ok(())) => {
+                self.persist_barrier()?;
+                Ok(removed)
+            }
+            Ok(Err(_)) => Err(Self::exhausted_contention("gc conflicted")),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
         }
     }
@@ -350,6 +564,7 @@ impl CanonicalRepository {
 
     /// Centralized command application: idempotent, atomic, precondition-checked.
     pub fn apply(&self, ctx: &CommandContext, cmd: &DomainCommand) -> DomainResult<CommandReceipt> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         // Validate the retry namespace: expired or unknown namespaces are
         // refused as stale, not silently converted into new work.
         self.validate_namespace(ctx)?;
@@ -361,7 +576,9 @@ impl CanonicalRepository {
             ctx.retry_epoch,
             ctx.operation_id,
         )? {
-            return self.replay_or_conflict(r, ctx);
+            let receipt = self.replay_or_conflict(r, ctx)?;
+            self.persist_barrier()?;
+            return Ok(receipt);
         }
 
         for _attempt in 0..MAX_RETRIES {
@@ -384,7 +601,10 @@ impl CanonicalRepository {
                         );
                     }
                     match tx.commit() {
-                        Ok(Ok(())) => return Ok(receipt),
+                        Ok(Ok(())) => {
+                            self.persist_barrier()?;
+                            return Ok(receipt);
+                        }
                         Ok(Err(_conflict)) => {
                             // Storage conflict: retry from a fresh snapshot.
                             continue;
@@ -397,12 +617,12 @@ impl CanonicalRepository {
                 }
                 TxAction::Replay(receipt) => {
                     tx.rollback();
+                    self.persist_barrier()?;
                     return Ok(receipt);
                 }
             }
         }
-        Err(DomainError::new(
-            DomainErrorCode::Validation,
+        Err(Self::exhausted_contention(
             "max transaction retries exceeded",
         ))
     }
@@ -461,6 +681,13 @@ impl CanonicalRepository {
         let raw = encode_receipt(&receipt)?;
         tx.insert(&self.receipts, &key, &raw);
 
+        // Mutation watermark for restore preview/confirm binding: every
+        // executed command advances it atomically with its receipt, so a
+        // restore can tell whether the live store moved since the preview.
+        // Replays return before this point and advance nothing. Per-frontend
+        // key: concurrent frontends never collide on one global counter.
+        self.bump_op_seq_tx(tx, &op_seq_key(Some(ctx.frontend_id)))?;
+
         Ok(TxAction::Commit(receipt))
     }
 
@@ -477,7 +704,11 @@ impl CanonicalRepository {
             ctx.retry_epoch,
             ctx.operation_id,
         )? {
-            Some(r) if r.request_digest == ctx.request_digest => Ok(r),
+            Some(r) if r.request_digest == ctx.request_digest => {
+                // The write did commit: barrier before acknowledging it.
+                self.persist_barrier()?;
+                Ok(r)
+            }
             Some(_) => Err(DomainError::new(
                 DomainErrorCode::KeyReuseDifferentInput,
                 "operation key reused with different input",
@@ -556,6 +787,7 @@ impl CanonicalRepository {
     /// workers' publish rights (design §12.3 step 9: old projection work is
     /// invalidated). A fresh pipeline can be staged immediately after.
     pub fn set_store_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let meta = Self::keyspace(&self.db, "meta")?;
         let mut tx = self
             .db
@@ -578,11 +810,11 @@ impl CanonicalRepository {
             );
         }
         match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "generation switch conflicted",
-            )),
+            Ok(Ok(())) => {
+                self.persist_barrier()?;
+                Ok(())
+            }
+            Ok(Err(_)) => Err(Self::exhausted_contention("generation switch conflicted")),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
         }
     }
@@ -593,6 +825,7 @@ impl CanonicalRepository {
     /// one pipeline (Staged/Building/Ready) may exist at a time. The active
     /// pointer is untouched — staging is never observable to readers.
     pub fn stage_generation(&self, fingerprint: ModelFingerprint) -> DomainResult<StoreGeneration> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let mut tx = self
             .db
             .write_tx()
@@ -641,11 +874,11 @@ impl CanonicalRepository {
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
         );
         match tx.commit() {
-            Ok(Ok(())) => Ok(next),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "generation staging conflicted",
-            )),
+            Ok(Ok(())) => {
+                self.persist_barrier()?;
+                Ok(next)
+            }
+            Ok(Err(_)) => Err(Self::exhausted_contention("generation staging conflicted")),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
         }
     }
@@ -660,11 +893,16 @@ impl CanonicalRepository {
     /// rebuild from a bare recount. The operator protocol (final rebuild
     /// before note) is assumed, not enforced; only the refusal paths
     /// (dirty, watermark) are verified.
+    ///
+    /// Deliberately buffered (no durability barrier): losing a progress
+    /// note only delays activation (fail-closed on the watermark), while
+    /// knowledge and protocol state always persist (see `persist_barrier`).
     pub fn note_generation_progress(
         &self,
         generation: StoreGeneration,
         projected: u64,
     ) -> DomainResult<GenerationRecord> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let mut tx = self
             .db
             .write_tx()
@@ -699,10 +937,7 @@ impl CanonicalRepository {
         );
         match tx.commit() {
             Ok(Ok(())) => Ok(rec),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "generation progress conflicted",
-            )),
+            Ok(Err(_)) => Err(Self::exhausted_contention("generation progress conflicted")),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
         }
     }
@@ -747,6 +982,7 @@ impl CanonicalRepository {
     /// partial rows after retention and a fresh pipeline can be staged.
     /// Active generations cannot be abandoned — restore or cut over instead.
     pub fn abandon_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let mut tx = self
             .db
             .write_tx()
@@ -772,11 +1008,11 @@ impl CanonicalRepository {
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
         );
         match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "generation abandon conflicted",
-            )),
+            Ok(Ok(())) => {
+                self.persist_barrier()?;
+                Ok(())
+            }
+            Ok(Err(_)) => Err(Self::exhausted_contention("generation abandon conflicted")),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
         }
     }
@@ -814,6 +1050,7 @@ impl CanonicalRepository {
     /// verify with `Projector::verify_generation_converged` (table-measured)
     /// before activating; per-memory pending verification is a follow-up.
     pub fn activate_generation(&self, generation: StoreGeneration) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let mut tx = self
             .db
             .write_tx()
@@ -906,9 +1143,11 @@ impl CanonicalRepository {
             }
         }
         match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
+            Ok(Ok(())) => {
+                self.persist_barrier()?;
+                Ok(())
+            }
+            Ok(Err(_)) => Err(Self::exhausted_contention(
                 "generation activation conflicted",
             )),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
@@ -1124,7 +1363,13 @@ impl CanonicalRepository {
     /// still carries exactly this seq — a stale worker (whose desired revision
     /// was superseded, or whose memory was forgotten) gets false and leaves no
     /// trace. Retries on storage conflict from a fresh snapshot.
+    /// Acknowledge a projection job as published. Deliberately buffered
+    /// (no durability barrier): losing an ack only republishes idempotent
+    /// work, while every ack costs a barrier. Progress notes share this
+    /// treatment; knowledge and protocol state always persist (see
+    /// `persist_barrier`).
     pub fn acknowledge_projection(&self, id: EntityId, seq: u64) -> DomainResult<bool> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -1154,8 +1399,7 @@ impl CanonicalRepository {
                 Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
             }
         }
-        Err(DomainError::new(
-            DomainErrorCode::Validation,
+        Err(Self::exhausted_contention(
             "max transaction retries exceeded",
         ))
     }
@@ -1188,6 +1432,7 @@ impl CanonicalRepository {
         seq: u64,
         is_tombstone: bool,
     ) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let job = crate::domain::projection::ProjectionJob {
             memory_id,
             desired_document_revision,
@@ -1209,13 +1454,15 @@ impl CanonicalRepository {
                     .as_slice(),
             );
             match tx.commit() {
-                Ok(Ok(())) => return Ok(()),
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
                 Ok(Err(_conflict)) => continue,
                 Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
             }
         }
-        Err(DomainError::new(
-            DomainErrorCode::Validation,
+        Err(Self::exhausted_contention(
             "max transaction retries exceeded",
         ))
     }
@@ -1258,22 +1505,30 @@ impl CanonicalRepository {
 
     /// Store a guide (keyed by lowercased name).
     pub fn put_guide(&self, guide: &crate::domain::guide::Guide) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let key = guide.name.to_lowercase();
         let raw = serde_json::to_vec(guide)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        let mut tx = self
-            .db
-            .write_tx()
-            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        tx.insert(&self.guides, &key, raw.as_slice());
-        match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "guide write conflicted",
-            )),
-            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.guides, &key, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
         }
+        Err(Self::exhausted_contention("guide write conflicted"))
     }
 
     /// Write a memory record directly (WP-09 guide_distill side-effect on a
@@ -1281,26 +1536,35 @@ impl CanonicalRepository {
     /// gateway: used only for the compatibility adapter's derived writes, which
     /// are not themselves user-addressable operations.
     pub fn put_memory_direct(&self, memory: &Memory) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let key = memory.id.as_uuid().to_string();
         let raw = serde_json::to_vec(memory)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        let mut tx = self
-            .db
-            .write_tx()
-            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        tx.insert(&self.memories, &key, raw.as_slice());
-        match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "memory write conflicted",
-            )),
-            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.memories, &key, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
         }
+        Err(Self::exhausted_contention("memory write conflicted"))
     }
 
     /// Delete a guide by name (case-insensitive). Returns true if removed.
     pub fn delete_guide(&self, name: &str) -> DomainResult<bool> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let key = name.to_lowercase();
         let snapshot = self.db.read_tx();
         let exists = snapshot
@@ -1310,19 +1574,26 @@ impl CanonicalRepository {
         if !exists {
             return Ok(false);
         }
-        let mut tx = self
-            .db
-            .write_tx()
-            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        tx.remove(&self.guides, &key);
-        match tx.commit() {
-            Ok(Ok(())) => Ok(true),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "guide delete conflicted",
-            )),
-            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.remove(&self.guides, &key);
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(true);
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
         }
+        Err(Self::exhausted_contention("guide delete conflicted"))
     }
 
     /// All suggestions from a single snapshot.
@@ -1351,22 +1622,30 @@ impl CanonicalRepository {
         &self,
         suggestion: &crate::domain::session::Suggestion,
     ) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
         let key = suggestion.id.to_string();
         let raw = serde_json::to_vec(suggestion)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        let mut tx = self
-            .db
-            .write_tx()
-            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        tx.insert(&self.suggestions, &key, raw.as_slice());
-        match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "suggestion write conflicted",
-            )),
-            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.suggestions, &key, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
         }
+        Err(Self::exhausted_contention("suggestion write conflicted"))
     }
 
     /// Next suggestion ID (max existing + 1, or 1 if none).
@@ -1413,6 +1692,13 @@ impl CanonicalRepository {
     /// projects/archives/history have no storage yet and stay empty by
     /// design (documented, counted as zero — never silently dropped).
     pub fn export_full(&self) -> DomainResult<CanonicalExport> {
+        Ok(self.export_full_with_generation()?.0)
+    }
+
+    /// Coherent cut: the domain export plus the live generation from ONE
+    /// read transaction. A concurrent generation flip between two snapshots
+    /// would otherwise mislabel data (backup manifest torn from content).
+    pub fn export_full_with_generation(&self) -> DomainResult<(CanonicalExport, StoreGeneration)> {
         let snapshot = self.db.read_tx();
         let read_all = |ks: &OptimisticTxKeyspace| -> DomainResult<Vec<Vec<u8>>> {
             let mut out = Vec::new();
@@ -1444,36 +1730,99 @@ impl CanonicalRepository {
             .iter()
             .map(|v| decode::<crate::domain::session::Suggestion>(v))
             .collect::<DomainResult<_>>()?;
-        Ok(CanonicalExport {
-            memories,
-            relations,
-            guides,
-            feedback,
-            suggestions,
-            ..Default::default()
-        })
+        let generation = Self::generation_from_snapshot(&snapshot, &self.generations, &self.db)?;
+        Ok((
+            CanonicalExport {
+                memories,
+                relations,
+                guides,
+                feedback,
+                suggestions,
+                ..Default::default()
+            },
+            generation,
+        ))
     }
 
-    /// Atomically replace the domain record sets (WP-11 restore): clears the
-    /// five domain keyspaces and inserts the given records in one write
-    /// transaction. Keys mirror the put_* schemes (memory/relation UUIDs,
-    /// lowercased guide names, suggestion ids, `feedback:{id}`). A concurrent
-    /// mutation conflicts instead of partially merging (caller retries from a
-    /// fresh preview). Sessions live in the daemon registry, not here.
-    pub fn replace_domain(
+    /// Generation preference (Active record, else meta pointer, else FIRST)
+    /// resolved inside the caller's snapshot so export and generation share
+    /// one coherent cut.
+    fn generation_from_snapshot(
+        snapshot: &fjall::Snapshot,
+        generations: &OptimisticTxKeyspace,
+        db: &OptimisticTxDatabase,
+    ) -> DomainResult<StoreGeneration> {
+        let mut active: Option<StoreGeneration> = None;
+        for kv in snapshot.iter(generations) {
+            let (_, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let rec = decode_generation(v.as_ref())?;
+            if matches!(rec.status, GenerationStatus::Active) {
+                active = Some(match active {
+                    Some(a) => a.max(rec.generation),
+                    None => rec.generation,
+                });
+            }
+        }
+        if let Some(generation) = active {
+            return Ok(generation);
+        }
+        let meta = Self::keyspace(db, "meta")?;
+        let raw = snapshot
+            .get(&meta, "store_generation")
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        match raw {
+            Some(v) => {
+                let bytes = v.as_ref();
+                if bytes.len() >= 8 {
+                    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    Ok(StoreGeneration::new(value))
+                } else {
+                    Ok(StoreGeneration::FIRST)
+                }
+            }
+            None => Ok(StoreGeneration::FIRST),
+        }
+    }
+
+    /// Atomically replace the store with a verified snapshot (restore): drain
+    /// every durable keyspace and insert the snapshot in ONE write
+    /// transaction with a durable commit, including the generation flip.
+    ///
+    /// Coverage: the five exported collections are replaced from the
+    /// snapshot; aliases are rebuilt from restored memories (a stale alias
+    /// must not block reuse or resolve to a deleted id); receipts and
+    /// namespaces are drained (single-generation operational state — the
+    /// caller abandons live sessions, so no live operation may replay);
+    /// projection jobs are re-enqueued for every restored memory (or search
+    /// never converges on the restored state); every generation record
+    /// retires and exactly one Active for the new generation is inserted
+    /// alongside the meta pointer (the Active==pointer invariant holds).
+    ///
+    /// Concurrency: the exclusive restore barrier is held across the whole
+    /// call and drain enumeration runs inside the same transaction, so no
+    /// writer can interleave between drain and commit. A concurrent mutation
+    /// blocks, then either precedes (drained) or follows (post-restore
+    /// write) — never tears. A commit conflict retries from a fresh preview
+    /// at the exec layer. Sessions live in the daemon registry, not here.
+    ///
+    /// Feedback keys reuse the canonical `feedback:{op}` scheme (the op id
+    /// is recovered as event.id XOR 0xF0), so replays cannot double-record
+    /// under a divergent key.
+    pub fn restore_replace(
         &self,
         memories: &[Memory],
         relations: &[Relation],
         guides: &[crate::domain::guide::Guide],
         feedback: &[crate::domain::session::FeedbackEvent],
         suggestions: &[crate::domain::session::Suggestion],
+        new_generation: StoreGeneration,
     ) -> DomainResult<()> {
-        fn drain(
-            snapshot: &fjall::Snapshot,
-            ks: &OptimisticTxKeyspace,
-        ) -> DomainResult<Vec<String>> {
+        let _restore_guard = self.restore_lock.write().unwrap();
+        fn drain(tx: &OptimisticWriteTx, ks: &OptimisticTxKeyspace) -> DomainResult<Vec<String>> {
             let mut keys = Vec::new();
-            for kv in snapshot.iter(ks) {
+            for kv in tx.iter(ks) {
                 let (k, _) = kv
                     .into_inner()
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
@@ -1481,60 +1830,129 @@ impl CanonicalRepository {
             }
             Ok(keys)
         }
-        let read = self.db.read_tx();
-        let doomed: Vec<(&OptimisticTxKeyspace, Vec<String>)> = vec![
-            (&self.memories, drain(&read, &self.memories)?),
-            (&self.relations, drain(&read, &self.relations)?),
-            (&self.guides, drain(&read, &self.guides)?),
-            (&self.feedback_events, drain(&read, &self.feedback_events)?),
-            (&self.suggestions, drain(&read, &self.suggestions)?),
-        ];
-        drop(read);
         let mut tx = self
             .db
             .write_tx()
-            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        for (ks, keys) in &doomed {
-            for key in keys {
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            .durability(Some(PersistMode::SyncAll));
+        for ks in [
+            &self.memories,
+            &self.relations,
+            &self.guides,
+            &self.feedback_events,
+            &self.suggestions,
+            &self.aliases,
+            &self.receipts,
+            &self.namespaces,
+            &self.projections,
+        ] {
+            for key in drain(&tx, ks)? {
                 tx.remove(ks, key);
             }
         }
-        let mut put = |ks: &OptimisticTxKeyspace, key: String, raw: Vec<u8>| {
-            tx.insert(ks, &key, raw.as_slice());
-        };
+        let now = self.clock.now_millis();
         for m in memories {
             let raw = serde_json::to_vec(m)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            put(&self.memories, m.id.as_uuid().to_string(), raw);
+            tx.insert(&self.memories, m.id.as_uuid().to_string(), raw.as_slice());
+            if let Some(alias) = &m.external_alias {
+                tx.insert(
+                    &self.aliases,
+                    alias.as_str(),
+                    m.id.as_uuid().to_string().as_bytes(),
+                );
+            }
+            let job = crate::domain::projection::ProjectionJob {
+                memory_id: m.id,
+                desired_document_revision: m.document_revision,
+                seq: 1,
+                enqueued_at_millis: now,
+                is_tombstone: false,
+            };
+            let raw = serde_json::to_vec(&job)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(
+                &self.projections,
+                m.id.as_uuid().to_string(),
+                raw.as_slice(),
+            );
         }
         for r in relations {
             let raw = serde_json::to_vec(r)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            put(&self.relations, r.id.as_uuid().to_string(), raw);
+            tx.insert(&self.relations, r.id.as_uuid().to_string(), raw.as_slice());
         }
         for g in guides {
             let raw = serde_json::to_vec(g)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            put(&self.guides, g.name.to_lowercase(), raw);
+            tx.insert(&self.guides, g.name.to_lowercase(), raw.as_slice());
         }
         for f in feedback {
             let raw = serde_json::to_vec(f)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            put(
+            let event_id = f.id.as_uuid();
+            let event_bytes = event_id.as_bytes();
+            let mut op_bytes = [0u8; 16];
+            for (i, b) in event_bytes.iter().enumerate() {
+                op_bytes[i] = b ^ 0xF0;
+            }
+            let op_id = uuid::Uuid::from_bytes(op_bytes).to_string();
+            tx.insert(
                 &self.feedback_events,
-                format!("feedback:{}", f.id.as_uuid()),
-                raw,
+                format!("feedback:{op_id}"),
+                raw.as_slice(),
             );
         }
         for s in suggestions {
             let raw = serde_json::to_vec(s)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            put(&self.suggestions, s.id.to_string(), raw);
+            tx.insert(&self.suggestions, s.id.to_string(), raw.as_slice());
         }
+        for mut rec in self.read_generation_records(&tx)? {
+            if !matches!(rec.status, GenerationStatus::Retired) {
+                rec.status = GenerationStatus::Retired;
+                rec.updated_at_millis = now;
+                let raw = serde_json::to_vec(&rec)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                tx.insert(
+                    &self.generations,
+                    generation_key(rec.generation),
+                    raw.as_slice(),
+                );
+            }
+        }
+        let active = GenerationRecord {
+            generation: new_generation,
+            model_fingerprint: None,
+            status: GenerationStatus::Active,
+            desired_memories: memories.len() as u64,
+            projected_memories: 0,
+            updated_at_millis: now,
+            build_dirty: true,
+        };
+        let raw = serde_json::to_vec(&active)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.insert(
+            &self.generations,
+            generation_key(new_generation),
+            raw.as_slice(),
+        );
+        let meta = Self::keyspace(&self.db, "meta")?;
+        tx.insert(
+            &meta,
+            "store_generation",
+            new_generation.as_u64().to_le_bytes(),
+        );
         match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(DomainError::new(
-                DomainErrorCode::Validation,
+            Ok(Ok(())) => {
+                // Same barrier discipline as every other mutation-ACK path:
+                // the SyncAll commit above is durable, but without this the
+                // barrier fault hook cannot fire here and failures stay
+                // untestable. One redundant fsync on a rare op.
+                self.persist_barrier()?;
+                Ok(())
+            }
+            Ok(Err(_)) => Err(Self::exhausted_contention(
                 "restore replace conflicted with a concurrent write",
             )),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
@@ -1568,6 +1986,15 @@ fn receipt_key(
 
 fn namespace_key(frontend_id: FrontendId) -> String {
     format!("epoch:{}", frontend_id.as_uuid())
+}
+
+/// Mutation-watermark key for a writer: per-frontend for commands (no
+/// cross-frontend contention), shared for the direct-write primitives.
+fn op_seq_key(frontend: Option<FrontendId>) -> String {
+    match frontend {
+        Some(fe) => format!("op_seq:{}", fe.as_uuid()),
+        None => "op_seq:direct".to_string(),
+    }
 }
 
 fn ns_key(ns: &RetryNamespace) -> String {
@@ -2223,9 +2650,12 @@ mod tests {
         assert!(repo.generation_record(next).unwrap().unwrap().build_dirty);
     }
 
-    /// Confidence-only updates touch no indexed column: no new job, no dirty.
+    /// Confidence-only updates refresh the projection: confidence is a
+    /// filter-relevant projection column (source pre-filter), so a changed
+    /// confidence must re-publish — otherwise post-convergence drift
+    /// silently breaks eligibility. No content changed, so no build-dirty.
     #[test]
-    fn confidence_only_update_stays_clean() {
+    fn confidence_only_update_enqueues_refresh() {
         let (repo, _dir) = repo_with_ns();
         repo.apply(
             &ctx(1, "m1"),
@@ -2250,8 +2680,183 @@ mod tests {
         )
         .unwrap();
         let job = repo.projection_job(eid(1)).unwrap().unwrap();
-        assert_eq!(job.seq, seq_before, "confidence change enqueues nothing");
+        assert_eq!(
+            job.seq,
+            seq_before + 1,
+            "confidence change must refresh the projection"
+        );
         assert!(!repo.generation_record(next).unwrap().unwrap().build_dirty);
+        // Identical absolute value: no drift, no job.
+        let seq_after = repo.projection_job(eid(1)).unwrap().unwrap().seq;
+        repo.apply(
+            &ctx(3, "conf2"),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: None,
+                patch: crate::domain::command::MemoryPatch {
+                    confidence: Some(0.9),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo.projection_job(eid(1)).unwrap().unwrap().seq,
+            seq_after,
+            "identical confidence must enqueue nothing"
+        );
+    }
+
+    /// Feedback changes confidence: the projection must refresh so the
+    /// source pre-filter reads the adjusted value, not the converged one.
+    #[test]
+    fn feedback_enqueues_projection_refresh() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let seq_before = repo.projection_job(eid(1)).unwrap().unwrap().seq;
+        let mut c = ctx(2, "fb");
+        c.retry_epoch = 1;
+        repo.apply(
+            &c,
+            &DomainCommand::Feedback {
+                memory_id: eid(1),
+                useful: false,
+            },
+        )
+        .unwrap();
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert_eq!(
+            job.seq,
+            seq_before + 1,
+            "feedback confidence change must refresh the projection"
+        );
+    }
+
+    /// Read-side access bumps confidence (+0.015): same refresh rule —
+    /// micro-drift still flips threshold eligibility over time.
+    #[test]
+    fn access_enqueues_projection_refresh() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let seq_before = repo.projection_job(eid(1)).unwrap().unwrap().seq;
+        let mut c = ctx(2, "acc");
+        c.retry_epoch = 1;
+        repo.apply(
+            &c,
+            &DomainCommand::Access {
+                memory_ids: vec![eid(1)],
+                context: None,
+            },
+        )
+        .unwrap();
+        let job = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert_eq!(
+            job.seq,
+            seq_before + 1,
+            "access confidence change must refresh the projection"
+        );
+    }
+
+    /// Saturated clamps enqueue nothing on any hot path: at confidence
+    /// 1.0 a positive feedback/access/boost changes nothing, so no
+    /// refresh job is recorded.
+    #[test]
+    fn saturated_clamp_enqueues_nothing() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let mut top = repo.get_memories(&[eid(1)]).unwrap().remove(0);
+        top.confidence = 1.0;
+        repo.put_memory_direct(&top).unwrap();
+        let seq_before = repo.projection_job(eid(1)).unwrap().unwrap().seq;
+        let mut c = ctx(2, "fb");
+        c.retry_epoch = 1;
+        repo.apply(
+            &c,
+            &DomainCommand::Feedback {
+                memory_id: eid(1),
+                useful: true,
+            },
+        )
+        .unwrap();
+        let mut c = ctx(3, "acc");
+        c.retry_epoch = 1;
+        repo.apply(
+            &c,
+            &DomainCommand::Access {
+                memory_ids: vec![eid(1)],
+                context: None,
+            },
+        )
+        .unwrap();
+        let mut c = ctx(4, "boost");
+        c.retry_epoch = 1;
+        repo.apply(
+            &c,
+            &DomainCommand::BoostConfidence {
+                memory_ids: vec![eid(1)],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo.projection_job(eid(1)).unwrap().unwrap().seq,
+            seq_before,
+            "saturated clamps must enqueue nothing on any path"
+        );
+    }
+
+    /// Floor clamp likewise: at confidence 0.0 a negative feedback
+    /// changes nothing, so no refresh job is recorded.
+    #[test]
+    fn floor_clamp_enqueues_nothing() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "m1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m1"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let mut low = repo.get_memories(&[eid(1)]).unwrap().remove(0);
+        low.confidence = 0.0;
+        repo.put_memory_direct(&low).unwrap();
+        let seq_before = repo.projection_job(eid(1)).unwrap().unwrap().seq;
+        let mut c = ctx(2, "fb");
+        c.retry_epoch = 1;
+        repo.apply(
+            &c,
+            &DomainCommand::Feedback {
+                memory_id: eid(1),
+                useful: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            repo.projection_job(eid(1)).unwrap().unwrap().seq,
+            seq_before,
+            "floor clamp must enqueue nothing"
+        );
     }
 
     /// Pre-upgrade records without the flag decode as dirty (fail-closed):
@@ -2567,6 +3172,48 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// GC must remove EVERY receipt under an expired namespace: removing
+    /// while iterating the keyspace risks skipping entries (iterator
+    /// invalidation) and orphaning receipts no future GC re-triggers for.
+    #[test]
+    fn gc_expired_removes_all_receipts_under_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = std::sync::Arc::new(crate::domain::clock::FrozenClock::new(1000));
+        let repo =
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock).unwrap();
+        let fe = crate::domain::id::FrontendId::new(Uuid::from_u128(1));
+        let ns = repo.issue_namespace(fe, 1000).unwrap();
+
+        let mut ops = Vec::new();
+        for (i, op) in [(1u64, 10u64), (2, 11), (3, 12)] {
+            let mut c = ctx(op, &format!("d{op}"));
+            c.retry_epoch = ns.retry_epoch;
+            repo.apply(
+                &c,
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(i), "x"),
+                    session: None,
+                },
+            )
+            .unwrap();
+            ops.push(c.operation_id);
+        }
+
+        let removed = repo.gc_expired(ns.expires_at + 1).unwrap();
+        assert_eq!(
+            removed, 3,
+            "all three receipts must be removed, got {removed}"
+        );
+        for op in ops {
+            assert!(
+                repo.lookup_receipt(StoreGeneration::FIRST, fe, ns.retry_epoch, op)
+                    .unwrap()
+                    .is_none(),
+                "receipt {op:?} orphaned by GC"
+            );
+        }
     }
 
     #[test]
@@ -3220,5 +3867,813 @@ mod tests {
         let j = repo.projection_job(eid(1)).unwrap().unwrap();
         repo.acknowledge_projection(eid(1), j.seq).unwrap();
         assert_eq!(repo.oldest_pending_age_millis(1200).unwrap(), Some(200));
+    }
+
+    /// Merged results register aliases like added memories do: a duplicate
+    /// alias fails, a fresh alias resolves.
+    #[test]
+    fn merge_registers_alias_with_uniqueness() {
+        use crate::domain::id::ExternalAlias;
+        let (repo, _dir) = repo_with_ns();
+        let mut first = memory(eid(1), "first");
+        first.external_alias = Some(ExternalAlias::new("taken"));
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: first,
+                session: None,
+            },
+        )
+        .unwrap();
+        // Duplicate alias on merge fails instead of shadowing.
+        let mut dup = memory(eid(10), "merged-dup");
+        dup.external_alias = Some(ExternalAlias::new("taken"));
+        let err = repo
+            .apply(
+                &ctx(2, "d2"),
+                &DomainCommand::Merge {
+                    source_ids: vec![eid(1)],
+                    result: dup,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::DuplicateAlias
+        );
+        // Fresh alias registers and resolves.
+        let mut fresh = memory(eid(11), "merged-fresh");
+        fresh.external_alias = Some(ExternalAlias::new("fresh-alias"));
+        repo.apply(
+            &ctx(3, "d3"),
+            &DomainCommand::Merge {
+                source_ids: vec![eid(1)],
+                result: fresh,
+            },
+        )
+        .unwrap();
+        assert_eq!(repo.resolve_id("fresh-alias").unwrap(), eid(11));
+    }
+
+    /// Absolute-only writes still advance the entity revision (concurrent
+    /// same-expected writers conflict instead of last-writer-winning), and
+    /// non-live memories refuse content writes.
+    #[test]
+    fn absolute_writes_advance_revision_and_respect_lifecycle() {
+        use crate::domain::command::MemoryPatch;
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+        let rev = repo.get_memories(&[eid(1)]).unwrap()[0].entity_revision;
+        repo.apply(
+            &ctx(2, "d2"),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: Some(rev),
+                patch: MemoryPatch {
+                    confidence: Some(0.9),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        // Same expected revision twice: the second write conflicts.
+        let err = repo
+            .apply(
+                &ctx(3, "d3"),
+                &DomainCommand::UpdateMemory {
+                    id: eid(1),
+                    expected_revision: Some(rev),
+                    patch: MemoryPatch {
+                        confidence: Some(0.1),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::RevisionConflict
+        );
+        // Archived memories refuse content writes.
+        repo.apply(
+            &ctx(4, "d4"),
+            &DomainCommand::Forget {
+                id: eid(1),
+                mode: ForgetMode::Archive,
+            },
+        )
+        .unwrap();
+        let err = repo
+            .apply(
+                &ctx(5, "d5"),
+                &DomainCommand::UpdateMemory {
+                    id: eid(1),
+                    expected_revision: None,
+                    patch: MemoryPatch {
+                        confidence: Some(0.2),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::Validation
+        );
+    }
+
+    /// Relation ids are bound to their endpoints: reuse with different
+    /// endpoints fails instead of silently overwriting.
+    #[test]
+    fn relation_id_reuse_with_different_endpoints_fails() {
+        use crate::domain::memory::Instant;
+        let (repo, _dir) = repo_with_ns();
+        for (n, title) in [(1u64, "a"), (2, "b"), (3, "c")] {
+            repo.apply(
+                &ctx(n, &format!("d{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), title),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        let rel = Relation::new(
+            EntityId::new(uuid::Uuid::from_u128(100)),
+            eid(1),
+            eid(2),
+            RelationType::Supports,
+            None,
+            Instant::new(1000),
+        );
+        repo.apply(&ctx(10, "d10"), &DomainCommand::Relate { relation: rel })
+            .unwrap();
+        let moved = Relation::new(
+            EntityId::new(uuid::Uuid::from_u128(100)),
+            eid(1),
+            eid(3),
+            RelationType::Supports,
+            None,
+            Instant::new(1000),
+        );
+        let err = repo
+            .apply(&ctx(11, "d11"), &DomainCommand::Relate { relation: moved })
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::KeyReuseDifferentInput
+        );
+    }
+
+    /// Relation ids are bound to their full input: reuse with a different
+    /// note fails instead of silently overwriting the annotation.
+    #[test]
+    fn relation_id_reuse_with_different_note_fails() {
+        use crate::domain::memory::Instant;
+        let (repo, _dir) = repo_with_ns();
+        for (n, title) in [(1u64, "a"), (2, "b")] {
+            repo.apply(
+                &ctx(n, &format!("d{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), title),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        let rel = Relation::new(
+            EntityId::new(uuid::Uuid::from_u128(100)),
+            eid(1),
+            eid(2),
+            RelationType::Supports,
+            None,
+            Instant::new(1000),
+        );
+        repo.apply(&ctx(10, "d10"), &DomainCommand::Relate { relation: rel })
+            .unwrap();
+        // Same endpoints, different note: reject (an exact duplicate falls
+        // through to DuplicateEdge — unchanged pre-existing behavior).
+        let noted = Relation::new(
+            EntityId::new(uuid::Uuid::from_u128(100)),
+            eid(1),
+            eid(2),
+            RelationType::Supports,
+            Some("changed".to_string()),
+            Instant::new(1000),
+        );
+        let err = repo
+            .apply(&ctx(12, "d12"), &DomainCommand::Relate { relation: noted })
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::KeyReuseDifferentInput
+        );
+    }
+
+    /// Contention contract: under same-frontend concurrent issuance every
+    /// conflicting attempt must report transient Contention (retryable),
+    /// never a fatal Validation — and every issue still succeeds on retry
+    /// with a distinct epoch.
+    #[test]
+    fn namespace_contention_is_transient_typed() {
+        use crate::domain::id::FrontendId;
+        use std::sync::{Arc, Barrier};
+        let (repo, _dir) = repo_with_ns();
+        let repo = Arc::new(repo);
+        let fe = FrontendId::new(Uuid::from_u128(99));
+        let start = Arc::new(Barrier::new(9));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let repo = Arc::clone(&repo);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let mut epochs = Vec::new();
+                for _ in 0..25 {
+                    for _ in 0..20 {
+                        match repo.issue_namespace(fe, 1000) {
+                            Ok(ns) => {
+                                epochs.push(ns.retry_epoch);
+                                break;
+                            }
+                            Err(e) => assert_eq!(
+                                e.code,
+                                crate::domain::command::DomainErrorCode::Contention,
+                                "contention must be typed transient, got {e:?}"
+                            ),
+                        }
+                    }
+                }
+                epochs
+            }));
+        }
+        start.wait();
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        assert_eq!(all.len(), 200, "every issue must succeed after retries");
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 200, "epochs must be distinct");
+    }
+
+    /// A corrupt epoch counter fails closed (epoch reuse would confuse
+    /// replays across channels): short/long payloads at the epoch key are
+    /// Validation, never silently reset to epoch 1.
+    #[test]
+    fn corrupt_epoch_counter_fails_closed() {
+        use crate::domain::id::FrontendId;
+        let (repo, _dir) = repo_with_ns();
+        let fe = FrontendId::new(Uuid::from_u128(99));
+        let mut tx = repo.db.write_tx().unwrap();
+        tx.insert(&repo.namespaces, namespace_key(fe), [0xFFu8; 3]);
+        tx.commit().unwrap().unwrap();
+        let err = repo.issue_namespace(fe, 1000).unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation);
+        assert!(
+            err.message.contains("corrupt namespace epoch counter"),
+            "must name the corruption, got: {err:?}"
+        );
+    }
+
+    /// Undecodable namespace records are healed by GC: every reader fails
+    /// closed on them already, so removal changes no observable outcome
+    /// but stops the entry leaking forever past every GC pass. Their
+    /// orphaned receipts go too (no trigger could ever match them);
+    /// other frontends' receipts are untouched. Malformed watermark keys
+    /// heal the same way so op_seq un-bricks.
+    #[test]
+    fn gc_removes_corrupt_namespace_records() {
+        use crate::domain::id::FrontendId;
+        let (repo, _dir) = repo_with_ns();
+        let fe = FrontendId::new(Uuid::from_u128(1));
+        // Two receipted commands under fe1/epoch1.
+        for (n, op) in [(1u64, 10u64), (2, 11)] {
+            let mut c = ctx(op, &format!("d{op}"));
+            c.retry_epoch = 1;
+            repo.apply(
+                &c,
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), "x"),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        // Corrupt fe1's namespace record + the watermark, and plant a
+        // foreign-frontend receipt row (raw bytes: GC must not touch it).
+        let mut tx = repo.db.write_tx().unwrap();
+        let bad_ns = format!("ns:{}:1", fe.as_uuid());
+        tx.insert(&repo.namespaces, &bad_ns, [0xFFu8; 5]);
+        tx.insert(&repo.namespaces, "op_seq:direct", [0xFFu8; 3]);
+        let foreign_key = format!(
+            "1:ffffffff-ffff-ffff-ffff-ffffffffffff:9:{}",
+            Uuid::from_u128(77)
+        );
+        tx.insert(&repo.receipts, &foreign_key, [0xFFu8; 1]);
+        tx.commit().unwrap().unwrap();
+
+        repo.gc_expired(1000).unwrap();
+
+        let snapshot = repo.db.read_tx();
+        let get = |ks: &_, k: &str| snapshot.get(ks, k).unwrap().is_some();
+        assert!(!get(&repo.namespaces, &bad_ns), "corrupt ns healed");
+        assert!(!get(&repo.namespaces, "op_seq:direct"), "watermark healed");
+        assert!(
+            get(&repo.receipts, &foreign_key),
+            "foreign receipts untouched"
+        );
+        drop(snapshot);
+        // fe1's orphaned receipts went with the corrupt record.
+        for op in [10u64, 11] {
+            assert!(
+                repo.lookup_receipt(
+                    StoreGeneration::FIRST,
+                    fe,
+                    1,
+                    OperationId::new(Uuid::from_u128(op as u128))
+                )
+                .unwrap()
+                .is_none(),
+                "orphaned receipt must not leak"
+            );
+        }
+        // Watermark reads again: fe1's two executions.
+        assert_eq!(repo.op_seq().unwrap(), 2);
+    }
+
+    /// Corrupt healing is epoch-scoped, not frontend-scoped: a corrupt
+    /// epoch-1 record must not take down live epoch-2 receipts (RQ-06
+    /// replay for the live epoch keeps working).
+    #[test]
+    fn gc_corrupt_healing_preserves_live_epochs() {
+        use crate::domain::id::FrontendId;
+        let (repo, _dir) = repo_with_ns();
+        let fe = FrontendId::new(Uuid::from_u128(1));
+        let mut c = ctx(10, "d10");
+        c.retry_epoch = 1;
+        repo.apply(
+            &c,
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "x"),
+                session: None,
+            },
+        )
+        .unwrap();
+        // Second epoch, live: must survive the healing below.
+        let ns2 = repo.issue_namespace(fe, 1000).unwrap();
+        assert_eq!(ns2.retry_epoch, 2);
+        let mut c2 = ctx(11, "d11");
+        c2.retry_epoch = 2;
+        repo.apply(
+            &c2,
+            &DomainCommand::AddMemory {
+                memory: memory(eid(2), "x"),
+                session: None,
+            },
+        )
+        .unwrap();
+        // Corrupt epoch 1's record only.
+        let mut tx = repo.db.write_tx().unwrap();
+        tx.insert(
+            &repo.namespaces,
+            format!("ns:{}:1", fe.as_uuid()),
+            [0xFFu8; 5],
+        );
+        tx.commit().unwrap().unwrap();
+
+        repo.gc_expired(1000).unwrap();
+
+        assert!(
+            repo.lookup_receipt(
+                StoreGeneration::FIRST,
+                fe,
+                1,
+                OperationId::new(Uuid::from_u128(10))
+            )
+            .unwrap()
+            .is_none(),
+            "corrupt epoch's receipt goes with it"
+        );
+        assert!(
+            repo.lookup_receipt(
+                StoreGeneration::FIRST,
+                fe,
+                2,
+                OperationId::new(Uuid::from_u128(11))
+            )
+            .unwrap()
+            .is_some(),
+            "live epoch's receipt must survive healing"
+        );
+        assert!(
+            repo.lookup_namespace(fe, 2).unwrap().is_some(),
+            "live epoch's namespace must survive healing"
+        );
+    }
+
+    /// The epoch counter cannot wrap: u64::MAX advances fail closed
+    /// instead of panicking (debug) or reusing epoch 0 (release).
+    #[test]
+    fn epoch_counter_overflow_fails_closed() {
+        use crate::domain::id::FrontendId;
+        let (repo, _dir) = repo_with_ns();
+        let fe = FrontendId::new(Uuid::from_u128(99));
+        let mut tx = repo.db.write_tx().unwrap();
+        tx.insert(&repo.namespaces, namespace_key(fe), u64::MAX.to_le_bytes());
+        tx.commit().unwrap().unwrap();
+        let err = repo.issue_namespace(fe, 1000).unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation);
+    }
+
+    /// Mutation watermark: every executed command advances op_seq
+    /// atomically with its receipt (restore preview/confirm binding).
+    /// Replays record nothing and advance nothing.
+    #[test]
+    fn op_seq_advances_per_execution_not_replay() {
+        let (repo, _dir) = repo_with_ns();
+        assert_eq!(repo.op_seq().unwrap(), 0);
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(repo.op_seq().unwrap(), 1);
+        repo.apply(
+            &ctx(2, "d2"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(2), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(repo.op_seq().unwrap(), 2);
+        // Same operation key + digest replays: no new execution, no advance.
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(repo.op_seq().unwrap(), 2);
+    }
+
+    /// Direct-write primitives advance the watermark too: guide/distill
+    /// writes bypass the command bus, but a restore must still count them.
+    #[test]
+    fn op_seq_counts_direct_writes() {
+        use crate::domain::guide::Guide;
+        use crate::domain::memory::Instant;
+        let (repo, _dir) = repo_with_ns();
+        assert_eq!(repo.op_seq().unwrap(), 0);
+        repo.put_guide(&Guide {
+            name: "g".into(),
+            category: "c".into(),
+            description: String::new(),
+            contexts: vec![],
+            learnings: vec![],
+            usage_count: 0,
+            last_used: None,
+            success_count: 0,
+            failure_count: 0,
+            anti_patterns: vec![],
+            pitfalls: vec![],
+            depends_on: vec![],
+            enables: vec![],
+            source_memories: vec![],
+            validated_by: vec![],
+            superseded_by: None,
+            deprecated: false,
+            entity_revision: crate::domain::id::EntityRevision::new(1),
+            created_at: Instant::new(0),
+            updated_at: Instant::new(0),
+        })
+        .unwrap();
+        assert_eq!(repo.op_seq().unwrap(), 1);
+        // The watermark sums across writer keys (per-frontend + direct):
+        // a command execution lands on top.
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(repo.op_seq().unwrap(), 2);
+    }
+
+    /// Lookalike keys do not pollute the watermark: only `op_seq:`-prefixed
+    /// counters sum (tight prefix, no decoys).
+    #[test]
+    fn op_seq_ignores_lookalike_keys() {
+        let (repo, _dir) = repo_with_ns();
+        let mut tx = repo.db.write_tx().unwrap();
+        tx.insert(&repo.namespaces, "op_seq_backup", 100u64.to_le_bytes());
+        tx.insert(&repo.namespaces, "op_seqx", 100u64.to_le_bytes());
+        tx.commit().unwrap().unwrap();
+        assert_eq!(
+            repo.op_seq().unwrap(),
+            0,
+            "decoy keys must not enter the sum"
+        );
+        // Empty suffix and nested colons: only exact `op_seq:`-prefixed
+        // counters sum; anything else is ignored, never failed closed.
+        let mut tx = repo.db.write_tx().unwrap();
+        tx.insert(&repo.namespaces, "op_seq:", 5u64.to_le_bytes());
+        tx.insert(&repo.namespaces, "op_seq:direct:extra", 7u64.to_le_bytes());
+        tx.commit().unwrap().unwrap();
+        assert_eq!(
+            repo.op_seq().unwrap(),
+            12,
+            "op_seq:-prefixed counters sum regardless of suffix shape"
+        );
+    }
+
+    /// Same-frontend parallel writes share one watermark key: disjoint
+    /// memories must all commit via the standard retry discipline (no
+    /// spurious exhaustion), each advancing the watermark exactly once.
+    /// Retry dynamics proven here; the transient typing of any residual
+    /// exhaustion is pinned by `exhaustion_reports_transient_contention`
+    /// (conflicts are too rare here to assert their code deterministically).
+    #[test]
+    fn concurrent_same_frontend_writes_all_commit() {
+        use std::sync::{Arc, Barrier};
+        let (repo, _dir) = repo_with_ns();
+        let repo = Arc::new(repo);
+        let start = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let repo = Arc::clone(&repo);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let mut done = 0;
+                for i in 0..10u64 {
+                    let n = t * 100 + i + 10;
+                    // Retry on conflicts (shared watermark key discipline);
+                    // exhaustion would be the bug.
+                    for _ in 0..20 {
+                        let r = repo.apply(
+                            &ctx(t * 1000 + i, &format!("c{t}-{i}")),
+                            &DomainCommand::AddMemory {
+                                memory: memory(eid(n), "x"),
+                                session: None,
+                            },
+                        );
+                        if r.is_ok() {
+                            done += 1;
+                            break;
+                        }
+                    }
+                }
+                done
+            }));
+        }
+        start.wait();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 40, "every parallel write must commit after retries");
+        assert_eq!(repo.op_seq().unwrap(), 40);
+        // Safety, not just liveness: every disjoint commit persisted.
+        let live: std::collections::BTreeSet<u128> = repo
+            .export_full()
+            .unwrap()
+            .memories
+            .iter()
+            .map(|m| m.id.as_uuid().as_u128())
+            .collect();
+        for t in 0..4u64 {
+            for i in 0..10u64 {
+                let n = t * 100 + i + 10;
+                assert!(
+                    live.contains(&(n as u128)),
+                    "disjoint commit {n} lost despite Ok"
+                );
+            }
+        }
+    }
+
+    /// SSI exhaustion is transient, never fatal: every write path that
+    /// runs out of conflict budget reports Contention (safe to retry)
+    /// instead of Validation (refuse). Pinned here; retry dynamics are
+    /// proven by the concurrent tests.
+    #[test]
+    fn exhaustion_reports_transient_contention() {
+        let err = CanonicalRepository::exhausted_contention("probe op");
+        assert_eq!(err.code, DomainErrorCode::Contention);
+        assert!(
+            err.message.contains("probe op"),
+            "site message preserved, got: {err:?}"
+        );
+    }
+
+    /// End-to-end exhaustion typing: hammered parallel applies on one
+    /// frontend collide on the shared watermark key; whatever conflicts
+    /// surface must be transient Contention, never fatal Validation.
+    /// (Conflicts are scheduled by the engine, so the kind assertion is
+    /// opportunistic — the constructor test pins the mapping
+    /// deterministically; all 200 commits succeeding proves liveness.)
+    #[test]
+    fn exhausted_apply_reports_transient_contention() {
+        use std::sync::{Arc, Barrier};
+        let (repo, _dir) = repo_with_ns();
+        let repo = Arc::new(repo);
+        let start = Arc::new(Barrier::new(9));
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let repo = Arc::clone(&repo);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let mut done = 0;
+                for i in 0..25u64 {
+                    let n = t * 100 + i + 10;
+                    for _ in 0..20 {
+                        match repo.apply(
+                            &ctx(t * 1000 + i, &format!("e{t}-{i}")),
+                            &DomainCommand::AddMemory {
+                                memory: memory(eid(n), "x"),
+                                session: None,
+                            },
+                        ) {
+                            Ok(_) => {
+                                done += 1;
+                                break;
+                            }
+                            Err(e) => assert_eq!(
+                                e.code,
+                                DomainErrorCode::Contention,
+                                "contention must be typed transient, got {e:?}"
+                            ),
+                        }
+                    }
+                }
+                done
+            }));
+        }
+        start.wait();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 200, "every hammered write must commit after retries");
+        assert_eq!(repo.op_seq().unwrap(), 200);
+    }
+
+    /// Feedback survives a backup/restore round trip under a stable key
+    /// (no silent re-keying, no double-recording on replay).
+    #[test]
+    fn feedback_survives_restore_round_trip() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+        repo.apply(
+            &ctx(2, "d2"),
+            &DomainCommand::Feedback {
+                memory_id: eid(1),
+                useful: true,
+            },
+        )
+        .unwrap();
+        let before = repo.export_full().unwrap().feedback;
+        assert_eq!(before.len(), 1);
+        let snapshot = repo.export_full().unwrap();
+        repo.restore_replace(
+            &snapshot.memories,
+            &snapshot.relations,
+            &snapshot.guides,
+            &snapshot.feedback,
+            &snapshot.suggestions,
+            StoreGeneration::new(2),
+        )
+        .unwrap();
+        let after = repo.export_full().unwrap().feedback;
+        assert_eq!(after, before, "feedback must round-trip identically");
+    }
+
+    /// No ACK without a barrier: an injected persist failure must fail the
+    /// command (not silently succeed with buffered-only data).
+    #[test]
+    fn ack_requires_durability_barrier() {
+        let (repo, _dir) = repo_with_ns();
+        repo.fault_injector().set_persist_failures(1);
+        let err = repo
+            .apply(
+                &ctx(1, "d1"),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(1), "m"),
+                    session: None,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "barrier failure must fail the ACK, got: {err:?}"
+        );
+        // Counter consumed: the retry succeeds and the write is real.
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "m"),
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(repo.get_memories(&[eid(1)]).unwrap().len(), 1);
+    }
+
+    /// The restore path honors the same barrier: an injected persist
+    /// failure fails the replace instead of reporting a durable cutover
+    /// on buffered-only data.
+    #[test]
+    fn restore_replace_requires_durability_barrier() {
+        let (repo, _dir) = repo_with_ns();
+        repo.fault_injector().set_persist_failures(1);
+        let err = repo
+            .restore_replace(&[], &[], &[], &[], &[], StoreGeneration::new(2))
+            .unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "barrier failure must fail the restore, got: {err:?}"
+        );
+    }
+
+    /// Direct writes ACK through the same barrier.
+    #[test]
+    fn direct_write_requires_durability_barrier() {
+        let (repo, _dir) = repo_with_ns();
+        repo.fault_injector().set_persist_failures(1);
+        let err = repo.put_memory_direct(&memory(eid(9), "x")).unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "barrier failure must fail the write, got: {err:?}"
+        );
+    }
+
+    /// Concurrent issuance for one frontend must yield distinct epochs
+    /// (shared retry namespace would confuse replays across channels).
+    #[test]
+    fn concurrent_namespace_issue_yields_distinct_epochs() {
+        use std::sync::{Arc, Barrier};
+        let (repo, _dir) = repo_with_ns();
+        let repo = std::sync::Arc::new(repo);
+        let fe = crate::domain::id::FrontendId::new(uuid::Uuid::from_u128(99));
+        let start = Arc::new(Barrier::new(9));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let repo = Arc::clone(&repo);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let mut epochs = Vec::new();
+                for _ in 0..50 {
+                    // Retry on conflicts (concurrent issuance discipline);
+                    // duplicates are the bug, conflicts are not.
+                    for _ in 0..20 {
+                        match repo.issue_namespace(fe, 1000) {
+                            Ok(ns) => {
+                                epochs.push(ns.retry_epoch);
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                }
+                epochs
+            }));
+        }
+        start.wait();
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        assert_eq!(all.len(), 400, "every issue must succeed after retries");
+        all.sort_unstable();
+        let distinct: Vec<u64> = {
+            let mut d = all.clone();
+            d.dedup();
+            d
+        };
+        assert_eq!(
+            distinct.len(),
+            400,
+            "epochs must be distinct (double-issue reuses an epoch)"
+        );
     }
 }

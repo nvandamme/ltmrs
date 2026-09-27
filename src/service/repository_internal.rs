@@ -184,6 +184,10 @@ impl<'a> CommandState<'a> {
     /// with the mutation, so activation can never observe the write without
     /// observing the flag. No pipeline open means no records touched.
     fn mark_build_dirty(&mut self) -> DomainResult<()> {
+        // Collect before writing (same rule as restore_replace/gc_expired):
+        // inserting while iterating the same keyspace risks skipping
+        // entries on iterators without snapshot isolation.
+        let mut dirty = Vec::new();
         for kv in self.tx.iter(self.generations) {
             let (k, v) = kv
                 .into_inner()
@@ -196,8 +200,11 @@ impl<'a> CommandState<'a> {
             {
                 rec.build_dirty = true;
                 let raw = encode(&rec)?;
-                self.tx.insert(self.generations, k, &raw);
+                dirty.push((k, raw));
             }
+        }
+        for (k, raw) in dirty {
+            self.tx.insert(self.generations, k, &raw);
         }
         Ok(())
     }
@@ -326,6 +333,17 @@ fn apply_update_memory(
         .get_memory(id)?
         .ok_or_else(|| DomainError::new(DomainErrorCode::NotFound, "memory not found"))?;
 
+    if !matches!(memory.lifecycle, MemoryLifecycle::Live) {
+        return Err(DomainError::new(
+            DomainErrorCode::Validation,
+            "memory is not live",
+        ));
+    }
+
+    // Pre-patch confidence: the refresh rule below compares against it so
+    // no-op writes (identical absolute values) enqueue nothing.
+    let old_confidence = memory.confidence;
+
     if let Some(expected) = expected_revision
         && memory.entity_revision != expected
     {
@@ -373,6 +391,12 @@ fn apply_update_memory(
 
     if content_changed {
         memory.advance_document();
+    } else {
+        // Absolute-only writes (confidence, tags, evidence) still advance
+        // the entity revision: concurrent writers holding the same expected
+        // revision must conflict instead of silently last-writer-winning.
+        // The document revision stays put (nothing to re-project).
+        memory.entity_revision = memory.entity_revision.next();
     }
 
     state.put_memory(&memory)?;
@@ -383,6 +407,16 @@ fn apply_update_memory(
         state.record_pending_projection(id, now)?;
         // The projected set changed: any open build must be refreshed.
         state.mark_build_dirty()?;
+    } else if patch.confidence.is_some_and(|c| c != old_confidence) {
+        // Confidence is a filter-relevant projection column (source
+        // pre-filter): a changed confidence must re-publish, or
+        // post-convergence drift silently breaks eligibility. The document
+        // revision stays put (no re-chunking); the set is unchanged, so no
+        // build-dirty. (Unlike feedback/access/boost there is no clamp
+        // here: absolute writes store raw, so only identical values skip.)
+        // Jobs coalesce per memory, bounding hot-path churn.
+        let now = state.now_millis;
+        state.record_pending_projection(id, now)?;
     }
     Ok(ReceiptOutcome::Success { affected: vec![id] })
 }
@@ -396,6 +430,7 @@ fn apply_feedback(
     let mut memory = state
         .get_memory(memory_id)?
         .ok_or_else(|| DomainError::new(DomainErrorCode::NotFound, "memory not found"))?;
+    let old_confidence = memory.confidence;
 
     // Domain state: the observable counters and confidence are the
     // compatibility-visible effects, persisted atomically with the command.
@@ -413,6 +448,13 @@ fn apply_feedback(
         memory.confidence = (memory.confidence - 0.02).max(0.0);
     }
     state.put_memory(&memory)?;
+
+    // Feedback moves confidence: refresh the projection so the source
+    // pre-filter reads the adjusted value (same rule as absolute writes).
+    // Saturated clamps that change nothing enqueue nothing.
+    if memory.confidence != old_confidence {
+        state.record_pending_projection(memory_id, state.now_millis)?;
+    }
 
     // Diagnostic telemetry: the feedback event log is separate from domain
     // state. One logical feedback produces exactly one event, keyed by the
@@ -450,6 +492,7 @@ fn apply_access(
         if let Some(mut memory) = state.get_memory(*id)? {
             // Contract-visible read side effects (upstream boostOnAccess):
             // confidence +0.015, access_count +1, last_accessed_at, context tag.
+            let old_confidence = memory.confidence;
             memory.confidence = (memory.confidence + 0.015).min(1.0);
             memory.access_count += 1;
             memory.last_accessed_at = Some(Instant::new(now));
@@ -461,6 +504,15 @@ fn apply_access(
                 memory.tags.push(tag);
             }
             state.put_memory(&memory)?;
+            // Read-side confidence bump: refresh the projection (same rule).
+            // Saturated clamps that change nothing enqueue nothing.
+            // Disclosed loop: reads enqueue jobs, so projection_lag > 0
+            // makes the next retrieval report partial=true until the worker
+            // passes. Conservative (never claims false completeness) and
+            // self-healing; jobs coalesce per memory.
+            if memory.confidence != old_confidence {
+                state.record_pending_projection(*id, now)?;
+            }
             affected.push(*id);
         }
     }
@@ -477,10 +529,18 @@ fn apply_boost_confidence(
     let mut affected = Vec::new();
     for id in memory_ids {
         if let Some(mut memory) = state.get_memory(*id)? {
+            let old_confidence = memory.confidence;
+            // Upstream boostConfidence is +0.02 (oracle + tools agree); the
+            // +0.015 here was a transcription slip from boostOnAccess.
             memory.confidence = (memory.confidence + 0.02).min(1.0);
             memory.access_count += 1;
             memory.last_accessed_at = Some(Instant::new(now));
             state.put_memory(&memory)?;
+            // Confidence bump: refresh the projection (same rule).
+            // Saturated clamps that change nothing enqueue nothing.
+            if memory.confidence != old_confidence {
+                state.record_pending_projection(*id, now)?;
+            }
             affected.push(*id);
         }
     }
@@ -488,6 +548,25 @@ fn apply_boost_confidence(
 }
 
 fn apply_relate(state: &mut CommandState<'_>, relation: &Relation) -> DomainResult<ReceiptOutcome> {
+    // Relation ids are bound to their full input: reusing an id with any
+    // divergence (endpoints, type, note, timestamp) fails instead of
+    // silently overwriting. An exact duplicate still falls through to the
+    // edge validator (DuplicateEdge) — unchanged pre-existing behavior.
+    if let Some(existing) = state
+        .get_all_relations()?
+        .into_iter()
+        .find(|r| r.id == relation.id)
+        && (existing.source != relation.source
+            || existing.target != relation.target
+            || existing.relation_type != relation.relation_type
+            || existing.note != relation.note
+            || existing.created_at != relation.created_at)
+    {
+        return Err(DomainError::new(
+            DomainErrorCode::KeyReuseDifferentInput,
+            "relation id reused with different input",
+        ));
+    }
     let relations = state.get_all_relations()?;
     let live_memory_ids = |id: EntityId| -> bool {
         state
@@ -545,6 +624,14 @@ fn apply_merge(
             "result memory already exists",
         ));
     }
+    if let Some(alias) = &result.external_alias
+        && state.alias_exists(alias)?
+    {
+        return Err(DomainError::new(
+            DomainErrorCode::DuplicateAlias,
+            "alias already in use",
+        ));
+    }
 
     let now = Instant::new(0);
     let mut affected = Vec::new();
@@ -560,6 +647,9 @@ fn apply_merge(
     let mut result = result.clone();
     result.entity_revision = EntityRevision::new(result.entity_revision.as_u64() + 1);
     state.put_memory(&result)?;
+    if let Some(alias) = &result.external_alias {
+        state.put_alias(alias, result.id)?;
+    }
     affected.push(result.id);
 
     // Merge write set, pending-work half (design §5.3 Merge row also lists

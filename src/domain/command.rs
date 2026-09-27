@@ -232,6 +232,11 @@ pub enum DomainErrorCode {
     StaleReplay,
     KeyReuseDifferentInput,
     OutOfScope,
+    StaleGeneration,
+    /// Transient write contention (SSI conflict budget exhausted): safe to
+    /// retry, never a validation of the request itself. Kept distinct from
+    /// Validation so callers (handshake) can retry instead of refusing.
+    Contention,
     Validation,
 }
 
@@ -248,6 +253,8 @@ impl DomainErrorCode {
             DomainErrorCode::StaleReplay => "stale_replay",
             DomainErrorCode::KeyReuseDifferentInput => "key_reuse_different_input",
             DomainErrorCode::OutOfScope => "out_of_scope",
+            DomainErrorCode::StaleGeneration => "stale_generation",
+            DomainErrorCode::Contention => "contention",
             DomainErrorCode::Validation => "validation",
         }
     }
@@ -264,6 +271,8 @@ impl DomainErrorCode {
             "stale_replay" => DomainErrorCode::StaleReplay,
             "key_reuse_different_input" => DomainErrorCode::KeyReuseDifferentInput,
             "out_of_scope" => DomainErrorCode::OutOfScope,
+            "stale_generation" => DomainErrorCode::StaleGeneration,
+            "contention" => DomainErrorCode::Contention,
             _ => DomainErrorCode::Validation,
         }
     }

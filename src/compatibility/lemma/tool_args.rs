@@ -111,6 +111,9 @@ impl ToolName {
             "conflict_scan" => Self::ConflictScan,
             "proactive_analysis" => Self::ProactiveAnalysis,
             "project_analytics" => Self::ProjectAnalytics,
+            "backup_create" => Self::BackupCreate,
+            "backup_preview" => Self::BackupPreview,
+            "backup_restore" => Self::BackupRestore,
             _ => return None,
         })
     }
@@ -269,7 +272,10 @@ pub struct SemanticSearchArgs {
     pub project: Option<String>,
     pub top_k: Option<usize>,
     pub offset: Option<usize>,
-    pub hybrid: bool,
+    /// Hybrid dense+lexical retrieval. None (absent) means hybrid when a
+    /// backend is attached (current default); Some(false) forces
+    /// lexical-only (upstream parity on demand); Some(true) is hybrid.
+    pub hybrid: Option<bool>,
     pub explain: bool,
     pub response_format: Option<ResponseFormat>,
 }
@@ -474,5 +480,40 @@ impl ToolArgs {
             Self::BackupPreview(_) => ToolName::BackupPreview,
             Self::BackupRestore(_) => ToolName::BackupRestore,
         }
+    }
+}
+
+/// Canonical project key: trimmed + lowercased, path collapsed to basename.
+/// "global" (case-insensitive) maps to None. Applied at the parse boundary
+/// so reads and writes meet on the same form; idempotent.
+pub fn normalize_project(raw: &str) -> Option<String> {
+    let mut p = raw.trim().to_string();
+    if p.is_empty() {
+        return None;
+    }
+    p = p.replace('\\', "/");
+    p = p.trim_end_matches('/').to_string();
+    if p.contains('/') {
+        p = p.rsplit('/').next().unwrap_or("").to_string();
+    }
+    p = p.trim().to_lowercase();
+    if p.is_empty() || p == "global" {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_project_canonicalizes() {
+        assert_eq!(normalize_project("  MyProj/ "), Some("myproj".to_string()));
+        assert_eq!(normalize_project("a\\b\\Work"), Some("work".to_string()));
+        assert_eq!(normalize_project("global"), None);
+        assert_eq!(normalize_project("  "), None);
+        assert_eq!(normalize_project("Home"), Some("home".to_string()));
     }
 }
