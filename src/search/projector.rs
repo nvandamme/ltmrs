@@ -40,13 +40,7 @@ pub trait Embedder: Send {
     /// stays model-bound while the version attributes each row to the policy
     /// that produced it.
     fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
-        let text = render_text(title, fragment);
-        let len = text.len() as u64;
-        vec![TextChunk {
-            text,
-            char_start: 0,
-            char_end: len,
-        }]
+        vec![single_chunk_unit(title, fragment)]
     }
 
     /// Chunking-policy version stamped on every projected row. Bump whenever
@@ -58,6 +52,19 @@ pub trait Embedder: Send {
 
 /// Version stamped by the default single-unit chunking policy.
 pub const SINGLE_CHUNK_VERSION: &str = "single-chunk-v1";
+
+/// The default single chunking unit: the whole rendered text. Shared by the
+/// `Embedder` default and degraded-mode fallbacks so a memory is never
+/// silently dropped when chunking is unavailable.
+pub fn single_chunk_unit(title: &str, fragment: &str) -> TextChunk {
+    let text = render_text(title, fragment);
+    let len = text.len() as u64;
+    TextChunk {
+        text,
+        char_start: 0,
+        char_end: len,
+    }
+}
 
 /// One embeddable unit of a memory: the row's lexical text plus the evidence
 /// span of its matched content in rendered-text coordinates
@@ -161,6 +168,30 @@ impl Projector {
             generation,
             guards: PublicationGuards::default(),
         }
+    }
+
+    /// One-shot production drive: project all pending jobs with the given
+    /// embedder under the E5 fingerprint at the repo's current generation.
+    /// Reading the generation fresh on every call means a generation
+    /// cutover can never strand a stale projector refusing publishes.
+    /// Returns jobs fully resolved (published or tombstoned); embed
+    /// failures stay pending for the next drive.
+    pub async fn project_pending(
+        repo: &Arc<crate::service::repository::CanonicalRepository>,
+        table: &SearchTable,
+        embedder: Box<dyn Embedder>,
+    ) -> DomainResult<usize> {
+        use crate::embeddings::e5_small::E5_SMALL_FINGERPRINT;
+
+        let generation = repo.store_generation()?;
+        let mut projector = Projector::new(
+            Arc::clone(repo),
+            table.clone(),
+            embedder,
+            E5_SMALL_FINGERPRINT,
+            generation,
+        );
+        projector.run_until_idle().await
     }
 
     /// Process one durable job end-to-end (design §8.2 steps 1-6).
@@ -1634,5 +1665,82 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(table.count_rows(None).await.unwrap(), 1);
+    }
+
+    /// Deterministic fake for the drive seam: constant vectors sized by
+    /// input length; `fail` makes every embed error.
+    struct VecFake {
+        dim: usize,
+        fail: bool,
+    }
+
+    impl Embedder for VecFake {
+        fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+            if self.fail {
+                return Err("fake embedder stalled".into());
+            }
+            Ok(vec![text.len() as f32; self.dim])
+        }
+    }
+
+    /// One-shot production drive: pending jobs project with the given
+    /// embedder under the E5 fingerprint, and jobs acknowledge.
+    #[tokio::test]
+    async fn project_pending_publishes_dense_rows() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "hello", "world");
+        assert_eq!(
+            Projector::project_pending(
+                &repo,
+                &table,
+                Box::new(VecFake {
+                    dim: 384,
+                    fail: false
+                })
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        // Job acknowledged, and the row carries the E5 fingerprint + vector.
+        assert!(!repo.has_pending_projection(eid(1)).unwrap());
+        let rows = table.rows_where("embedding IS NOT NULL").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].model_fingerprint,
+            crate::embeddings::e5_small::E5_SMALL_FINGERPRINT
+        );
+        assert_eq!(rows[0].embedding.as_ref().unwrap().len(), 384);
+    }
+
+    /// A stalled embedder resolves nothing but still publishes lexical rows:
+    /// the job stays pending for the next pass (retry), never lost.
+    #[tokio::test]
+    async fn project_pending_leaves_semantic_retry_on_embed_failure() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "hello", "world");
+        assert_eq!(
+            Projector::project_pending(
+                &repo,
+                &table,
+                Box::new(VecFake {
+                    dim: 384,
+                    fail: true
+                })
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        // Nothing acknowledged, but the lexical row is searchable.
+        assert!(repo.has_pending_projection(eid(1)).unwrap());
+        assert_eq!(table.count_rows(None).await.unwrap(), 1);
+        assert!(
+            table
+                .rows_where("embedding IS NOT NULL")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

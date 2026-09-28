@@ -108,8 +108,7 @@ impl E5SmallAdapter {
         Self::load_verified(&cache.load_cached(&artifact)?)
     }
 
-    /// Explicit fetch + verify, then load (online mode).
-    #[allow(dead_code)] // used by CLI/daemon wiring in later WPs
+    /// Explicit fetch + verify, then load (online mode; `--provision-models`).
     pub async fn fetch_and_load(
         cache: &ArtifactCache,
         client: Option<&HttpClient>,

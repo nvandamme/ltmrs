@@ -355,6 +355,19 @@ impl SearchTable {
         Ok(())
     }
 
+    /// Idempotent production ensure: builds the FTS index when absent
+    /// (returns true), skips when present (false). The index covers rows
+    /// appended after creation, so no rebuild watermark is needed — build
+    /// once, serve forever. A build failure errors loudly for the
+    /// caller's retry policy (derived state is always recoverable).
+    pub async fn ensure_fts_index(&self) -> DomainResult<bool> {
+        if self.fts_index_ready().await? {
+            return Ok(false);
+        }
+        self.create_fts_index().await?;
+        Ok(true)
+    }
+
     /// Create scalar indexes (BTree) over the identity/scope columns.
     pub async fn create_scalar_indexes(&self) -> DomainResult<()> {
         use lancedb::index::{Index, scalar::BTreeIndexBuilder};
@@ -831,6 +844,84 @@ mod tests {
             .unwrap();
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].memory_id, eid(2));
+    }
+
+    /// FTS freshness contract: does the index cover rows appended AFTER
+    /// creation? The production rebuild policy depends on the answer.
+    #[tokio::test]
+    async fn fts_index_covers_rows_appended_after_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let tbl = SearchTable::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        tbl.publish_rows(&[row(1, "alpha onlyonce", 0, None)])
+            .await
+            .unwrap();
+        tbl.create_fts_index().await.unwrap();
+        tbl.publish_rows(&[row(2, "beta onlytwice", 0, None)])
+            .await
+            .unwrap();
+        let hits = tbl.fts_query("onlytwice", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "FTS must cover post-creation rows");
+        assert_eq!(hits[0].memory_id, eid(2));
+    }
+
+    /// FTS rebuild contract: creating the index twice must succeed (the
+    /// production policy rebuilds after new writes).
+    #[tokio::test]
+    async fn fts_index_recreation_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let tbl = SearchTable::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        tbl.publish_rows(&[row(1, "alpha onlyonce", 0, None)])
+            .await
+            .unwrap();
+        tbl.create_fts_index().await.unwrap();
+        tbl.create_fts_index().await.unwrap();
+        let hits = tbl.fts_query("onlyonce", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// Idempotent ensure: builds the FTS index on first call (true),
+    /// skips when already present (false) — never a wasteful rebuild.
+    #[tokio::test]
+    async fn ensure_fts_index_builds_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let tbl = SearchTable::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(!tbl.fts_index_ready().await.unwrap());
+        assert!(tbl.ensure_fts_index().await.unwrap(), "first call builds");
+        assert!(tbl.fts_index_ready().await.unwrap());
+        assert!(!tbl.ensure_fts_index().await.unwrap(), "second call skips");
+    }
+
+    /// Cross-handle reality: index metadata is snapshot-pinned (a live
+    /// handle does NOT observe a new index), but `refresh()` reopens to
+    /// the latest version and observes it. Production serving refreshes
+    /// per request; this pins the contract it relies on.
+    #[tokio::test]
+    async fn fts_index_visible_across_handles_after_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let a = SearchTable::open(uri).await.unwrap();
+        let mut b = SearchTable::open(uri).await.unwrap();
+        a.publish_rows(&[row(1, "alpha onlyonce", 0, None)])
+            .await
+            .unwrap();
+        a.create_fts_index().await.unwrap();
+        assert!(
+            !b.fts_index_ready().await.unwrap(),
+            "handles are snapshot-pinned"
+        );
+        b.refresh().await.unwrap();
+        assert!(
+            b.fts_index_ready().await.unwrap(),
+            "refresh observes the new index"
+        );
+        let hits = b.fts_query("onlyonce", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     /// The version column is appended last: positional reads depend on it,

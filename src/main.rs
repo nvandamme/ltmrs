@@ -5,7 +5,7 @@
 
 use ltmrs::cli::{
     CliError, Command, help_text, install_shim_command, install_skill_command, parse_args,
-    run_library, version_text,
+    provision_models_command, run_library, version_text,
 };
 use ltmrs::frontend::serve::serve_stdio;
 use ltmrs::visualizer::run_visualize;
@@ -58,6 +58,15 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
+        Ok(Command::ProvisionModels) => {
+            match provision_models_command(std::env::var("HOME").ok()).await {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(e) => fail(&e),
+            }
+        }
         Err(e) => fail(&e),
     };
     flush_stdout();

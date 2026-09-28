@@ -20,6 +20,8 @@ pub enum Command {
     InstallSkill,
     /// Install the opt-in legacy `lemma` executable shim.
     InstallShim,
+    /// Download + verify the pinned E5 embedding artifacts into the managed home.
+    ProvisionModels,
     /// Print help to stdout.
     Help,
     /// Print the version to stdout.
@@ -70,6 +72,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         Visualize,
         InstallSkill,
         InstallShim,
+        ProvisionModels,
     }
     let mut selected: Option<Selected> = None;
     let mut select = |next: Selected| -> Result<(), CliError> {
@@ -95,6 +98,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             "-vis" | "--visualize" => select(Selected::Visualize)?,
             "--install-skill" => select(Selected::InstallSkill)?,
             "--install-shim" => select(Selected::InstallShim)?,
+            "--provision-models" => select(Selected::ProvisionModels)?,
             "--fg" => foreground = true,
             "-p" | "--port" => {
                 let raw = args.next().ok_or_else(|| {
@@ -157,6 +161,14 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             }
             Ok(Command::InstallShim)
         }
+        Some(Selected::ProvisionModels) => {
+            if store.is_some() || socket.is_some() || foreground || port.is_some() {
+                return Err(CliError::Usage(
+                    "--provision-models takes no options".to_string(),
+                ));
+            }
+            Ok(Command::ProvisionModels)
+        }
         None => {
             if store.is_some() {
                 return Err(CliError::Usage(
@@ -206,6 +218,7 @@ Commands (default with no arguments: stdio):
   -vis, --visualize       Run the visualizer [--fg] [-p PORT | --port PORT]
   --install-skill         Install/update the managed skill
   --install-shim          Install the opt-in legacy `lemma` shim
+  --provision-models      Download + verify pinned E5 embedding artifacts
   -h, --help              Show this help
   -V, --version           Print the version
 
@@ -328,6 +341,50 @@ pub fn install_shim_command(home: Option<String>) -> Result<String, CliError> {
     Ok(out)
 }
 
+/// Download + verify the pinned E5 embedding artifacts into the managed
+/// home's models directory (`None`/empty = missing HOME). Existing files
+/// are re-verified, not re-downloaded; every digest must match or the
+/// provision fails loudly (no partial model left enabled — the daemon only
+/// enables dense when the full set verifies). Returns the human-readable
+/// result: artifact id + revision + verified file count.
+pub async fn provision_models_command(home: Option<String>) -> Result<String, CliError> {
+    use crate::embeddings::artifacts::{ArtifactCache, HttpClient};
+    use crate::embeddings::e5_small::E5SmallAdapter;
+    use crate::embeddings::manifest::{E5_SMALL_ID, E5_SMALL_REVISION, e5_small_artifact};
+
+    let home = home
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| CliError::Runtime("HOME is not set".to_string()))?;
+    let models = std::path::Path::new(&home)
+        .join(crate::frontend::serve::MANAGED_HOME_DIR)
+        .join(crate::frontend::serve::MODELS_DIR_NAME);
+    let cache = ArtifactCache::new(&models);
+    // Bound the whole operation: the default client has no timeout, so a
+    // stalled connection would hang provisioning forever instead of failing
+    // loudly. Ten minutes per file is generous (the pinned set is ~120MB).
+    let client: HttpClient = std::sync::Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .map_err(|e| CliError::Runtime(format!("cannot build network client: {e}")))?,
+    );
+    let _loaded = E5SmallAdapter::fetch_and_load(&cache, Some(&client))
+        .await
+        .map_err(|e| {
+            CliError::Runtime(format!(
+                "model provisioning failed: {e} (a digest mismatch fails closed: \
+                 nothing half-verified is served; if local corruption is suspected, \
+                 remove {} and retry)",
+                models.display()
+            ))
+        })?;
+    Ok(format!(
+        "Provisioned {E5_SMALL_ID} revision {E5_SMALL_REVISION} at {} ({} files verified)",
+        models.display(),
+        e5_small_artifact().digests.len(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +488,36 @@ mod tests {
         assert!(parse(&["-lib", "--socket", "/tmp/d.sock"]).is_err());
         assert!(parse(&["--install-skill", "--store", "/tmp/s"]).is_err());
         assert!(parse(&["--install-shim", "-p", "8080"]).is_err());
+        assert!(parse(&["--provision-models", "--store", "/tmp/s"]).is_err());
+    }
+
+    /// --provision-models downloads the pinned E5 artifacts into the managed home.
+    #[test]
+    fn provision_models_alias() {
+        assert!(matches!(
+            parse(&["--provision-models"]).unwrap(),
+            Command::ProvisionModels
+        ));
+    }
+
+    /// Provisioning conflicts with every other command and takes no options —
+    /// never silent precedence, never swallowed flags.
+    #[test]
+    fn provision_models_conflicts_and_no_options() {
+        assert!(parse(&["--provision-models", "-lib"]).is_err());
+        assert!(parse(&["-vis", "--provision-models"]).is_err());
+        assert!(parse(&["--provision-models", "--install-skill"]).is_err());
+        assert!(parse(&["--provision-models", "--install-shim"]).is_err());
+        assert!(parse(&["--provision-models", "-p", "1"]).is_err());
+        assert!(parse(&["--provision-models", "--socket", "/tmp/d.sock"]).is_err());
+    }
+
+    /// Provisioning needs a home: no invented model location (offline-safe check).
+    #[tokio::test]
+    async fn provision_models_requires_home() {
+        let err = provision_models_command(None).await.unwrap_err();
+        assert!(matches!(err, CliError::Runtime(_)), "got: {err}");
+        assert!(err.to_string().contains("HOME"), "got: {err}");
     }
 
     /// Flag-like option values are rejected, never swallowed as paths.
@@ -508,6 +595,7 @@ mod tests {
             "--port",
             "--install-skill",
             "--install-shim",
+            "--provision-models",
             "--store",
             "--socket",
         ] {

@@ -112,6 +112,13 @@ pub struct Daemon {
     embedding: Option<crate::embeddings::service::EmbeddingService>,
     maintenance_worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     maintenance_config: MaintenanceConfig,
+    /// Dense-projection worker (E5 mode only): drives pending projection
+    /// jobs to the Lance table. Aborted on shutdown like maintenance.
+    projection_worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Verified model-cache directory (E5 mode only): the projection
+    /// worker loads its passage adapter from here. `None` parks
+    /// projection (lexical-only daemon).
+    models_dir: Option<String>,
     quotas: Arc<QuotaTracker>,
     /// The singleton lock + bound 0600 socket listener, kept alive for the
     /// daemon's lifetime.
@@ -142,8 +149,10 @@ impl Daemon {
             let registry = FrontendRegistry::load(&p).map_err(DaemonError::Io)?;
             (registry, Some(p))
         };
-        let (dispatcher, embedding) = match &config.embedding {
-            EmbeddingMode::Disabled => (Arc::new(Dispatcher::new(repo, registry, clock)), None),
+        let (dispatcher, embedding, models_dir) = match &config.embedding {
+            EmbeddingMode::Disabled => {
+                (Arc::new(Dispatcher::new(repo, registry, clock)), None, None)
+            }
             EmbeddingMode::E5SmallCached { cache_dir } => {
                 if config.search_path.is_empty() {
                     return Err(DaemonError::Embedding {
@@ -168,6 +177,7 @@ impl Daemon {
                 (
                     Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend)),
                     Some(service),
+                    Some(cache_dir.clone()),
                 )
             }
         };
@@ -185,6 +195,8 @@ impl Daemon {
             embedding,
             maintenance_worker: tokio::sync::Mutex::new(None),
             maintenance_config: config.maintenance,
+            projection_worker: tokio::sync::Mutex::new(None),
+            models_dir,
             quotas,
             runtime,
             paths: paths.clone(),
@@ -253,6 +265,15 @@ impl Daemon {
         if let Some(mworker) = aborted {
             mworker.abort();
         }
+        // Same best-effort abort for the projection worker (E5 mode only).
+        let paborted = self
+            .projection_worker
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(pworker) = paborted {
+            pworker.abort();
+        }
     }
 
     /// Build a health/doctor report (no memory contents).
@@ -297,12 +318,123 @@ impl Daemon {
         self.maintenance_worker.lock().await.is_some()
     }
 
+    /// Spawn the dense-projection worker when E5 embedding is configured.
+    /// Idempotent. Each tick rebuilds the projector at the repo's current
+    /// generation (a cutover can never strand it refusing publishes) and
+    /// drives pending jobs off the Tokio I/O workers via `spawn_blocking`
+    /// (candle inference is synchronous CPU; the single outer bridge
+    /// contains no nested blocking). Embed failures stay pending and retry
+    /// next tick; lexical rows publish regardless. Convergence latency is
+    /// one maintenance interval. Without embedding this parks silently:
+    /// lexical-only daemons have nothing to index densely.
+    pub async fn start_projection(&self) {
+        let mut pw = self.projection_worker.lock().await;
+        if pw.is_some() {
+            return;
+        }
+        let Some(models_dir) = self.models_dir.clone() else {
+            return;
+        };
+        let repo = self.dispatcher.repo_arc();
+        let table = match SearchTable::open(&self.search_path).await {
+            Ok(table) => table,
+            Err(e) => {
+                eprintln!(
+                    "ltmrs: projection table unavailable ({}); dense indexing parked",
+                    e.message
+                );
+                return;
+            }
+        };
+        let cache = ArtifactCache::new(&models_dir);
+        // Digest-hash + weight load (~1GB with the query service) runs on
+        // the blocking pool: holding the worker guard across it is fine
+        // (async yield only), but Tokio I/O workers must never hash.
+        let adapter = match tokio::task::spawn_blocking(move || {
+            crate::embeddings::e5_small::E5SmallAdapter::load_from_cache(&cache)
+        })
+        .await
+        {
+            Ok(Ok(adapter)) => std::sync::Arc::new(std::sync::Mutex::new(adapter)),
+            Ok(Err(e)) => {
+                eprintln!(
+                    "ltmrs: projection adapter failed ({e}); dense indexing parked; \
+                     run `ltmrs --provision-models` to repair"
+                );
+                return;
+            }
+            Err(join_err) => {
+                eprintln!("ltmrs: projection adapter load panicked ({join_err}); parked");
+                return;
+            }
+        };
+        let interval = self.maintenance_config.interval;
+        *pw = Some(tokio::spawn(async move {
+            loop {
+                let tick = tokio::task::spawn_blocking({
+                    let repo = Arc::clone(&repo);
+                    let table = table.clone();
+                    let adapter = std::sync::Arc::clone(&adapter);
+                    move || {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let driven = crate::search::projector::Projector::project_pending(
+                                &repo,
+                                &table,
+                                Box::new(adapter),
+                            )
+                            .await;
+                            // FTS only after a successful drive: a failing
+                            // table needs repair, not an index build.
+                            let fts = if driven.is_ok() {
+                                Some(table.ensure_fts_index().await)
+                            } else {
+                                None
+                            };
+                            (driven, fts)
+                        })
+                    }
+                })
+                .await;
+                match tick {
+                    Err(join_err) => eprintln!(
+                        "ltmrs: projection drive panicked ({join_err}); retrying next tick"
+                    ),
+                    Ok((Err(e), _)) => eprintln!(
+                        "ltmrs: projection pass failed ({}); retrying next tick",
+                        e.message
+                    ),
+                    Ok((Ok(resolved), fts)) => {
+                        if resolved > 0 {
+                            eprintln!("ltmrs: projection converged {resolved} job(s)");
+                        }
+                        match fts {
+                            Some(Err(fe)) => eprintln!(
+                                "ltmrs: fts index build failed ({}); retrying next tick",
+                                fe.message
+                            ),
+                            Some(Ok(true)) => eprintln!("ltmrs: fts index built"),
+                            _ => {}
+                        }
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        }));
+    }
+
+    /// Whether the projection worker is currently running (diagnostics/tests).
+    pub async fn projection_worker_running(&self) -> bool {
+        self.projection_worker.lock().await.is_some()
+    }
+
     /// Run the accept loop until the socket is closed, an error occurs, or
     /// the idle timeout elapses with no connections (design §7.2).
     /// Uses the 0600 listener bound at startup (already permission-locked).
     pub async fn serve(&self) -> Result<(), DaemonError> {
         // Start background maintenance under its explicit budgets, if configured.
         self.start_maintenance().await;
+        // Start dense projection when E5 embedding is configured (no-op otherwise).
+        self.start_projection().await;
 
         let listener = &self.runtime.listener;
 
@@ -842,6 +974,30 @@ mod tests {
             matches!(DaemonConfig::default().embedding, EmbeddingMode::Disabled),
             "the daemon must stay lexical-only unless embedding is configured"
         );
+    }
+
+    /// No embedding configured: projection stays parked (no worker, no
+    /// crash) and shutdown is a clean no-op for it.
+    #[tokio::test]
+    async fn projection_worker_parked_without_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "proj-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            search_path: dir.path().join("search").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let mut daemon = Daemon::start(&paths, config).await.unwrap();
+
+        assert!(!daemon.projection_worker_running().await);
+        daemon.start_projection().await;
+        assert!(
+            !daemon.projection_worker_running().await,
+            "lexical-only daemons must not spawn a projection worker"
+        );
+
+        daemon.shutdown();
+        assert!(!daemon.projection_worker_running().await);
     }
 
     /// E5 mode without model artifacts fails fast at startup (no silent

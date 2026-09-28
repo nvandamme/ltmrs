@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::cli::CliError;
 use crate::daemon::client::IpcClient;
 use crate::daemon::runtime::RuntimePaths;
-use crate::daemon::server::{Daemon, DaemonConfig, handle_connection};
+use crate::daemon::server::{Daemon, DaemonConfig, EmbeddingMode, handle_connection};
 use crate::domain::id::{ChannelId, FrontendId};
 use crate::frontend::mcp::{FrontendIdentity, LtmrsFrontend};
 
@@ -29,6 +29,10 @@ pub const SESSIONS_FILE_NAME: &str = "sessions.json";
 /// Lance projection directory name under the managed home (empty disables
 /// the maintenance scheduler; the projection stays rebuildable).
 pub const SEARCH_DIR_NAME: &str = "search";
+/// Verified E5 embedding-artifact directory name under the managed home
+/// (provisioned by `--provision-models`; absent or unverifiable means the
+/// daemon serves dense-disabled — never a partial model).
+pub const MODELS_DIR_NAME: &str = "models";
 /// Store identity used for the stdio daemon's runtime paths.
 pub const RUNTIME_IDENTITY: &str = "daemon";
 
@@ -43,6 +47,9 @@ pub struct StdioLayout {
     pub sessions_path: String,
     /// Projection directory path (string form for `DaemonConfig`).
     pub search_path: String,
+    /// Verified embedding-artifact directory path (provision target for
+    /// `--provision-models`; enablement source for the local daemon).
+    pub models_path: String,
     /// Base dir handed to `RuntimePaths::resolve` (lock + socket live under
     /// `<base>/ltmrs/<identity>/`).
     pub runtime_base: PathBuf,
@@ -66,24 +73,66 @@ pub fn stdio_layout(base: &Path) -> StdioLayout {
         store_path: base.join(STORE_DIR_NAME).to_string_lossy().into_owned(),
         sessions_path: base.join(SESSIONS_FILE_NAME).to_string_lossy().into_owned(),
         search_path: base.join(SEARCH_DIR_NAME).to_string_lossy().into_owned(),
+        models_path: base.join(MODELS_DIR_NAME).to_string_lossy().into_owned(),
         runtime_base: base.to_path_buf(),
+    }
+}
+
+/// Resolve the local daemon's embedding mode from the managed models
+/// directory. Verification-only (`load_cached`, no download): a full digest
+/// match enables dense, anything else serves lexical-only with a stderr
+/// diagnostic naming the cause and the `--provision-models` remedy. A
+/// partial or corrupt cache therefore degrades loudly, never half-enabled.
+///
+/// Cost note: verification hashes the full ~470MB artifact set (seconds),
+/// and the daemon hashes + loads twice more (query service, projection
+/// adapter). Slow, loud boots beat fast, uncertain ones.
+fn resolve_daemon_embedding(layout: &StdioLayout) -> EmbeddingMode {
+    use crate::embeddings::artifacts::ArtifactCache;
+    use crate::embeddings::manifest::e5_small_artifact;
+
+    let cache = ArtifactCache::new(&layout.models_path);
+    match cache.load_cached(&e5_small_artifact()) {
+        Ok(_) => EmbeddingMode::E5SmallCached {
+            cache_dir: layout.models_path.clone(),
+        },
+        Err(e) => {
+            eprintln!(
+                "ltmrs: dense embeddings disabled ({e}); run `ltmrs --provision-models` to enable hybrid retrieval"
+            );
+            EmbeddingMode::Disabled
+        }
     }
 }
 
 /// Start the in-process daemon for stdio mode and return it together with a
 /// frontend client bridged over a `UnixStream` pair. The daemon must be kept
 /// alive (and `shutdown` at the end) to hold the singleton lock.
+///
+/// Dense enablement is auto-detect, never silent: when the managed models
+/// directory holds the full verified E5 artifact set the daemon starts
+/// dense-enabled; otherwise it serves lexical-only and names the reason plus
+/// the `--provision-models` remedy on stderr. Either way every
+/// `semantic_search` answer carries its effective mode (`hybrid` vs
+/// `lexical-fallback`) with `dense_ready`, so callers never infer dense
+/// from a provisioned directory alone.
 pub async fn start_local_daemon(layout: &StdioLayout) -> Result<(Daemon, IpcClient), CliError> {
     let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
+    let embedding = resolve_daemon_embedding(layout);
     let config = DaemonConfig {
         store_path: layout.store_path.clone(),
         sessions_path: layout.sessions_path.clone(),
         search_path: layout.search_path.clone(),
+        embedding,
         ..Default::default()
     };
     let daemon = Daemon::start(&paths, config)
         .await
         .map_err(|e| CliError::Runtime(format!("cannot start local daemon: {e}")))?;
+    // Dense projection when E5 embedding is configured (no-op otherwise):
+    // the stdio path has no accept loop calling serve(), so workers that
+    // serve() starts must start here too.
+    daemon.start_projection().await;
     let (client_stream, server_stream) = tokio::net::UnixStream::pair()
         .map_err(|e| CliError::Runtime(format!("cannot bridge stdio daemon: {e}")))?;
     // Detached on purpose: the task lives until the client stream closes
@@ -311,5 +360,103 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, CliError::Runtime(_)), "got: {err}");
+    }
+
+    /// Layout pins the models directory (provision target + daemon enablement source).
+    #[test]
+    fn stdio_layout_pins_models_path() {
+        let base = Path::new("/tmp/x/.ltmrs");
+        let layout = stdio_layout(base);
+        assert_eq!(layout.models_path, "/tmp/x/.ltmrs/models");
+    }
+
+    /// Unprovisioned models dir resolves dense-disabled (offline-safe).
+    #[test]
+    fn resolve_embedding_disabled_without_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = stdio_layout(&dir.path().join(".ltmrs"));
+        assert!(
+            matches!(resolve_daemon_embedding(&layout), EmbeddingMode::Disabled),
+            "no models must mean dense-disabled"
+        );
+    }
+
+    /// Partial/corrupt cache resolves dense-disabled too — never half-enabled.
+    #[test]
+    fn resolve_embedding_disabled_on_partial_cache() {
+        use crate::embeddings::manifest::{E5_SMALL_ID, E5_SMALL_REVISION};
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = stdio_layout(&dir.path().join(".ltmrs"));
+        let partial = Path::new(&layout.models_path)
+            .join(E5_SMALL_ID)
+            .join(E5_SMALL_REVISION);
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("model.safetensors"), b"not a model").unwrap();
+        assert!(
+            matches!(resolve_daemon_embedding(&layout), EmbeddingMode::Disabled),
+            "a partial cache must mean dense-disabled"
+        );
+    }
+
+    /// No provisioned models: the local daemon serves lexical-only and says so
+    /// on the wire (mode + dense_ready), never a silent dense claim.
+    #[tokio::test]
+    async fn local_daemon_without_models_serves_lexical_fallback() {
+        use crate::compatibility::lemma::tool_args::{SemanticSearchArgs, ToolArgs};
+        use crate::daemon::envelope::{DomainPayload, IpcResult};
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = stdio_layout(&dir.path().join(".ltmrs"));
+        let (mut daemon, mut client) = start_local_daemon(&layout).await.unwrap();
+        let id = test_identity();
+        let hs = client
+            .handshake(&HandshakeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: id.frontend_id,
+                channel_id: id.channel_id,
+            })
+            .await
+            .unwrap();
+        let env = IpcEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: id.frontend_id,
+            channel_id: id.channel_id,
+            operation_id: OperationId::new(Uuid::from_u128(9)),
+            session: None,
+            retry_epoch: hs.retry_epoch,
+            deadline_millis: None,
+            scope: Scope::default(),
+            body: DomainRequest::ToolCall {
+                tool: ToolArgs::SemanticSearch(SemanticSearchArgs {
+                    query: "bridged write".into(),
+                    project: None,
+                    top_k: None,
+                    offset: None,
+                    hybrid: None,
+                    explain: true,
+                    response_format: None,
+                }),
+            },
+        };
+        let resp = client.roundtrip(&env).await.unwrap();
+        match resp.result {
+            IpcResult::Success {
+                payload:
+                    DomainPayload::ToolResult {
+                        structured: Some(v),
+                        is_error: false,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(v["explanation"]["mode"], "lexical-fallback");
+                assert_eq!(v["explanation"]["dense_ready"], false);
+            }
+            other => panic!("expected tool result, got: {other:?}"),
+        }
+        daemon.shutdown();
     }
 }

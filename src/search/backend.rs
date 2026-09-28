@@ -60,9 +60,21 @@ impl SearchBackend {
                 format!("no tokio runtime for search: {e}"),
             )
         })?;
-        let engine = Engine::new(self.repo.clone(), self.table.clone());
+        let repo = self.repo.clone();
+        let table = self.table.clone();
         let embedder = Arc::clone(&self.embedder);
-        handle.block_on(async move { engine.retrieve(req, embedder.as_ref()).await })
+        handle.block_on(async move {
+            // Reopen to the latest dataset version: table handles are
+            // snapshot-pinned, and the projection tick commits through its
+            // own handle. Without this, serving would silently miss
+            // tick-published rows and indexes until a daemon restart.
+            // Bench and unit tests construct `Engine` directly and keep
+            // full control of handle freshness themselves.
+            let mut table = table;
+            table.refresh().await?;
+            let engine = Engine::new(repo, table);
+            engine.retrieve(req, embedder.as_ref()).await
+        })
     }
 
     /// Embed one query-role vector synchronously (bridges async via
@@ -335,6 +347,32 @@ impl QueryEmbedder for ServiceQueryEmbedder {
     }
 }
 
+/// Projector embedder over a shared adapter handle: per-tick projector
+/// rebuilds (generation freshness) clone the `Arc` without reloading
+/// weights. Ticks are sequential so the mutex is uncontended in practice;
+/// a poisoned lock fails the tick loudly (retry next tick), never silently.
+impl Embedder for Arc<Mutex<E5SmallAdapter>> {
+    fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        let mut guard = self
+            .lock()
+            .map_err(|_| "embedding adapter lock poisoned".to_string())?;
+        (&mut *guard as &mut dyn Embedder).embed(text)
+    }
+
+    fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
+        match self.lock() {
+            Ok(guard) => e5_chunks_to_text_chunks(title, &guard.chunk_passage(title, fragment)),
+            // Poisoned by a panicked tick: stay lexically indexed with the
+            // default single unit rather than dropping the memory.
+            Err(_) => vec![crate::search::projector::single_chunk_unit(title, fragment)],
+        }
+    }
+
+    fn chunker_version(&self) -> String {
+        E5_CHUNK_VERSION.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +605,81 @@ mod tests {
         );
     }
 
+    /// Live E5 embedding against a provisioned cache (ignored: needs the
+    /// ~500MB pinned artifacts). Gate: `LTMRS_PROBE_MODELS=<models dir>`;
+    /// skips (never fails) without it so the suite stays offline-safe.
+    /// Proves the serving-time embed path — adapter load + worker + sync
+    /// bridge, query and passage roles — independent of table contents.
+    #[tokio::test]
+    #[ignore]
+    async fn live_e5_embed_against_provisioned_cache() {
+        use crate::embeddings::artifacts::ArtifactCache;
+        use crate::embeddings::service::EmbeddingService;
+
+        let models = std::env::var("LTMRS_PROBE_MODELS").unwrap_or_default();
+        if models.is_empty() || !std::path::Path::new(&models).exists() {
+            eprintln!("SKIP: set LTMRS_PROBE_MODELS to a provisioned models dir");
+            return;
+        }
+        let cache = ArtifactCache::new(&models);
+        let svc =
+            EmbeddingService::load_e5_small_from_cache(&cache).expect("provisioned cache loads");
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = std::sync::Arc::new(
+            crate::service::repository::CanonicalRepository::open(
+                repo_dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
+        );
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = crate::search::table::SearchTable::open(table_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let backend = SearchBackend::new(
+            repo,
+            table,
+            std::sync::Arc::new(ServiceQueryEmbedder::new(svc)),
+        );
+        // Same sync-context rule as the dispatcher: bridge from blocking code.
+        let (q, p) = tokio::task::spawn_blocking(move || {
+            let q = backend.embed_query_sync("fox jumping near a river")?;
+            let p = backend.embed_passages_sync(&[
+                "the quick brown fox jumps over the lazy dog".to_string(),
+            ])?;
+            Ok::<_, crate::domain::command::DomainError>((q, p))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        for (role, v) in [("query", &q), ("passage", &p[0])] {
+            assert_eq!(v.len(), 384, "{role} dim");
+            assert!(v.iter().all(|x| x.is_finite()), "{role} finite");
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "{role} L2-normalized, got {norm}"
+            );
+        }
+        assert_ne!(q, p[0], "query/passage roles differ (prefixes applied)");
+
+        // The projection seam over a shared adapter handle: same vector
+        // space, E5 chunk policy stamp, single unit for short text.
+        use crate::embeddings::e5_small::E5SmallAdapter;
+        use crate::search::projector::Embedder as _;
+        let adapter = E5SmallAdapter::load_from_cache(&cache)
+            .expect("provisioned cache loads for projection");
+        let mut shared = std::sync::Arc::new(std::sync::Mutex::new(adapter));
+        let pv = shared
+            .embed("the quick brown fox jumps over the lazy dog")
+            .unwrap();
+        assert_eq!(pv.len(), 384, "projection dim");
+        assert!(pv.iter().all(|x| x.is_finite()), "projection finite");
+        let units = shared.chunk_text("T", "short fragment");
+        assert_eq!(units.len(), 1, "short text is one unit");
+        assert_eq!(units[0].text, "T\nshort fragment");
+        assert_eq!(shared.chunker_version(), E5_CHUNK_VERSION);
+    }
+
     /// The E5 chunk mapping re-prefixes each verbatim fragment span for
     /// lexical searchability and shifts its offsets into rendered coordinates.
     #[test]
@@ -598,5 +711,69 @@ mod tests {
     #[test]
     fn e5_chunk_mapping_preserves_empty() {
         assert!(e5_chunks_to_text_chunks("T", &[]).is_empty());
+    }
+
+    /// Serving freshness: `retrieve_sync` observes commits made after the
+    /// backend was constructed (production: the tick publishes through its
+    /// own handle; serving must not pin a stale snapshot).
+    #[tokio::test]
+    async fn retrieve_sync_sees_post_construction_commits() {
+        use crate::domain::id::ModelFingerprint;
+        use crate::retrieval::engine::RetrievalRequest;
+        use crate::search::row::SearchRow;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = std::sync::Arc::new(
+            crate::service::repository::CanonicalRepository::open(
+                repo_dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
+        );
+        let table_dir = tempfile::tempdir().unwrap();
+        let uri = table_dir.path().to_str().unwrap();
+        let table = crate::search::table::SearchTable::open(uri).await.unwrap();
+        let backend = std::sync::Arc::new(SearchBackend::new(
+            repo,
+            table,
+            std::sync::Arc::new(QueryEmbedderAdapter::new(std::sync::Arc::new(
+                ClosureEmbedder::new(|_| Ok(vec![1.0; 384])),
+            ))),
+        ));
+        // A second handle commits a dense row after construction.
+        let writer = crate::search::table::SearchTable::open(uri).await.unwrap();
+        writer
+            .publish_rows(&[SearchRow {
+                store_generation: crate::domain::id::StoreGeneration::FIRST,
+                memory_id: crate::domain::id::EntityId::new(uuid::Uuid::from_u128(1)),
+                document_revision: crate::domain::id::DocumentRevision::new(1),
+                model_fingerprint: ModelFingerprint::new(1),
+                chunk_id: crate::domain::id::ChunkId::new(0),
+                chunker_version: "single-chunk-v1".to_string(),
+                lexical_text: "fresh row".to_string(),
+                char_start: 0,
+                char_end: 9,
+                project: None,
+                fragment_type: "fact".to_string(),
+                created_at_millis: 1,
+                confidence: 0.5,
+                updated_at_millis: 1,
+                embedding: Some(vec![1.0; 384]),
+            }])
+            .await
+            .unwrap();
+        let req = RetrievalRequest {
+            query: "fresh".to_string(),
+            model_fingerprint: Some(ModelFingerprint::new(1)),
+            ..Default::default()
+        };
+        // Same sync-context rule as the dispatcher: bridge from blocking code.
+        let out = tokio::task::spawn_blocking(move || backend.retrieve_sync(&req))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            out.explanation.dense_ready,
+            "serving must observe the committed dense row"
+        );
     }
 }
