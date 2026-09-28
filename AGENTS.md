@@ -29,6 +29,13 @@ Project instructions for coding agents working in this repository.
 - Do not commit secrets, model weights, private memories or raw result dumps; reference
   them by digest/provenance.
 
+### Module Organization and Code Hygiene (STRICT — applies repo-wide)
+
+1. **Domain modules own their features** — All code belonging to a domain lives in that domain's module, not scattered at the package/experiment root. A domain is a cohesive set of related features (e.g. graph logic, retrieval, probing, export). Code for a domain MUST live in a module named after that domain, never as loose files at the experiment level. *Example: in the cross-view experiment, graph logic lives in `geo_graph/` (e.g. `geo_graph/observation.py`, `geo_graph/policy/...`), never as loose `*_graph.py` files at the experiment root.*
+2. **Split by intent/domain, not by size alone** — When a file grows beyond ~600–800 lines or mixes distinct concerns, split it per intent/domain. When a domain has multiple related modules, make it a subpackage. *Example: `geo_graph/policy/` is a subpackage because it has ≥2 related modules (assembly, builder, contract, dto, etc.).*
+3. **No code duplication** — Never duplicate logic across modules. Maintain shared functions/features in a single owning module and import them. If a helper is used by ≥2 modules, it belongs in a shared/common module for that domain (or a cross-module utility if truly generic). Before writing a helper, search for an existing one.
+4. **These rules are permanent** — They apply to the whole repository and all future work. Do not violate them for convenience; restructure existing code to comply when you touch it.
+
 ## Rust Rules
 
 - Write idiomatic modern Rust (edition 2024, current stable).
@@ -95,6 +102,21 @@ CLI tools: `ccc init`, `ccc index`, `ccc search`. The index lives in `.cocoindex
   1. Formal review — re-read the code against plans/ requirements and verify coverage.
   2. Functional review — hunt for bugs/logic flaws (off-by-one, races, edge cases).
   Each pass ends with its findings fixed before the next begins. Non-compliance is a no-go.
+
+### Commit Workflow for CHANGELOG.md
+
+When preparing a commit that includes work tracked in `DONE.md`:
+
+1. **Prepare** — Move all entries from `DONE.md` into `CHANGELOG.md` under a new heading using the date (e.g., `## 2026-06-17 — short title`). Clear the unreleased section in `DONE.md`.
+2. **Verify BEFORE committing** — Confirm CHANGELOG.md contains the date entry by running: `grep -c "## YYYY-MM-DD" CHANGELOG.md` (replace with actual date). If grep finds zero matches, STOP and fix CHANGELOG.md before proceeding. Code changes MUST NOT be committed without their changelog entry in the same commit.
+3. **Commit** — Stage all files (`git add -A`) and commit with full changelog as commit message body: `git commit -m "short summary\n\nfull changelog body"`. The commit MUST include CHANGELOG.md (date heading) AND DONE.md (cleared). If the commit fails (e.g., pre-commit hook rejection or conflict), do NOT proceed to step 4. Report the exact error output to the user and stop. Do not attempt to resolve hooks or conflicts autonomously.
+4. **Get hash** — Run `git --no-pager log -1 --oneline` to retrieve the new commit SHA.
+5. **Update CHANGELOG.md** — Replace the date placeholder in the heading with the actual SHA (e.g., `## b4529c9 (2026-06-17) — short title`). If updating CHANGELOG.md fails, report the error and the SHA to the user so they can apply the fix manually. Do not attempt to amend or re-commit under any circumstances.
+6. **STOP** — Do NOT amend, do NOT recommit, do NOT stage/commit CHANGELOG.md again. The hash is now baked in and the commit chain is clean.
+
+> ⚠️ NEVER amend a commit to fix the SHA in CHANGELOG.md — amending changes the hash, creating an infinite loop.
+>
+> **Hard constraint**: A code change commit that skips step 1 (writing DONE.md entries into CHANGELOG.md) produces a broken commit chain where code and its changelog are separated across commits. This is always a structural error. If you discover such a mistake after committing, fix it by soft-resetting to the parent (`git reset --soft HEAD~1`), adding the CHANGELOG entry with date placeholder, then re-committing as step 3 — this restores the invariant that code + changelog live in one commit.
 
 ## Tracking Rules
 

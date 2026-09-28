@@ -5,7 +5,45 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-09-27 — WP-13 review fix pass over WP-12
+## 2026-09-28 — WP-13 release evidence and agent process docs
+
+### WP-13 release evidence: suite refresh + native-code policy (2026-09-27)
+
+- Full validation green on the collapsed tree: `cargo fmt -- --check`
+  clean, `cargo clippy --all-targets -- -D warnings` clean,
+  `cargo test` 635 lib + 2 smoke, 0 failed.
+- Release build green (25.77s); binary sha256
+  `b82f158a73985804d464cec583a4e2970e6b815276e24f480fe3293916044189`
+  (285,312,656 bytes). Digest differs from the pre-collapse build
+  (new code since) — this is the current release-candidate digest.
+- Native-code policy re-check: dependency set matches WP-00 audit
+  exactly plus `getrandom 0.3` only; its build script probes the rustc
+  version (no C compilation hooks); runtime is the `getrandom(2)`
+  syscall via already-accepted `libc`. No new native code.
+  Policy ACCEPTABLE, unchanged.
+- Offline proof (lexical surface, fresh HOME, release binary):
+  initialize + memory_add + semantic_search (hybrid:false) +
+  memory_read all succeed with clean exit 0; data persists across
+  runs in the managed store. `strace -f -e trace=%network` over the
+  full run shows exactly ONE socket (the daemon AF_UNIX socket;
+  SO_PEERCRED same-user check) and ZERO AF_INET/AF_INET6 uses —
+  no TCP/UDP/DNS of any kind. Caveats: network was available but
+  unused (absence-of-use proof; namespace isolation unavailable in
+  this environment); covers embeddings-disabled production
+  configuration only; batch-mode stdin-EOF can race a queued
+  response (write landed, response lost — observed once, not
+  adjudicated).
+
+### Agent process docs (AGENTS.md, no DONE entry)
+
+- New `Module Organization and Code Hygiene` section (STRICT,
+  repo-wide, permanent): domain modules own their features, split
+  by intent, no duplication.
+- New `Commit Workflow for CHANGELOG.md` section: date-heading
+  prepare/verify/commit/hash/worktree-header/stop, no-amend rule,
+  hard constraint against code/changelog separation.
+
+## 4714b30 (2026-09-27) — WP-13 review fix pass over WP-12
 
 ### WP-13 review fix pass (retrieval, surface, durability)
 
