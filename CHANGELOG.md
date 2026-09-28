@@ -5,7 +5,22 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-09-28 — Restore session survival + live readiness
+## 2026-09-28 — Provenance vocabulary (DEV-004)
+
+### Provenance vocabulary (DEV-004, owner-agreed) (2026-09-28)
+
+- `MemorySource` expanded beyond user|ai: user|ai|web|paper|book|code
+  with disjoint documented rules (URL-captured vs DOI/arXiv-identified
+  vs ISBN-identified vs path-identified; verification state stays out
+  — feedback counts already model it). Ingress (tools.rs parse+coerce),
+  stats (dynamic by_source), icons (non-ai → person, upstream parity),
+  serde round-trip all covered; truly-unknown still coerces to ai
+  (tested residual, e.g. 'user-corrected formal review').
+- Tests: provenance_vocabulary_round_trips (RED-first) +
+  memory_stats_groups_expanded_provenance. Ledger narrowed
+  (behavior, impact, test, release_wording); owner-approved.
+
+## ba54d03 (2026-09-28) — Restore session survival + live readiness
 
 ### Restore session survival + live readiness (2026-09-28)
 

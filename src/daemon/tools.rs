@@ -6049,6 +6049,50 @@ mod tests {
         assert!(result_text(&result).contains("## Memory Stats"));
     }
 
+    /// Provenance flows end-to-end: a `paper` source stores as Paper and
+    /// groups under its own stats bucket (unknown strings still coerce
+    /// to `ai`, the documented residual).
+    #[test]
+    fn memory_stats_groups_expanded_provenance() {
+        use crate::compatibility::lemma::tool_args::MemoryAddArgs;
+
+        let (disp, _dir) = test_dispatcher();
+        for (op, title, source) in [
+            (1u64, "Paper Memory", Some("paper".to_string())),
+            (2, "AI Memory", None),
+            (
+                3,
+                "Exotic Memory",
+                Some("user-corrected formal review".to_string()),
+            ),
+        ] {
+            let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: format!("## {title}\n\n### Context\nProvenance fixture."),
+                title: Some(title.to_string()),
+                source,
+                ..Default::default()
+            });
+            let result = run(&disp, &tool_call(op, args.clone()), &args);
+            assert!(
+                !result_is_error(&result),
+                "add failed: {}",
+                result_text(&result)
+            );
+        }
+        let env = tool_call(4, ToolArgs::MemoryStats(MemoryStatsArgs::default()));
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::MemoryStats(MemoryStatsArgs::default()),
+        );
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let by_source = structured["by_source"].as_object().unwrap();
+        assert_eq!(by_source["paper"].as_u64().unwrap(), 1);
+        // Default (absent) and exotic sources both land in `ai`.
+        assert_eq!(by_source["ai"].as_u64().unwrap(), 2);
+    }
+
     // ---- memory_audit ----
 
     #[test]

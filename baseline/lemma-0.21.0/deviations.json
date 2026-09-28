@@ -49,12 +49,12 @@
       "class": "compatibility",
       "tool": "memory_add",
       "upstream_behavior": "source is a free-form string stored verbatim; the detail icon is 'ai' -> robot, anything else -> person.",
-      "ltmrs_behavior": "source is a strict enum (user|ai); unknown values are coerced to 'ai' at add time.",
+      "ltmrs_behavior": "source is a strict enum (user|ai|web|paper|book|code) with disjoint documented rules; truly-unknown values coerce to ai at add time (verification state stays out — see feedback counts).",
       "reason": "Strict domain typing (AGENTS.md); the real upstream DB contains non-canonical source values (e.g. 'user-corrected formal review') that the enum cannot express.",
-      "user_visible_impact": "A memory added with a non-canonical source renders the robot icon and is counted under 'ai' in stats, where upstream would show the person icon and the original string.",
-      "test": "T-MCP-02 (differential detail/summary wire tests)",
-      "release_wording": "Source is normalized to the canonical user/ai vocabulary; non-canonical upstream source strings are not preserved verbatim.",
-      "approval": "pending"
+      "user_visible_impact": "Corpus values render and count correctly (non-ai shows the person icon, matching the upstream rule). Truly-unknown strings still render the robot icon and count under ai, where upstream would show the person icon and the original string.",
+      "test": "T-MCP-02 (differential detail/summary wire tests); provenance_vocabulary_round_trips, memory_stats_groups_expanded_provenance",
+      "release_wording": "Source is normalized to the canonical provenance vocabulary (user|ai|web|paper|book|code); values outside it coerce to ai.",
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-005",
