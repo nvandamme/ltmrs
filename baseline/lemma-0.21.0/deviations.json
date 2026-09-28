@@ -13,12 +13,12 @@
       "class": "retrieval",
       "tool": "semantic_search",
       "upstream_behavior": "TF-IDF lexical ranking only; scores are raw TF-IDF/RRF values.",
-      "ltmrs_behavior": "Dense Candle embeddings + hybrid lexical/dense RRF + graph-aware context + calibrated scoring.",
+      "ltmrs_behavior": "Dense Candle embeddings + hybrid lexical/dense RRF + graph-aware context + normalized native scoring (held-out calibration open, AD-05).",
       "reason": "Intentional retrieval enhancement (Part I 10.3, 11.2).",
       "user_visible_impact": "Different result ordering and score interpretation; no byte-identical equivalence.",
       "test": "T-RANK-01, T-RANK-02, T-QUALITY-01",
       "release_wording": "Complete supported Lemma API/workflow surface with documented retrieval enhancements.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-002",
@@ -30,7 +30,7 @@
       "user_visible_impact": "Under a strict policy, confirm=true may be rejected with a policy error.",
       "test": "T-MCP-04, T-SEC-04",
       "release_wording": "Secret detection is best-effort; verbatim override is policy-gated and documented.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-003",
@@ -42,7 +42,7 @@
       "user_visible_impact": "Concurrent independent frontends stay isolated; legacy single-client behavior preserved per channel.",
       "test": "T-SESS-01, T-SESS-02",
       "release_wording": "Session isolation across concurrent frontends; per-channel legacy semantics retained.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-004",
@@ -61,12 +61,12 @@
       "class": "retrieval",
       "tool": "memory_read, semantic_search, tools/list",
       "upstream_behavior": "Ranks context injection and empty-query recall with injectionScore (confidence*0.7 + recency*0.3); computes a composite quality_score on every fragment touch.",
-      "ltmrs_behavior": "Uses its own calibrated native scorer (design 10.3) for ranking; quality_score is an optional passthrough field, never computed natively.",
+      "ltmrs_behavior": "Uses its own normalized native scorer (held-out calibration open, AD-05) (design 10.3) for ranking; quality_score is an optional passthrough field, never computed natively.",
       "reason": "Intentional retrieval enhancement (Part I 10.3); upstream formulas retained as reference oracles (reference::injection_score, reference::calculate_quality_score) for differential testing only.",
       "user_visible_impact": "Different recall/injection ordering and no live quality_score values; neither formula is exposed on the wire.",
       "test": "T-RANK-01, T-RANK-02; differential tests calculate_quality_score_matches_upstream, injection_score_matches_upstream",
       "release_wording": "Enhanced native ranking; upstream quality/injection formulas preserved as frozen reference oracles, not native behavior.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-006",
@@ -78,7 +78,7 @@
       "user_visible_impact": "Calls without an explicit project are unattributed; no silent cwd-derived projects.",
       "test": "T-MCP-02",
       "release_wording": "Project scope is explicit; no cwd-derived attribution.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-007",
@@ -90,7 +90,7 @@
       "user_visible_impact": "Near-duplicate adds may be refused or linked differently than upstream.",
       "test": "T-MCP-02",
       "release_wording": "Duplicate handling follows documented ltmrs thresholds, not upstream heuristics.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-008",
@@ -102,7 +102,7 @@
       "user_visible_impact": "Fresh stores start empty; session output contains no coaching text.",
       "test": "T-MCP-02",
       "release_wording": "No seeded content or coaching output; workflow activation is host-driven.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-009",
@@ -114,7 +114,7 @@
       "user_visible_impact": "Install recipes may need adaptation per host version.",
       "test": "T-HOST-01",
       "release_wording": "Host support is recipe-based; per-host verification pending.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-010",
@@ -126,7 +126,7 @@
       "user_visible_impact": "Legacy backups cannot be imported; they are refused with a reason, never converted silently.",
       "test": "T-IMPORT-02",
       "release_wording": "Legacy backup import unsupported; native backup/restore only.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-011",
@@ -138,7 +138,7 @@
       "user_visible_impact": "Absent hybrid returns dense-enriched results where upstream returns TF-IDF-only; pass hybrid:false for upstream-identical behavior.",
       "test": "hybrid absent/explicit unit tests in frontend::mcp (I8)",
       "release_wording": "semantic_search runs hybrid retrieval by default; hybrid:false restores pure lexical parity.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     },
     {
       "id": "DEV-012",
@@ -150,7 +150,7 @@
       "user_visible_impact": "Extra explanation object only when explain:true is passed; default responses unchanged.",
       "test": "explain readiness unit tests in frontend::mcp (I8)",
       "release_wording": "semantic_search accepts explain:true for a native readiness/partial explanation.",
-      "approval": "pending"
+      "approval": "approved by owner 2026-09-28"
     }
   ]
 }

@@ -447,14 +447,14 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 ### Tasks
 
-- [ ] Run formatting, lint, unit, integration, property, recovery, conformance and target-specific build suites.
-- [ ] Check the CPU binary and resolved dependencies against the audited native-code policy.
-- [ ] Validate an offline installation from a fresh user directory with pre-provisioned model artifacts and no network access.
-- [ ] Test migration from the prior ltmrs schema and supported Lemma sources; verify rollback instructions.
-- [ ] Publish supported tool/workflow, host, model, OS and durability matrices.
-- [ ] Review every enhancement/deviation and remove unsupported absolute claims.
-- [ ] Archive source lock, Cargo.lock, binary digest, SBOM/license inventory, model manifest, fixture checksums, raw results and signed review decisions.
-- [ ] Publish v0.1-alpha until all claimed full-surface release gates pass.
+- [x] Run formatting, lint, unit, integration, property, recovery, conformance and target-specific build suites. (Executed 2026-09-28: `cargo fmt -- --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test --workspace --all-targets` 657 lib + 2 smoke green; compat fixtures run in-suite; upstream-differential bench not re-run — no contract change, honest not_run.)
+- [x] Check the CPU binary and resolved dependencies against the audited native-code policy. (No dependency changes across the release delta — Cargo diff is the version label only; getrandom audit stands; 594-component SBOM has no GPL/AGPL/proprietary; see reports/release-01/INDEX.md.)
+- [x] Validate an offline installation from a fresh user directory with pre-provisioned model artifacts and no network access. (Enforced via `unshare -Unr`: provision-in-netns control fails loudly exit 1; full serving flow with pre-provisioned E5 exit 0 and zero routes. Reqwest audit: only the provision CLI builds network clients.)
+- [x] Test migration from the prior ltmrs schema and supported Lemma sources; verify rollback instructions. (Migration unit suites + legacy-refusal tests green; rollback instructions written in README Operations and executed live end-to-end: backup/restore/rollback with state assertions, exit 0, same session.)
+- [x] Publish supported tool/workflow, host, model, OS and durability matrices. (reports/release-01/matrices.md: tool cells referenced to conformance_matrix.json, host/model/OS/durability rows executed or marked not_run.)
+- [x] Review every enhancement/deviation and remove unsupported absolute claims. (12/12 deviations reviewed claim-by-claim with spot verification; `calibrated` wording fixed where AD-05 is open; absolute-claims sweep of new strings clean; all 12 owner-approved.)
+- [x] Archive source lock, Cargo.lock, binary digest, SBOM/license inventory, model manifest, fixture checksums, raw results and signed review decisions. (reports/release-01/: INDEX.md, sbom.json, digests, rollback transcript, suite record; review decisions signed by commit authorship.)
+- [ ] Publish v0.1-alpha until all claimed full-surface release gates pass. (NOT done: tag/push requires owner approval. Binary reports `ltmrs 0.1.0-alpha`; upstream-differential re-run, power-loss qualification and multi-host matrices remain honest not_run.)
 
 **Outputs:** release bundle, compatibility statement, operational guide and evidence index.
 

@@ -11,12 +11,19 @@ never calls a remote model.
 
 ## Status
 
-**Implementation through WP-12; release qualification (WP-13) in progress.**
-The `cargo test` gate (library + smoke suites) is green on the tracked tree;
-storage/load reference benchmarks and an upstream comparison have been
-executed (see `benchmarks.toml` and `CHANGELOG.md`); fault/soak suites, the
-300-case quality corpus, offline install validation and host-matrix
-verification remain `not_run`. This repository currently contains:
+**Release candidate v0.1-alpha.** Implementation covers WP-12 plus
+post-WP-12 enhancements (E5 dense end-to-end, restore session
+survival, provenance vocabulary), with WP-13 evidence largely
+executed — see `CHANGELOG.md` and `reports/release-01/`.
+The `cargo test` gate (657 lib + 2 smoke) is green on the tracked
+tree; offline install is validated under enforced network isolation;
+rollback is verified live end-to-end; the SBOM carries no
+GPL/AGPL/proprietary licenses; all 12 ledger deviations are
+owner-approved. Honest `not_run`: upstream-differential re-run (no
+contract change to re-verify), power-loss qualification (needs a
+dedicated machine), the 300-case quality corpus and held-out
+calibration, fault/soak harnesses, and multi-host matrices. Publish
+(tag/push) is pending owner approval. This repository contains:
 
 - the reviewed implementation specification and test plan in [`plans/`](plans/),
 - the frozen Lemma 0.21.0 baseline in
@@ -41,7 +48,29 @@ Dense semantic search and graph-aware context are **intentional enhancements**.
 The release claim under qualification is therefore: *complete supported Lemma
 API/workflow surface with documented retrieval enhancements*, not byte-identical
 behavioral equivalence — pending the WP-13 gates (approvals + checklist). Known deviations are tracked in an explicit ledger
-(`baseline/lemma-0.21.0/deviations.json`; approvals pending).
+(`baseline/lemma-0.21.0/deviations.json`; all 12 owner-approved).
+
+## Quick Start
+
+Point an MCP host at the built binary over stdio (config file and key
+names differ per host — Claude Desktop, Claude Code and opencode each
+use their own shape; the server identifies as `ltmrs`):
+
+```json
+{
+  "mcpServers": {
+    "ltmrs": {
+      "command": "/path/to/ltmrs"
+    }
+  }
+}
+```
+
+Then ask your assistant to remember something. It saves findings with
+`memory_add`, recalls with `memory_read` / `semantic_search`, and
+follows the skill workflow (recall → act → persist) when the managed
+skill is installed. No terminal command is needed for daily use; the
+CLI surface below is for setup, snapshots and maintenance.
 
 ## Architecture (planned)
 
@@ -65,6 +94,96 @@ CLI / visualizer client -----------+                         |
 - Canonical backend is **B** Fjall + LanceDB (decided, AD-01
   `plans/AD-01_canonical_backend.md`, gated on hard correctness/atomicity
   tests — not on feature lists or throughput scores).
+
+## How It Works
+
+The host starts every call with live context: the server prefetches
+a memory snapshot into its instructions, and `session_start`
+pre-loads task-relevant memories. Knowledge flows along an explicit
+pipeline — finding (`memory_add`) → pattern (`type: "pattern"`) →
+guide (`guide_distill` → `guide_practice`) — across five fragment
+types: `fact`, `pattern`, `lesson`, `warning`, `context`.
+
+Saving is active, not archival: `memory_add` auto-redacts detected
+secrets (pass `confirm: true` to store verbatim), flags distill
+candidates, and auto-links topic overlaps. Explanations (`explain:
+true` on `memory_read` / `semantic_search`) report the effective
+mode, readiness and partial flags behind each answer.
+
+## Dense retrieval (E5)
+
+Lexical recall works with no model. Dense hybrid retrieval needs the
+pinned E5 artifacts, provisioned explicitly (the only step that uses
+the network):
+
+```bash
+ltmrs --provision-models   # download + digest-verify 6 pinned files into $HOME/.ltmrs/models
+```
+
+- Provisioning is idempotent (existing files are re-verified, not
+  re-downloaded) and fails closed: any digest mismatch aborts loudly
+  and nothing half-verified is served. If local corruption is
+  suspected, remove `$HOME/.ltmrs/models` and retry.
+- On the next start the daemon auto-detects the verified set and
+  serves hybrid; without it (absent, partial or corrupt cache) it
+  serves lexical-only and says so on stderr. Either way every
+  `semantic_search` answer carries its effective mode (`hybrid` vs
+  `lexical-fallback`) with `dense_ready`, plus `partial` while
+  projection work is still pending.
+- Indexing is asynchronous: writes return immediately and a
+  background worker projects up to 100 jobs per maintenance interval
+  (default 300s), retrying failures on later ticks. Serving itself
+  makes no network calls (verified by strace over stdio runs).
+- Operating costs when E5 is enabled: two resident model adapters
+  (~1GB RAM for the 470MB artifact set) and digest verification plus
+  weight loading at startup. Deterministic oversize inputs stay
+  lexically indexed with vector retry pending; fallback relevance
+  scores are display values, not probabilities.
+
+## Operations
+
+All state lives under the managed home `$HOME/.ltmrs`:
+
+| Path | Contents |
+|---|---|
+| `store/` | Canonical Fjall store (source of truth) |
+| `sessions.json` | Frontend session registry (persisted on shutdown) |
+| `search/` | Lance projection (derived, rebuildable) |
+| `models/` | Verified E5 artifacts (`--provision-models` target) |
+
+There is no config file; behavior comes from flags plus `$HOME`.
+`ltmrs --help` is authoritative for flags. Commands:
+
+| Command | Purpose |
+|---|---|
+| (no args) | Serve MCP over stdio (default) |
+| `--socket PATH` | Attach stdio to a running daemon instead of starting one |
+| `-lib/--library --store PATH` | Print a knowledge-base snapshot (never creates stores) |
+| `-vis/--visualize [--fg] [-p PORT]` | Run the library visualizer (default port 18721) |
+| `--install-skill` | Install/update the managed agent skill |
+| `--install-shim` | Install the opt-in legacy `lemma` executable shim |
+| `--provision-models` | Fetch + verify E5 artifacts (only step using the network) |
+| `-h/--help`, `-V/--version` | Help text (authoritative flag reference), version |
+
+Install locations: skill → `~/.agents/skills/ltmrs/SKILL.md`
+(idempotent, versioned, refuses foreign or user-modified files
+instead of overwriting); shim → `~/.local/bin/lemma` symlink
+(refuses non-managed paths, warns on PATH collisions).
+
+Exit codes: 0 success, 1 runtime failure, 2 usage error,
+3 parsed-but-unimplemented slice. stdout carries protocol data;
+diagnostics go to stderr.
+
+The visualizer mints a per-boot access token and prints its URL in
+the foreground (`http://127.0.0.1:PORT/?token=…`); `/` and
+`/api/library` return 403 without it.
+
+Backup and restore are native MCP tools (`backup_create` to a
+destination directory, `backup_preview`, `backup_restore` with a
+single-use confirmation token plus explicit confirm). Backups are
+logical exports from a consistent canonical snapshot; model weights
+and derived indexes are excluded by default. Restore replaces —
+never merges — under a staged-generation switch.
 
 ## Constraints
 
@@ -94,15 +213,90 @@ dependency lock) and **WP-01** (domain model + reference interpreter). Do not
 implement the full tool surface against an unproven storage transaction
 assumption.
 
-## Building
+## Install
+
+Prerequisites: a Rust stable toolchain. `rust-toolchain.toml` pins it
+(currently 1.96.0 with rustfmt + clippy); rustup picks it up
+automatically. No Node, Python, or system database engine is needed —
+inference is CPU Candle, storage is Fjall + LanceDB.
 
 ```bash
-cargo build      # builds the current skeleton
-cargo run
+cargo build                # debug binary at target/debug/ltmrs
+cargo build --release      # release binary at target/release/ltmrs (~286MB)
 ```
 
-The planned repository layout, toolchain pin and development runners are
-defined in [Part II, §3 and §20](plans/02_implementation_guide.md).
+Optional, for dense retrieval (the only step that uses the network):
+
+```bash
+ltmrs --provision-models   # verified E5 artifacts into $HOME/.ltmrs/models
+```
+
+Optional, for agent hosts: `ltmrs --install-skill` installs the
+managed skill (`--install-shim` adds the opt-in legacy `lemma` shim).
+
+## Usage
+
+Run the server (it speaks MCP over stdio and identifies as `ltmrs`):
+
+```bash
+ltmrs                      # serve; store auto-creates under $HOME/.ltmrs
+```
+
+Point an MCP host at the binary over stdio (exact key names are
+host-configured — Claude Code, OpenCode and Codex each use their own
+config shape — with the command pointing at your built binary).
+Then, from the host: save findings with `memory_add`, recall with
+`memory_read` / `semantic_search`, and follow the skill workflow
+(recall → act → persist) if installed.
+
+Beyond the host loop:
+
+```bash
+ltmrs --help                                   # authoritative flag reference
+ltmrs -lib --store $HOME/.ltmrs/store          # knowledge-base snapshot
+ltmrs -vis --fg                                # library visualizer (prints its token URL)
+ltmrs --socket PATH                            # attach stdio to a running daemon
+```
+
+Backups run through the MCP tools (`backup_create` to a
+directory, `backup_preview`, `backup_restore` with token + confirm);
+see Operations above. Verification gates: `cargo test` (657 lib +
+2 smoke suites), `cargo fmt -- --check`, `cargo clippy
+--all-targets -- -D warnings`.
+
+## Tools (29)
+
+Short MCP names (`memory_read`, `memory_add`, `session_start`);
+hosts may display them namespaced (e.g. `mcp_ltmrs_memory_add`).
+Tool schemas are frozen from the Lemma 0.21.0 capture; behavior
+deviations are ledgered (see Compatibility target).
+
+| Family | Tools |
+|---|---|
+| Memory (10) | `memory_read`, `memory_add`, `memory_update`, `memory_feedback`, `memory_forget`, `memory_merge`, `memory_relate`, `memory_stats`, `memory_audit`, `memory_library` |
+| Guides (7) | `guide_get`, `guide_practice`, `guide_create`, `guide_distill`, `guide_update`, `guide_forget`, `guide_merge` |
+| Sessions (5) | `session_start`, `session_attempt`, `session_end`, `session_stats`, `suggestion_respond` |
+| Intelligence (4) | `conflict_scan`, `proactive_analysis`, `project_analytics`, `semantic_search` |
+| Backup, native (3) | `backup_create`, `backup_preview`, `backup_restore` |
+
+Back up by asking: *"Back up my memory to this folder."* The
+assistant creates a verified `.ltmrs-backup`, you move it where it
+must survive, then `backup_preview` checks it: `ready` issues a
+single-use confirmation token, `blocked` names the live connections
+to close first (close them through their app, keep this connection
+open, preview again). `backup_restore` with token + `confirm: true`
+replaces the store — never merges — after writing a verified safety
+backup first; restoring the safety file undoes a restore.
+
+## Security
+
+Local-first: everything stays under `$HOME/.ltmrs`; serving makes
+no network calls (only `--provision-models` downloads, digest
+verified). Fragments are scanned for secrets at add time and
+redacted unless `confirm: true` stores them verbatim. The visualizer
+binds `127.0.0.1` only and gates `/` and `/api/library` behind its
+per-boot token (403 without it). Backups are unencrypted — keep
+them in trusted storage, never on the disk being formatted.
 
 ## License
 

@@ -2,10 +2,12 @@
 //!
 //! Serves the canonical library snapshot over HTTP on loopback only:
 //! `GET /` renders an HTML index (all dynamic text HTML-escaped),
-//! `GET /api/library` returns the canonical export as JSON. Anything else
-//! is 404 (unknown route) or 405 (non-GET). `-vis` backgrounds by spawning
-//! a detached child (`-vis --fg`); `-vis --fg` serves in the foreground
-//! until Ctrl-C. No new dependencies: minimal HTTP/1.1 over tokio.
+//! `GET /api/library` returns the canonical export as JSON,
+//! `GET /api/export` downloads memories as JSONL (one object per line).
+//! Anything else is 404 (unknown route) or 405 (non-GET). `-vis`
+//! backgrounds by spawning a detached child (`-vis --fg`); `-vis --fg`
+//! serves in the foreground until Ctrl-C. No new dependencies: minimal
+//! HTTP/1.1 over tokio.
 
 use std::path::Path;
 
@@ -67,7 +69,7 @@ pub fn render_index(export: &CanonicalExport, token: &str) -> String {
         ));
     }
     page.push_str(&format!(
-        "</ul>\n<p><a href=\"/api/library?token={token}\">JSON snapshot</a></p>\n</body></html>\n"
+        "</ul>\n<p><a href=\"/api/library?token={token}\">JSON snapshot</a> | <a href=\"/api/export?token={token}\">JSONL export</a></p>\n</body></html>\n"
     ));
     page
 }
@@ -219,6 +221,26 @@ async fn handle_request(
                 message.as_bytes(),
             ),
         }
+    } else if path == "/api/export" {
+        // Memory export as a JSONL download (upstream parity: one JSON
+        // object per fragment, attachment disposition). Token-gated
+        // like every route (?token= form, since a download link cannot
+        // set custom headers).
+        match library_export(&store_path) {
+            Ok(export) => respond_extra(
+                200,
+                "OK",
+                "application/x-jsonlines",
+                "content-disposition: attachment; filename=memory-export.jsonl\r\n",
+                export.to_jsonlines().as_bytes(),
+            ),
+            Err(message) => respond(
+                500,
+                "Internal Server Error",
+                "text/plain",
+                message.as_bytes(),
+            ),
+        }
     } else {
         respond(404, "Not Found", "text/plain", b"unknown route")
     };
@@ -243,8 +265,20 @@ fn library_export(store_path: &str) -> Result<CanonicalExport, String> {
 
 /// Build a minimal HTTP/1.1 response (caller closes the connection).
 fn respond(code: u16, reason: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    respond_extra(code, reason, content_type, "", body)
+}
+
+/// Response with additional headers (e.g. download disposition);
+/// `extra_headers` must already end with `\r\n` when non-empty.
+fn respond_extra(
+    code: u16,
+    reason: &str,
+    content_type: &str,
+    extra_headers: &str,
+    body: &[u8],
+) -> Vec<u8> {
     let mut out = format!(
-        "HTTP/1.1 {code} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\ncontent-type: {content_type}\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -693,5 +727,101 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("no store"), "got: {err}");
         assert!(!std::path::Path::new("/nonexistent-dir-xyz/store").exists());
+    }
+
+    /// `/api/export` serves one JSON object per memory as a download
+    /// attachment (upstream parity): token-gated like every route,
+    /// JSONL content type, filename pinned.
+    #[tokio::test]
+    async fn export_serves_jsonl_attachment() {
+        use crate::domain::id::{DocumentRevision, EligibilityRevision, EntityId, EntityRevision};
+        use crate::domain::memory::{FragmentType, Instant, Memory, MemoryLifecycle, MemorySource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store").to_str().unwrap().to_string();
+        let repo = crate::service::repository::CanonicalRepository::open(&store).unwrap();
+        repo.put_memory_direct(&Memory {
+            id: EntityId::new(uuid::Uuid::from_u128(1)),
+            external_alias: None,
+            title: "Export Me".to_string(),
+            fragment: "exportable content".to_string(),
+            description: String::new(),
+            fragment_type: FragmentType::Fact,
+            project: None,
+            source: MemorySource::Ai,
+            confidence: 0.5,
+            quality_score: None,
+            lifecycle: MemoryLifecycle::Live,
+            tags: vec![],
+            associated_with: vec![],
+            relations: vec![],
+            parent_id: None,
+            child_ids: vec![],
+            session_id: None,
+            task_type: None,
+            related_guides: vec![],
+            evidence: vec![],
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: EntityRevision::new(1),
+            document_revision: DocumentRevision::new(1),
+            eligibility_revision: EligibilityRevision::new(1),
+            created_at: Instant::new(100),
+            updated_at: Instant::new(100),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        })
+        .unwrap();
+        drop(repo);
+        let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(serve_with_token(
+            listener,
+            store,
+            rx,
+            "test-token-abc".to_string(),
+        ));
+
+        let denied = raw_request(port, "GET /api/export HTTP/1.1\r\nhost: x\r\n\r\n").await;
+        assert!(
+            denied.starts_with("HTTP/1.1 403"),
+            "export without token must be denied, got: {denied}"
+        );
+        let wrong_method = raw_request(
+            port,
+            "POST /api/export?token=test-token-abc HTTP/1.1\r\nhost: x\r\n\r\n",
+        )
+        .await;
+        assert!(
+            wrong_method.starts_with("HTTP/1.1 405"),
+            "export POST must be rejected, got: {wrong_method}"
+        );
+        let ok = raw_request(
+            port,
+            "GET /api/export?token=test-token-abc HTTP/1.1\r\nhost: x\r\n\r\n",
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "got: {ok}");
+        assert!(
+            ok.contains("content-type: application/x-jsonlines"),
+            "got: {ok}"
+        );
+        assert!(
+            ok.contains("attachment; filename=memory-export.jsonl"),
+            "got: {ok}"
+        );
+        let body = ok.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert_eq!(body.lines().count(), 1);
+        let row: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(row["title"], "Export Me");
+
+        let _ = tx.send(());
+        handle.await.unwrap().unwrap();
     }
 }

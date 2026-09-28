@@ -1,6 +1,9 @@
 [package]
 name = "ltmrs"
-version = "0.1.0"
+# Pre-release per §2.3: the useful vertical slice ships as v0.1-alpha;
+# the full v0.1 compatibility release stays gated. (Skill recipe versions
+# are independent dotted numerics; see skills::installer::SKILL_VERSION.)
+version = "0.1.0-alpha"
 edition = "2024"
 description = "Local MCP memory service for LLM agents (Lemma 0.21.0 API/workflow target; compatibility gated on release qualification)."
 license = "MIT OR Apache-2.0"

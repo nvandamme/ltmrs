@@ -41,6 +41,17 @@ impl CanonicalExport {
         serde_json::to_string(self).unwrap_or_default()
     }
 
+    /// One JSON object per memory (JSONL) for the visualizer export
+    /// route (upstream parity: fragments only, newline-joined, no
+    /// trailing newline).
+    pub fn to_jsonlines(&self) -> String {
+        self.memories
+            .iter()
+            .filter_map(|m| serde_json::to_string(m).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Stable digest of the export, independent of record ordering.
     /// A normalized copy is hashed so two exports with the same records in
     /// different orders produce the same digest.
@@ -270,5 +281,12 @@ mod tests {
                 .as_str(),
             "m2a5d0cde45ce"
         );
+    }
+
+    /// JSONL shape for the visualizer export route: one JSON object per
+    /// memory, no trailing newline; empty export yields an empty body.
+    #[test]
+    fn to_jsonlines_empty_export_is_empty_body() {
+        assert_eq!(CanonicalExport::default().to_jsonlines(), "");
     }
 }

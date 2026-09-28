@@ -27,6 +27,13 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [ ] WP-11 — Import, legacy interchange, backup and restore (S7)
 - [ ] WP-12 — Qualification, quality and performance (S8)
 - [ ] WP-13 — Release, documentation and evidence closure (S8)
+- [ ] DEV-008 follow-up — Upstream instructional UX (seed fragments,
+  coaching blocks, technology autodetect, distill suggestion).
+  Baseline captures mechanisms only, no content/heuristics. First
+  step: read upstream source at d30a816 for exact content, then
+  decide host-side vs skill-side. Not a plan WP: instructional
+  content is a host/model concern, not canonical contract
+  (owner-agreed 2026-09-28).
 
 ## Open decisions (from Part I §13)
 
