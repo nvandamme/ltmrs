@@ -170,16 +170,18 @@ impl Projector {
         }
     }
 
-    /// One-shot production drive: project all pending jobs with the given
+    /// One-shot production drive: project pending jobs with the given
     /// embedder under the E5 fingerprint at the repo's current generation.
     /// Reading the generation fresh on every call means a generation
     /// cutover can never strand a stale projector refusing publishes.
-    /// Returns jobs fully resolved (published or tombstoned); embed
-    /// failures stay pending for the next drive.
+    /// Resolves at most `max_jobs` (fairness §7.3); the remainder stays
+    /// pending for the next drive. Returns jobs fully resolved (published
+    /// or tombstoned); embed failures stay pending for the next drive.
     pub async fn project_pending(
         repo: &Arc<crate::service::repository::CanonicalRepository>,
         table: &SearchTable,
         embedder: Box<dyn Embedder>,
+        max_jobs: usize,
     ) -> DomainResult<usize> {
         use crate::embeddings::e5_small::E5_SMALL_FINGERPRINT;
 
@@ -191,7 +193,7 @@ impl Projector {
             E5_SMALL_FINGERPRINT,
             generation,
         );
-        projector.run_until_idle().await
+        projector.run_capped(max_jobs).await
     }
 
     /// Process one durable job end-to-end (design §8.2 steps 1-6).
@@ -412,8 +414,22 @@ impl Projector {
     /// only caller needed to keep Lance converged with canonical state. Returns
     /// the number of jobs fully resolved (published or tombstoned).
     pub async fn run_until_idle(&mut self) -> DomainResult<usize> {
+        self.run_limited(None).await
+    }
+
+    /// Bounded drive: resolve at most `max_jobs`, leaving the remainder
+    /// pending for the next tick. Fairness (§7.3): a bulk backfill must not
+    /// turn one tick into an unbounded CPU pass starving interactive recall.
+    pub async fn run_capped(&mut self, max_jobs: usize) -> DomainResult<usize> {
+        self.run_limited(Some(max_jobs)).await
+    }
+
+    async fn run_limited(&mut self, limit: Option<usize>) -> DomainResult<usize> {
         let mut total_resolved = 0usize;
         loop {
+            if limit.is_some_and(|max| total_resolved >= max) {
+                return Ok(total_resolved);
+            }
             let jobs = self.repo.projection_jobs()?;
             if jobs.is_empty() {
                 return Ok(total_resolved);
@@ -424,6 +440,9 @@ impl Projector {
             // in any sequence (RV-07).
             let mut resolved_this_pass = 0usize;
             for job in &jobs {
+                if limit.is_some_and(|max| total_resolved + resolved_this_pass >= max) {
+                    break;
+                }
                 match self.process_job(job).await? {
                     ProjectorOutcome::Published | ProjectorOutcome::Tombstoned => {
                         resolved_this_pass += 1;
@@ -1696,7 +1715,8 @@ mod tests {
                 Box::new(VecFake {
                     dim: 384,
                     fail: false
-                })
+                }),
+                10
             )
             .await
             .unwrap(),
@@ -1726,7 +1746,8 @@ mod tests {
                 Box::new(VecFake {
                     dim: 384,
                     fail: true
-                })
+                }),
+                10
             )
             .await
             .unwrap(),
@@ -1742,5 +1763,47 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The drive honors a per-tick job cap (fairness §7.3): beyond the cap,
+    /// extra jobs stay pending for the next tick instead of one unbounded
+    /// bulk pass starving interactive recall.
+    #[tokio::test]
+    async fn project_pending_respects_job_cap() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "a", "1");
+        add(&repo, 2, "b", "2");
+        add(&repo, 3, "c", "3");
+        assert_eq!(
+            Projector::project_pending(
+                &repo,
+                &table,
+                Box::new(VecFake {
+                    dim: 384,
+                    fail: false
+                }),
+                2
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(repo.projection_jobs().unwrap().len(), 1);
+        // The remainder converges on the next drive.
+        assert_eq!(
+            Projector::project_pending(
+                &repo,
+                &table,
+                Box::new(VecFake {
+                    dim: 384,
+                    fail: false
+                }),
+                2
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(repo.projection_jobs().unwrap().is_empty());
     }
 }

@@ -5,7 +5,37 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-09-28 — E5 end-to-end: provision, projection drive, FTS ensure
+## 2026-09-28 — Release review: per-tick projection cap
+
+### Release review: per-tick projection cap (2026-09-28)
+
+- Release-grade review vs all plans surfaced a §7.3 fairness gap:
+  the drive drained ALL pending jobs per tick (unbounded bulk
+  backfill). Fix: `run_limited`/`run_capped` (unbounded
+  `run_until_idle` preserved for bench/tests), `project_pending`
+  takes `max_jobs`, daemon constant 100/tick with rationale;
+  remainder converges over successive ticks with per-tick logs.
+  RED cap test first (signature-missing, then remainder-converges
+  asserted).
+- Adjacent audit results (verified, no changes): socket-mode E5 has
+  no config producer (stdio-only dense today; `serve()` wiring is
+  future-proofing consistent with `start_maintenance`); backup
+  exports the canonical repo only (models/ cannot bloat backups);
+  restore re-enqueues projection jobs (worker converges them);
+  conformance matrix has no retrieval rows to invalidate; no new
+  MCP tools (count intact); provision digest-mismatch fails closed
+  (no auto-redownload masking tampering) + removal remedy named.
+- AD-06 stays OPEN (plan-level decision; FTS probes are evidence
+  toward it, null-vector half not probed here) — no plan/ledger
+  edits. Absolute-claims sweep of all new strings: every
+  never/always/every verified against mechanism + test.
+- Validation: `cargo fmt -- --check` clean,
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo test`
+  651 lib + 2 smoke green. Release boot smoke (warm page cache):
+  initialize in 3s, immediate hybrid + dense + fts,
+  partial=false, top entanglement 0.975, empty stderr.
+
+## 90a0d34 (2026-09-28) — E5 end-to-end: provision, projection drive, FTS ensure
 
 ### E5 wiring: provision + daemon enablement + live dense evidence (2026-09-27)
 

@@ -381,6 +381,7 @@ impl Daemon {
                                 &repo,
                                 &table,
                                 Box::new(adapter),
+                                Self::MAX_PROJECTION_JOBS_PER_TICK,
                             )
                             .await;
                             // FTS only after a successful drive: a failing
@@ -426,6 +427,12 @@ impl Daemon {
     pub async fn projection_worker_running(&self) -> bool {
         self.projection_worker.lock().await.is_some()
     }
+
+    /// Max projection jobs resolved per tick (fairness §7.3): bounds one
+    /// tick to minutes of CPU at measured embed rates so a bulk backfill
+    /// converges over successive ticks instead of one unbounded pass
+    /// starving interactive recall. Steady-state write rates never bind.
+    const MAX_PROJECTION_JOBS_PER_TICK: usize = 100;
 
     /// Run the accept loop until the socket is closed, an error occurs, or
     /// the idle timeout elapses with no connections (design §7.2).
