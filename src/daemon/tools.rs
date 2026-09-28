@@ -4620,7 +4620,10 @@ fn exec_backup_preview(
         })?
         .as_u64();
     let now = disp.clock().now_millis();
-    let channels = disp.registry().channel_count();
+    // Readiness counts LIVE connections: persisted channel bindings
+    // outlive their runs (every restart binds anew) and must never
+    // block a restore after a daemon restart.
+    let channels = disp.registry().live_connection_count();
     let channel = envelope.channel_id.as_uuid().to_string();
     let live_op_seq = disp.repo().op_seq().map_err(|e| {
         crate::domain::command::DomainError::new(
@@ -4712,7 +4715,8 @@ fn exec_backup_restore(
     // Writes that landed anyway (same channel, transient writers) are
     // counted, not refused: the replace drains them, so the report must
     // acknowledge the delta (recoverable from the safety backup).
-    let active_channels = disp.registry().channel_count();
+    // Live connections again (see preview): history never blocks.
+    let active_channels = disp.registry().live_connection_count();
     let live_op_seq = disp
         .repo()
         .op_seq()
@@ -7956,6 +7960,55 @@ mod tests {
         let missing = ToolArgs::BackupPreview(BackupPreviewArgs { path: None });
         let result = run(&disp, &tool_call(4, missing.clone()), &missing);
         assert!(result_is_error(&result));
+    }
+
+    /// Dead channels must not block restore: after two sessions bound two
+    /// channels (prior runs leave persisted bindings behind), preview with
+    /// no LIVE connection still reports READY — readiness counts live
+    /// connections, not registry history.
+    #[test]
+    fn backup_preview_ignores_dead_channels() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Preview Me\n\n### Context\nPreview fixture.");
+        for (n, op) in [(1u64, 10u64), (2, 11)] {
+            let start = ToolArgs::SessionStart(SessionStartArgs {
+                task_type: "debugging".to_string(),
+                technologies: vec![],
+                initial_approach: None,
+            });
+            let env = IpcEnvelope {
+                frontend_id: fe(n),
+                channel_id: ch(n),
+                operation_id: OperationId::new(Uuid::from_u128(op as u128)),
+                ..tool_call(op, start.clone())
+            };
+            run(&disp, &env, &start);
+        }
+        assert_eq!(disp.registry().channel_count(), 2);
+        let out = tempfile::tempdir().unwrap();
+        let create = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(2, create.clone()), &create);
+        assert!(!result_is_error(&result));
+        let path = result_structured(&result).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(path.clone()),
+        });
+        let result = run(&disp, &tool_call(3, preview.clone()), &preview);
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["readiness"]["status"], "ready",
+            "dead channels must not block restore, got: {structured:?}"
+        );
+        assert!(
+            structured["confirmation_token"].as_str().is_some(),
+            "ready preview must issue a token"
+        );
     }
 
     /// Loss accounting through the tool surface: an evolved backup carrying

@@ -362,6 +362,65 @@ mod tests {
         assert!(matches!(err, CliError::Runtime(_)), "got: {err}");
     }
 
+    /// A generation-mismatched handshake keeps the connection open for a
+    /// retry (restore bumps the generation mid-session): same-connection
+    /// re-handshake at the live generation succeeds and serves.
+    #[tokio::test]
+    async fn mismatched_handshake_retry_on_same_connection() {
+        use crate::daemon::envelope::IpcError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = stdio_layout(&dir.path().join(".ltmrs"));
+        let (mut daemon, mut client) = start_local_daemon(&layout).await.unwrap();
+        daemon
+            .dispatcher_arc()
+            .repo_arc()
+            .set_store_generation(crate::domain::id::StoreGeneration::new(2))
+            .unwrap();
+        let id = test_identity();
+        let bad = HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: id.frontend_id,
+            channel_id: id.channel_id,
+        };
+        assert!(
+            matches!(
+                client.handshake(&bad).await,
+                Err(IpcError::GenerationMismatch { daemon: 2, .. })
+            ),
+            "stale handshake must be typed GenerationMismatch"
+        );
+        let good = HandshakeRequest {
+            store_generation: crate::domain::id::StoreGeneration::new(2),
+            ..bad
+        };
+        let hs = client.handshake(&good).await.unwrap();
+        assert_eq!(hs.store_generation.as_u64(), 2);
+        let env = IpcEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: crate::domain::id::StoreGeneration::new(2),
+            frontend_id: id.frontend_id,
+            channel_id: id.channel_id,
+            operation_id: OperationId::new(Uuid::from_u128(11)),
+            session: None,
+            retry_epoch: hs.retry_epoch,
+            deadline_millis: None,
+            scope: Scope::default(),
+            body: DomainRequest::ListMemories,
+        };
+        let resp = client.roundtrip(&env).await.unwrap();
+        assert!(
+            matches!(
+                resp.result,
+                crate::daemon::envelope::IpcResult::Success { .. }
+            ),
+            "post-retry call must serve, got: {:?}",
+            resp.result
+        );
+        daemon.shutdown();
+    }
+
     /// Layout pins the models directory (provision target + daemon enablement source).
     #[test]
     fn stdio_layout_pins_models_path() {

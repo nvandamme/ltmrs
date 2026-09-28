@@ -359,7 +359,10 @@ impl LtmrsFrontend {
         if !stale {
             return Ok(resp);
         }
-        client.forget_handshake();
+        // Epoch-only reset: the stale reply arrived over a healthy stream,
+        // so the connection stays up in both modes (redialing a live
+        // socket is wasteful; redialing a bridge is fatal — no listener).
+        client.forget_epoch();
         drop(client);
         self.ensure_handshaked().await?;
         let mut client = self.client.lock().await;
@@ -1521,6 +1524,82 @@ mod tests {
 
         drop(daemon);
         server_handle.abort();
+    }
+
+    /// Bridged post-restore regression (release Critical): the stdio bridge
+    /// has no socket listener to redial, so an established bridged frontend
+    /// must survive a generation bump transparently — stale answer,
+    /// epoch-only forget, same-stream re-handshake, one retry. Timeout
+    /// guarded: the pre-fix shape parked forever on a dead socket dial.
+    #[tokio::test]
+    async fn bridged_frontend_survives_generation_bump() {
+        use crate::daemon::runtime::RuntimePaths;
+        use crate::daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let _ = handle_connection(server_end, dispatcher, quotas).await;
+        });
+
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_end);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        // Establish at generation 1.
+        let first = fe
+            .roundtrip_with_rehandshake(DomainRequest::ListMemories)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                first.result,
+                crate::daemon::envelope::IpcResult::Success { .. }
+            ),
+            "baseline call must serve, got {:?}",
+            first.result
+        );
+        // Restore bumps the live generation mid-session.
+        daemon
+            .dispatcher_arc()
+            .repo()
+            .set_store_generation(crate::domain::id::StoreGeneration::new(2))
+            .unwrap();
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            fe.roundtrip_with_rehandshake(DomainRequest::ListMemories),
+        )
+        .await
+        .expect("post-restore call must complete, never park");
+        let resp = recovered.unwrap();
+        assert!(
+            matches!(
+                resp.result,
+                crate::daemon::envelope::IpcResult::Success { .. }
+            ),
+            "established bridged connection must recover, got {:?}",
+            resp.result
+        );
+        assert_eq!(
+            fe.identity.generation(),
+            crate::domain::id::StoreGeneration::new(2),
+            "frontend must adopt the live generation"
+        );
+
+        drop(daemon);
     }
 
     /// Sticky-stream regression: a generically rejected handshake must close

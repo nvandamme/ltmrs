@@ -46,6 +46,10 @@ pub struct IpcClient {
     stream: Option<UnixStream>,
     /// The retry epoch issued by the daemon handshake (None until handshaked).
     retry_epoch: Option<u64>,
+    /// In-process bridge (stdio mode): the stream was handed over directly
+    /// and no socket listener exists to redial. Dialing the daemon's
+    /// bound-but-unaccepted socket path would park the caller forever.
+    bridged: bool,
 }
 
 impl IpcClient {
@@ -54,11 +58,21 @@ impl IpcClient {
             socket_path,
             stream: None,
             retry_epoch: None,
+            bridged: false,
         }
     }
 
-    /// Connect to the daemon (or reconnect if already connected).
+    /// Connect to the daemon (or reconnect if already connected). On a
+    /// bridged client this never dials: a live bridge stream is kept
+    /// as-is, and a closed one fails loudly — there is no listener to
+    /// redial in-process.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
+        if self.bridged {
+            if self.stream.is_some() {
+                return Ok(());
+            }
+            return Err(IpcError::NotConnected);
+        }
         let stream = UnixStream::connect(&self.socket_path).await?;
         self.stream = Some(stream);
         self.retry_epoch = None;
@@ -112,6 +126,7 @@ impl IpcClient {
     /// Set an existing stream (for tests using a stream pair).
     pub fn set_stream(&mut self, stream: UnixStream) {
         self.stream = Some(stream);
+        self.bridged = true;
     }
 
     /// Whether the client is connected.
@@ -177,6 +192,13 @@ impl IpcClient {
     /// frontend would keep sending the dead epoch forever.
     pub fn forget_handshake(&mut self) {
         self.stream = None;
+        self.retry_epoch = None;
+    }
+
+    /// Drop only the retry epoch, keeping a live stream: a StaleGeneration
+    /// reply arrives over a healthy connection, so redialing would abandon
+    /// it pointlessly — and on a bridged client fatally (no listener).
+    pub fn forget_epoch(&mut self) {
         self.retry_epoch = None;
     }
 }
@@ -357,6 +379,27 @@ mod tests {
         assert!(
             !client.is_connected(),
             "transport failure must drop the dead stream"
+        );
+    }
+
+    /// Bridged clients never dial the socket path: connect() keeps a live
+    /// bridge stream (no-op) and fails loudly without one — dialing the
+    /// daemon's bound-but-unaccepted listener would park the caller
+    /// forever with nobody to answer.
+    #[tokio::test]
+    async fn bridged_connect_never_dials_socket() {
+        let (a, _peer) = tokio::net::UnixStream::pair().unwrap();
+        let mut client =
+            IpcClient::new(std::path::PathBuf::from("/nonexistent-dir-xyz/daemon.sock"));
+        client.set_stream(a);
+        client.retry_epoch = Some(7);
+        assert!(client.connect().await.is_ok());
+        assert!(client.is_connected(), "live bridge must survive connect");
+        assert_eq!(client.retry_epoch(), Some(7), "epoch must survive connect");
+        client.close();
+        assert!(
+            client.connect().await.is_err(),
+            "closed bridge must fail loudly, never dial"
         );
     }
 

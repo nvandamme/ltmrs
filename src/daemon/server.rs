@@ -571,80 +571,26 @@ pub async fn handle_connection(
     }
     let mut buf = Vec::with_capacity(4096);
 
+    // Live-connection tracking for restore readiness: counted while this
+    // task lives (RAII decrement on every exit path, including panic
+    // unwind). Persisted channel bindings outlive their runs and must
+    // never stand in for liveness.
+    let _live_guard = LiveConnGuard::new(&dispatcher);
     // Released at connection end on every path below: assigned after a
     // successful handshake, dropped when this function returns.
-    let _client_guard: Option<ClientGuard>;
+    let mut _client_guard: Option<ClientGuard> = None;
     // Handshake-authenticated frontend; every later frame must carry it.
-    let authed: Option<crate::domain::id::FrontendId>;
+    // None until the first accepted handshake (a generation-mismatched
+    // first attempt keeps the connection open for a same-stream retry).
+    let mut authed: Option<crate::domain::id::FrontendId> = None;
     // Handshake-authenticated channel; every later frame must carry it.
     // Frontend-only binding would let one channel's frames reach another
     // channel's session (RQ-05).
-    let authed_channel: Option<crate::domain::id::ChannelId>;
+    let mut authed_channel: Option<crate::domain::id::ChannelId> = None;
 
-    // ---- Handshake: the first frame on every connection ----
-    let first = read_wire_frame(&mut stream, &mut buf).await?;
-    match first {
-        WireMessage::Handshake(req) => {
-            let frontend = req.frontend_id;
-            let channel = req.channel_id;
-            let dispatcher = Arc::clone(&dispatcher);
-            let result = tokio::task::spawn_blocking(move || dispatcher.handle_handshake(&req))
-                .await
-                .unwrap_or_else(|e| Err(IpcError::from(std::io::Error::other(e.to_string()))));
-            match result {
-                Ok(hs) => {
-                    // Admit the client to the quota table; a full table
-                    // rejects instead of over-admitting (RQ-22).
-                    if let Err(qe) = quotas.register_client(frontend, channel) {
-                        let err = WireError {
-                            kind: "client_limit_reached".into(),
-                            message: qe.to_string(),
-                        };
-                        write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
-                        return Ok(());
-                    }
-                    // Free the connection's quota slot at connection end on
-                    // every path below. Bound to the handshake-authenticated
-                    // (frontend, channel), not request-claimed ones: each
-                    // connection holds exactly one slot.
-                    _client_guard = Some(ClientGuard::new(Arc::clone(&quotas), frontend, channel));
-                    authed = Some(frontend);
-                    authed_channel = Some(channel);
-                    let reply = WireReply::Handshake(hs);
-                    write_reply(&mut stream, &reply, &quotas).await?;
-                }
-                Err(e) => {
-                    // Rejected handshake: send a wire error and close. A
-                    // generation mismatch keeps a machine-readable kind so
-                    // the frontend can adopt the live generation and retry
-                    // instead of bricking new clients after a restore.
-                    let kind = match &e {
-                        IpcError::GenerationMismatch { .. } => "generation_mismatch",
-                        IpcError::Busy(_) => "daemon_busy",
-                        _ => "handshake_rejected",
-                    };
-                    let err = WireError {
-                        kind: kind.into(),
-                        message: e.to_string(),
-                    };
-                    write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
-                    return Ok(());
-                }
-            }
-        }
-        // A request before a handshake is a protocol violation.
-        WireMessage::Request(_) => {
-            let err = WireError {
-                kind: "handshake_required".into(),
-                message: "first frame must be a handshake".into(),
-            };
-            write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
-            return Ok(());
-        }
-    }
-
-    // Free the client's quota slot at connection end on every path below.
-    // (Guard created in the handshake arm above.)
+    // ---- Frames: the first must be a handshake. A generation-mismatched
+    // handshake keeps the connection open for a same-stream retry (restore
+    // bumps the generation mid-session); every other rejection closes it.
     // ---- Request loop ----
     loop {
         let msg = match read_wire_frame(&mut stream, &mut buf).await {
@@ -654,81 +600,187 @@ pub async fn handle_connection(
             }
             Err(e) => return Err(e),
         };
-        let envelope = match msg {
-            WireMessage::Request(env) => env,
-            // A second handshake is a protocol violation.
-            WireMessage::Handshake(_) => {
-                let err = WireError {
-                    kind: "unexpected_handshake".into(),
-                    message: "handshake already completed".into(),
-                };
-                write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+        match msg {
+            WireMessage::Handshake(req) => {
+                // RQ-05: on an authenticated connection only a same-identity
+                // epoch refresh is accepted; a different identity stays a
+                // protocol violation, never routed anywhere.
+                if let (Some(af), Some(ac)) = (authed, authed_channel)
+                    && (req.frontend_id != af || req.channel_id != ac)
+                {
+                    let err = WireError {
+                        kind: "unexpected_handshake".into(),
+                        message: "handshake already completed".into(),
+                    };
+                    write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+                    continue;
+                }
+                let frontend = req.frontend_id;
+                let channel = req.channel_id;
+                let dispatcher = Arc::clone(&dispatcher);
+                let result = tokio::task::spawn_blocking(move || dispatcher.handle_handshake(&req))
+                    .await
+                    .unwrap_or_else(|e| Err(IpcError::from(std::io::Error::other(e.to_string()))));
+                match result {
+                    Ok(hs) => {
+                        // Admit the client to the quota table on first success
+                        // only (a refresh reuses the held slot); a full table
+                        // rejects instead of over-admitting (RQ-22).
+                        if _client_guard.is_none() {
+                            if let Err(qe) = quotas.register_client(frontend, channel) {
+                                let err = WireError {
+                                    kind: "client_limit_reached".into(),
+                                    message: qe.to_string(),
+                                };
+                                write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+                                return Ok(());
+                            }
+                            // Free the connection's quota slot at connection end
+                            // on every path below. Bound to the
+                            // handshake-authenticated (frontend, channel), not
+                            // request-claimed ones: each connection holds
+                            // exactly one slot.
+                            _client_guard =
+                                Some(ClientGuard::new(Arc::clone(&quotas), frontend, channel));
+                        }
+                        authed = Some(frontend);
+                        authed_channel = Some(channel);
+                        let reply = WireReply::Handshake(hs);
+                        write_reply(&mut stream, &reply, &quotas).await?;
+                    }
+                    Err(e) => {
+                        // Rejected handshake: send a wire error. A generation
+                        // mismatch keeps the connection open for a same-stream
+                        // retry (the frontend adopts the live generation);
+                        // every other rejection closes it, as before.
+                        let keep_open = matches!(&e, IpcError::GenerationMismatch { .. });
+                        let kind = match &e {
+                            IpcError::GenerationMismatch { .. } => "generation_mismatch",
+                            IpcError::Busy(_) => "daemon_busy",
+                            _ => "handshake_rejected",
+                        };
+                        let err = WireError {
+                            kind: kind.into(),
+                            message: e.to_string(),
+                        };
+                        write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+                        if !keep_open {
+                            return Ok(());
+                        }
+                        // De-authenticate so a failed epoch refresh retries
+                        // from scratch (slot freed, re-registered on success).
+                        _client_guard = None;
+                        authed = None;
+                        authed_channel = None;
+                    }
+                }
                 continue;
             }
-        };
-        // Bind every frame to the handshake identity (RQ-05): a frame
-        // claiming another frontend OR another channel is a protocol
-        // violation, never routed into its session namespace or quota
-        // bucket. Channel is bound too: same-frontend frames must not
-        // reach a sibling channel's session.
-        if Some(envelope.frontend_id) != authed {
-            let err = WireError {
-                kind: "frontend_mismatch".into(),
-                message: "frame frontend differs from handshake identity".into(),
-            };
-            write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
-            continue;
-        }
-        if Some(envelope.channel_id) != authed_channel {
-            let err = WireError {
-                kind: "channel_mismatch".into(),
-                message: "frame channel differs from handshake identity".into(),
-            };
-            write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
-            continue;
-        }
-        // (Client slot was bound to the handshake ID by the guard above.)
+            WireMessage::Request(env) => {
+                if authed.is_none() {
+                    // A request before a handshake is a protocol violation.
+                    let err = WireError {
+                        kind: "handshake_required".into(),
+                        message: "first frame must be a handshake".into(),
+                    };
+                    write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+                    return Ok(());
+                }
+                let envelope = env;
+                // Bind every frame to the handshake identity (RQ-05): a frame
+                // claiming another frontend OR another channel is a protocol
+                // violation, never routed into its session namespace or quota
+                // bucket. Channel is bound too: same-frontend frames must not
+                // reach a sibling channel's session.
+                if Some(envelope.frontend_id) != authed {
+                    let err = WireError {
+                        kind: "frontend_mismatch".into(),
+                        message: "frame frontend differs from handshake identity".into(),
+                    };
+                    write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+                    continue;
+                }
+                if Some(envelope.channel_id) != authed_channel {
+                    let err = WireError {
+                        kind: "channel_mismatch".into(),
+                        message: "frame channel differs from handshake identity".into(),
+                    };
+                    write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
+                    continue;
+                }
+                // (Client slot was bound to the handshake ID by the guard above.)
 
-        // Enforce the per-client quota: visible backpressure, not unbounded work.
-        if let Err(qe) = quotas.try_enqueue(envelope.frontend_id) {
-            let busy = DomainError::new(DomainErrorCode::Validation, format!("backpressure: {qe}"));
-            let resp = IpcResponse::error(envelope.operation_id, &busy);
-            write_reply(&mut stream, &WireReply::Response(resp), &quotas).await?;
-            continue;
+                // Enforce the per-client quota: visible backpressure, not unbounded work.
+                if let Err(qe) = quotas.try_enqueue(envelope.frontend_id) {
+                    let busy = DomainError::new(
+                        DomainErrorCode::Validation,
+                        format!("backpressure: {qe}"),
+                    );
+                    let resp = IpcResponse::error(envelope.operation_id, &busy);
+                    write_reply(&mut stream, &WireReply::Response(resp), &quotas).await?;
+                    continue;
+                }
+
+                // In-flight storage bound: refuse visibly instead of piling up
+                // blocking work beyond the configured concurrency.
+                if let Err(qe) = quotas.try_start_storage() {
+                    quotas.dequeue(envelope.frontend_id);
+                    let busy = DomainError::new(
+                        DomainErrorCode::Validation,
+                        format!("backpressure: {qe}"),
+                    );
+                    let resp = IpcResponse::error(envelope.operation_id, &busy);
+                    write_reply(&mut stream, &WireReply::Response(resp), &quotas).await?;
+                    continue;
+                }
+
+                // Dispatch on a blocking thread: Fjall write transactions + fsync
+                // must not block a Tokio core I/O worker (§7.3).
+                let op_id = envelope.operation_id;
+                let fe_id = envelope.frontend_id;
+                let dispatcher = Arc::clone(&dispatcher);
+                let dispatch_result =
+                    tokio::task::spawn_blocking(move || dispatcher.handle(&envelope))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(DomainError::new(
+                                DomainErrorCode::Validation,
+                                format!("dispatch task failed: {e}"),
+                            ))
+                        });
+                let response = match dispatch_result {
+                    Ok(r) => r,
+                    Err(e) => IpcResponse::error(op_id, &e),
+                };
+                quotas.finish_storage();
+                quotas.dequeue(fe_id);
+
+                // Write the response.
+                write_reply(&mut stream, &WireReply::Response(response), &quotas).await?;
+            }
         }
+    }
+}
 
-        // In-flight storage bound: refuse visibly instead of piling up
-        // blocking work beyond the configured concurrency.
-        if let Err(qe) = quotas.try_start_storage() {
-            quotas.dequeue(envelope.frontend_id);
-            let busy = DomainError::new(DomainErrorCode::Validation, format!("backpressure: {qe}"));
-            let resp = IpcResponse::error(envelope.operation_id, &busy);
-            write_reply(&mut stream, &WireReply::Response(resp), &quotas).await?;
-            continue;
+/// Tracks one live IPC connection in the frontend registry (RAII decrement
+/// on drop, mirroring `ClientGuard`). Restore readiness counts live
+/// connections, never persisted channel history.
+struct LiveConnGuard {
+    dispatcher: Arc<Dispatcher>,
+}
+
+impl LiveConnGuard {
+    fn new(dispatcher: &Arc<Dispatcher>) -> Self {
+        dispatcher.registry().note_live_connect();
+        Self {
+            dispatcher: Arc::clone(dispatcher),
         }
+    }
+}
 
-        // Dispatch on a blocking thread: Fjall write transactions + fsync
-        // must not block a Tokio core I/O worker (§7.3).
-        let op_id = envelope.operation_id;
-        let fe_id = envelope.frontend_id;
-        let dispatcher = Arc::clone(&dispatcher);
-        let dispatch_result = tokio::task::spawn_blocking(move || dispatcher.handle(&envelope))
-            .await
-            .unwrap_or_else(|e| {
-                Err(DomainError::new(
-                    DomainErrorCode::Validation,
-                    format!("dispatch task failed: {e}"),
-                ))
-            });
-        let response = match dispatch_result {
-            Ok(r) => r,
-            Err(e) => IpcResponse::error(op_id, &e),
-        };
-        quotas.finish_storage();
-        quotas.dequeue(fe_id);
-
-        // Write the response.
-        write_reply(&mut stream, &WireReply::Response(response), &quotas).await?;
+impl Drop for LiveConnGuard {
+    fn drop(&mut self) {
+        self.dispatcher.registry().note_live_disconnect();
     }
 }
 

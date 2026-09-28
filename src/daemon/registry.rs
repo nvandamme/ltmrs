@@ -7,7 +7,7 @@
 //! the MCP numeric request IDs collide.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::domain::id::{ChannelId, FrontendId, SessionHandle};
 use crate::domain::memory::Instant;
@@ -58,6 +58,11 @@ pub struct FrontendRegistry {
     channels: HashMap<(FrontendId, ChannelId), ChannelBinding>,
     sessions: HashMap<SessionHandle, Session>,
     handle_gen: AtomicU64,
+    /// Live IPC connections serving right now (incremented on connect,
+    /// decremented on drop). Restore readiness counts these — never the
+    /// persisted channel history, whose dead entries outlive their runs
+    /// and would otherwise block every restore after a daemon restart.
+    live: AtomicUsize,
 }
 
 impl FrontendRegistry {
@@ -66,6 +71,7 @@ impl FrontendRegistry {
             channels: HashMap::new(),
             sessions: HashMap::new(),
             handle_gen: AtomicU64::new(1),
+            live: AtomicUsize::new(0),
         }
     }
 
@@ -603,6 +609,30 @@ impl FrontendRegistry {
         self.channels.len()
     }
 
+    /// Note a live IPC connection (paired with `note_live_disconnect`
+    /// via RAII in the connection task).
+    pub fn note_live_connect(&self) {
+        self.live.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Note a live IPC connection closing. Saturating: an imbalance
+    /// must degrade to a possibly-stale positive (recoverable by
+    /// restart), never wrap to usize::MAX (blocking restores forever).
+    pub fn note_live_disconnect(&self) {
+        let prev = self.live.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(prev > 0, "live-connection count imbalance");
+        if prev == 0 {
+            self.live.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// Live IPC connections right now. Restore readiness uses this —
+    /// persisted channel bindings outlive their runs and must never
+    /// block a restore after a daemon restart.
+    pub fn live_connection_count(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
     /// Number of sessions (for health/diagnostics).
     pub fn session_count(&self) -> usize {
         self.sessions.len()
@@ -671,6 +701,8 @@ impl FrontendRegistry {
             channels,
             sessions,
             handle_gen: AtomicU64::new(snapshot.handle_gen),
+            // Live connections never persist: a fresh process starts at zero.
+            live: AtomicUsize::new(0),
         })
     }
 }
@@ -839,6 +871,15 @@ mod tests {
         assert_eq!(reg2.resolve_session(fe(1), ch(2)), Some(h_b));
         // Attempts and lease restored.
         assert_eq!(reg2.channel_count(), 2);
+        // Live connections never persist: a fresh process starts at zero
+        // even with channel history on disk (restore readiness counts
+        // live connections, never this history).
+        assert_eq!(reg2.live_connection_count(), 0);
+        reg2.note_live_connect();
+        reg2.note_live_connect();
+        assert_eq!(reg2.live_connection_count(), 2);
+        reg2.note_live_disconnect();
+        assert_eq!(reg2.live_connection_count(), 1);
         // The restored session for ch(1) has its recorded attempt.
         let s = reg2.session(h_a).unwrap();
         assert_eq!(s.attempts.len(), 1);

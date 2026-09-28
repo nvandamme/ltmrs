@@ -5,7 +5,30 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-09-28 — Release review: per-tick projection cap
+## 2026-09-28 — Restore session survival + live readiness
+
+### Restore session survival + live readiness (2026-09-28)
+
+- Two release-blockers found live and fixed TDD-first. (1) Post-
+  restore sessions bricked silently: the daemon closed on
+  GenerationMismatch while the bridged frontend dialed the
+  bound-but-unaccepted socket (read pends forever). Fix:
+  `IpcClient` tracks bridged mode (`connect()` no-ops on a live
+  bridge, loud `NotConnected` without one); daemon keeps the
+  connection open on mismatch and accepts same-identity epoch
+  refresh on authenticated connections (different IDs stay a
+  violation — RQ-05 preserved); stale path uses epoch-only forget
+  (no pointless redial, fatal on bridge). (2) Restore blocked
+  after any restart: readiness counted persisted channel history.
+  Fix: RAII live-connection counter (`note_live_connect`/
+  `disconnect`, saturating floor); preview + confirm use it.
+- Tests (RED observed each): bridged-connect never dials; same-
+  connection mismatch retry; timeout-guarded full-stack generation
+  bump; dead channels → READY; live count resets on registry load.
+  Full suite green; live rollback cycle verified same-session
+  (backup/restore/rollback with state assertions, exit 0).
+
+## 6c16a54 (2026-09-28) — Release review: per-tick projection cap
 
 ### Release review: per-tick projection cap (2026-09-28)
 
