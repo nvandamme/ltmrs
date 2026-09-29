@@ -11,19 +11,11 @@ never calls a remote model.
 
 ## Status
 
-**Release candidate v0.1-alpha.** Implementation covers WP-12 plus
-post-WP-12 enhancements (E5 dense end-to-end, restore session
-survival, provenance vocabulary), with WP-13 evidence largely
-executed — see `CHANGELOG.md` and `reports/release-01/`.
-The `cargo test` gate (657 lib + 2 smoke) is green on the tracked
-tree; offline install is validated under enforced network isolation;
-rollback is verified live end-to-end; the SBOM carries no
-GPL/AGPL/proprietary licenses; all 12 ledger deviations are
-owner-approved. Honest `not_run`: upstream-differential re-run (no
-contract change to re-verify), power-loss qualification (needs a
-dedicated machine), the 300-case quality corpus and held-out
-calibration, fault/soak harnesses, and multi-host matrices. Publish
-(tag/push) is pending owner approval. This repository contains:
+**Release candidate v0.1-alpha** (`ltmrs 0.1.0-alpha`). Implementation
+covers WP-12 plus post-WP-12 enhancements, with WP-13 evidence largely
+executed. Release tracking (per-ticker status, evidence pointers,
+open items) lives in [`docs/RELEASE.md`](docs/RELEASE.md); history in
+[`CHANGELOG.md`](CHANGELOG.md). This repository contains:
 
 - the reviewed implementation specification and test plan in [`plans/`](plans/),
 - the frozen Lemma 0.21.0 baseline in
@@ -260,7 +252,7 @@ ltmrs --socket PATH                            # attach stdio to a running daemo
 
 Backups run through the MCP tools (`backup_create` to a
 directory, `backup_preview`, `backup_restore` with token + confirm);
-see Operations above. Verification gates: `cargo test` (657 lib +
+see Operations above. Verification gates: `cargo test` (664 lib +
 2 smoke suites), `cargo fmt -- --check`, `cargo clippy
 --all-targets -- -D warnings`.
 

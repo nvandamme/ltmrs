@@ -1823,6 +1823,46 @@ mod tests {
         assert!(repo.projection_jobs().unwrap().is_empty());
     }
 
+    /// Idempotency: a second drive immediately after a converged one
+    /// resolves nothing (compare-and-clear actually cleared). A repeat
+    /// resolution here means acknowledgements are lost and any
+    /// long-running drive spins forever re-publishing.
+    #[tokio::test]
+    async fn project_pending_second_drive_resolves_nothing() {
+        let (repo, table, _guard) = env().await;
+        add(&repo, 1, "hello", "world");
+        add(&repo, 2, "foo", "bar");
+        assert_eq!(
+            Projector::project_pending(
+                &repo,
+                &table,
+                Box::new(VecFake {
+                    dim: 384,
+                    fail: false
+                }),
+                10
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            Projector::project_pending(
+                &repo,
+                &table,
+                Box::new(VecFake {
+                    dim: 384,
+                    fail: false
+                }),
+                10
+            )
+            .await
+            .unwrap(),
+            0,
+            "converged state must stay converged"
+        );
+    }
+
     /// Batch default maps per-text results 1:1 in order, preserving errors.
     #[test]
     fn embed_texts_default_preserves_order_and_errors() {

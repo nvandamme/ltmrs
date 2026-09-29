@@ -52,11 +52,11 @@ verdict = "put/search not comparable (dedup-gate refusal cascade diverged the co
 
 [[not_run]]
 name = "fault-soak-steady-state"
-reason = "No fault-injection or soak run exists; all bench stores are freshly created tempdirs. Disk-growth trends, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
+reason = "Point fault-injection, fragmented-state kill, deterministic soak and sustained-load consistency are executed in-suite (fjall_backend tests). No long-run clock-time soak harness and no fault injection under sustained load; disk-growth trends, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
 
 [[not_run]]
 name = "quality-corpus-300"
-reason = "Reviewed corpus target (§8.1, ≥300 cases) not built; the 10-case safety fixture pins mechanics, not retrieval quality. Held-out split (2 cases) is insufficient evidence for RQ-24."
+reason = "Human-reviewed corpus target (§8.1, ≥300 cases) not built; a synthetic 300-case known-answer corpus (topic-disjoint dev/heldout, paraphrase queries) is built and executed instead — experiments/quality/retrieval-calibration.json. The 10-case safety fixture pins mechanics, not retrieval quality."
 
 [[not_run]]
 name = "ablation-dense-hybrid-priority-graph-mmr-upstream"
@@ -67,8 +67,8 @@ name = "ann-vs-exact"
 reason = "No ANN index configuration evaluated (§8.3 orders exact search first; T-QUALITY-02)."
 
 [[not_run]]
-name = "dev-calibration"
-reason = "No thresholds, candidate pools or model choices tuned (nothing to tune yet); min_similarity stays unset. Calibration must use the dev split only when it happens (task 9)."
+name = "beir-scifact-full"
+reason = "Harness built and proven through 709 real indexed docs (ignored test beir_scifact_hybrid_quality; needs LTMRS_PROBE_MODELS + LTMRS_BEIR_DIR). Full 5,183-doc run needs ~5h CPU single-threaded bulk indexing (~4s/job measured: multi-chunk candle forwards + per-job Lance commits); run on a GPU-backed or unattended box, not interactively."
 
 [[not_run]]
 name = "contended-write-mix"

@@ -27,6 +27,10 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [ ] WP-11 — Import, legacy interchange, backup and restore (S7)
 - [ ] WP-12 — Qualification, quality and performance (S8)
 - [ ] WP-13 — Release, documentation and evidence closure (S8)
+- [ ] Parallel bulk drive — phased plan at
+  docs/superpowers/plans/2026-09-28-parallel-bulk-drive.md
+  (batch-per-memory → bounded chunk pool → CUDA-gated; fairness
+  first, owner-ordered 2026-09-28)
 - [ ] DEV-008 follow-up — Upstream instructional UX (seed fragments,
   coaching blocks, technology autodetect, distill suggestion).
   Baseline captures mechanisms only, no content/heuristics. First

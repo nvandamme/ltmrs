@@ -567,6 +567,160 @@ mod tests {
         eprintln!("Fjall T-REC-01: kill/reopen with SyncAll — data durable");
     }
 
+    /// Steady-state kill: fragmented state (creates + updates + feedback
+    /// across revisions) survives kill/reopen with every record intact —
+    /// durability is not a fresh-database-only property.
+    #[test]
+    fn fjall_kill_reopen_fragmented_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+
+        {
+            let be = FjallBackend::open(&path).unwrap();
+            for i in 1..=50u64 {
+                be.create_memory_if_absent(eid(i), &format!("T{i}"), "frag", 0.5, 1)
+                    .unwrap();
+            }
+            for i in 1..=25u64 {
+                be.update_memory_conditional(eid(i), 1, &format!("T{i}-v2"), 2)
+                    .unwrap();
+                be.apply_feedback(eid(i), true).unwrap();
+            }
+            be.persist(PersistMode::SyncAll).unwrap();
+        }
+
+        let be2 = FjallBackend::open(&path).unwrap();
+        for i in 1..=50u64 {
+            let found = be2.read_memory(eid(i)).unwrap();
+            let record = found.unwrap_or_else(|| panic!("memory {i} lost across kill"));
+            if i <= 25 {
+                assert_eq!(
+                    record.title,
+                    format!("T{i}-v2"),
+                    "updated title lost for {i}"
+                );
+            } else {
+                assert_eq!(record.title, format!("T{i}"), "title lost for {i}");
+            }
+        }
+        eprintln!("Fjall steady-state kill: 50 fragmented records durable");
+    }
+
+    /// Soak: a long deterministic mixed-op run (seeded LCG schedule over
+    /// 40 keys: creates, conditional updates, feedback) with periodic
+    /// barriers, then kill/reopen — every key holds exactly its
+    /// last-written state.
+    #[test]
+    fn fjall_soak_mixed_ops_then_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        // Expected titles tracked alongside; updates always advance rev.
+        let mut expected = std::collections::HashMap::new();
+        let mut rev = std::collections::HashMap::new();
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+
+        {
+            let be = FjallBackend::open(&path).unwrap();
+            for i in 1..=40u64 {
+                be.create_memory_if_absent(eid(i), &format!("S{i}-v1"), "frag", 0.5, 1)
+                    .unwrap();
+                expected.insert(i, format!("S{i}-v1"));
+                rev.insert(i, 1u64);
+            }
+            for step in 0..960u64 {
+                // Seeded LCG: deterministic schedule, no test harness.
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let id = 1 + rng % 40;
+                let r = *rev.get(&id).unwrap();
+                let title = format!("S{id}-s{step}");
+                // Conditional update may lose a (single-threaded: never
+                // contends here); only record wins.
+                if be
+                    .update_memory_conditional(eid(id), r, &title, r + 1)
+                    .unwrap()
+                    == 1
+                {
+                    expected.insert(id, title);
+                    rev.insert(id, r + 1);
+                }
+                if step % 7 == 0 {
+                    be.apply_feedback(eid(id), step % 2 == 0).unwrap();
+                }
+                if step % 200 == 199 {
+                    be.persist(PersistMode::SyncAll).unwrap();
+                }
+            }
+            be.persist(PersistMode::SyncAll).unwrap();
+        }
+
+        let be2 = FjallBackend::open(&path).unwrap();
+        for (id, title) in &expected {
+            let found = be2
+                .read_memory(eid(*id))
+                .unwrap()
+                .unwrap_or_else(|| panic!("memory {id} lost in soak"));
+            assert_eq!(&found.title, title, "last-write-wins violated for {id}");
+        }
+        eprintln!("Fjall soak: 1000 mixed ops, all last-written states durable");
+    }
+
+    /// Sustained load consistency: racing conditional writers across
+    /// keys, then persist + reopen — every key holds either its original
+    /// or a fully-written writer value (no torn strings, no missing
+    /// keys), and at least one writer visibly won.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fjall_sustained_write_load_stays_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let be = Arc::new(FjallBackend::open(&path).unwrap());
+        for i in 1..=8u64 {
+            be.create_memory_if_absent(eid(i), &format!("L{i}"), "frag", 0.5, 1)
+                .unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for w in 0..4usize {
+            let be = Arc::clone(&be);
+            handles.push(tokio::task::spawn_blocking(move || {
+                let mut won = 0u32;
+                for n in 0..200u32 {
+                    let id = 1 + (n as u64 + w as u64) % 8;
+                    // Revision churns under contention; attempts use the
+                    // create-time revision and count actual wins.
+                    if be
+                        .update_memory_conditional(eid(id), 1, &format!("L{id}-w{w}n{n}"), 2)
+                        .unwrap_or(0)
+                        == 1
+                    {
+                        won += 1;
+                    }
+                }
+                won
+            }));
+        }
+        let mut total_won = 0u32;
+        for h in handles {
+            total_won += h.await.unwrap();
+        }
+        assert!(total_won >= 1, "at least one racing writer must win");
+        be.persist(PersistMode::SyncAll).unwrap();
+        drop(be);
+
+        let be2 = FjallBackend::open(&path).unwrap();
+        for i in 1..=8u64 {
+            let found = be2
+                .read_memory(eid(i))
+                .unwrap()
+                .unwrap_or_else(|| panic!("memory {i} lost under load"));
+            let ok = found.title == format!("L{i}")
+                || (found.title.starts_with(&format!("L{i}-w")) && found.title.contains('n'));
+            assert!(ok, "torn title for {i}: {}", found.title);
+        }
+        eprintln!("Fjall sustained load: consistent state, {total_won} racing wins");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fjall_bounded_retry_under_contention() {
         let dir = tempfile::tempdir().unwrap();

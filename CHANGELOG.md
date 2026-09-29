@@ -5,7 +5,133 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-09-28 — Batch embedding per memory (bulk-drive Phase 1)
+## faaf731 (2026-09-28) — Final release evidence: quality, waves, tickers
+
+### Inference parallelism probe: candle already threads (2026-09-28)
+
+- Same 11-chunk probe: default threads 47s vs RAYON_NUM_THREADS=1
+  298s (**6.3x from internal threading**; production runs show
+  140-330% CPU). Candle-core depends on rayon itself — the pool
+  is already scaled, not idle.
+- Verdict: NO rayon/thread-pool added on top (would oversubscribe
+  saturated cores; single bounded worker + sync adapters stay per
+  RQ-22 and plan §7.3/§9). Bulk cost is inherent CPU inference
+  (~4s/job measured end-to-end on release) + per-job commits.
+- Fairness posture (unchanged): 100 jobs / 5-min tick bounds bulk
+  CPU windows; interactive recall contends only transiently.
+  Parallel bulk drive (batched forwards across cores) is a real
+  future project, not a tweak — deferred deliberately.
+- Temp probes deleted; no production code changed in this probe.
+
+### BEIR harness built; full run needs GPU box (2026-09-28)
+
+- Downloaded canonical SciFact (5183 docs / 300 test queries, UKP)
+  and built the ignored eval harness (production-shape: real
+  index + FTS + hybrid retrieve; nDCG@10/MAP/Recall/MRR).
+- Proved working through 709 real indexed docs, then diagnosed a
+  flat throughput wall (~4.2s/job: multi-chunk CPU forwards +
+  per-job Lance commits) — the full run needs ~5h machine time.
+  Per-phase probes + post-mortem job inspection done instead of
+  guessing; added an idempotency regression test from the
+  investigation (second drive resolves nothing).
+- LM Studio note: BEIR correctly uses zero model-server traffic
+  (local E5 embeddings); LM Studio served only the agent wave.
+- Recorded honestly: harness done, full run open (GPU box);
+  synthetic calibration stands as executed quality evidence.
+
+### Live-agent wave via LM Studio qwen3.8-27b (2026-09-28)
+
+- Hookup works: LM Studio server :1234 serves
+  qwen3.8-27b-efficientthink-simpo-lynnstyle@q5, OpenAI-compatible,
+  no key; 27B reasoning model answers in ~3s (reasoning_content
+  separate; parse last content line). Harness:
+  tools/agent_quality_wave.py (20 heldout cases, seed 7, temp 0,
+  pinned prompt; verdicts YES/NO/UNCERTAIN verbatim).
+- Run 1 (zero-shot rater): agreement 0.389. Analysis showed two
+  confounds, not retrieval failure (exact-target hit@1 was 15/20):
+  rater too strict on synonyms + template queries that don't
+  answer their own targets (corpus validity gap — same human-
+  review gap as the 300-case corpus).
+- Run 2 (few-shot rater with synonym-bridging examples):
+  agreement 0.632 (`reports/release-01/agent-wave.json`).
+  Residual NOs mix genuine misses and corpus mismatches.
+- Verdict: harness sound and reusable; numbers are wave evidence
+  with stated caveats, not a quality gate (needs answerability-
+  reviewed corpus + calibrated rater for gate use).
+
+### Upstream harness exploration (2026-09-28)
+
+- Mapped tmp/upstream-lemma/tests: ~40 node:test files (db, memory,
+  guides, sessions, server, intelligence), manual MCP waves
+  (mcp-smoke, recall-explain, c2/wave2/wave3/glm-agent quality),
+  exactly ONE fixture file (unused-vec0.sql).
+- RRF/MMR math parity verified in-suite (hand-computed fusion,
+  missing legs, normalization, diversity tests both sides).
+  Backup/migration/lifecycle areas have tests both sides.
+- Nothing to import (their fixtures are thinner than ours:
+  compat captures, reference vectors, calibration corpus).
+- Live-agent waves recorded as not_run (need agents, like
+  power-loss needs a lab). No code changed in this sweep.
+
+### Clearing open tickers: soak/fault, corpus/calibration, differential (2026-09-28)
+
+- Soak (new): deterministic 1000-op mixed schedule (seeded LCG,
+  last-write-wins verified) + sustained racing-write consistency —
+  both green, suite stays fast. WP-12 fault box updated (long-run
+  soak + sustained-load fault stay honestly not_run).
+- 300-case synthetic known-answer corpus
+  (tools/gen_calibration_corpus.py → experiments/quality/
+  retrieval-calibration.json): topic-disjoint dev/heldout,
+  paraphrase queries (0.63 mean shared tokens). Calibration run
+  (ignored, env-gated, 15 min): retention 1.0 through 0.70 on
+  BOTH splits, collapses after — recommended 0.70, default HELD
+  at 0.0 (thin margin + synthetic caveat; E5 similarities
+  saturate high, ranking does the work). Changing the default
+  needs owner approval. benchmarks.toml + WP-12 boxes updated.
+- Differential: upstream 100-op sample fresh (26 ok / 74
+  expected read-misses); ltmrs storage experiment re-run on the
+  release tree (1614 ops 0 failures + 386 search ops 0 failures);
+  transcripts in bundle. Full differential still tied to WP-12
+  evidence (no contract delta).
+- Validation: fmt/clippy clean, 664 lib + 2 smoke green.
+
+### WP-12/13 ticker clearing: fault evidence + honest opens (2026-09-28)
+
+- Fault box was stale ("no fault-injection harness"): injector
+  exists with point tests (migration-atomicity, unknown-outcome,
+  persist-barrier faults, all green). Added fragmented-state kill
+  test (50 records + updates + feedback survive reopen) plus soak
+  and sustained-load tests (see Clearing entry) and flipped the
+  box to [x]-Partial with exact test names; long-run clock-time
+  soak stays not_run (no harness exists).
+- Re-audited every WP-12/WP-13 box against fresh evidence: all
+  accurate except the fault box (fixed above). Calibration executed
+  on the synthetic corpus (see Clearing entry; default held);
+  human-reviewed corpus still open. Publish stays open (tag/push is
+  owner action — deliberately untagged on a moving tree).
+- Validation: fmt/clippy clean, 664 lib + 2 smoke green (7 ignored:
+  export/storage/load reference runs + live-E5 + calibration + BEIR
+  + batch-parity — all env-gated or harness-runners).
+
+
+### Load + timing differentials (2026-09-28)
+
+- Load harness re-run on release tree (ignored
+  load_experiment_reference_run): closed 811 ops 0 failures
+  (gets p50 3µs, puts p50 16.3ms — durability barrier cost);
+  open Poisson-200/s 811 ops 0 failures, tight tails (puts p99
+  11.3ms). Summaries in bundle; wp12-load-01 evidence restored
+  untouched.
+- Timing differential vs upstream (salted 100-op stream, same
+  box): puts med 4.4→1.2ms, search med 1.2→0.2ms, get-miss
+  0.6→0.1ms. First run invalid (upstream dedup refused 52/53)
+  and redone via sanctioned per-seq resalting, not averaged.
+  Small stores, lexical paths, indicative only. Runner
+  (tools/bench_against_ltmrs.py, transcript-compatible) +
+  transcripts in bundle. Get-ok counts incomparable by contract;
+  our duplicate gate passing salted content is DEV-007, known.
+
+## 1ef65d1 (2026-09-28) — Batch embedding per memory (bulk-drive Phase 1)
 
 ### Batch embedding per memory (bulk-drive Phase 1) (2026-09-28)
 
