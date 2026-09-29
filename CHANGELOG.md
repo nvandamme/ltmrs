@@ -5,7 +5,25 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 32432e6 (2026-09-28) — Release closure: version, docs, approvals
+## 2026-09-28 — Batch embedding per memory (bulk-drive Phase 1)
+
+### Batch embedding per memory (bulk-drive Phase 1) (2026-09-28)
+
+- `Embedder::embed_texts` with order/error-preserving default +
+  `render_chunk_rows` routed through one batch call (row shape
+  unchanged; failures stay lexical-only). E5 override does a single
+  `embed_batch` (Passage role) with defensive length match; shared
+  `Arc<Mutex>` handle forwards so the live tick path actually uses
+  it (caught in review before merge).
+- Delivered subagent-driven (implementer per task + reviewer per
+  task + whole-branch review, all clean; one fix round split a
+  stray test out of scope). Phase 2 parked by measurement
+  (candle scales 6.3x internally; data-parallel forwards would
+  time-slice the same cores).
+- Tests: batch-default mapping, parity within 1e-5 (direct +
+  shared-handle, weight-gated), full suite green.
+
+## 0c01e55 (2026-09-28) — Release closure: version, docs, approvals, export route, readme completion
 
 ### Visualizer /api/export route (upstream parity) (2026-09-28)
 

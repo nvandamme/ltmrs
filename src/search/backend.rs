@@ -231,6 +231,35 @@ impl Embedder for E5SmallAdapter {
         .ok_or_else(|| "embedding returned no sequences".to_string())
     }
 
+    fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
+        use crate::embeddings::e5_small::EmbedInput;
+        use crate::embeddings::recipe::Role;
+
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        let inputs: Vec<EmbedInput> = texts
+            .iter()
+            .map(|text| EmbedInput {
+                text: text.clone(),
+                role: Role::Passage,
+            })
+            .collect();
+        match self.embed_batch(&inputs) {
+            Ok(seqs) => {
+                let mut out: Vec<Result<Vec<f32>, String>> =
+                    seqs.into_iter().map(|s| Ok(s.vector)).collect();
+                // Defensive length match: never silently drop or pad units.
+                while out.len() < texts.len() {
+                    out.push(Err("batch returned fewer sequences than inputs".to_string()));
+                }
+                out.truncate(texts.len());
+                out
+            }
+            Err(e) => texts.iter().map(|_| Err(e.to_string())).collect(),
+        }
+    }
+
     fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
         e5_chunks_to_text_chunks(title, &self.chunk_passage(title, fragment))
     }
@@ -357,6 +386,16 @@ impl Embedder for Arc<Mutex<E5SmallAdapter>> {
             .lock()
             .map_err(|_| "embedding adapter lock poisoned".to_string())?;
         (&mut *guard as &mut dyn Embedder).embed(text)
+    }
+
+    fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
+        match self.lock() {
+            Ok(mut guard) => (&mut *guard as &mut dyn Embedder).embed_texts(texts),
+            Err(_) => texts
+                .iter()
+                .map(|_| Err("embedding adapter lock poisoned".to_string()))
+                .collect(),
+        }
     }
 
     fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
@@ -678,6 +717,61 @@ mod tests {
         assert_eq!(units.len(), 1, "short text is one unit");
         assert_eq!(units[0].text, "T\nshort fragment");
         assert_eq!(shared.chunker_version(), E5_CHUNK_VERSION);
+    }
+
+    /// Batched E5 embedding matches sequential embedding within float
+    /// tolerance on fixed texts (padding masks make the math identical;
+    /// batch dim may reorder reductions). Ignored: needs pinned artifacts.
+    #[tokio::test]
+    #[ignore]
+    async fn e5_batch_matches_sequential_within_tolerance() {
+        use crate::embeddings::artifacts::ArtifactCache;
+        use crate::embeddings::e5_small::E5SmallAdapter;
+        use crate::search::projector::Embedder;
+
+        let models = std::env::var("LTMRS_PROBE_MODELS").unwrap_or_default();
+        if models.is_empty() || !std::path::Path::new(&models).exists() {
+            eprintln!("SKIP: set LTMRS_PROBE_MODELS to a provisioned models dir");
+            return;
+        }
+        let cache = ArtifactCache::new(&models);
+        let mut adapter = E5SmallAdapter::load_from_cache(&cache).expect("provisioned cache loads");
+        let texts = vec![
+            "the quick brown fox jumps over the lazy dog".to_string(),
+            "quantum entanglement enables instantaneous correlation".to_string(),
+        ];
+        let batched = adapter
+            .embed_texts(&texts)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let single0 = Embedder::embed(&mut adapter, &texts[0]).unwrap();
+        let single1 = Embedder::embed(&mut adapter, &texts[1]).unwrap();
+        for (b, s) in batched.iter().zip([single0, single1].iter()) {
+            assert_eq!(b.len(), s.len());
+            for (x, y) in b.iter().zip(s.iter()) {
+                assert!((x - y).abs() < 1e-5, "batched diverged: {x} vs {y}");
+            }
+        }
+        // Production tick shape: the projector boxes the shared
+        // `Arc<Mutex<E5SmallAdapter>>` handle, so the batch override must
+        // fire through the wrapper's `embed_texts` forward as well.
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(
+            E5SmallAdapter::load_from_cache(&cache).expect("provisioned cache loads"),
+        ));
+        let mut boxed: Box<dyn Embedder> = Box::new(std::sync::Arc::clone(&shared));
+        let wrapped = boxed
+            .embed_texts(&texts)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(wrapped.len(), batched.len());
+        for (w, b) in wrapped.iter().zip(batched.iter()) {
+            assert_eq!(w.len(), b.len());
+            for (x, y) in w.iter().zip(b.iter()) {
+                assert!((x - y).abs() < 1e-5, "wrapper diverged: {x} vs {y}");
+            }
+        }
     }
 
     /// The E5 chunk mapping re-prefixes each verbatim fragment span for

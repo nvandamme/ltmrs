@@ -23,6 +23,10 @@ use crate::search::table::SearchTable;
 pub trait Embedder: Send {
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, String>;
 
+    fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+
     /// Split rendered memory text into embeddable units (RQ-10). The default is
     /// a single unit covering the whole rendered text — byte-identical to the
     /// pre-chunking behavior. A model-aware override returns one unit per
@@ -270,10 +274,22 @@ impl Projector {
                 char_end: len,
             }];
         }
+        let vectors: Vec<Option<Vec<f32>>> = self
+            .embedder
+            .embed_texts(&chunks.iter().map(|c| c.text.clone()).collect::<Vec<_>>())
+            .into_iter()
+            .map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            vectors.len(),
+            chunks.len(),
+            "batch embedder must answer per chunk"
+        );
         chunks
             .iter()
             .enumerate()
-            .map(|(i, c)| SearchRow {
+            .zip(vectors)
+            .map(|((i, c), embedding)| SearchRow {
                 store_generation: self.generation,
                 memory_id,
                 document_revision: memory.document_revision,
@@ -288,7 +304,7 @@ impl Projector {
                 created_at_millis: memory.created_at.as_millis(),
                 updated_at_millis: memory.updated_at.as_millis(),
                 confidence: memory.confidence,
-                embedding: self.embedder.embed(&c.text).ok(),
+                embedding,
             })
             .collect()
     }
@@ -1805,5 +1821,31 @@ mod tests {
             1
         );
         assert!(repo.projection_jobs().unwrap().is_empty());
+    }
+
+    /// Batch default maps per-text results 1:1 in order, preserving errors.
+    #[test]
+    fn embed_texts_default_preserves_order_and_errors() {
+        use crate::search::projector::Embedder as _;
+
+        struct Flaky {
+            calls: usize,
+        }
+        impl Embedder for Flaky {
+            fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+                self.calls += 1;
+                if text == "bad" {
+                    return Err("stalled".into());
+                }
+                Ok(vec![text.len() as f32; 4])
+            }
+        }
+        let mut fx = Flaky { calls: 0 };
+        let out = fx.embed_texts(&["ok".to_string(), "bad".to_string(), "ok2".to_string()]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].as_ref().unwrap(), &vec![2.0; 4]);
+        assert!(out[1].is_err());
+        assert_eq!(out[2].as_ref().unwrap(), &vec![3.0; 4]);
+        assert_eq!(fx.calls, 3);
     }
 }
