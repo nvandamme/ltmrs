@@ -131,6 +131,35 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   transcripts in bundle. Get-ok counts incomparable by contract;
   our duplicate gate passing salted content is DEV-007, known.
 
+## 2026-09-29 — Release build profile + publish record
+
+### Release build profile: LTO thin (2026-09-29)
+
+- Neither profile set LTO (Cargo defaults). Set `lto = "thin"`
+  for dev + release (owner-ordered): dev full build now 6m40s
+  (link cost — reversibly expensive for iteration), suite green
+  (664+2) under the new profile, release binary serves
+  (initialize + clean exit).
+- Measured effect: binary grew 286.1MB → 290.0MB (+1.3%, thin
+  LTO trades size for speed); runtime delta unmeasured. Keep or
+  revert on owner call.
+
+### Publish v0.1-alpha (2026-09-29)
+
+- Windows x64 blocked with full analysis: Unix-only IPC
+  (tokio UnixStream gated out on Windows, std::os::unix uses,
+  RQ-20 peer-cred design) + no Windows machine to verify on.
+  Cross-toolchain assembled (Arch GCC 16.2) but correctly unused
+  — shipping an unverifiable binary would violate evidence
+  discipline. Port is future work, not a review fix.
+- Tag disputed honestly: package reports 0.1.0-alpha and §2.3
+  reserves v0.1; owner chose v0.1-alpha. Pushed master
+  fast-forward (no force) + tag; GitHub release carries the
+  Linux x86_64 binary + SHA256SUMS with known limitations in
+  the notes (no silent claims).
+- LTO rebuild supersedes those artifacts (same tag name, new
+  binary + sums re-uploaded; tag moved, never duplicated).
+
 ## 1ef65d1 (2026-09-28) — Batch embedding per memory (bulk-drive Phase 1)
 
 ### Batch embedding per memory (bulk-drive Phase 1) (2026-09-28)

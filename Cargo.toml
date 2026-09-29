@@ -75,3 +75,13 @@ tempfile = "3"
 # Test-only tokio features: `test-util` enables #[tokio::test(start_paused)] for
 # deterministic, fast interval/scheduling tests (no real-time sleeps).
 tokio = { version = "1", features = ["test-util"] }
+
+# Release-grade optimization on both profiles (v0.1-alpha decision):
+# thin LTO trades link time (notably slower dev/test cycles) for
+# optimized codegen; measured +1.3% binary size on this tree, so no
+# size claim is made — runtime delta unmeasured, keep or revert on call.
+[profile.dev]
+lto = "thin"
+
+[profile.release]
+lto = "thin"
