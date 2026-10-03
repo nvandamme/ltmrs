@@ -122,10 +122,13 @@ ltmrs --provision-models   # download + digest-verify 6 pinned files into $HOME/
   `semantic_search` answer carries its effective mode (`hybrid` vs
   `lexical-fallback`) with `dense_ready`, plus `partial` while
   projection work is still pending.
-- Indexing is asynchronous: writes return immediately and a
-  background worker projects up to 100 jobs per maintenance interval
-  (default 300s), retrying failures on later ticks. Serving itself
-  makes no network calls (verified by strace over stdio runs).
+- Indexing is asynchronous: writes return immediately and a commit
+  wake-up drives the background worker at once (up to 100 jobs per
+  pass); the maintenance interval (default 300s) remains as the
+  fallback for retries and repair. Until a write is projected,
+  `semantic_search` answers carry `partial: true` with the pending
+  count instead of silently presenting incomplete results. Serving
+  itself makes no network calls (verified by strace over stdio runs).
 - Operating costs when E5 is enabled: two resident model adapters
   (~1GB RAM for the 470MB artifact set) and digest verification plus
   weight loading at startup. Deterministic oversize inputs stay

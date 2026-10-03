@@ -138,6 +138,15 @@ pub struct CanonicalRepository {
     feedback_events: OptimisticTxKeyspace,
     guides: OptimisticTxKeyspace,
     suggestions: OptimisticTxKeyspace,
+    /// Idempotency log for guide practice (P1 replay safety): operation ID
+    /// → guide name. Written atomically with the guide mutation so a retried
+    /// operation replays without double-counting usage/success counters.
+    guide_ops: OptimisticTxKeyspace,
+    /// Post-commit wake-up hook (P2-1 projection latency): fired once per
+    /// committed mutation so the projection worker drives the new job
+    /// immediately instead of waiting out its maintenance interval. Replays
+    /// fire nothing (no new work). Never fails the commit when unset.
+    commit_hook: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     fault_injector: std::sync::Arc<FaultInjector>,
     clock: std::sync::Arc<dyn crate::domain::clock::Clock + Send + Sync>,
     /// Restore barrier: shared by every mutating entry point, exclusive to
@@ -205,6 +214,7 @@ impl CanonicalRepository {
         let feedback_events = Self::keyspace(&db, "feedback_events")?;
         let guides = Self::keyspace(&db, "guides")?;
         let suggestions = Self::keyspace(&db, "suggestions")?;
+        let guide_ops = Self::keyspace(&db, "guide_ops")?;
 
         Ok(Self {
             db,
@@ -218,6 +228,8 @@ impl CanonicalRepository {
             feedback_events,
             guides,
             suggestions,
+            guide_ops,
+            commit_hook: std::sync::Mutex::new(None),
             fault_injector,
             clock,
             restore_lock: std::sync::RwLock::new(()),
@@ -232,6 +244,22 @@ impl CanonicalRepository {
     /// Access the fault injector for crash/durability testing (RV-18).
     pub fn fault_injector(&self) -> &std::sync::Arc<FaultInjector> {
         &self.fault_injector
+    }
+
+    /// Set the post-commit wake-up hook (P2-1): fired once per committed
+    /// mutation, never on replay. The projection worker uses it to drive new
+    /// jobs immediately; the interval remains as the maintenance fallback.
+    pub fn set_commit_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self.commit_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Fire the commit hook after a durable commit (best-effort: a panicking
+    /// hook must never fail the already-committed write).
+    fn fire_commit_hook(&self) {
+        let hook = self.commit_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
+        }
     }
 
     /// Durability barrier (RQ-18): no ACK without it. Flushes through
@@ -603,6 +631,7 @@ impl CanonicalRepository {
                     match tx.commit() {
                         Ok(Ok(())) => {
                             self.persist_barrier()?;
+                            self.fire_commit_hook();
                             return Ok(receipt);
                         }
                         Ok(Err(_conflict)) => {
@@ -1531,6 +1560,164 @@ impl CanonicalRepository {
         Err(Self::exhausted_contention("guide write conflicted"))
     }
 
+    /// Practice a guide idempotently (P1 replay safety): the operation ID is
+    /// logged atomically with the guide mutation, so a retried operation with
+    /// the same ID returns the recorded guide without double-counting usage
+    /// or success/failure counters. Fresh-read inside each retry preserves
+    /// concurrent updates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn practice_guide_idempotent(
+        &self,
+        operation_id: &str,
+        guide_name: &str,
+        category: &str,
+        description: Option<&str>,
+        contexts: &[String],
+        learnings: &[String],
+        validated_by: &[String],
+        outcome: Option<bool>,
+        now_millis: u64,
+    ) -> DomainResult<crate::domain::guide::Guide> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            // Replay check first: same operation already applied.
+            if let Some(raw) = tx
+                .get(&self.guide_ops, operation_id)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                let name: String = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key = name.to_lowercase();
+                if let Some(raw) = tx
+                    .get(&self.guides, &key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                {
+                    let guide: crate::domain::guide::Guide = serde_json::from_slice(raw.as_ref())
+                        .map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    return Ok(guide);
+                }
+                // Log without guide (deleted since): treat as replay, no-op.
+                return Err(DomainError::new(
+                    DomainErrorCode::NotFound,
+                    "guide not found (practiced guide was forgotten)",
+                ));
+            }
+            // Fresh guide state inside the tx.
+            let key = guide_name.to_lowercase();
+            let existing: Option<crate::domain::guide::Guide> = tx
+                .get(&self.guides, &key)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                .map(|raw| {
+                    serde_json::from_slice(raw.as_ref())
+                        .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
+                })
+                .transpose()?;
+            let mut updated = match existing {
+                None => {
+                    let mut g = crate::domain::guide::Guide {
+                        name: guide_name.to_lowercase().trim().to_string(),
+                        category: category.to_lowercase().trim().to_string(),
+                        description: description.unwrap_or("").trim().to_string(),
+                        contexts: contexts
+                            .iter()
+                            .map(|c| c.to_lowercase().trim().to_string())
+                            .filter(|c| !c.is_empty())
+                            .collect(),
+                        learnings: learnings
+                            .iter()
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty())
+                            .collect(),
+                        usage_count: 1,
+                        last_used: Some(crate::domain::memory::Instant::new(now_millis)),
+                        success_count: 0,
+                        failure_count: 0,
+                        anti_patterns: vec![],
+                        pitfalls: vec![],
+                        depends_on: vec![],
+                        enables: vec![],
+                        source_memories: vec![],
+                        validated_by: vec![],
+                        superseded_by: None,
+                        deprecated: false,
+                        entity_revision: crate::domain::id::EntityRevision::new(1),
+                        created_at: crate::domain::memory::Instant::new(now_millis),
+                        updated_at: crate::domain::memory::Instant::new(now_millis),
+                    };
+                    if outcome == Some(true) {
+                        g.success_count = 1;
+                    } else if outcome == Some(false) {
+                        g.failure_count = 1;
+                    }
+                    g
+                }
+                Some(mut g) => {
+                    g.usage_count += 1;
+                    g.last_used = Some(crate::domain::memory::Instant::new(now_millis));
+                    if g.description.is_empty()
+                        && let Some(desc) = description
+                    {
+                        g.description = desc.trim().to_string();
+                    }
+                    for ctx in contexts {
+                        let normalized = ctx.to_lowercase().trim().to_string();
+                        if !normalized.is_empty()
+                            && !g
+                                .contexts
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(&normalized))
+                        {
+                            g.contexts.push(normalized);
+                        }
+                    }
+                    for learning in learnings {
+                        let trimmed = learning.trim().to_string();
+                        if !trimmed.is_empty() && !g.learnings.contains(&trimmed) {
+                            g.learnings.push(trimmed);
+                        }
+                    }
+                    if outcome == Some(true) {
+                        g.success_count += 1;
+                    } else if outcome == Some(false) {
+                        g.failure_count += 1;
+                    }
+                    g.updated_at = crate::domain::memory::Instant::new(now_millis);
+                    g
+                }
+            };
+            for mem_id in validated_by {
+                if !updated.validated_by.contains(mem_id) {
+                    updated.validated_by.push(mem_id.clone());
+                }
+            }
+            let raw = serde_json::to_vec(&updated)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.guides, &key, raw.as_slice());
+            let log_raw = serde_json::to_vec(&updated.name)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.guide_ops, operation_id, log_raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(updated);
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("guide practice conflicted"))
+    }
+
     /// Write a memory record directly (WP-09 guide_distill side-effect on a
     /// fragment's related_guides / distill_candidate). Bypasses the command
     /// gateway: used only for the compatibility adapter's derived writes, which
@@ -1594,6 +1781,288 @@ impl CanonicalRepository {
             }
         }
         Err(Self::exhausted_contention("guide delete conflicted"))
+    }
+
+    /// Rename a guide reference in every memory's `related_guides` (P1 atomic
+    /// fix): patches freshly read records inside the transaction, so a
+    /// concurrent content update is preserved (no stale-clone overwrite).
+    /// `related_guides` is unindexed, so the document revision stays put
+    /// while the entity revision advances for conflict detection. Errors
+    /// propagate — callers must not swallow them with `let _`.
+    pub fn rename_guide_references(&self, old_name: &str, new_name: &str) -> DomainResult<usize> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let old_norm = old_name.to_lowercase().trim().to_string();
+        let new_norm = new_name.to_lowercase().trim().to_string();
+        if old_norm.is_empty() || old_norm == new_norm {
+            return Ok(0);
+        }
+        // Collect affected memory IDs from a snapshot (keys only; values are
+        // re-read fresh inside each write attempt).
+        let ids: Vec<String> = {
+            let snapshot = self.db.read_tx();
+            let mut out = Vec::new();
+            for kv in snapshot.iter(&self.memories) {
+                let (k, v) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key: String = String::from_utf8_lossy(k.as_ref()).into_owned();
+                let mem: Memory = serde_json::from_slice(v.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if mem
+                    .related_guides
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(&old_norm))
+                {
+                    out.push(key);
+                }
+            }
+            out
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut patched = 0usize;
+            for key in &ids {
+                let raw = tx
+                    .get(&self.memories, key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let Some(raw) = raw else { continue };
+                let mut mem: Memory = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if !mem
+                    .related_guides
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(&old_norm))
+                {
+                    continue;
+                }
+                // Patch fresh record: swap the reference, dedup, preserve all
+                // other content (concurrent updates survive).
+                let mut refs: Vec<String> = mem
+                    .related_guides
+                    .iter()
+                    .filter(|g| !g.eq_ignore_ascii_case(&old_norm))
+                    .cloned()
+                    .collect();
+                if !refs.iter().any(|g| g.eq_ignore_ascii_case(&new_norm)) {
+                    refs.push(new_norm.clone());
+                }
+                mem.related_guides = refs;
+                mem.entity_revision = mem.entity_revision.next();
+                let raw = serde_json::to_vec(&mem)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                tx.insert(&self.memories, key, raw.as_slice());
+                patched += 1;
+            }
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(patched);
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention(
+            "guide rename references conflicted",
+        ))
+    }
+
+    /// Remove a guide reference from every memory's `related_guides` (P1
+    /// atomic fix): same fresh-read patch contract as renames.
+    pub fn remove_guide_references(&self, guide_name: &str) -> DomainResult<usize> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let normalized = guide_name.to_lowercase().trim().to_string();
+        if normalized.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<String> = {
+            let snapshot = self.db.read_tx();
+            let mut out = Vec::new();
+            for kv in snapshot.iter(&self.memories) {
+                let (k, v) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key: String = String::from_utf8_lossy(k.as_ref()).into_owned();
+                let mem: Memory = serde_json::from_slice(v.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if mem
+                    .related_guides
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(&normalized))
+                {
+                    out.push(key);
+                }
+            }
+            out
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut patched = 0usize;
+            for key in &ids {
+                let raw = tx
+                    .get(&self.memories, key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let Some(raw) = raw else { continue };
+                let mut mem: Memory = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if !mem
+                    .related_guides
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(&normalized))
+                {
+                    continue;
+                }
+                mem.related_guides = mem
+                    .related_guides
+                    .iter()
+                    .filter(|g| !g.eq_ignore_ascii_case(&normalized))
+                    .cloned()
+                    .collect();
+                mem.entity_revision = mem.entity_revision.next();
+                let raw = serde_json::to_vec(&mem)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                tx.insert(&self.memories, key, raw.as_slice());
+                patched += 1;
+            }
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(patched);
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention(
+            "guide remove references conflicted",
+        ))
+    }
+
+    /// Merge guides atomically (P1): reference updates, source deletions and
+    /// the merged put commit in one Fjall transaction — no visible half-merge.
+    /// Failures (missing source, existing result, storage conflict exhaustion)
+    /// return errors; nothing is swallowed.
+    pub fn merge_guides_atomically(
+        &self,
+        source_names: &[String],
+        result: &crate::domain::guide::Guide,
+    ) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        if source_names.len() < 2 {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "'guides' must name at least 2 guides",
+            ));
+        }
+        let result_key = result.name.to_lowercase();
+        let source_keys: Vec<String> = source_names.iter().map(|n| n.to_lowercase()).collect();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            // Validate inside the transaction (fresh snapshot).
+            for key in &source_keys {
+                let exists = tx
+                    .get(&self.guides, key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                    .is_some();
+                if !exists {
+                    return Err(DomainError::new(
+                        DomainErrorCode::NotFound,
+                        format!("guide not found: {key}"),
+                    ));
+                }
+            }
+            let result_exists = tx
+                .get(&self.guides, &result_key)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                .is_some();
+            if result_exists {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "guide already exists",
+                ));
+            }
+            // Patch affected memories fresh inside the same tx.
+            let mut mem_keys: Vec<String> = Vec::new();
+            for kv in tx.iter(&self.memories) {
+                let (k, v) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key: String = String::from_utf8_lossy(k.as_ref()).into_owned();
+                let mem: Memory = serde_json::from_slice(v.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if source_keys
+                    .iter()
+                    .any(|s| mem.related_guides.iter().any(|g| g.eq_ignore_ascii_case(s)))
+                {
+                    mem_keys.push(key);
+                }
+            }
+            for key in &mem_keys {
+                let raw = tx
+                    .get(&self.memories, key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let Some(raw) = raw else { continue };
+                let mut mem: Memory = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let mut refs: Vec<String> = mem
+                    .related_guides
+                    .iter()
+                    .filter(|g| !source_keys.iter().any(|s| g.eq_ignore_ascii_case(s)))
+                    .cloned()
+                    .collect();
+                if !refs.iter().any(|g| g.eq_ignore_ascii_case(&result.name)) {
+                    refs.push(result.name.to_lowercase());
+                }
+                mem.related_guides = refs;
+                mem.entity_revision = mem.entity_revision.next();
+                let raw = serde_json::to_vec(&mem)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                tx.insert(&self.memories, key, raw.as_slice());
+            }
+            // Delete sources, put result — same commit.
+            for key in &source_keys {
+                tx.remove(&self.guides, key);
+            }
+            let raw = serde_json::to_vec(result)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.guides, &result_key, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("guide merge conflicted"))
     }
 
     /// All suggestions from a single snapshot.
@@ -4674,6 +5143,44 @@ mod tests {
             distinct.len(),
             400,
             "epochs must be distinct (double-issue reuses an epoch)"
+        );
+    }
+
+    /// P2-1 wake-up: a committed mutation fires the commit hook exactly once;
+    /// an idempotent replay fires nothing (no new work to project).
+    #[test]
+    fn commit_hook_fires_once_per_commit_not_replay() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (repo, _dir) = repo_with_ns();
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        let hook_fired = std::sync::Arc::clone(&fired);
+        repo.set_commit_hook(std::sync::Arc::new(move || {
+            hook_fired.fetch_add(1, Ordering::SeqCst);
+        }));
+        let m = memory(eid(1), "hello");
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: m,
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        // Same operation + digest replays the receipt: no new commit, no fire.
+        let m2 = memory(eid(1), "hello");
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: m2,
+                session: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "replay must not wake the projection worker"
         );
     }
 }

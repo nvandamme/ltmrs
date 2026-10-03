@@ -314,7 +314,7 @@ pub fn config_digest(
     let mut h = Sha256::new();
     let s = format!("{seed}:{puts_per_1000}:{key_space}:{value_bytes}:{top_k}:{ops}");
     h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Machine + workload provenance attached to every report (RQ-23: declared

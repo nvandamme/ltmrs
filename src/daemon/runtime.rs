@@ -56,10 +56,12 @@ pub struct DaemonLock {
 
 /// The acquired runtime: the singleton lock and the bound 0600 socket
 /// listener. Both must be kept alive for the daemon's lifetime; the lock
-/// guards ownership and the listener serves connections.
+/// guards ownership and the listener serves connections. The listener is
+/// reference-counted so the stdio path can spawn a background accept loop
+/// that outlives any single borrow of the daemon.
 pub struct DaemonRuntime {
     pub lock: DaemonLock,
-    pub listener: tokio::net::UnixListener,
+    pub listener: std::sync::Arc<tokio::net::UnixListener>,
 }
 
 /// Acquire the singleton lock and bind a secure 0600 socket, recovering a
@@ -102,7 +104,7 @@ pub fn acquire_singleton(paths: &RuntimePaths) -> Result<DaemonRuntime, RuntimeE
 
     Ok(DaemonRuntime {
         lock: DaemonLock { file: lock_file },
-        listener,
+        listener: std::sync::Arc::new(listener),
     })
 }
 

@@ -2,10 +2,13 @@
 //!
 //! Two modes, matching the CLI surface: `--socket <path>` attaches the
 //! frontend to an already-running daemon (fail fast when unreachable);
-//! without `--socket` an in-process daemon starts under the managed home
-//! (`$HOME/.ltmrs`) and the frontend talks to it over a `UnixStream` pair
-//! through the same `handle_connection` path as socket clients. Either way
-//! the MCP boundary is `LtmrsFrontend` served over rmcp stdio.
+//! without `--socket` the frontend attaches to the managed-home daemon if
+//! one is reachable (connect-or-spawn), otherwise it starts the daemon
+//! in-process under the managed home (`$HOME/.ltmrs`) and serves its socket
+//! alongside the bridged `UnixStream` pair. Either way the MCP boundary is
+//! `LtmrsFrontend` served over rmcp stdio. Losing the startup lock race
+//! retries the connection instead of failing; the owning frontend stays
+//! alive serving socket clients after its own stdio closes.
 
 use std::path::{Path, PathBuf};
 
@@ -129,10 +132,11 @@ pub async fn start_local_daemon(layout: &StdioLayout) -> Result<(Daemon, IpcClie
     let daemon = Daemon::start(&paths, config)
         .await
         .map_err(|e| CliError::Runtime(format!("cannot start local daemon: {e}")))?;
-    // Dense projection when E5 embedding is configured (no-op otherwise):
-    // the stdio path has no accept loop calling serve(), so workers that
-    // serve() starts must start here too.
+    // Dense projection when E5 embedding is configured (no-op otherwise).
     daemon.start_projection().await;
+    // Serve the bound socket too: without this a second frontend dials a
+    // bound-but-unaccepted listener and parks forever (P1 shared lifecycle).
+    daemon.spawn_socket_server().await;
     let (client_stream, server_stream) = tokio::net::UnixStream::pair()
         .map_err(|e| CliError::Runtime(format!("cannot bridge stdio daemon: {e}")))?;
     // Detached on purpose: the task lives until the client stream closes
@@ -160,9 +164,63 @@ pub async fn connect_remote(socket: &str) -> Result<IpcClient, CliError> {
     Ok(client)
 }
 
-/// Serve MCP over stdio: `socket=None` starts the in-process daemon under
-/// the managed home, `socket=Some` attaches to a running daemon. Runs until
-/// stdin closes, then shuts the local daemon down (persisting sessions).
+/// Bounded connection retries for the startup lock race (P1): losing the
+/// singleton race means another frontend just became the owner, so dial its
+/// socket instead of failing. Each attempt dials fresh; the total wait stays
+/// under ~1s so the default CLI path never hangs on a dead listener.
+pub async fn connect_with_retry(socket: &Path, attempts: usize) -> Result<IpcClient, CliError> {
+    let socket_str = socket.to_string_lossy().into_owned();
+    let mut last_err = String::new();
+    for _ in 0..attempts {
+        match connect_remote(&socket_str).await {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                last_err = e.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    Err(CliError::Runtime(format!(
+        "cannot connect to daemon at {} after {attempts} retries: {last_err}",
+        socket.display()
+    )))
+}
+
+/// Connect-or-spawn for the default CLI path (P1 shared-daemon lifecycle):
+/// attach to the managed-home daemon when reachable, otherwise start it.
+/// A lost lock race falls back to a bounded connection retry instead of
+/// `AlreadyRunning`. Returns the owned daemon when this process became the
+/// owner (`Some`), or `None` when attached to an existing owner.
+pub async fn connect_or_spawn(
+    layout: &StdioLayout,
+) -> Result<(Option<Daemon>, IpcClient), CliError> {
+    let managed_socket = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).socket_path;
+    // Fast path: another frontend already owns the daemon.
+    if let Ok(client) = connect_remote(&managed_socket.to_string_lossy()).await {
+        return Ok((None, client));
+    }
+    match start_local_daemon(layout).await {
+        Ok((daemon, client)) => Ok((Some(daemon), client)),
+        Err(e) => {
+            let msg = e.to_string();
+            // Lost the race after our probe: the winner is serving now —
+            // retry the connection instead of failing (P1 essential).
+            if msg.contains("already owns the store lock") || msg.contains("AlreadyRunning") {
+                let client = connect_with_retry(&managed_socket, 20).await?;
+                Ok((None, client))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Serve MCP over stdio: `socket=None` attaches to the managed-home daemon
+/// when reachable, otherwise starts it (connect-or-spawn); `socket=Some`
+/// attaches to a running daemon. Runs until stdin closes. An owning frontend
+/// stays alive serving socket clients after its own stdio closes (persisting
+/// sessions first) so a second frontend survives the first disconnect; it
+/// shuts down only once no live socket clients remain.
 pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result<(), CliError> {
     let identity = FrontendIdentity::new(
         FrontendId::new(Uuid::now_v7()),
@@ -173,8 +231,7 @@ pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result
         None => {
             let base = resolve_home(home)?;
             let layout = stdio_layout(&base);
-            let (daemon, client) = start_local_daemon(&layout).await?;
-            (Some(daemon), client)
+            connect_or_spawn(&layout).await?
         }
     };
     let frontend = LtmrsFrontend::new(identity, client);
@@ -191,10 +248,39 @@ pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result
             "stdio serving ended abnormally: {other:?}"
         ))),
     };
-    // Shut down on every exit path so sessions persist even when serving
-    // ends in an error; the singleton lock releases on drop either way.
+    // Owned daemon: persist sessions on every exit path, but stay alive
+    // serving socket clients after our own stdio closes (P1). The singleton
+    // lock releases on drop, so dropping while peers are connected would
+    // stop service for them; instead linger until no live connections remain
+    // (bounded by idle polling), then shut down. Attached frontends (None)
+    // simply return — they never owned the daemon.
     if let Some(daemon) = daemon.as_mut() {
-        daemon.shutdown();
+        let live = daemon.dispatcher_arc().registry().live_connection_count();
+        if live == 0 {
+            daemon.shutdown();
+        } else {
+            // Our bridge closed, but socket peers remain: persist now so a
+            // crash loses nothing, then linger as the daemon host until
+            // peers disconnect. Polling keeps this bounded and explicit.
+            let spath = daemon.sessions_path_display();
+            if !spath.is_empty()
+                && let Err(e) = daemon
+                    .dispatcher_arc()
+                    .registry()
+                    .persist(std::path::Path::new(&spath))
+            {
+                eprintln!("ltmrs: failed to persist session history at frontend exit: {e:?}");
+            }
+            // Note: persist failure above is loud (previous file intact via
+            // tmp+rename); lingering continues regardless so peers survive.
+            for _ in 0..600 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if daemon.dispatcher_arc().registry().live_connection_count() == 0 {
+                    break;
+                }
+            }
+            daemon.shutdown();
+        }
     }
     result
 }
@@ -517,5 +603,103 @@ mod tests {
             other => panic!("expected tool result, got: {other:?}"),
         }
         daemon.shutdown();
+    }
+
+    /// P1 shared lifecycle: the stdio daemon serves its bound socket, so a
+    /// second frontend dialing the managed socket handshakes (previously the
+    /// socket was bound-but-unaccepted and parked forever).
+    #[tokio::test]
+    async fn socket_second_client_handshakes_after_spawn() {
+        use crate::daemon::client::IpcClient;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = stdio_layout(&dir.path().join(".ltmrs"));
+        let (mut daemon, _bridged) = start_local_daemon(&layout).await.unwrap();
+        assert!(
+            daemon.socket_server_running().await,
+            "stdio daemon must serve its socket"
+        );
+        let socket = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).socket_path;
+        let mut second = IpcClient::new(socket);
+        tokio::time::timeout(std::time::Duration::from_secs(2), second.connect())
+            .await
+            .expect("socket connect must not hang")
+            .unwrap();
+        let id = FrontendIdentity::new(
+            FrontendId::new(Uuid::from_u128(101)),
+            ChannelId::new(Uuid::from_u128(102)),
+        );
+        let hs = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            second.handshake(&HandshakeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: id.frontend_id,
+                channel_id: id.channel_id,
+            }),
+        )
+        .await
+        .expect("socket handshake must not hang")
+        .unwrap();
+        assert_eq!(hs.store_generation, StoreGeneration::FIRST);
+        daemon.shutdown();
+    }
+
+    /// P1 connect-or-spawn: when a daemon already owns the managed home, a
+    /// second frontend attaches instead of failing with AlreadyRunning.
+    #[tokio::test]
+    async fn connect_or_spawn_attaches_to_existing_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = stdio_layout(&dir.path().join(".ltmrs"));
+        let (mut owner, _bridged) = start_local_daemon(&layout).await.unwrap();
+        let (second_daemon, mut second) = connect_or_spawn(&layout).await.unwrap();
+        assert!(
+            second_daemon.is_none(),
+            "second frontend must attach, not own"
+        );
+        let id = FrontendIdentity::new(
+            FrontendId::new(Uuid::from_u128(201)),
+            ChannelId::new(Uuid::from_u128(202)),
+        );
+        let hs = second
+            .handshake(&HandshakeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: id.frontend_id,
+                channel_id: id.channel_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hs.store_generation, StoreGeneration::FIRST);
+        owner.shutdown();
+    }
+
+    /// P1 lock race: a direct second `Daemon::start` rejects with
+    /// AlreadyRunning, but `connect_or_spawn` retries the connection.
+    #[tokio::test]
+    async fn lock_race_falls_back_to_bounded_connect() {
+        use crate::daemon::server::{Daemon as DaemonServer, DaemonConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = stdio_layout(&dir.path().join(".ltmrs"));
+        let (mut owner, _bridged) = start_local_daemon(&layout).await.unwrap();
+        let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
+        let config = DaemonConfig {
+            store_path: layout.store_path.clone(),
+            sessions_path: layout.sessions_path.clone(),
+            search_path: layout.search_path.clone(),
+            ..Default::default()
+        };
+        let race = DaemonServer::start(&paths, config).await;
+        assert!(
+            race.is_err_and(|e| e.to_string().contains("already owns the store lock")),
+            "second direct start must lose the lock race"
+        );
+        let (second_daemon, _second) = connect_or_spawn(&layout).await.unwrap();
+        assert!(
+            second_daemon.is_none(),
+            "race loser must attach via bounded retry"
+        );
+        owner.shutdown();
     }
 }

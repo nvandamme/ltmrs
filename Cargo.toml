@@ -22,17 +22,19 @@ rmcp = { version = "3.4.0", default-features = false, features = ["server", "tra
 # `pub mod job` is unconditional but `Error::Http` is `remote`-gated. Enabling
 # `remote` pulls reqwest/http/urlencoding (unused in local mode). See
 # baseline/lemma-0.21.0/dependency-native-audit.md.
-lancedb = { version = "0.38.0", default-features = false, features = ["remote"] }
-lance = { version = "11.0.0", default-features = false }
+lancedb = { version = "0.39.0", default-features = false, features = ["remote"] }
+lance = { version = "12.0.0", default-features = false }
 
 # Candidate B: Fjall canonical KV (pure Rust, no native deps).
 fjall = { version = "3.1.10" }
 
 # Candle embeddings (CPU). default features = CPU baseline; onig_sys (C) is a
 # hard transitive dep via tokenizers. Do NOT enable cuda/metal/mkl.
+# NOTE: candle-transformers is intentionally NOT a dependency — E5 uses the
+# local bert_impl (avoids its position-embedding bug); pulling the crate
+# would add an unused dep to the graph.
 candle-core = { version = "0.11.0" }
 candle-nn = { version = "0.11.0" }
-candle-transformers = { version = "0.11.0" }
 # Match candle-core 0.11.0's tokenizers to avoid a duplicate version in the graph.
 tokenizers = { version = "0.22.2" }
 
@@ -42,7 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # OS CSPRNG for the per-boot visualizer access token (no std equivalent;
 # DefaultHasher has fixed keys and is brute-forceable from /proc + port scan).
-getrandom = "0.3"
+getrandom = "0.4"
 
 # OS-level primitives: singleton lock (flock), socket/permission control.
 libc = "0.2"
@@ -53,21 +55,20 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order: legacy wire objects (e.g. memory_stats by_source/by_project)
 # must serialize in upstream insertion order, not BTreeMap-alphabetical.
 serde_json = { version = "1", features = ["preserve_order"] }
-# Insertion-ordered maps for wire-faithful stats/audit aggregation.
-indexmap = { version = "2", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
-anyhow = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 # Best-effort secret detection for memory_add privacy (design 12.1).
 regex = { version = "1", default-features = false, features = ["std"] }
 
-# Arrow (behind storage/ only).
+# Arrow (behind storage/ only). Pinned to the lance/lancedb ecosystem line:
+# lance 12 + lancedb 0.39 + datafusion 54.1 all resolve arrow 58, so a
+# direct 60 pin would fork arrow_array/arrow_schema in our own calls.
 arrow-array = "58"
 arrow-schema = "58"
 arrow-buffer = "58"
-lance-index = { version = "11", default-features = false }
+lance-index = { version = "12", default-features = false }
 futures-util = "0.3"
 
 [dev-dependencies]

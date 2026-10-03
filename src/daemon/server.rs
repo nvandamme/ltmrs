@@ -24,6 +24,42 @@ use crate::search::maintenance::{MaintenanceConfig, MaintenanceScheduler};
 use crate::search::table::SearchTable;
 use crate::service::repository::CanonicalRepository;
 
+/// Commit-to-search wake-up (P2-1 projection latency).
+///
+/// The projection worker used to sleep a full maintenance interval between
+/// passes, so a newly saved memory stayed invisible to dense retrieval for
+/// minutes. Now every committed canonical mutation fires the commit hook,
+/// which wakes this trigger; the worker drives the new job immediately in a
+/// bounded batch. The interval remains as the maintenance fallback (repair /
+/// retry of failed passes) — the wake-up is a latency optimization only, and
+/// the durable pending-job records stay the recovery mechanism.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionTrigger {
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ProjectionTrigger {
+    pub fn new() -> Self {
+        Self {
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Wake the worker: a canonical commit just landed.
+    pub fn wake(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Wait for the next drive: returns on a commit wake or when `interval`
+    /// elapses, whichever comes first.
+    pub async fn wait(&self, interval: std::time::Duration) {
+        tokio::select! {
+            _ = self.notify.notified() => {},
+            _ = tokio::time::sleep(interval) => {},
+        }
+    }
+}
+
 /// Which embedding backend the daemon runs (design §9; RQ-09).
 #[derive(Debug, Clone, Default)]
 pub enum EmbeddingMode {
@@ -120,9 +156,16 @@ pub struct Daemon {
     /// projection (lexical-only daemon).
     models_dir: Option<String>,
     quotas: Arc<QuotaTracker>,
+    /// Commit-to-search wake-up (P2-1): fired by the repository commit hook,
+    /// waited on by the projection worker. The interval stays the fallback.
+    projection_trigger: ProjectionTrigger,
     /// The singleton lock + bound 0600 socket listener, kept alive for the
     /// daemon's lifetime.
     runtime: DaemonRuntime,
+    /// Background socket accept loop for stdio-owned daemons (P1 shared
+    /// lifecycle): bound sockets must accept, otherwise a second frontend
+    /// dials a dead listener. Aborted on shutdown.
+    socket_server: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     paths: RuntimePaths,
     sessions_path: Option<std::path::PathBuf>,
     search_path: String,
@@ -181,6 +224,20 @@ impl Daemon {
                 )
             }
         };
+        // Eager durability (P1): session mutations persist before ack.
+        dispatcher.set_sessions_path(sessions_path.clone());
+        // P2-1 wake-up: every committed mutation wakes the projection
+        // worker so new memories become searchable without waiting out
+        // the maintenance interval.
+        let projection_trigger = ProjectionTrigger::new();
+        {
+            let waker = projection_trigger.clone();
+            dispatcher
+                .repo_arc()
+                .set_commit_hook(std::sync::Arc::new(move || {
+                    waker.wake();
+                }));
+        }
 
         let (scheduler, scheduler_worker) = EmbeddingScheduler::spawn(
             Box::new(crate::daemon::scheduler::FixedDimAdapter { dim: 384 }),
@@ -199,6 +256,8 @@ impl Daemon {
             models_dir,
             quotas,
             runtime,
+            projection_trigger,
+            socket_server: tokio::sync::Mutex::new(None),
             paths: paths.clone(),
             sessions_path,
             search_path: config.search_path,
@@ -214,6 +273,15 @@ impl Daemon {
     /// The resolver for the socket path (for frontends to connect).
     pub fn socket_path(&self) -> &std::path::Path {
         &self.paths.socket_path
+    }
+
+    /// The sessions snapshot path for eager persistence (P1 owned-daemon
+    /// linger): empty when sessions are disabled.
+    pub fn sessions_path_display(&self) -> String {
+        self.sessions_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     /// Access the dispatcher (for session operations, diagnostics).
@@ -234,6 +302,42 @@ impl Daemon {
     /// Whether the scheduler worker has been aborted (post-shutdown).
     pub fn scheduler_worker_aborted(&self) -> bool {
         self.scheduler_worker.is_none()
+    }
+
+    /// Spawn the background socket accept loop (P1 shared-daemon lifecycle).
+    /// The stdio path owns a bound 0600 listener but never called `serve()`,
+    /// so a second frontend dialing the managed socket parked forever. This
+    /// serves that listener with the same `handle_connection` path as `serve`,
+    /// idempotently: a second call is a no-op. The loop lives until `shutdown`
+    /// aborts it or the daemon drops (lock release).
+    pub async fn spawn_socket_server(&self) {
+        let mut guard = self.socket_server.lock().await;
+        if guard.is_some() {
+            return;
+        }
+        let listener = Arc::clone(&self.runtime.listener);
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let quotas = Arc::clone(&self.quotas);
+        *guard = Some(tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let dispatcher = Arc::clone(&dispatcher);
+                        let quotas = Arc::clone(&quotas);
+                        tokio::spawn(async move {
+                            let _ = handle_connection(stream, dispatcher, quotas).await;
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    /// Whether the background socket server is running (diagnostics/tests).
+    pub async fn socket_server_running(&self) -> bool {
+        self.socket_server.lock().await.is_some()
     }
 
     /// Coordinate shutdown: persist durable session history, abort the embedding
@@ -273,6 +377,15 @@ impl Daemon {
             .and_then(|mut guard| guard.take());
         if let Some(pworker) = paborted {
             pworker.abort();
+        }
+        // Same best-effort abort for the background socket server (stdio path).
+        let saborted = self
+            .socket_server
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(server) = saborted {
+            server.abort();
         }
     }
 
@@ -324,8 +437,9 @@ impl Daemon {
     /// drives pending jobs off the Tokio I/O workers via `spawn_blocking`
     /// (candle inference is synchronous CPU; the single outer bridge
     /// contains no nested blocking). Embed failures stay pending and retry
-    /// next tick; lexical rows publish regardless. Convergence latency is
-    /// one maintenance interval. Without embedding this parks silently:
+    /// next tick; lexical rows publish regardless. A commit wake drives the
+    /// new job immediately (P2-1); the interval is the maintenance fallback.
+    /// Without embedding this parks silently:
     /// lexical-only daemons have nothing to index densely.
     pub async fn start_projection(&self) {
         let mut pw = self.projection_worker.lock().await;
@@ -369,6 +483,7 @@ impl Daemon {
             }
         };
         let interval = self.maintenance_config.interval;
+        let trigger = self.projection_trigger.clone();
         *pw = Some(tokio::spawn(async move {
             loop {
                 let tick = tokio::task::spawn_blocking({
@@ -418,7 +533,10 @@ impl Daemon {
                         }
                     }
                 }
-                tokio::time::sleep(interval).await;
+                // Commit wake or maintenance interval, whichever comes first
+                // (P2-1): new memories drive immediately in a bounded batch;
+                // the interval covers repair/retries of failed passes.
+                trigger.wait(interval).await;
             }
         }));
     }
@@ -1581,5 +1699,42 @@ mod tests {
         );
         let memories = repo.get_memories(&[test_memory(1).id]).unwrap();
         assert_eq!(memories.len(), 1, "committed memory must survive");
+    }
+
+    /// P2-1 wake-up: a commit notification returns from the wait immediately
+    /// (no interval sleep); without one the wait spans the full interval.
+    /// Paused clock: fully deterministic, no real-time sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn projection_trigger_wakes_on_commit_not_interval() {
+        let trigger = ProjectionTrigger::new();
+        let mut wait = Box::pin(trigger.wait(std::time::Duration::from_secs(300)));
+        // Probe at t=0 (starts the interval timer), then elapse 299s: the
+        // wait must still be pending — zero-duration timeouts probe liveness
+        // without moving the clock.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(0), &mut wait)
+                .await
+                .is_err()
+        );
+        tokio::time::advance(std::time::Duration::from_secs(299)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(0), &mut wait)
+                .await
+                .is_err(),
+            "without a wake the wait must span the full interval"
+        );
+        // The 300th second completes the interval wait.
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+            .await
+            .expect("interval expiry must still fire the wait");
+        // A commit wake fires a fresh wait without any clock advance.
+        trigger.wake();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            trigger.wait(std::time::Duration::from_secs(300)),
+        )
+        .await
+        .expect("commit wake must fire immediately");
     }
 }

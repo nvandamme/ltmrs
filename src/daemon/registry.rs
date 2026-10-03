@@ -259,7 +259,11 @@ impl FrontendRegistry {
     }
 
     /// Record an attempt on the channel's session. Returns the session handle.
-    /// Fails if the channel has no active session.
+    /// Fails if the channel has no active session. Idempotent on the
+    /// deterministic attempt ID (P1 replay safety): a retried operation with
+    /// the same `operation_id` reuses its UUIDv5 attempt ID, so a second
+    /// record is a no-op returning the same handle — exactly one attempt and
+    /// one counter increment per operation.
     pub fn record_attempt(
         &mut self,
         frontend_id: FrontendId,
@@ -272,8 +276,23 @@ impl FrontendRegistry {
         if !session.can_end() {
             return Some(handle);
         }
+        if session.attempts.iter().any(|a| a.id == attempt.id) {
+            return Some(handle);
+        }
         session.attempts.push(attempt);
         Some(handle)
+    }
+
+    /// Whether an attempt ID is already recorded on a session (replay check
+    /// for counter increments that live outside `record_attempt`).
+    pub fn has_attempt(
+        &self,
+        handle: SessionHandle,
+        attempt_id: crate::domain::id::EntityId,
+    ) -> bool {
+        self.sessions
+            .get(&handle)
+            .is_some_and(|s| s.attempts.iter().any(|a| a.id == attempt_id))
     }
 
     /// Track a practiced guide into the channel's active session (lowercased,

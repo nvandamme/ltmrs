@@ -185,7 +185,11 @@ pub fn verify_digest(path: &Path, expected_hex: &str) -> ArtifactResult<()> {
         }
         hasher.update(&buf[..n]);
     }
-    let actual = format!("{:x}", hasher.finalize());
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if !actual.eq_ignore_ascii_case(expected_hex) {
         return Err(ArtifactError::DigestMismatch {
             file: path.display().to_string(),
@@ -218,7 +222,10 @@ mod tests {
     }
 
     fn sha256_hex(data: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(data))
+        Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     #[test]

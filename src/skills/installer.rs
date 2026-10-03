@@ -153,7 +153,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Install or update a skill asset under a home directory.
@@ -242,12 +242,12 @@ fn render_asset(asset: &SkillAsset) -> String {
 /// Atomic write: temp file in the target directory, then rename. Creates
 /// parent directories as needed.
 fn write_atomic(path: &Path, content: &str) -> Result<(), InstallError> {
-    let fail = |e: std::io::Error| InstallError::Write {
-        path: path.display().to_string(),
-        message: e.to_string(),
-    };
+    let display = path.display().to_string();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(&fail)?;
+        std::fs::create_dir_all(parent).map_err(|e: std::io::Error| InstallError::Write {
+            path: display.clone(),
+            message: e.to_string(),
+        })?;
     }
     // Unique temp name per call: concurrent installers never share one.
     let tmp = path.with_extension(format!(
@@ -258,8 +258,14 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), InstallError> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    std::fs::write(&tmp, content).map_err(&fail)?;
-    std::fs::rename(&tmp, path).map_err(&fail)?;
+    std::fs::write(&tmp, content).map_err(|e: std::io::Error| InstallError::Write {
+        path: display.clone(),
+        message: e.to_string(),
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e: std::io::Error| InstallError::Write {
+        path: display,
+        message: e.to_string(),
+    })?;
     Ok(())
 }
 

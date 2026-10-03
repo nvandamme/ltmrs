@@ -131,7 +131,93 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   transcripts in bundle. Get-ok counts incomparable by contract;
   our duplicate gate passing salted content is DEV-007, known.
 
-## 2026-09-29 — Release build profile + publish record
+## 2026-10-03 — P1/P2 review fixes, release evidence, dependency majors
+
+### P1 code-review fixes: shared daemon, durable sessions, atomic guides
+
+- P1-1 shared daemon (`runtime.rs`, `server.rs`, `frontend/serve.rs`):
+  listener in `Arc`, `spawn_socket_server` background accept loop,
+  `connect_or_spawn` + `connect_with_retry` (bounded ~1s) on lock race,
+  owner lingers serving socket peers after own stdio closes (verified:
+  `waiting(mut self)` drops our bridge first, so the linger branch
+  counts only real peers; 60s bound, never a hang).
+  Tests: socket second handshake, attach-to-owner, lock-race fallback.
+- P1-2 durable sessions (`registry.rs`, `dispatcher.rs`, `tools.rs`):
+  `record_attempt` dedups deterministic UUIDv5 IDs, `has_attempt` guard,
+  `Dispatcher::persist_sessions` eager persist before every ack
+  (attempt/end/start/guide-track), counters increment exactly once.
+  Tests: dispatcher replay-once, kill-without-shutdown survives,
+  tool replay-once (counters).
+- P1-3 atomic guides (`service/repository.rs`, `daemon/tools.rs`):
+  `rename/remove_guide_references` fresh-read patch (content preserved),
+  `merge_guides_atomically` single-tx (refs+deletes+put, no tear),
+  `practice_guide_idempotent` op-logged single-tx (no double-count),
+  rename/forget/merge propagate errors (no `let _`).
+  Tests: rename-preserves-content, merge-all-or-nothing,
+  practice-replay-once.
+- Reviews: formal (coverage vs P1/P2 goals, no plan change) +
+  functional (linger liveness proven via rmcp `waiting(mut self)`
+  + smoke timing; tx iteration-then-mutate ordering; Notify
+  wake-then-wait permit semantics). No findings outstanding.
+
+### Deps + P2s: pruning, updates, projection wake-up, release evidence
+
+- Deps (`Cargo.toml`, `Cargo.lock`): removed 3 unused direct deps —
+  `anyhow` (0 uses), `indexmap` (0 uses; `serde_json/preserve_order`
+  already covers wire order), `candle-transformers` (0 uses; E5 runs
+  the local `bert_impl`). Targeted updates: fjall 3.1.10→3.1.11,
+  rmcp 3.4.0→3.5.0, thiserror 2.0.20→2.0.21, uuid 1.26.1→1.27.0,
+  libc 0.2.189→0.2.190. `cargo check` + full suite green after both
+  steps. Frozen `baseline/.../dependency-native-audit.md`
+  (2026-09-16) still lists candle-transformers — stale by design,
+  not edited.
+- Toolchain fallout (pre-existing `rust-toolchain.toml` 1.96→1.99 bump):
+  reinstalled stale clippy/rustfmt components; fixed 3 new
+  `needless_borrows_for_generic_args` lints in `skills/installer.rs`
+  (shared closure → per-site mapping; same behavior).
+- P2-1 projection wake-up (`service/repository.rs`, `daemon/server.rs`,
+  README): `set_commit_hook` fires once per committed mutation (never
+  on replay; panic-safe); `ProjectionTrigger` (Notify + interval
+  select); `start_projection` waits on wake-or-interval instead of
+  bare sleep. Readiness signal already existed (`projection_lag` /
+  `partial`); README latency paragraph updated.
+  Tests (paused-clock, deterministic): commit-hook-once-not-replay,
+  trigger-wakes-on-commit-not-interval.
+- P2-2 release evidence (`tools/gen_release_evidence.sh`,
+  `tests/release_evidence.rs`): regenerable sanitized bundle
+  `reports/release-<short-sha>/` (manifest.json with HEAD, toolchain,
+  lock digest, direct dep versions, fmt/clippy/suite status; no memory
+  contents, secrets or absolute paths) + acceptance test in quick
+  mode. Regenerate after commit — bundles name HEAD but run on the
+  committing tree.
+
+### Major upgrades: latest majors where the graph stays single-version
+
+- Taken: sha2 0.10→0.11 (4 `{:x}`-on-digest sites → byte-iterating hex;
+  0.11 digest output dropped `LowerHex`), getrandom 0.3→0.4 (no call
+  change), lance 11→12 + lance-index 12 + lancedb 0.38→0.39 (zero code
+  changes; storage/search suites green).
+- Reverted with evidence: arrow 58→60 compiles our code but forks
+  arrow_array/arrow_schema against `lancedb::arrow` (lance 12, lancedb
+  0.39 and datafusion 54.1 all resolve arrow 58) — back to 58 with a
+  Cargo.toml comment pinning the ecosystem line.
+- Deferred with reasons: reqwest 0.13 (would fork vs lancedb `remote`
+  on 0.12; ours stays single at 0.12.28), tokenizers 1.0-rc.2
+  (pre-release; candle-core 0.11 needs 0.22 API — upgrading creates
+  the dup it was pinned to avoid), libc 1.0-alpha.5 (alpha).
+- Result: every direct dep resolves to exactly one version
+  (rmcp 3.5, lancedb 0.39, lance 12, fjall 3.1.11, candle 0.11,
+  reqwest 0.12.28, sha2 0.11, arrow 58, rest current). Remaining
+  multi-version crates are all transitive-ecosystem and unactionable
+  from our manifest: lancedb's own sha2 0.10, ring's getrandom 0.2,
+  ahash/lsm-tree getrandom 0.3, lance-12-vs-datafusion-54 splits
+  (object_store 0.13/0.14, axum 0.7/0.8, rand, itertools), snafu/
+  darling/syn/hashbrown lines.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets
+  -- -D warnings`, `cargo test` (675 lib passed, 0 failed, 7 ignored;
+  + release_evidence + 2 smoke). No plan change.
+
+## 538c0b2 (2026-09-29) — Release build profile + publish record
 
 ### Release build profile: LTO thin (2026-09-29)
 
@@ -159,6 +245,18 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   the notes (no silent claims).
 - LTO rebuild supersedes those artifacts (same tag name, new
   binary + sums re-uploaded; tag moved, never duplicated).
+
+### Publish executed: tag moved, release live (2026-09-29)
+
+- Amended finale (message fix) as 538c0b2 with corrected body;
+  baked SHA worktree-only and stopped — no amend loop.
+- Remote tag was dangling at an unpublished hash (own earlier
+  truncated push output hid a tag push): recovered with
+  delete + recreate, never force. No force-push used anywhere.
+- Master pushed fast-forward (de8139c..538c0b2); tag v0.1-alpha
+  now points at the release commit; Linux x86_64 binary +
+  SHA256SUMS (re)attached; draft flipped live. Verified: tag
+  target, both assets, published timestamp.
 
 ## 1ef65d1 (2026-09-28) — Batch embedding per memory (bulk-drive Phase 1)
 

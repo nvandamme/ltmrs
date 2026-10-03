@@ -44,6 +44,10 @@ pub struct Dispatcher {
     /// Restore preview registry (WP-11): single-use TTL tokens bound to
     /// backup digest + live store generation. Daemon-lifetime state.
     restore: Mutex<crate::interchange::restore::RestoreCoordinator>,
+    /// Sessions snapshot path for eager durability (P1): every acknowledged
+    /// session mutation persists before success returns, so kill-after-ack
+    /// loses nothing. None disables persistence (tests without a path).
+    sessions_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl Dispatcher {
@@ -58,6 +62,7 @@ impl Dispatcher {
             clock,
             search: None,
             restore: Mutex::new(crate::interchange::restore::RestoreCoordinator::default()),
+            sessions_path: Mutex::new(None),
         }
     }
 
@@ -65,6 +70,25 @@ impl Dispatcher {
     pub fn with_search(mut self, search: Arc<SearchBackend>) -> Self {
         self.search = Some(search);
         self
+    }
+
+    /// Set the sessions snapshot path for eager durability (P1). Called by
+    /// `Daemon::start` when sessions are enabled.
+    pub fn set_sessions_path(&self, path: Option<std::path::PathBuf>) {
+        *self.sessions_path.lock().unwrap() = path;
+    }
+
+    /// Persist registry sessions now, before an acknowledgement returns (P1
+    /// durable sessions). Loud on failure (previous file intact via
+    /// tmp+rename); callers still return success — the loss is bounded to a
+    /// failed disk write, never a silent shutdown-only persist.
+    pub fn persist_sessions(&self) {
+        let path = self.sessions_path.lock().unwrap().clone();
+        if let Some(p) = path
+            && let Err(e) = self.registry.lock().unwrap().persist(&p)
+        {
+            eprintln!("ltmrs: failed to persist session history: {e:?}");
+        }
     }
 
     /// Handle the connect-time handshake: validate protocol + generation,
@@ -222,6 +246,9 @@ impl Dispatcher {
                     envelope.channel_id,
                     attempt,
                 );
+                // Durable before ack (P1): a kill immediately after success
+                // must not lose the attempt.
+                self.persist_sessions();
                 Ok(IpcResponse::success(
                     envelope.operation_id,
                     ReceiptOutcome::Success { affected: vec![] },
@@ -242,6 +269,8 @@ impl Dispatcher {
                     lessons.clone(),
                     self.clock.now_millis(),
                 );
+                // Durable before ack (P1): outcome/lessons survive kill.
+                self.persist_sessions();
                 Ok(IpcResponse::success(
                     envelope.operation_id,
                     ReceiptOutcome::Success { affected: vec![] },
@@ -470,5 +499,86 @@ mod tests {
         let mut fresh = envelope(fe(1), ch(1), 2, DomainRequest::ListMemories);
         fresh.store_generation = StoreGeneration::new(2);
         assert!(disp.handle(&fresh).is_ok());
+    }
+
+    /// P1 replay safety: repeating the same SessionAttempt operation records
+    /// exactly one attempt (deterministic UUIDv5 ID dedups).
+    #[test]
+    fn session_attempt_replay_records_once() {
+        use crate::domain::session::AttemptOutcome;
+
+        let (disp, _dir) = test_dispatcher();
+        let handle = disp
+            .registry()
+            .start_session(fe(1), ch(1), None, None, 1000);
+        let env = envelope(
+            fe(1),
+            ch(1),
+            42,
+            DomainRequest::SessionAttempt {
+                approach: "try X".into(),
+                outcome: AttemptOutcome::Rejected,
+                critique: None,
+                rationale: None,
+                related_memory_id: None,
+            },
+        );
+        disp.handle(&env).unwrap();
+        disp.handle(&env).unwrap();
+        let session = disp.registry().session(handle).unwrap().clone();
+        assert_eq!(
+            session.attempts.len(),
+            1,
+            "replayed operation must not duplicate the attempt"
+        );
+    }
+
+    /// P1 durability: an acknowledged session_end persists before success
+    /// returns, so a kill (drop without shutdown) loses nothing — the
+    /// reloaded registry holds the outcome and lessons.
+    #[test]
+    fn session_end_ack_survives_kill_without_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_file = dir.path().join("sessions.json");
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock);
+        disp.set_sessions_path(Some(sessions_file.clone()));
+        let handle = disp
+            .registry()
+            .start_session(fe(1), ch(1), None, None, 1000);
+        disp.persist_sessions();
+        let env = envelope(
+            fe(1),
+            ch(1),
+            7,
+            DomainRequest::SessionEnd {
+                outcome: TaskOutcome::Success,
+                final_approach: Some("fixed".into()),
+                lessons: vec!["check logs".into()],
+            },
+        );
+        disp.handle(&env).unwrap();
+        // Kill: drop without shutdown. Eager persist already wrote the file.
+        let live_handle = handle;
+        drop(disp);
+        let restored = FrontendRegistry::load(&sessions_file).unwrap();
+        let session = restored
+            .session(live_handle)
+            .expect("session must survive kill");
+        assert_eq!(session.outcome, Some(TaskOutcome::Success));
+        assert_eq!(session.lessons, vec!["check logs".to_string()]);
+        assert_eq!(
+            session.final_approach.as_deref(),
+            Some("fixed"),
+            "final approach must survive kill"
+        );
     }
 }
