@@ -203,19 +203,30 @@ impl Projector {
     /// Process one durable job end-to-end (design §8.2 steps 1-6).
     pub async fn process_job(&mut self, job: &ProjectionJob) -> DomainResult<ProjectorOutcome> {
         // Step 2: read canonical state fresh and capture its version.
+        // A job whose memory is gone is ORPHANED, not healthy: explicitly
+        // remove its stale rows and compare-and-clear the job itself, so
+        // the pass retires real work instead of recounting a ghost every
+        // tick (re-review P2-1). A superseded ack (false) means a newer job
+        // owns this work — report stale, never false progress.
         let Some(memory) = self
             .repo
             .get_memories(std::slice::from_ref(&job.memory_id))?
             .pop()
         else {
-            return Ok(ProjectorOutcome::Tombstoned);
+            self.propagate_deletion(job.memory_id).await?;
+            if self.repo.acknowledge_projection(job.memory_id, job.seq)? {
+                return Ok(ProjectorOutcome::Tombstoned);
+            }
+            return Ok(ProjectorOutcome::StaleRevision);
         };
 
         // Tombstone path (task 7): a non-recallable memory must not be projected.
         if !memory.lifecycle.is_recallable() || job.is_tombstone {
             self.propagate_deletion(job.memory_id).await?;
-            let _ = self.repo.acknowledge_projection(job.memory_id, job.seq);
-            return Ok(ProjectorOutcome::Tombstoned);
+            if self.repo.acknowledge_projection(job.memory_id, job.seq)? {
+                return Ok(ProjectorOutcome::Tombstoned);
+            }
+            return Ok(ProjectorOutcome::StaleRevision);
         }
 
         // Step 4 guard: canonical revision must still match the job's desired
@@ -455,8 +466,15 @@ impl Projector {
             // revision guard and left pending, so a retryable wakeup may arrive
             // in any sequence (RV-07).
             let mut resolved_this_pass = 0usize;
-            for job in &jobs {
+            for (attempted_this_pass, job) in jobs.iter().enumerate() {
                 if limit.is_some_and(|max| total_resolved + resolved_this_pass >= max) {
+                    break;
+                }
+                // Per-pass work budget (re-review P2-1): the cap bounds
+                // attempted jobs, not just resolutions — a large set of
+                // failing embeddings must not turn one pass into unbounded
+                // CPU while resolving nothing.
+                if limit.is_some_and(|max| attempted_this_pass >= max) {
                     break;
                 }
                 match self.process_job(job).await? {
@@ -804,12 +822,23 @@ mod tests {
         .unwrap();
 
         let mut p = projector(repo.clone(), table.clone());
+        // The pre-forget job object is superseded by the forget's tombstone
+        // job: it must report stale (never clear newer work), not claim a
+        // tombstone it did not publish.
         assert_eq!(
             p.process_job(&job).await.unwrap(),
+            ProjectorOutcome::StaleRevision
+        );
+        // The worker always drives the CURRENT job: the tombstone retires,
+        // rows are gone, and nothing stays pending.
+        let current = repo.projection_job(eid(1)).unwrap().unwrap();
+        assert_eq!(
+            p.process_job(&current).await.unwrap(),
             ProjectorOutcome::Tombstoned
         );
         let count = table.count_rows(None).await.unwrap();
         assert_eq!(count, 0);
+        assert!(repo.projection_jobs().unwrap().is_empty());
     }
 
     /// Task 6: events are retryable wakeups, not an ordered commit log. A job
@@ -1821,6 +1850,36 @@ mod tests {
             1
         );
         assert!(repo.projection_jobs().unwrap().is_empty());
+    }
+
+    /// Re-review P2-1: a pending job whose memory is absent (orphaned)
+    /// retires instead of being recounted as progress every pass. A capped
+    /// drive resolves it once; the next drive finds nothing — no
+    /// false-progress loop for the drain worker to spin on.
+    #[tokio::test]
+    async fn orphaned_pending_job_retires_instead_of_looping() {
+        let (repo, table, _guard) = env().await;
+        let ghost = eid(4242);
+        repo.enqueue_projection_job(ghost, DocumentRevision::new(7), 1, false)
+            .unwrap();
+        assert_eq!(repo.projection_jobs().unwrap().len(), 1);
+        let drive = |limit: usize| {
+            Projector::project_pending(
+                &repo,
+                &table,
+                Box::new(VecFake {
+                    dim: 384,
+                    fail: false,
+                }),
+                limit,
+            )
+        };
+        assert_eq!(drive(100).await.unwrap(), 1);
+        assert!(
+            repo.projection_jobs().unwrap().is_empty(),
+            "orphaned job must be retired, not left pending"
+        );
+        assert_eq!(drive(100).await.unwrap(), 0);
     }
 
     /// Idempotency: a second drive immediately after a converged one

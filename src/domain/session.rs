@@ -171,6 +171,35 @@ pub struct Suggestion {
     pub resolved_at: Option<Instant>,
 }
 
+/// A durable receipt for one completed session operation, stored in the
+/// canonical store alongside the session it acted on (never in a sidecar
+/// file): same operation ID + digest replays the recorded outcome, the same
+/// ID with a different digest rejects as key reuse. Attempts additionally
+/// record their sequence number so replays rebuild responses without
+/// touching session state.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionReceipt {
+    /// The request digest the operation first executed with.
+    pub digest: String,
+    /// The session this operation acted on.
+    pub session: SessionHandle,
+    /// The attempt sequence number, for attempt operations only.
+    #[serde(default)]
+    pub seq: Option<u32>,
+}
+
+/// The outcome of claiming a session operation inside its transaction:
+/// either it executes (or replays) to a usable result, or it rejects.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionOp<T> {
+    /// Fresh execution completed.
+    Applied(T),
+    /// Same ID + digest seen before: the recorded result, no re-execution.
+    Replayed(T),
+    /// Same ID, different digest: reject, never execute.
+    Conflict,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

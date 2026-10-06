@@ -491,10 +491,12 @@ mod tests {
             },
         };
         let _ = disp.handle(&start_env).unwrap();
-        // Two sessions ride along: the traced login plus the virtual
-        // session the session-less calls ensured (WP-09 behavior).
-        let sessions = disp.registry().all_sessions_owned();
-        assert_eq!(sessions.len(), 2);
+        // One traced session rides along (canonical store). The virtual
+        // session ensured by session-less calls stays routing-ephemeral in
+        // the registry: it carries no durable knowledge worth backing up
+        // (and would typically be idle-expired by restore time anyway).
+        let sessions = disp.repo().all_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
         let out = dir.path().join("backups");
         let report = export_backup(&repo, &sessions, &out, "test", 1700000000000).unwrap();
         assert_eq!(report.path.extension().unwrap(), BACKUP_EXTENSION);
@@ -505,7 +507,9 @@ mod tests {
         assert_eq!(v["format_version"], BACKUP_FORMAT_VERSION);
         assert_eq!(v["manifest"]["memories"], 2);
         assert_eq!(v["manifest"]["guides"], 1);
-        assert_eq!(v["manifest"]["sessions"], 2);
+        // Only the traced session is backup cargo now; the virtual one
+        // stays routing-ephemeral (see above).
+        assert_eq!(v["manifest"]["sessions"], 1);
         // Both the explicit edge and the add-time auto-link are captured.
         assert_eq!(v["manifest"]["relations"], 2);
         let snapshot: CanonicalExport = serde_json::from_value(v["snapshot"].clone()).unwrap();

@@ -23,7 +23,6 @@ use crate::compatibility::lemma::tool_args::{
 };
 use crate::daemon::dispatcher::Dispatcher;
 use crate::daemon::envelope::{DomainPayload, IpcEnvelope};
-use crate::daemon::registry::OpCheck;
 use crate::domain::command::{
     CommandContext, DomainCommand, DomainError, DomainErrorCode, DomainResult, ForgetMode,
     MemoryPatch,
@@ -32,9 +31,8 @@ use crate::domain::guide::Guide;
 use crate::domain::id::{EntityId, EntityRevision, OperationId, SessionHandle};
 use crate::domain::memory::{Evidence, FragmentType, Instant, Memory, MemorySource};
 use crate::domain::relation::{Relation, RelationType};
-use crate::domain::session::{
-    Attempt, AttemptOutcome, Session, Suggestion, SuggestionStatus, TaskOutcome,
-};
+use crate::domain::session::SessionOp;
+use crate::domain::session::{AttemptOutcome, Session, Suggestion, SuggestionStatus, TaskOutcome};
 use serde_json::{Value, json};
 
 /// Execute a typed tool call, returning the shaped legacy result.
@@ -1146,22 +1144,33 @@ fn exec_memory_add(
 
     // Resolve the session link BEFORE building the record so attribution
     // lands in the single AddMemory apply: the channel's traced session
-    // when present, else its virtual session — session-less calls are
-    // attributed per channel, never silently dropped (DEV-003: no
-    // daemon-global session). A two-step link would blind-overwrite a
-    // concurrent change with no revision check and no receipt.
+    // (canonical store) when present, else its virtual session —
+    // session-less calls are attributed per channel, never silently
+    // dropped (DEV-003: no daemon-global session). A two-step link would
+    // blind-overwrite a concurrent change with no revision check and no
+    // receipt.
     let (session_handle, session_task_type) = {
-        let mut reg = disp.registry();
-        let handle = reg.ensure_virtual_session(
-            envelope.frontend_id,
-            envelope.channel_id,
-            disp.clock().now_millis(),
-        );
-        let task_type = reg
-            .session(handle)
-            .and_then(|s| s.task_type.clone())
-            .unwrap_or_default();
-        (handle, task_type)
+        let now = disp.clock().now_millis();
+        match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
+            Some(handle) => {
+                let task_type = disp
+                    .repo()
+                    .get_session(handle)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.task_type.clone())
+                    .unwrap_or_default();
+                (handle, task_type)
+            }
+            None => {
+                let handle = disp.registry().ensure_virtual_session(
+                    envelope.frontend_id,
+                    envelope.channel_id,
+                    now,
+                );
+                (handle, String::new())
+            }
+        }
     };
 
     // Build the memory.
@@ -1216,16 +1225,19 @@ fn exec_memory_add(
     let ctx = sub_command_ctx(envelope, 0)?;
     disp.repo().apply(&ctx, &cmd)?;
 
-    // Attribute the created memory to the session in the registry. The
-    // canonical record already carries the link (set before AddMemory);
-    // this is registry-side bookkeeping only.
-    {
-        let mut reg = disp.registry();
-        if let Some(s) = reg.session_mut(session_handle)
-            && !s.memories_created.contains(&legacy_id)
-        {
-            s.memories_created.push(legacy_id.clone());
-        }
+    // Attribute the created memory to the session in the canonical store
+    // (deduped), or to the virtual record when session-less (best-effort
+    // routing attribution). The canonical record already carries the link
+    // (set before AddMemory).
+    if disp.registry().virtual_record(session_handle).is_some() {
+        disp.registry()
+            .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id));
+    } else {
+        let _ = disp.repo().track_session_link(
+            session_handle,
+            crate::service::repository::SessionLinkField::MemoryCreated,
+            std::slice::from_ref(&legacy_id),
+        );
     }
 
     // Find topic overlaps for auto-linking.
@@ -3178,22 +3190,27 @@ fn exec_guide_practice(
         return Ok(err_result("'outcome' must be one of: success, failure."));
     }
     let now = disp.clock().now_millis();
-    // Track into the active session (best-effort) before the guide mutation
-    // so validated_by links the session's pre-loaded reads.
-    let validated: Vec<String> = {
-        let mut reg = disp.registry();
-        reg.track_guide_used(
-            envelope.frontend_id,
-            envelope.channel_id,
-            args.guide.to_lowercase().trim(),
-        );
-        reg.resolve_session(envelope.frontend_id, envelope.channel_id)
-            .and_then(|h| reg.session(h).map(|s| s.memories_read.clone()))
-            .unwrap_or_default()
-    };
-    // Session link is durable state too: persist before the guide
-    // mutation, failing loudly on error (re-review R1).
-    persist_before_ack(disp)?;
+    // Track into the active session (canonical store, best-effort) before
+    // the guide mutation so validated_by links the session's pre-loaded
+    // reads. Virtual sessions have no canonical record: their link is a
+    // no-op and validated_by stays empty.
+    let validated: Vec<String> =
+        match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
+            Some(handle) => {
+                let _ = disp.repo().track_session_link(
+                    handle,
+                    crate::service::repository::SessionLinkField::GuideUsed,
+                    std::slice::from_ref(&args.guide.to_lowercase().trim().to_string()),
+                );
+                disp.repo()
+                    .get_session(handle)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.memories_read.clone())
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
     let outcome_bool = match args.outcome.as_deref() {
         Some("success") => Some(true),
         Some("failure") => Some(false),
@@ -3273,10 +3290,19 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
     let now = disp.clock().now_millis();
 
     if let Some(existing) = repo.get_guide(&args.guide)? {
+        let expected = existing.entity_revision;
         let mut updated = existing;
         updated.description = args.description.clone();
         updated.updated_at = Instant::new(now);
-        repo.put_guide(&updated)?;
+        // Revision-checked: a concurrent mutation since the read rejects
+        // instead of being overwritten (re-review P1-2).
+        match repo.put_guide_checked(Some(expected), &updated) {
+            Ok(()) => {}
+            Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
+                return Ok(err_result(&e.message));
+            }
+            Err(e) => return Err(e),
+        }
         return Ok(ok_result(
             format!(
                 "Updated manual for existing guide \"{}\" ({})",
@@ -3293,10 +3319,17 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
         .iter()
         .find(|g| g.name.contains(normalized) || normalized.contains(g.name.as_str()))
     {
+        let expected = similar.entity_revision;
         let mut updated = similar.clone();
         updated.description = args.description.clone();
         updated.updated_at = Instant::new(now);
-        repo.put_guide(&updated)?;
+        match repo.put_guide_checked(Some(expected), &updated) {
+            Ok(()) => {}
+            Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
+                return Ok(err_result(&e.message));
+            }
+            Err(e) => return Err(e),
+        }
         return Ok(ok_result(
             format!(
                 "Updated manual for existing guide \"{}\" ({})",
@@ -3314,7 +3347,15 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
         &args.learnings,
         now,
     );
-    repo.put_guide(&new_guide)?;
+    // Create-if-absent: a concurrent creation wins instead of being
+    // overwritten (re-review P1-2).
+    match repo.put_guide_checked(None, &new_guide) {
+        Ok(()) => {}
+        Err(e) if e.code == crate::domain::command::DomainErrorCode::Validation => {
+            return Ok(err_result(&e.message));
+        }
+        Err(e) => return Err(e),
+    }
     Ok(ok_result(
         format!(
             "Created new guide \"{}\" ({}) with a detailed manual.",
@@ -3401,6 +3442,10 @@ fn exec_guide_update(disp: &Dispatcher, args: &GuideUpdateArgs) -> DomainResult<
         Some(g) => g,
         None => return Ok(err_result(&format!("Guide \"{}\" not found.", args.guide))),
     };
+    // Planning revision (re-review P1-2): every mutation below validates
+    // against it, so a concurrent writer invalidates this stale plan
+    // instead of being silently overwritten by it.
+    let expected_revision = guide.entity_revision;
 
     let old_name = guide.name.clone();
     if let Some(new_name) = &args.new_name
@@ -3442,9 +3487,16 @@ fn exec_guide_update(disp: &Dispatcher, args: &GuideUpdateArgs) -> DomainResult<
 
     // Rename path (re-review R3, single transaction): the renamed put,
     // memory reference moves and old-key delete commit together — a
-    // failure anywhere leaves no half-rename. Errors propagate.
+    // failure anywhere leaves no half-rename. The planning revision
+    // guards against concurrent updates (re-review P1-2).
     if !old_name.eq_ignore_ascii_case(&guide.name) {
-        repo.rename_guide_atomically(&old_name, &guide)?;
+        match repo.rename_guide_atomically(&old_name, expected_revision, &guide) {
+            Ok(()) => {}
+            Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
+                return Ok(err_result(&e.message));
+            }
+            Err(e) => return Err(e),
+        }
         // Already stored above; return without a second put.
         return Ok(ok_result(
             format!(
@@ -3455,7 +3507,16 @@ fn exec_guide_update(disp: &Dispatcher, args: &GuideUpdateArgs) -> DomainResult<
             json!({ "success": true, "guide": guide.name }),
         ));
     }
-    repo.put_guide(&guide)?;
+    // Non-rename update through the revision-checked write (re-review
+    // P1-2): a concurrent mutation since the read above rejects instead
+    // of being overwritten.
+    match repo.put_guide_checked(Some(expected_revision), &guide) {
+        Ok(()) => {}
+        Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
+            return Ok(err_result(&e.message));
+        }
+        Err(e) => return Err(e),
+    }
 
     Ok(ok_result(
         format!(
@@ -3580,12 +3641,18 @@ fn exec_guide_merge(disp: &Dispatcher, args: &GuideMergeArgs) -> DomainResult<Do
     // Atomic single-transaction merge: references, source deletes and the
     // merged put commit together, guarded by the source revisions read
     // during planning (re-review R3). A concurrent source update rejects
-    // explicitly instead of being silently discarded. Errors propagate.
+    // explicitly instead of being silently discarded.
     let expected: Vec<(String, EntityRevision)> = source_guides
         .iter()
         .map(|g| (g.name.clone(), g.entity_revision))
         .collect();
-    repo.merge_guides_atomically(&args.guides, &expected, &new_guide)?;
+    match repo.merge_guides_atomically(&args.guides, &expected, &new_guide) {
+        Ok(()) => {}
+        Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
+            return Ok(err_result(&e.message));
+        }
+        Err(e) => return Err(e),
+    }
 
     let mut response = format!(
         "Merged {} guides into \"{}\" ({})\n",
@@ -3670,37 +3737,36 @@ fn exec_session_start(
     // does not observe).
     let project: Option<String> = None;
 
-    // Operation receipt first (re-review R5): a replayed start returns the
-    // recorded session instead of abandoning it and creating another; a
-    // digest mismatch rejects instead of executing.
+    // ONE canonical operation (re-review P1-3): abandon-previous, decay,
+    // create and receipt commit together in the store. A replay resolves
+    // to the recorded handle instead of abandoning and recreating; a
+    // digest mismatch rejects. The registry only (re)binds the channel.
     let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    match disp.registry().check_op(&op_id, &digest) {
-        OpCheck::Replay(rec) => {
-            let text = rec.text.clone().unwrap_or_default();
-            let data = rec.data.clone().unwrap_or(json!({}));
-            return Ok(ok_result(text, data));
-        }
-        OpCheck::Conflict => return key_reuse_result(),
-        OpCheck::Fresh => {}
-    }
-
-    // Abandon any existing active session for this channel; create a fresh one.
-    let handle = {
-        let mut reg = disp.registry();
-        reg.decay_attempts(0.002);
-        let h = reg.start_legacy_session(
-            envelope.frontend_id,
-            envelope.channel_id,
-            args.task_type.clone(),
-            args.technologies.clone(),
-            now,
-        );
-        if let Some(s) = reg.session_mut(h) {
-            s.initial_approach = args.initial_approach.clone();
-        }
-        h
+    let abandon = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
+    let new_handle = crate::domain::id::SessionHandle::new(uuid::Uuid::now_v7());
+    let handle = match repo.session_start_tx(
+        &op_id,
+        &digest,
+        new_handle,
+        envelope.channel_id,
+        project.clone(),
+        Some(args.task_type.clone()),
+        args.technologies.clone(),
+        args.initial_approach.clone(),
+        abandon,
+        now,
+    ) {
+        Ok(SessionOp::Applied(h)) | Ok(SessionOp::Replayed(h)) => h,
+        Ok(SessionOp::Conflict) => return key_reuse_result(),
+        Err(e) => return Err(e),
     };
+    {
+        let mut reg = disp.registry();
+        reg.bind_session(envelope.frontend_id, envelope.channel_id, handle, false);
+    }
+    // Binding durability: the channel→handle route must survive restart.
+    persist_before_ack(disp)?;
 
     // Guide suggestions for the task description.
     let task_desc = format!("{} {}", args.task_type, args.technologies.join(" "));
@@ -3731,12 +3797,13 @@ fn exec_session_start(
         let _ = disp.repo().apply(&ctx, &cmd);
     }
 
-    // Track read memories into the session.
+    // Track read memories into the session (canonical store, deduped).
     let read_ids: Vec<String> = relevant.iter().map(|m| legacy_id_of(repo, m)).collect();
-    {
-        let mut reg = disp.registry();
-        reg.track_memories_read(envelope.frontend_id, envelope.channel_id, &read_ids);
-    }
+    repo.track_session_link(
+        handle,
+        crate::service::repository::SessionLinkField::MemoryRead,
+        &read_ids,
+    )?;
 
     let mut response = format!(
         "Session started: {} ({})\n",
@@ -3791,20 +3858,6 @@ fn exec_session_start(
         "guides": guide_names,
         "preloaded_memories": read_ids,
     });
-    // Record the outcome, then persist before ack (re-review R1/R5): the
-    // receipt makes a replay return this exact response; a failed save
-    // fails loudly instead of reporting success for lost state.
-    {
-        let mut reg = disp.registry();
-        reg.record_op(
-            &op_id,
-            &digest,
-            handle,
-            Some(response.clone()),
-            Some(data.clone()),
-        );
-    }
-    persist_before_ack(disp)?;
     Ok(ok_result(response, data))
 }
 
@@ -3816,7 +3869,7 @@ fn build_continuity_recall(
     project: Option<&str>,
     now: u64,
 ) -> String {
-    let sessions = disp.registry().all_sessions_owned();
+    let sessions = disp.repo().all_sessions().unwrap_or_default();
 
     // Layer 1 — dead ends from similar prior sessions.
     let mut dead_ends: Vec<(SessionHandle, u32, String, Option<String>)> = Vec::new();
@@ -3898,10 +3951,9 @@ fn build_continuity_recall(
             ));
             boosted.push((*handle, *seq));
         }
-        // Boost recalled attempts (best-effort).
-        let mut reg = disp.registry();
+        // Boost recalled attempts (best-effort, canonical store).
         for (handle, seq) in boosted {
-            reg.boost_attempt(handle, seq, 0.015, now);
+            let _ = disp.repo().adjust_attempt(handle, seq, 0.015, now);
         }
     }
     if !lessons.is_empty() {
@@ -3949,63 +4001,12 @@ fn exec_session_attempt(
     let approach_redacted = privacy::redact(&args.approach);
     let critique_redacted = args.critique.as_deref().map(privacy::redact);
 
-    // Operation identity for the receipt check below (re-review R5).
+    // Operation identity for the canonical call below.
     let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    let attempt_id = EntityId::new(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        format!("ltmrs:attempt:{}", envelope.operation_id.as_uuid()).as_bytes(),
-    ));
 
-    // Resolve the channel's active session.
-    let session = {
-        let reg = disp.registry();
-        reg.resolve_session(envelope.frontend_id, envelope.channel_id)
-    };
-    // A recorded replay resolves without touching session state — even
-    // after a terminal session. The sequence number comes from the
-    // recorded data, else from the (possibly terminal) session's attempt
-    // with the deterministic ID. A digest mismatch rejects outright.
-    match disp.registry().check_op(&op_id, &digest) {
-        OpCheck::Conflict => return key_reuse_result(),
-        OpCheck::Replay(rec) => {
-            let seq = rec
-                .data
-                .as_ref()
-                .and_then(|d| d.get("seq"))
-                .and_then(|s| s.as_u64())
-                .map(|s| s as u32)
-                .or_else(|| {
-                    disp.registry()
-                        .session(rec.session)
-                        .and_then(|s| s.attempts.iter().find(|a| a.id == attempt_id))
-                        .map(|a| a.seq)
-                });
-            if let Some(seq) = seq {
-                let value_tag = match outcome {
-                    AttemptOutcome::Rejected => "(dead end — most valuable)",
-                    AttemptOutcome::Partial => "(partial)",
-                    AttemptOutcome::Promising => "(promising)",
-                };
-                let preview = if approach_redacted.len() > 80 {
-                    let mut end = 80;
-                    while !approach_redacted.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}…", &approach_redacted[..end])
-                } else {
-                    approach_redacted.clone()
-                };
-                let response = format!("Recorded attempt #{seq} — {preview} {value_tag}.");
-                let data = json!({
-                    "recorded": true,
-                    "attempt_id": format!("{}#{}", rec.session.as_uuid(), seq),
-                });
-                return Ok(ok_result(response, data));
-            }
-        }
-        OpCheck::Fresh => {}
-    }
+    // Resolve the channel's active session (canonical liveness).
+    let session = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let Some(handle) = session else {
         return Ok(err_result(
             "No active session. Call session_start before recording attempts.",
@@ -4020,59 +4021,25 @@ fn exec_session_attempt(
 
     let now = disp.clock().now_millis();
 
-    // Record the attempt and compute its seq. Replay-safe: the attempt ID
-    // derives deterministically from the operation ID, so a retried
-    // operation reuses its ID — `record_attempt` dedups and we skip counter
-    // increments, reporting the original seq. (Same-ID replays with
-    // recorded outcomes returned above; only fresh executions reach here,
-    // plus pre-receipt-era duplicates that dedup by attempt ID.)
-    let seq = {
-        let mut reg = disp.registry();
-        if let Some(existing) = reg
-            .session(handle)
-            .and_then(|s| s.attempts.iter().find(|a| a.id == attempt_id))
-        {
-            existing.seq
-        } else {
-            let next_seq = reg
-                .session(handle)
-                .map(|s| s.attempts.len() as u32 + 1)
-                .unwrap_or(1);
-            let attempt = Attempt {
-                id: attempt_id,
-                session_id: handle,
-                seq: next_seq,
-                approach: approach_redacted.clone(),
-                outcome,
-                critique: critique_redacted.clone(),
-                rationale: args.rationale.clone(),
-                related_memory_id,
-                confidence: 1.0,
-                access_count: 0,
-                last_accessed_at: None,
-                created_at: Instant::new(now),
-            };
-            reg.record_attempt(envelope.frontend_id, envelope.channel_id, attempt);
-            // Self-critique + refinement counters: exactly once per operation.
-            if let Some(s) = reg.session_mut(handle) {
-                s.refinement_attempts += 1;
-                if matches!(outcome, AttemptOutcome::Rejected | AttemptOutcome::Partial)
-                    && critique_redacted.is_some()
-                {
-                    s.self_critique_count += 1;
-                }
-            }
-            next_seq
-        }
+    // ONE canonical operation (re-review P1-3): record, counters and
+    // receipt commit together in the store. Replays resolve to the
+    // recorded sequence number (the rebuilt response needs no live
+    // session); digest mismatch rejects; barrier failures fail loudly.
+    let seq = match disp.repo().session_attempt_tx(
+        &op_id,
+        &digest,
+        handle,
+        approach_redacted.clone(),
+        outcome,
+        critique_redacted.clone(),
+        args.rationale.clone(),
+        related_memory_id,
+        now,
+    ) {
+        Ok(SessionOp::Applied((_, seq))) | Ok(SessionOp::Replayed((_, seq))) => seq,
+        Ok(SessionOp::Conflict) => return key_reuse_result(),
+        Err(e) => return Err(e),
     };
-    // Record the operation (with its sequence number for session-less
-    // replays), then persist before ack (re-review R1/R5): a failed save
-    // fails loudly instead of reporting success.
-    {
-        let mut reg = disp.registry();
-        reg.record_op(&op_id, &digest, handle, None, Some(json!({"seq": seq})));
-    }
-    persist_before_ack(disp)?;
 
     let value_tag = match outcome {
         AttemptOutcome::Rejected => "(dead end — most valuable)",
@@ -4117,90 +4084,53 @@ fn exec_session_end(
 
     let now = disp.clock().now_millis();
 
-    // Operation receipt first (re-review R5): a replay returns the recorded
-    // response instead of re-ending; a digest mismatch rejects. The gate
-    // precedes session resolution so replays after a terminal session
-    // still resolve to the recorded outcome.
+    // Operation identity for the canonical call below.
     let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    match disp.registry().check_op(&op_id, &digest) {
-        OpCheck::Replay(rec) => {
-            let text = rec.text.clone().unwrap_or_default();
-            let data = rec.data.clone().unwrap_or(json!({}));
-            if !text.is_empty() {
-                return Ok(ok_result(text, data));
-            }
-        }
-        OpCheck::Conflict => return key_reuse_result(),
-        OpCheck::Fresh => {}
-    }
 
-    let session = {
-        let reg = disp.registry();
-        reg.resolve_session(envelope.frontend_id, envelope.channel_id)
-    };
-    let Some(handle) = session else {
+    // Resolve the channel's session binding (live or terminal — replays
+    // after a terminal session still resolve to the recorded outcome).
+    let bound = disp
+        .registry()
+        .channel_session(envelope.frontend_id, envelope.channel_id);
+    let Some(handle) = bound else {
         return Ok(err_result("No active session to end."));
     };
 
-    let repo = disp.repo();
-    let mut improvement_lines: Vec<String> = Vec::new();
-
-    // Guide outcomes BEFORE the terminal transition (re-review R5): each
-    // effect commits atomically with its idempotency marker, so a failure
-    // or retry between steps resumes the missing effects instead of
-    // double-counting completed ones or stranding them unapplied.
-    let guides_used = {
-        let reg = disp.registry();
-        reg.session(handle)
-            .map(|s| s.guides_used.clone())
-            .unwrap_or_default()
+    // ONE canonical operation (re-review P1-3): required guide outcomes,
+    // the terminal transition and the receipt commit in a single
+    // transaction. A replay resolves; a digest mismatch rejects; barrier
+    // failures fail loudly. Ending an already-terminal session reports
+    // "no active session" (nothing was done, so nothing is recorded).
+    let improvement_lines = match disp.repo().session_end_tx(
+        &op_id,
+        &digest,
+        handle,
+        outcome,
+        args.final_approach.clone(),
+        args.lessons.clone(),
+        now,
+    ) {
+        Ok(SessionOp::Applied((_, lines, true))) | Ok(SessionOp::Replayed((_, lines, _))) => lines,
+        Ok(SessionOp::Applied((_, _, false))) => {
+            return Ok(err_result("No active session to end."));
+        }
+        Ok(SessionOp::Conflict) => return key_reuse_result(),
+        Err(e) => return Err(e),
     };
-    for guide_name in &guides_used {
-        if outcome != TaskOutcome::Success && outcome != TaskOutcome::Failure {
-            break;
-        }
-        repo.apply_session_guide_effect(&op_id, guide_name, outcome == TaskOutcome::Success, now)?;
-        if let Some(guide) = repo.get_guide(guide_name)? {
-            if outcome == TaskOutcome::Failure {
-                let total = guide.success_count + guide.failure_count;
-                if total >= 3 {
-                    let rate = guide.success_count as f64 / total as f64;
-                    if rate < 0.4 {
-                        improvement_lines.push(format!(
-                            "  [!] Guide \"{}\" success rate is {:.2} ({}/{total}). Consider refining with guide_update.",
-                            guide.name, rate, guide.success_count
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // End the session (only this channel's).
-    {
-        let mut reg = disp.registry();
-        reg.end_session(
-            envelope.frontend_id,
-            envelope.channel_id,
-            outcome,
-            args.final_approach.clone(),
-            args.lessons.clone(),
-            now,
-        );
-    }
 
     // Persist improvement suggestions: deduplicated per session+text so a
     // retried end does not file the same suggestion twice.
-    let existing_suggestions = repo.get_suggestions()?;
+    let existing_suggestions = disp.repo().get_suggestions()?;
     for line in &improvement_lines {
         let text = line.trim().to_string();
-        if existing_suggestions.iter().any(|s| {
+        let already = existing_suggestions.iter().any(|s| {
             s.session_id.as_deref() == Some(&handle.as_uuid().to_string()) && s.suggestion == text
-        }) {
+        });
+        if already {
             continue;
         }
-        let id = repo.next_suggestion_id()?;
+        let id = disp.repo().next_suggestion_id()?;
         let suggestion = Suggestion {
             id,
             session_id: Some(handle.as_uuid().to_string()),
@@ -4209,13 +4139,12 @@ fn exec_session_end(
             created_at: Instant::new(now),
             resolved_at: None,
         };
-        let _ = repo.put_suggestion(&suggestion);
+        let _ = disp.repo().put_suggestion(&suggestion);
     }
 
-    let session_end_info = {
-        let reg = disp.registry();
-        reg.session(handle).cloned()
-    };
+    // Rebuild the response from canonical state (identical on replay:
+    // the session is terminal with the recorded outcome/lessons).
+    let session_end_info = disp.repo().get_session(handle)?;
     let started = session_end_info
         .as_ref()
         .map(|s| s.started_at.as_millis())
@@ -4276,18 +4205,8 @@ fn exec_session_end(
         "outcome_recorded": true,
         "suggestions": improvement_lines,
     });
-    // Record the outcome, then persist before ack (re-review R1/R5).
-    {
-        let mut reg = disp.registry();
-        reg.record_op(
-            &op_id,
-            &digest,
-            handle,
-            Some(response.clone()),
-            Some(data.clone()),
-        );
-    }
-    persist_before_ack(disp)?;
+    // No separate record/persist tail: the receipt committed atomically
+    // with the end transition (and its barrier) in session_end_tx above.
     Ok(ok_result(response, data))
 }
 
@@ -4301,11 +4220,8 @@ fn exec_session_stats(
     let count = args.count.unwrap_or(10);
     let format = args.response_format;
 
-    // One guard for the whole read: chaining disp.registry() calls in a
-    // single expression would deadlock (the first temporary guard outlives
-    // the nested lock on a non-reentrant Mutex).
-    let reg = disp.registry();
-    let sessions = reg.all_sessions_owned();
+    // Canonical session snapshot (the registry holds bindings only).
+    let sessions = disp.repo().all_sessions()?;
 
     // Recent completed sessions (most recent first).
     let mut completed: Vec<&Session> = sessions
@@ -4315,10 +4231,10 @@ fn exec_session_stats(
     completed.sort_by_key(|s| std::cmp::Reverse(s.started_at.as_millis()));
     completed.truncate(count.min(5));
 
-    // Active session for this channel.
-    let active = reg
+    // Active session for this channel (canonical liveness).
+    let active = disp
         .resolve_session(envelope.frontend_id, envelope.channel_id)
-        .and_then(|h| reg.session(h).cloned());
+        .and_then(|h| disp.repo().get_session(h).unwrap_or(None));
 
     let mut output = String::from("## Session Stats\n");
     if let Some(current) = &active {
@@ -4410,25 +4326,21 @@ fn exec_suggestion_respond(
         if let Some(h) = handle_uuid {
             let handle = crate::domain::id::SessionHandle::new(h);
             let attempts = disp
-                .registry()
-                .session(handle)
+                .repo()
+                .get_session(handle)
+                .unwrap_or(None)
                 .map(|s| s.attempts.clone())
                 .unwrap_or_default();
-            let mut reg = disp.registry();
-            if action == "dismiss" {
-                for a in &attempts {
-                    if matches!(
+            for a in &attempts {
+                if action == "dismiss"
+                    && matches!(
                         a.outcome,
                         AttemptOutcome::Rejected | AttemptOutcome::Partial
-                    ) {
-                        reg.penalize_attempt(handle, a.seq, 0.02, now);
-                    }
-                }
-            } else {
-                for a in &attempts {
-                    if a.outcome == AttemptOutcome::Promising {
-                        reg.boost_attempt(handle, a.seq, 0.02, now);
-                    }
+                    )
+                {
+                    let _ = disp.repo().adjust_attempt(handle, a.seq, -0.02, now);
+                } else if action != "dismiss" && a.outcome == AttemptOutcome::Promising {
+                    let _ = disp.repo().adjust_attempt(handle, a.seq, 0.02, now);
                 }
             }
         }
@@ -4563,7 +4475,7 @@ fn exec_backup_create(disp: &Dispatcher, args: &BackupCreateArgs) -> DomainResul
         }
     };
     let now = disp.clock().now_millis();
-    let sessions = disp.registry().all_sessions_owned();
+    let sessions = disp.repo().all_sessions().unwrap();
     let report = crate::interchange::backup::export_backup(
         disp.repo(),
         &sessions,
@@ -4599,7 +4511,7 @@ fn exec_backup_create(disp: &Dispatcher, args: &BackupCreateArgs) -> DomainResul
 /// Live per-collection counts in manifest shape (for preview comparison).
 fn live_counts(disp: &Dispatcher) -> DomainResult<BTreeMap<String, u64>> {
     let export = disp.repo().export_full()?;
-    let sessions = disp.registry().all_sessions_owned();
+    let sessions = disp.repo().all_sessions().unwrap();
     let count = |n: usize| n as u64;
     Ok(BTreeMap::from([
         ("memories".to_string(), count(export.memories.len())),
@@ -4781,7 +4693,10 @@ fn exec_backup_restore(
         .repo()
         .export_full()
         .map_err(|e| fail(format!("safety backup failed: {}", e.message)))?;
-    live_export.sessions = disp.registry().all_sessions_owned();
+    live_export.sessions = disp
+        .repo()
+        .all_sessions()
+        .map_err(|e| fail(format!("safety backup failed: {}", e.message)))?;
     let (safety_bytes, _, _) = encode_backup(&live_export, live_generation, now)
         .map_err(|e| fail(format!("safety backup failed: {e}")))?;
     export_backup_to(&safety_path, &safety_bytes)
@@ -4790,7 +4705,10 @@ fn exec_backup_restore(
     let new_generation = crate::domain::id::StoreGeneration::new(live_generation + 1);
     let report = restore_verified(disp.repo(), &verified, new_generation)
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
-    let abandoned = disp.registry().abandon_all_sessions(now);
+    let abandoned = disp
+        .repo()
+        .abandon_all_sessions(now)
+        .map_err(|e| fail(format!("backup restore failed: {}", e.message)))?;
     let quarantined = report
         .quarantined
         .iter()
@@ -4850,7 +4768,7 @@ fn exec_project_analytics(
     let export = repo.export_snapshot()?;
     let mut guides = repo.get_guides()?;
     guides.sort_by_key(|g| std::cmp::Reverse(g.usage_count));
-    let sessions = disp.registry().all_sessions_owned();
+    let sessions = disp.repo().all_sessions().unwrap();
     let memories: Vec<Memory> = export
         .memories
         .iter()
@@ -5355,7 +5273,11 @@ mod tests {
             Some(virtual_handle.as_uuid().to_string()).as_deref(),
             "fragment must link the virtual session"
         );
-        let session = disp.registry().session(virtual_handle).unwrap().clone();
+        let session = disp
+            .registry()
+            .virtual_record(virtual_handle)
+            .unwrap()
+            .clone();
         assert!(
             session.is_virtual && session.memories_created.contains(&id),
             "virtual session must track the created memory"
@@ -5384,7 +5306,6 @@ mod tests {
             "## After Traced\n\n### Context\nLinks traced now.",
         );
         let traced = disp
-            .registry()
             .resolve_session(fe(1), ch(1))
             .expect("traced session must be active");
         let virtual_handle = disp
@@ -8439,9 +8360,11 @@ mod tests {
         repo.put_memory_direct(&m).unwrap();
         let rev = m.document_revision;
         let rev_entity = m.entity_revision;
-        let mut renamed = repo.get_guide("old").unwrap().expect("old exists");
+        let existing = repo.get_guide("old").unwrap().expect("old exists");
+        let mut renamed = existing.clone();
         renamed.name = "new".to_string();
-        repo.rename_guide_atomically("old", &renamed).unwrap();
+        repo.rename_guide_atomically("old", existing.entity_revision, &renamed)
+            .unwrap();
         let after = repo.get_memories(&[m.id]).unwrap().remove(0);
         assert_eq!(after.related_guides, vec!["new".to_string()]);
         assert!(repo.get_guide("old").unwrap().is_none());
@@ -8630,9 +8553,11 @@ mod tests {
         });
         let create_env = tool_call(3, create.clone());
         run(&disp, &create_env, &create);
-        let mut renamed = repo.get_guide("old").unwrap().expect("old exists");
+        let existing = repo.get_guide("old").unwrap().expect("old exists");
+        let mut renamed = existing.clone();
         renamed.name = "new".to_string();
-        repo.rename_guide_atomically("old", &renamed).unwrap();
+        repo.rename_guide_atomically("old", existing.entity_revision, &renamed)
+            .unwrap();
         let after = repo.get_memories(&[m.id]).unwrap().remove(0);
         assert!(
             after.fragment.contains("new body"),
@@ -8705,6 +8630,125 @@ mod tests {
         assert!(result_is_error(&bad_result));
         assert!(repo.get_guide("gamma").unwrap().is_some());
         assert!(repo.get_guide("delta").unwrap().is_none());
+    }
+
+    /// Re-review P1-2: a public `guide_update` between merge planning and
+    /// commit rejects the stale merge instead of losing the update. The
+    /// update travels the real public tool path.
+    #[test]
+    fn guide_merge_rejects_stale_plan_after_public_update() {
+        let (disp, _dir) = test_dispatcher();
+        for (op, name) in [(1, "alpha"), (2, "beta")] {
+            let args = GuideCreateArgs {
+                guide: name.to_string(),
+                category: "dev-tool".to_string(),
+                description: format!("{name} guide"),
+                contexts: vec![],
+                learnings: vec![],
+            };
+            let env = tool_call(op, ToolArgs::GuideCreate(args.clone()));
+            run(&disp, &env, &ToolArgs::GuideCreate(args));
+        }
+        // Planning snapshot: current revisions.
+        let rev_alpha = disp
+            .repo()
+            .get_guide("alpha")
+            .unwrap()
+            .unwrap()
+            .entity_revision;
+        // Concurrent update through the PUBLIC path.
+        let update = ToolArgs::GuideUpdate(GuideUpdateArgs {
+            guide: "alpha".to_string(),
+            new_name: None,
+            category: None,
+            description: None,
+            add_anti_patterns: vec!["never skip validation".to_string()],
+            add_pitfalls: vec![],
+            add_depends_on: vec![],
+            add_enables: vec![],
+            superseded_by: None,
+            deprecated: false,
+        });
+        let update_env = tool_call(3, update.clone());
+        let update_result = run(&disp, &update_env, &update);
+        assert!(!result_is_error(&update_result));
+        // Merge commit with the stale plan: explicit conflict, update kept.
+        let mut merged = disp.repo().get_guide("alpha").unwrap().unwrap();
+        merged.name = "gamma".to_string();
+        let stale = vec![
+            ("alpha".to_string(), rev_alpha),
+            (
+                "beta".to_string(),
+                disp.repo()
+                    .get_guide("beta")
+                    .unwrap()
+                    .unwrap()
+                    .entity_revision,
+            ),
+        ];
+        let err = disp
+            .repo()
+            .merge_guides_atomically(&["alpha".to_string(), "beta".to_string()], &stale, &merged)
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::RevisionConflict
+        );
+        let alpha = disp.repo().get_guide("alpha").unwrap().unwrap();
+        assert!(
+            alpha
+                .anti_patterns
+                .iter()
+                .any(|p| p == "never skip validation"),
+            "concurrent update must survive a rejected merge"
+        );
+        assert!(disp.repo().get_guide("gamma").unwrap().is_none());
+    }
+
+    /// Re-review P1-2: a public `guide_practice` between rename planning
+    /// and commit rejects the stale rename; counters never regress.
+    #[test]
+    fn guide_rename_rejects_stale_plan_after_public_practice() {
+        let (disp, _dir) = test_dispatcher();
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "old".to_string(),
+            category: "dev-tool".to_string(),
+            description: "old guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        run(&disp, &tool_call(1, create.clone()), &create);
+        // Planning snapshot.
+        let planned = disp.repo().get_guide("old").unwrap().unwrap();
+        // Concurrent practice through the PUBLIC path (bumps revision).
+        let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "old".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec![],
+            learnings: vec!["fresh learning".to_string()],
+            outcome: None,
+        });
+        let practice_env = tool_call(2, practice.clone());
+        assert!(!result_is_error(&run(&disp, &practice_env, &practice)));
+        // Stale rename: explicit conflict, practiced state intact.
+        let mut renamed = planned.clone();
+        renamed.name = "new".to_string();
+        let err = disp
+            .repo()
+            .rename_guide_atomically("old", planned.entity_revision, &renamed)
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::RevisionConflict
+        );
+        let old = disp.repo().get_guide("old").unwrap().unwrap();
+        assert_eq!(
+            old.usage_count, 2,
+            "create counts once, practice counts once more"
+        );
+        assert!(old.learnings.contains(&"fresh learning".to_string()));
+        assert!(disp.repo().get_guide("new").unwrap().is_none());
     }
 
     #[test]
@@ -9166,7 +9210,7 @@ mod tests {
         // Coherence across the loop, read back from canonical state.
         let handle =
             crate::domain::id::SessionHandle::new(uuid::Uuid::parse_str(&session_id).unwrap());
-        let session = disp.registry().session(handle).unwrap().clone();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
         assert!(session.memories_read.contains(&rust_id));
         assert!(session.memories_created.contains(&new_id));
         assert_eq!(session.attempts.len(), 1);
@@ -9402,7 +9446,7 @@ mod tests {
         assert!(!result_is_error(&first));
         let second = run(&disp, &env, &attempt);
         assert!(!result_is_error(&second));
-        let sessions = disp.registry().all_sessions_owned();
+        let sessions = disp.repo().all_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].attempts.len(),
@@ -9442,7 +9486,7 @@ mod tests {
             "replay must return the recorded session"
         );
         assert_eq!(
-            disp.registry().all_sessions_owned().len(),
+            disp.repo().all_sessions().unwrap().len(),
             1,
             "replay must not create another session"
         );
@@ -9458,7 +9502,7 @@ mod tests {
         let third = run(&disp, &changed_env, &changed);
         assert!(result_is_error(&third));
         assert!(result_text(&third).contains("different input"));
-        assert_eq!(disp.registry().all_sessions_owned().len(), 1);
+        assert_eq!(disp.repo().all_sessions().unwrap().len(), 1);
     }
 
     /// Re-review R5: replaying session_end returns the recorded response and
@@ -9542,7 +9586,7 @@ mod tests {
         let result = run(&disp, &changed_env, &changed);
         assert!(result_is_error(&result));
         assert!(result_text(&result).contains("different input"));
-        let sessions = disp.registry().all_sessions_owned();
+        let sessions = disp.repo().all_sessions().unwrap();
         assert_eq!(sessions[0].attempts.len(), 1);
     }
 

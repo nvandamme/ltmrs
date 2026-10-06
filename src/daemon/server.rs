@@ -185,11 +185,21 @@ impl Daemon {
                 .map_err(DaemonError::from)?,
         );
         // Restore durable session history from a previous run (if any).
+        // Traced sessions + receipts live in the canonical store: a
+        // pre-migration sessions.json splits its traced state into a
+        // legacy payload, imported once here (idempotent by handle and
+        // operation ID). Bindings and virtual sessions stay in the file.
         let (registry, sessions_path) = if config.sessions_path.is_empty() {
             (FrontendRegistry::new(), None)
         } else {
             let p = std::path::PathBuf::from(&config.sessions_path);
-            let registry = FrontendRegistry::load(&p).map_err(DaemonError::Io)?;
+            let (registry, legacy) = FrontendRegistry::load(&p).map_err(DaemonError::Io)?;
+            let imported = repo
+                .import_legacy_sessions(legacy.sessions, legacy.receipts)
+                .map_err(DaemonError::from)?;
+            if imported > 0 {
+                eprintln!("ltmrs: imported {imported} legacy session record(s) into the store");
+            }
             (registry, Some(p))
         };
         let (dispatcher, embedding, models_dir) = match &config.embedding {
@@ -1634,10 +1644,13 @@ mod tests {
         }
     }
 
-    /// Shutdown persists session state and aborts background jobs so a
-    /// restart restores durable history (design §7.2, §7.3).
+    /// Shutdown persists routing state and aborts background jobs so a
+    /// restart restores bindings while sessions live in the store
+    /// (design §7.2, §7.3).
     #[tokio::test]
     async fn shutdown_persists_sessions_and_aborts_scheduler() {
+        use crate::domain::session::SessionOp;
+
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::resolve(dir.path(), "test-store");
         let sessions_path = dir.path().join("sessions.json");
@@ -1647,19 +1660,51 @@ mod tests {
             ..Default::default()
         };
         let mut daemon = Daemon::start(&paths, config).await.unwrap();
-        // Start a session through the dispatcher so there is state to persist.
-        daemon
+        // Start a session through the canonical store so there is durable
+        // state, and bind the channel to it.
+        let handle = crate::domain::id::SessionHandle::new(uuid::Uuid::from_u128(77));
+        match daemon
             .dispatcher()
-            .registry()
-            .start_session(fe(1), ch(1), Some("proj".into()), None, 100);
+            .repo()
+            .session_start_tx(
+                "test-op-1",
+                "digest-1",
+                handle,
+                ch(1),
+                Some("proj".into()),
+                None,
+                vec![],
+                None,
+                None,
+                100,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) | SessionOp::Replayed(h) => {
+                daemon
+                    .dispatcher()
+                    .registry()
+                    .bind_session(fe(1), ch(1), h, false);
+            }
+            SessionOp::Conflict => panic!("test setup conflict"),
+        }
 
-        // Shutdown: persist sessions + abort the scheduler worker.
+        // Shutdown: persist routing + abort the scheduler worker.
         daemon.shutdown();
 
-        // The sessions file exists and restores the started session.
+        // The sessions file exists and restores the channel binding, while
+        // the session itself lives in the reopened store.
         assert!(sessions_path.exists(), "shutdown must persist sessions");
-        let restored = FrontendRegistry::load(&sessions_path).unwrap();
+        let (restored, _) = FrontendRegistry::load(&sessions_path).unwrap();
         assert_eq!(restored.channel_count(), 1);
+        assert_eq!(restored.channel_session(fe(1), ch(1)), Some(handle));
+        let session = daemon
+            .dispatcher()
+            .repo()
+            .get_session(handle)
+            .unwrap()
+            .expect("session must live in the store");
+        assert_eq!(session.project.as_deref(), Some("proj"));
         // The scheduler worker was aborted.
         assert!(daemon.scheduler_worker_aborted());
     }

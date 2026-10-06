@@ -65,3 +65,34 @@ fn quick_evidence_manifest_ties_to_head() {
         "manifest must be sanitized (no absolute local paths):\n{manifest}"
     );
 }
+
+/// Re-review P2-2: two runs in the same timestamp second must not share
+/// (and must not overwrite) a run directory — mktemp exclusivity.
+#[test]
+fn same_second_runs_never_share_a_directory() {
+    let run_once = || {
+        let script = Command::new("bash")
+            .args(["tools/gen_release_evidence.sh", "--quick"])
+            .output()
+            .expect("evidence script must be runnable");
+        assert!(script.status.success());
+        String::from_utf8(script.stdout)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let first = run_once();
+    let second = run_once();
+    assert_ne!(first, second, "run directories must be exclusive");
+    for dir in [&first, &second] {
+        let manifest = std::fs::read_to_string(format!("{dir}/manifest.json"))
+            .unwrap_or_else(|_| panic!("manifest must exist at {dir}"));
+        assert!(
+            manifest.contains(&head_sha()),
+            "both manifests must survive intact"
+        );
+    }
+}

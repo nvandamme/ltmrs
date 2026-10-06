@@ -131,7 +131,38 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   transcripts in bundle. Get-ok counts incomparable by contract;
   our duplicate gate passing salted content is DEV-007, known.
 
-## 2026-10-06 — Dependency hygiene and re-review hardening
+## 2026-10-06 — Canonical sessions and re-review hardening
+
+### P1-3 sessions in Fjall: single-tx session completion
+
+- New `sessions` + `session_ops` keyspaces; `SessionReceipt`
+  (digest/session/seq) + `SessionOp::{Applied,Replayed,Conflict}` in
+  `domain::session`. One-transaction methods: `session_start_tx`
+  (abandon-previous + decay + create + receipt), `session_attempt_tx`
+  (record + counters + receipt), `session_end_tx` (guide effects +
+  terminal transition + receipt, returns ended-now flag + improvement
+  lines), `track_session_link`, `adjust_attempt`, `abandon_all_sessions`,
+  `import_legacy_sessions`, plus reads. Replays re-run the barrier;
+  `Conflict` is a first-class outcome (tools→tool error, dispatcher→
+  wire error), never a swallowed success.
+- Registry keeps bindings/leases/live/virtual only; op_log, traced
+  sessions and handle counter removed (handles are UUIDv7).
+  sessions.json splits legacy traced state into an import payload
+  (old files load; virtual/bindings restore); daemon imports once
+  at start, idempotently. Fresh end on a terminal session reports
+  "no active session" (nothing done, nothing recorded); virtual
+  sessions track created-memory links routing-ephemerally and stay
+  out of backup cargo.
+- Dispatcher/tools/backup/stats/analytics restored against repo
+  sessions; single-tx end replaces per-guide markers (method
+  removed); `Dispatcher::resolve_session` = binding + store liveness.
+- Validation: evidence gate full `--release --locked` green (fmt
+  clean, clippy clean, 693 lib passed, 0 failed) — it caught 2 fresh
+  clippy lints, 2 wrong test expectations of mine (usage baseline,
+  superseded-job outcome), 1 stale manifest count and 3 error-level
+  inconsistencies, all fixed and re-gated. No plan change.
+
+## ffa7103 (2026-10-06) — Dependency hygiene and re-review hardening
 
 ### Re-review R1–R7: operation receipts, atomic guide ops, drain, idle lifetime, evidence gating
 

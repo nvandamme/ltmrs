@@ -19,10 +19,13 @@ use crate::domain::command::{
     ReceiptOutcome, RetryNamespace,
 };
 use crate::domain::export::CanonicalExport;
-use crate::domain::id::{EntityId, FrontendId, ModelFingerprint, OperationId, StoreGeneration};
+use crate::domain::id::{
+    ChannelId, EntityId, FrontendId, ModelFingerprint, OperationId, SessionHandle, StoreGeneration,
+};
 use crate::domain::memory::Memory;
 use crate::domain::projection::{GenerationRecord, GenerationStatus};
 use crate::domain::relation::Relation;
+use crate::domain::session::{Session, SessionOp, SessionReceipt};
 use crate::service::migrations::{
     MigrationOutcome, MigrationPlan, MigrationRunner, MigrationSafetyRules,
 };
@@ -142,6 +145,14 @@ pub struct CanonicalRepository {
     /// → guide name. Written atomically with the guide mutation so a retried
     /// operation replays without double-counting usage/success counters.
     guide_ops: OptimisticTxKeyspace,
+    /// Canonical session state (P1-3 re-review): traced sessions keyed by
+    /// handle. The daemon registry keeps only channel bindings, leases and
+    /// ephemeral virtual sessions; every durable session mutation commits
+    /// here atomically with its receipt.
+    sessions: OptimisticTxKeyspace,
+    /// Canonical session operation receipts (op ID → SessionReceipt),
+    /// committed in the same transaction as the mutation they record.
+    session_ops: OptimisticTxKeyspace,
     /// Post-commit wake-up hook (P2-1 projection latency): fired once per
     /// committed mutation so the projection worker drives the new job
     /// immediately instead of waiting out its maintenance interval. Replays
@@ -168,6 +179,15 @@ struct PracticeLog {
     name: String,
     digest: String,
     recorded: crate::domain::guide::Guide,
+}
+
+/// Which session link field [`CanonicalRepository::track_session_link`]
+/// appends to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLinkField {
+    GuideUsed,
+    MemoryRead,
+    MemoryCreated,
 }
 
 impl CanonicalRepository {
@@ -226,6 +246,8 @@ impl CanonicalRepository {
         let guides = Self::keyspace(&db, "guides")?;
         let suggestions = Self::keyspace(&db, "suggestions")?;
         let guide_ops = Self::keyspace(&db, "guide_ops")?;
+        let sessions = Self::keyspace(&db, "sessions")?;
+        let session_ops = Self::keyspace(&db, "session_ops")?;
 
         Ok(Self {
             db,
@@ -240,6 +262,8 @@ impl CanonicalRepository {
             guides,
             suggestions,
             guide_ops,
+            sessions,
+            session_ops,
             commit_hook: std::sync::Mutex::new(None),
             fault_injector,
             clock,
@@ -1543,6 +1567,76 @@ impl CanonicalRepository {
             .find(|g| g.name.eq_ignore_ascii_case(&target)))
     }
 
+    /// Store a guide with revision enforcement (re-review P1-2): every
+    /// mutation of an existing guide must invalidate concurrent plans.
+    /// `expected=None` creates if absent and fails when the key already
+    /// exists; `expected=Some(rev)` requires the live record at `rev`
+    /// (else RevisionConflict) and advances it. The blind `put_guide`
+    /// remains for seed paths that own their key outright.
+    pub fn put_guide_checked(
+        &self,
+        expected: Option<crate::domain::id::EntityRevision>,
+        guide: &crate::domain::guide::Guide,
+    ) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let key = guide.name.to_lowercase();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let fresh: Option<crate::domain::guide::Guide> = tx
+                .get(&self.guides, &key)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                .map(|raw| {
+                    serde_json::from_slice(raw.as_ref())
+                        .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
+                })
+                .transpose()?;
+            let mut guide = guide.clone();
+            match (fresh, expected) {
+                (None, None) => {}
+                (Some(_), None) => {
+                    return Err(DomainError::new(
+                        DomainErrorCode::Validation,
+                        "guide already exists",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(DomainError::new(
+                        DomainErrorCode::NotFound,
+                        "guide not found",
+                    ));
+                }
+                (Some(live), Some(rev)) => {
+                    if live.entity_revision != rev {
+                        return Err(DomainError::new(
+                            DomainErrorCode::RevisionConflict,
+                            "guide changed since read: re-read and re-plan",
+                        ));
+                    }
+                    guide.entity_revision = live.entity_revision.next();
+                }
+            }
+            let raw = serde_json::to_vec(&guide)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.guides, &key, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("guide write conflicted"))
+    }
+
     /// Store a guide (keyed by lowercased name).
     pub fn put_guide(&self, guide: &crate::domain::guide::Guide) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
@@ -1603,7 +1697,10 @@ impl CanonicalRepository {
                 .get(&self.guide_ops, operation_id)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
-                // New format: digest-bound recorded outcome.
+                // New format: digest-bound recorded outcome. The barrier runs
+                // again before acknowledging (re-review P1-1): a visible
+                // receipt is not proof its flush succeeded — a prior
+                // barrier failure must fail this replay too.
                 if let Ok(log) = serde_json::from_slice::<PracticeLog>(raw.as_ref()) {
                     if log.digest != digest {
                         return Err(DomainError::new(
@@ -1611,6 +1708,7 @@ impl CanonicalRepository {
                             "operation key reused with different input",
                         ));
                     }
+                    self.persist_barrier()?;
                     return Ok(log.recorded);
                 }
                 // Legacy bare-name entries (pre-digest): preserve exact old
@@ -1754,15 +1852,19 @@ impl CanonicalRepository {
     }
 
     /// Apply one session_end guide outcome atomically with its idempotency
-    /// marker (re-review R5): the success/failure count bump and the
-    /// `{op}:guide:{name}` marker commit in ONE transaction. Returns true
-    /// when newly applied, false when the marker was already present (retry
-    /// resumes without double-counting) or the guide is gone (forget wins —
-    /// no marker written, so a later retry re-checks). Entity revision
-    /// advances so concurrent merges observe the change.
+    /// marker (re-review R5, hardened re-review P1-3): the success/failure
+    /// count bump and the `{op}:guide:{name}` marker commit in ONE
+    /// transaction. Returns true when newly applied, false when the marker
+    /// was already present for the same arguments (retry resumes without
+    /// double-counting) or the guide is gone (forget wins — no marker
+    /// written, so a later retry re-checks). The marker binds the request
+    /// digest AND outcome: a retry with changed arguments after partial
+    /// effects rejects as key reuse instead of completing a mixed outcome.
+    /// Entity revision advances so concurrent merges observe the change.
     pub fn apply_session_guide_effect(
         &self,
         operation_id: &str,
+        digest: &str,
         guide_name: &str,
         success: bool,
         now_millis: u64,
@@ -1775,12 +1877,24 @@ impl CanonicalRepository {
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            if tx
+            if let Some(raw) = tx
                 .get(&self.guide_ops, &marker)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
-                .is_some()
             {
-                return Ok(false);
+                // A completed marker for this effect binds its digest and
+                // outcome: same arguments resume, changed arguments reject
+                // — a mixed-outcome completion can never assemble.
+                let marked: serde_json::Value = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let same = marked.get("digest").and_then(|d| d.as_str()) == Some(digest)
+                    && marked.get("success").and_then(|s| s.as_bool()) == Some(success);
+                if same {
+                    return Ok(false);
+                }
+                return Err(DomainError::new(
+                    DomainErrorCode::KeyReuseDifferentInput,
+                    "operation key reused with different input after partial effects",
+                ));
             }
             let guide_key = guide_name.to_lowercase();
             let raw = tx
@@ -1801,8 +1915,12 @@ impl CanonicalRepository {
             let raw = serde_json::to_vec(&guide)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.guides, &guide_key, raw.as_slice());
-            let marker_raw = serde_json::to_vec(&serde_json::json!({"applied": true}))
-                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let marker_raw = serde_json::to_vec(&serde_json::json!({
+                "applied": true,
+                "digest": digest,
+                "success": success,
+            }))
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.guide_ops, &marker, marker_raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
@@ -1849,6 +1967,8 @@ impl CanonicalRepository {
                 .get(&self.guide_ops, operation_id)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
+                // Recorded outcome — but durability is not inherited from a
+                // visible receipt (re-review P1-1): flush again first.
                 if let Ok(log) = serde_json::from_slice::<PracticeLog>(raw.as_ref()) {
                     if log.digest != digest {
                         return Err(DomainError::new(
@@ -1856,6 +1976,7 @@ impl CanonicalRepository {
                             "operation key reused with different input",
                         ));
                     }
+                    self.persist_barrier()?;
                     return Ok(log.recorded);
                 }
                 return Err(DomainError::new(
@@ -2355,12 +2476,15 @@ impl CanonicalRepository {
     /// Rename a guide atomically (re-review R3): the renamed put, memory
     /// reference moves and old-key delete commit in ONE transaction. A
     /// failure anywhere leaves no half-rename (no dangling references to a
-    /// deleted guide, no duplicate guides). Reference patching follows the
-    /// unindexed-field contract (document revision untouched, entity
-    /// revision advances).
+    /// deleted guide, no duplicate guides). The source revision read during
+    /// planning is enforced: a concurrent update (practice, end-effects)
+    /// rejects the stale rename explicitly instead of discarding it
+    /// (re-review P1-2). Reference patching follows the unindexed-field
+    /// contract (document revision untouched, entity revision advances).
     pub fn rename_guide_atomically(
         &self,
         old_name: &str,
+        expected: crate::domain::id::EntityRevision,
         updated: &crate::domain::guide::Guide,
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
@@ -2374,12 +2498,23 @@ impl CanonicalRepository {
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             let old_exists = tx
                 .get(&self.guides, &old_key)
-                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
-                .is_some();
-            if !old_exists {
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let Some(old_raw) = old_exists else {
                 return Err(DomainError::new(
                     DomainErrorCode::NotFound,
                     format!("guide not found: {old_key}"),
+                ));
+            };
+            // Stale-source guard (re-review P1-2): the rename must apply to
+            // the revision it was planned against, not silently overwrite a
+            // newer concurrent update.
+            let old_guide: crate::domain::guide::Guide =
+                serde_json::from_slice(old_raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if old_guide.entity_revision != expected {
+                return Err(DomainError::new(
+                    DomainErrorCode::RevisionConflict,
+                    "guide changed since rename planning: re-read and re-plan",
                 ));
             }
             if new_key != old_key {
@@ -2433,8 +2568,14 @@ impl CanonicalRepository {
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
                 tx.insert(&self.memories, key, raw.as_slice());
             }
-            let raw = serde_json::to_vec(updated)
-                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let raw = serde_json::to_vec(&{
+                let mut renamed = updated.clone();
+                // The rename itself is a mutation: advance from the live
+                // revision so later plans observe it.
+                renamed.entity_revision = old_guide.entity_revision.next();
+                renamed
+            })
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.guides, &new_key, raw.as_slice());
             if new_key != old_key {
                 tx.remove(&self.guides, &old_key);
@@ -2520,6 +2661,686 @@ impl CanonicalRepository {
             }
         }
         Err(Self::exhausted_contention("guide forget conflicted"))
+    }
+
+    /// Start a traced session as ONE canonical operation (re-review P1-3):
+    /// abandon-previous, attempt decay, session insert and operation
+    /// receipt commit in a single transaction. A replay returns the
+    /// recorded handle instead of abandoning and recreating; a digest
+    /// mismatch rejects. The channel binding itself stays in the daemon
+    /// registry (routing, not durability).
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_start_tx(
+        &self,
+        operation_id: &str,
+        digest: &str,
+        handle: SessionHandle,
+        channel_id: ChannelId,
+        project: Option<String>,
+        task_type: Option<String>,
+        technologies: Vec<String>,
+        initial_approach: Option<String>,
+        abandon: Option<SessionHandle>,
+        now_millis: u64,
+    ) -> DomainResult<SessionOp<SessionHandle>> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if let Some(raw) = tx
+                .get(&self.session_ops, operation_id)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if rec.digest != digest {
+                    return Ok(SessionOp::Conflict);
+                }
+                // Durability is not inherited from a visible receipt
+                // (re-review P1-1): flush again before acknowledging.
+                self.persist_barrier()?;
+                return Ok(SessionOp::Replayed(rec.session));
+            }
+            // Abandon the channel's previous session, if it can still end.
+            if let Some(prev) = abandon {
+                let pkey = prev.as_uuid().to_string();
+                if let Some(raw) = tx
+                    .get(&self.sessions, &pkey)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                {
+                    let mut prev_session: Session =
+                        serde_json::from_slice(raw.as_ref()).map_err(|e| {
+                            DomainError::new(DomainErrorCode::Validation, e.to_string())
+                        })?;
+                    if prev_session.can_end() {
+                        prev_session.status = crate::domain::session::SessionStatus::Abandoned;
+                        prev_session.outcome = Some(crate::domain::session::TaskOutcome::Abandoned);
+                        prev_session.ended_at =
+                            Some(crate::domain::memory::Instant::new(now_millis));
+                        let raw = serde_json::to_vec(&prev_session).map_err(|e| {
+                            DomainError::new(DomainErrorCode::Validation, e.to_string())
+                        })?;
+                        tx.insert(&self.sessions, &pkey, raw.as_slice());
+                    }
+                }
+            }
+            // Decay stale dead-ends across sessions (same 0.002 policy the
+            // registry applied at start).
+            let mut all: Vec<(String, Session)> = Vec::new();
+            for kv in tx.iter(&self.sessions) {
+                let (k, v) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key: String = String::from_utf8_lossy(k.as_ref()).into_owned();
+                let mut s: Session = serde_json::from_slice(v.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                for a in &mut s.attempts {
+                    a.confidence = (a.confidence - 0.002).max(0.0);
+                }
+                all.push((key, s));
+            }
+            for (key, s) in &all {
+                let raw = serde_json::to_vec(s)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                tx.insert(&self.sessions, key, raw.as_slice());
+            }
+            let session = Session {
+                handle,
+                channel_id,
+                project: project.clone(),
+                task_type: task_type.clone(),
+                technologies: technologies.clone(),
+                status: crate::domain::session::SessionStatus::Active,
+                attempts: Vec::new(),
+                outcome: None,
+                final_approach: None,
+                lessons: Vec::new(),
+                initial_approach: initial_approach.clone(),
+                guides_used: Vec::new(),
+                memories_read: Vec::new(),
+                memories_created: Vec::new(),
+                refinement_attempts: 0,
+                self_critique_count: 0,
+                started_at: crate::domain::memory::Instant::new(now_millis),
+                ended_at: None,
+                is_virtual: false,
+            };
+            let hkey = handle.as_uuid().to_string();
+            let raw = serde_json::to_vec(&session)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.sessions, &hkey, raw.as_slice());
+            let receipt = SessionReceipt {
+                digest: digest.to_string(),
+                session: handle,
+                seq: None,
+            };
+            let log_raw = serde_json::to_vec(&receipt)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.session_ops, operation_id, log_raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    self.fire_commit_hook();
+                    return Ok(SessionOp::Applied(handle));
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("session start conflicted"))
+    }
+
+    /// Record a session attempt as ONE canonical operation (re-review P1-3):
+    /// the attempt ID derives deterministically from the operation ID, so
+    /// retries dedup; counters increment exactly once per operation; the
+    /// receipt commits in the same transaction. Digest mismatch rejects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_attempt_tx(
+        &self,
+        operation_id: &str,
+        digest: &str,
+        handle: SessionHandle,
+        approach: String,
+        outcome: crate::domain::session::AttemptOutcome,
+        critique: Option<String>,
+        rationale: Option<String>,
+        related_memory_id: Option<EntityId>,
+        now_millis: u64,
+    ) -> DomainResult<SessionOp<(SessionHandle, u32)>> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let attempt_id = EntityId::new(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("ltmrs:attempt:{operation_id}").as_bytes(),
+        ));
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if let Some(raw) = tx
+                .get(&self.session_ops, operation_id)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if rec.digest != digest {
+                    return Ok(SessionOp::Conflict);
+                }
+                self.persist_barrier()?;
+                let seq = rec.seq.unwrap_or(0);
+                return Ok(SessionOp::Replayed((rec.session, seq)));
+            }
+            let hkey = handle.as_uuid().to_string();
+            let raw = tx
+                .get(&self.sessions, &hkey)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let Some(raw) = raw else {
+                return Err(DomainError::new(
+                    DomainErrorCode::NotFound,
+                    "session not found",
+                ));
+            };
+            let mut session: Session = serde_json::from_slice(raw.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if !session.can_end() {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "session is already terminal",
+                ));
+            }
+            let seq = match session.attempts.iter().find(|a| a.id == attempt_id) {
+                Some(existing) => existing.seq,
+                None => {
+                    let next = session.attempts.len() as u32 + 1;
+                    session.attempts.push(crate::domain::session::Attempt {
+                        id: attempt_id,
+                        session_id: handle,
+                        seq: next,
+                        approach: approach.clone(),
+                        outcome,
+                        critique: critique.clone(),
+                        rationale: rationale.clone(),
+                        related_memory_id,
+                        confidence: 1.0,
+                        access_count: 0,
+                        last_accessed_at: None,
+                        created_at: crate::domain::memory::Instant::new(now_millis),
+                    });
+                    session.refinement_attempts += 1;
+                    if matches!(
+                        outcome,
+                        crate::domain::session::AttemptOutcome::Rejected
+                            | crate::domain::session::AttemptOutcome::Partial
+                    ) && critique.is_some()
+                    {
+                        session.self_critique_count += 1;
+                    }
+                    next
+                }
+            };
+            let raw = serde_json::to_vec(&session)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.sessions, &hkey, raw.as_slice());
+            let receipt = SessionReceipt {
+                digest: digest.to_string(),
+                session: handle,
+                seq: Some(seq),
+            };
+            let log_raw = serde_json::to_vec(&receipt)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.session_ops, operation_id, log_raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    self.fire_commit_hook();
+                    return Ok(SessionOp::Applied((handle, seq)));
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("session attempt conflicted"))
+    }
+
+    /// Success-rate warning line for a guide after an outcome bump, or
+    /// empty when the guide is healthy. Shared by the fresh end path and
+    /// the replay path so both render identically.
+    fn improvement_line(guide: &crate::domain::guide::Guide) -> String {
+        let total = guide.success_count + guide.failure_count;
+        if total >= 3 {
+            let rate = guide.success_count as f64 / total as f64;
+            if rate < 0.4 {
+                return format!(
+                    "  [!] Guide \"{}\" success rate is {:.2} ({}/{total}). Consider refining with guide_update.",
+                    guide.name, rate, guide.success_count
+                );
+            }
+        }
+        String::new()
+    }
+
+    /// Recompute improvement lines for a session's used guides from current
+    /// store state (replay rendering): same rule as the fresh path.
+    fn improvement_lines_tx(
+        &self,
+        tx: &mut OptimisticWriteTx,
+        handle: SessionHandle,
+    ) -> DomainResult<Vec<String>> {
+        let hkey = handle.as_uuid().to_string();
+        let raw = tx
+            .get(&self.sessions, &hkey)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        let session: Session = serde_json::from_slice(raw.as_ref())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut lines = Vec::new();
+        for guide_name in &session.guides_used {
+            let gkey = guide_name.to_lowercase();
+            if let Some(graw) = tx
+                .get(&self.guides, &gkey)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                let guide: crate::domain::guide::Guide = serde_json::from_slice(graw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let line = Self::improvement_line(&guide);
+                if !line.is_empty() {
+                    lines.push(line);
+                }
+            }
+        }
+        Ok(lines)
+    }
+
+    /// End a session as ONE canonical operation (re-review P1-3): required
+    /// guide outcomes, the terminal transition and the operation receipt
+    /// commit in a single transaction — no observable partial completion,
+    /// no mixed outcomes. Replay returns the recorded handle; digest
+    /// mismatch rejects. Improvement lines are derived from the committed
+    /// counts and returned for the response (suggestion filing itself stays
+    /// best-effort, content-deduplicated).
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_end_tx(
+        &self,
+        operation_id: &str,
+        digest: &str,
+        handle: SessionHandle,
+        outcome: crate::domain::session::TaskOutcome,
+        final_approach: Option<String>,
+        lessons: Vec<String>,
+        now_millis: u64,
+    ) -> DomainResult<SessionOp<(SessionHandle, Vec<String>, bool)>> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if let Some(raw) = tx
+                .get(&self.session_ops, operation_id)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if rec.digest != digest {
+                    return Ok(SessionOp::Conflict);
+                }
+                // Rebuild the improvement lines from current guide state so
+                // the replayed response matches a fresh rendering: same
+                // inputs, same text (rates only change via later ops, in
+                // which case current truth is the right rendering).
+                let lines = self.improvement_lines_tx(&mut tx, rec.session)?;
+                tx.rollback();
+                // Flush again before ack (re-review P1-1): the receipt may
+                // predate an unflushed barrier.
+                self.persist_barrier()?;
+                return Ok(SessionOp::Replayed((rec.session, lines, true)));
+            }
+            let hkey = handle.as_uuid().to_string();
+            let raw = tx
+                .get(&self.sessions, &hkey)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let Some(raw) = raw else {
+                return Err(DomainError::new(
+                    DomainErrorCode::NotFound,
+                    "session not found",
+                ));
+            };
+            let mut session: Session = serde_json::from_slice(raw.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if !session.can_end() {
+                // Already terminal via another operation: no mutation, no
+                // receipt — the caller reports "no active session". A
+                // retry deterministically reports the same (nothing was
+                // done, so there is nothing to make idempotent).
+                tx.rollback();
+                return Ok(SessionOp::Applied((handle, Vec::new(), false)));
+            }
+            // Required guide outcomes inside the SAME transaction.
+            let mut improvement_lines: Vec<String> = Vec::new();
+            if outcome == crate::domain::session::TaskOutcome::Success
+                || outcome == crate::domain::session::TaskOutcome::Failure
+            {
+                for guide_name in session.guides_used.clone() {
+                    let gkey = guide_name.to_lowercase();
+                    let graw = tx.get(&self.guides, &gkey).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    let Some(graw) = graw else { continue };
+                    let mut guide: crate::domain::guide::Guide =
+                        serde_json::from_slice(graw.as_ref()).map_err(|e| {
+                            DomainError::new(DomainErrorCode::Validation, e.to_string())
+                        })?;
+                    if outcome == crate::domain::session::TaskOutcome::Success {
+                        guide.success_count += 1;
+                    } else {
+                        guide.failure_count += 1;
+                    }
+                    guide.entity_revision = guide.entity_revision.next();
+                    guide.updated_at = crate::domain::memory::Instant::new(now_millis);
+                    if outcome == crate::domain::session::TaskOutcome::Failure {
+                        improvement_lines.push(Self::improvement_line(&guide));
+                    }
+                    let graw = serde_json::to_vec(&guide).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    tx.insert(&self.guides, &gkey, graw.as_slice());
+                }
+                improvement_lines.retain(|l| !l.is_empty());
+            }
+            session.status = crate::domain::session::SessionStatus::Ended;
+            session.outcome = Some(outcome);
+            session.final_approach = final_approach.clone();
+            session.lessons = lessons.clone();
+            session.ended_at = Some(crate::domain::memory::Instant::new(now_millis));
+            let raw = serde_json::to_vec(&session)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.sessions, &hkey, raw.as_slice());
+            let receipt = SessionReceipt {
+                digest: digest.to_string(),
+                session: handle,
+                seq: None,
+            };
+            let log_raw = serde_json::to_vec(&receipt)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.session_ops, operation_id, log_raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    self.fire_commit_hook();
+                    return Ok(SessionOp::Applied((handle, improvement_lines, true)));
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("session end conflicted"))
+    }
+
+    /// Track session links (guides used, memories read/created) with
+    /// order-preserving deduplication, committed atomically.
+    pub fn track_session_link(
+        &self,
+        handle: SessionHandle,
+        field: SessionLinkField,
+        ids: &[String],
+    ) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let hkey = handle.as_uuid().to_string();
+            let raw = tx
+                .get(&self.sessions, &hkey)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let Some(raw) = raw else {
+                return Ok(());
+            };
+            let mut session: Session = serde_json::from_slice(raw.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let target = match field {
+                SessionLinkField::GuideUsed => &mut session.guides_used,
+                SessionLinkField::MemoryRead => &mut session.memories_read,
+                SessionLinkField::MemoryCreated => &mut session.memories_created,
+            };
+            if field == SessionLinkField::GuideUsed {
+                for id in ids {
+                    let lower = id.to_lowercase();
+                    if !target.contains(&lower) {
+                        target.push(lower);
+                    }
+                }
+            } else {
+                for id in ids {
+                    if !target.contains(id) {
+                        target.push(id.clone());
+                    }
+                }
+            }
+            let raw = serde_json::to_vec(&session)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.sessions, &hkey, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("session link conflicted"))
+    }
+
+    /// Adjust one attempt's confidence (suggestion feedback): boost capped
+    /// at 1.0, penalty floored at 0.0; access counters increment. No-op
+    /// when the session or attempt is absent.
+    pub fn adjust_attempt(
+        &self,
+        handle: SessionHandle,
+        seq: u32,
+        delta: f64,
+        now_millis: u64,
+    ) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let hkey = handle.as_uuid().to_string();
+            let raw = tx
+                .get(&self.sessions, &hkey)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let Some(raw) = raw else {
+                return Ok(());
+            };
+            let mut session: Session = serde_json::from_slice(raw.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if let Some(a) = session.attempts.iter_mut().find(|a| a.seq == seq) {
+                a.confidence = (a.confidence + delta).clamp(0.0, 1.0);
+                a.access_count += 1;
+                a.last_accessed_at = Some(crate::domain::memory::Instant::new(now_millis));
+            }
+            let raw = serde_json::to_vec(&session)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.sessions, &hkey, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("attempt adjust conflicted"))
+    }
+
+    /// Read one session by handle.
+    pub fn get_session(&self, handle: SessionHandle) -> DomainResult<Option<Session>> {
+        let snapshot = self.db.read_tx();
+        let raw = snapshot
+            .get(&self.sessions, handle.as_uuid().to_string())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        raw.map(|raw| {
+            serde_json::from_slice(raw.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
+        })
+        .transpose()
+    }
+
+    /// All traced sessions (analytics, stats, continuity recall, backup).
+    pub fn all_sessions(&self) -> DomainResult<Vec<Session>> {
+        let snapshot = self.db.read_tx();
+        let mut out = Vec::new();
+        for kv in snapshot.iter(&self.sessions) {
+            let (_k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            out.push(
+                serde_json::from_slice(v.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Abandon every live session (restore path) in one transaction.
+    pub fn abandon_all_sessions(&self, now_millis: u64) -> DomainResult<usize> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut keys: Vec<String> = Vec::new();
+            for kv in tx.iter(&self.sessions) {
+                let (k, v) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key: String = String::from_utf8_lossy(k.as_ref()).into_owned();
+                let mut s: Session = serde_json::from_slice(v.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if s.can_end() {
+                    s.status = crate::domain::session::SessionStatus::Abandoned;
+                    s.ended_at = Some(crate::domain::memory::Instant::new(now_millis));
+                    let raw = serde_json::to_vec(&s).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    tx.insert(&self.sessions, &key, raw.as_slice());
+                    keys.push(key);
+                }
+            }
+            let abandoned = keys.len();
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(abandoned);
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("session abandon conflicted"))
+    }
+
+    /// One-time import of pre-migration registry state (traced sessions +
+    /// operation receipts from sessions.json): inserts only absent records,
+    /// so repeated starts never duplicate. Virtual sessions and bindings
+    /// stay in the registry file.
+    pub fn import_legacy_sessions(
+        &self,
+        sessions: Vec<Session>,
+        receipts: Vec<(String, SessionReceipt)>,
+    ) -> DomainResult<usize> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        let mut imported = 0usize;
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut dirty = false;
+            for s in &sessions {
+                let key = s.handle.as_uuid().to_string();
+                let exists = tx
+                    .get(&self.sessions, &key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                    .is_some();
+                if !exists {
+                    let raw = serde_json::to_vec(s).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    tx.insert(&self.sessions, &key, raw.as_slice());
+                    imported += 1;
+                    dirty = true;
+                }
+            }
+            for (op_id, rec) in &receipts {
+                let exists = tx
+                    .get(&self.session_ops, op_id)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                    .is_some();
+                if !exists {
+                    let raw = serde_json::to_vec(rec).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    tx.insert(&self.session_ops, op_id, raw.as_slice());
+                    dirty = true;
+                }
+            }
+            if !dirty {
+                return Ok(imported);
+            }
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(imported);
+                }
+                Ok(Err(_)) => {
+                    imported = 0;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention(
+            "legacy session import conflicted",
+        ))
     }
 
     /// All suggestions from a single snapshot.
@@ -5675,20 +6496,28 @@ mod tests {
         let (repo, _dir) = repo_with_ns();
         repo.put_guide(&test_guide("git")).unwrap();
         assert!(
-            repo.apply_session_guide_effect("end-1", "git", true, 1000)
+            repo.apply_session_guide_effect("end-1", "digest-1", "git", true, 1000)
                 .unwrap()
         );
         assert_eq!(repo.get_guide("git").unwrap().unwrap().success_count, 1);
         // Same operation again: marker hit, no recount.
         assert!(
             !repo
-                .apply_session_guide_effect("end-1", "git", true, 1000)
+                .apply_session_guide_effect("end-1", "digest-1", "git", true, 1000)
                 .unwrap()
         );
         assert_eq!(repo.get_guide("git").unwrap().unwrap().success_count, 1);
+        // Same operation with changed arguments after a partial effect:
+        // reject, never complete a mixed outcome (re-review P1-3).
+        let err = repo
+            .apply_session_guide_effect("end-1", "digest-CHANGED", "git", false, 1000)
+            .unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::KeyReuseDifferentInput);
+        let g = repo.get_guide("git").unwrap().unwrap();
+        assert_eq!((g.success_count, g.failure_count), (1, 0));
         // Same guide, different operation: applies (independent outcome).
         assert!(
-            repo.apply_session_guide_effect("end-2", "git", false, 1000)
+            repo.apply_session_guide_effect("end-2", "digest-2", "git", false, 1000)
                 .unwrap()
         );
         let g = repo.get_guide("git").unwrap().unwrap();
@@ -5696,12 +6525,12 @@ mod tests {
         // Missing guide: skip, no marker (a later retry re-checks).
         assert!(
             !repo
-                .apply_session_guide_effect("end-3", "gone", true, 1000)
+                .apply_session_guide_effect("end-3", "digest-3", "gone", true, 1000)
                 .unwrap()
         );
         assert!(
             !repo
-                .apply_session_guide_effect("end-3", "gone", true, 1000)
+                .apply_session_guide_effect("end-3", "digest-3", "gone", true, 1000)
                 .unwrap()
         );
     }
@@ -5771,12 +6600,87 @@ mod tests {
         let mut renamed = test_guide("renamed");
         renamed.usage_count = 5;
         let err = repo
-            .rename_guide_atomically("missing", &renamed)
+            .rename_guide_atomically(
+                "missing",
+                crate::domain::id::EntityRevision::new(1),
+                &renamed,
+            )
             .unwrap_err();
         assert_eq!(err.code, DomainErrorCode::NotFound);
         assert!(repo.get_guide("solo").unwrap().is_some());
         assert!(repo.get_guide("renamed").unwrap().is_none());
         assert!(!repo.forget_guide_atomically("missing").unwrap());
         assert!(repo.get_guide("solo").unwrap().is_some());
+    }
+
+    /// Re-review P1-2: an ordinary guide write through the checked path
+    /// rejects a stale revision instead of overwriting; create-if-absent
+    /// refuses to clobber an existing guide.
+    #[test]
+    fn checked_guide_write_rejects_stale_revision() {
+        let (repo, _dir) = repo_with_ns();
+        repo.put_guide(&test_guide("g")).unwrap();
+        let rev = repo.get_guide("g").unwrap().unwrap().entity_revision;
+        // Concurrent writer bumps the revision (practice path).
+        repo.practice_guide_idempotent("p1", "d1", "g", "dev-tool", None, &[], &[], &[], None, 1)
+            .unwrap();
+        let mut stale = repo.get_guide("g").unwrap().unwrap();
+        // Simulate the stale plan: revision captured before the practice.
+        let err = repo.put_guide_checked(Some(rev), &stale).unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::RevisionConflict);
+        // Fresh revision commits.
+        stale = repo.get_guide("g").unwrap().unwrap();
+        let rev2 = stale.entity_revision;
+        stale.description = "updated".into();
+        repo.put_guide_checked(Some(rev2), &stale).unwrap();
+        assert_eq!(repo.get_guide("g").unwrap().unwrap().description, "updated");
+        // Create-if-absent refuses to overwrite.
+        let err = repo.put_guide_checked(None, &test_guide("g")).unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation);
+    }
+
+    /// Re-review P1-1: a durability-barrier failure fails the ack, and a
+    /// replay while the barrier still fails fails too — a visible receipt
+    /// never fabricates durable success. Once the barrier works, the replay
+    /// resolves to the recorded outcome without recounting.
+    #[test]
+    fn practice_replay_without_durability_fails() {
+        let (repo, _dir) = repo_with_ns();
+        let practice = || {
+            repo.practice_guide_idempotent(
+                "op-p",
+                "digest-p",
+                "git",
+                "dev-tool",
+                None,
+                &[],
+                &["learn it".to_string()],
+                &[],
+                Some(true),
+                1000,
+            )
+        };
+        // First execution: barrier fails → error, no ack. (The mutation +
+        // receipt committed in-tx; only durability is unestablished.)
+        repo.fault_injector().set_persist_failures(1);
+        let err = practice().unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "barrier failure must fail loudly, got: {err:?}"
+        );
+        // Retry with the barrier STILL failing: must fail again, never flip
+        // the in-tx receipt into a successful ack.
+        repo.fault_injector().set_persist_failures(1);
+        let err = practice().unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "replay without durability must fail loudly, got: {err:?}"
+        );
+        // Barrier healthy: replay resolves to the recorded outcome, counted
+        // exactly once across all three attempts.
+        let guide = practice().unwrap();
+        assert_eq!(guide.usage_count, 1);
+        assert_eq!(guide.success_count, 1);
+        assert_eq!(repo.get_guide("git").unwrap().unwrap().usage_count, 1);
     }
 }

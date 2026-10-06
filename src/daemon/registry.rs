@@ -7,11 +7,11 @@
 //! the MCP numeric request IDs collide.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::domain::id::{ChannelId, FrontendId, SessionHandle};
 use crate::domain::memory::Instant;
-use crate::domain::session::{Attempt, Session, SessionStatus, TaskOutcome};
+use crate::domain::session::{Session, SessionStatus, TaskOutcome};
 use uuid::Uuid;
 
 /// A channel's lease: when it expires the channel's session may be abandoned
@@ -50,21 +50,21 @@ pub struct ChannelBinding {
     pub explicit: bool,
 }
 
-/// The frontend registry: per-(frontend, channel) session state.
+/// The frontend registry: per-(frontend, channel) routing state.
 ///
 /// There is deliberately no daemon-global "current session". Every operation
 /// is routed by (frontend_id, channel_id).
+///
+/// Durable traced-session state (sessions, attempts, outcomes, operation
+/// receipts) lives in the canonical store ([`CanonicalRepository`]); this
+/// registry keeps only routing and ephemeral state: channel bindings (which
+/// handle a channel currently addresses), leases, live-connection counts
+/// and implicit virtual sessions for session-less calls.
 pub struct FrontendRegistry {
     channels: HashMap<(FrontendId, ChannelId), ChannelBinding>,
-    sessions: HashMap<SessionHandle, Session>,
-    handle_gen: AtomicU64,
-    /// Durable operation receipts for session/tool operations (re-review
-    /// R5): keyed by operation ID, bound to the request digest. A retried
-    /// operation with the same ID + digest replays its recorded outcome;
-    /// the same ID with a different digest is rejected as key reuse.
-    /// Persisted in sessions.json alongside sessions (ephemeral leases and
-    /// live counts stay out, as before).
-    op_log: HashMap<String, OpRecord>,
+    /// Implicit per-channel virtual sessions only. Traced sessions live in
+    /// the canonical store; handles here never collide with them (UUIDv7).
+    virtual_sessions: HashMap<SessionHandle, Session>,
     /// Live IPC connections serving right now (incremented on connect,
     /// decremented on drop). Restore readiness counts these — never the
     /// persisted channel history, whose dead entries outlive their runs
@@ -72,169 +72,32 @@ pub struct FrontendRegistry {
     live: AtomicUsize,
 }
 
-/// A durable receipt for one completed session/tool operation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct OpRecord {
-    /// The request digest the operation first executed with. Replays must
-    /// match; mismatches are key-reuse conflicts, never silent replays.
-    pub digest: String,
-    /// The session this operation acted on.
-    pub session: SessionHandle,
-    /// Recorded response text (tool path), if any.
-    pub text: Option<String>,
-    /// Recorded structured data (tool path), if any.
-    pub data: Option<serde_json::Value>,
-    /// Effect markers for multi-step operations (e.g. session_end guide
-    /// updates): effect keys applied under this operation, so a retry
-    /// resumes the missing effects instead of duplicating completed ones.
-    #[serde(default)]
-    pub effects: Vec<String>,
-}
-
-/// The outcome of consulting the operation log before executing.
-#[derive(Debug, Clone)]
-pub enum OpCheck {
-    /// No record: execute normally, then record the outcome.
-    Fresh,
-    /// Same ID + digest seen before: return the recorded outcome.
-    Replay(OpRecord),
-    /// Same ID, different digest: reject, never execute.
-    Conflict,
+/// Traced sessions + operation receipts recovered from a pre-migration
+/// sessions.json file. The daemon imports these into the canonical store
+/// once at startup (idempotent by handle/operation ID); bindings and
+/// virtual sessions stay in the registry file.
+pub struct LegacyPayload {
+    pub sessions: Vec<Session>,
+    pub receipts: Vec<(String, crate::domain::session::SessionReceipt)>,
 }
 
 impl FrontendRegistry {
     pub fn new() -> Self {
         Self {
             channels: HashMap::new(),
-            sessions: HashMap::new(),
-            handle_gen: AtomicU64::new(1),
-            op_log: HashMap::new(),
+            virtual_sessions: HashMap::new(),
             live: AtomicUsize::new(0),
         }
     }
 
-    /// Consult the operation log before executing a session/tool operation.
-    pub fn check_op(&self, operation_id: &str, digest: &str) -> OpCheck {
-        match self.op_log.get(operation_id) {
-            None => OpCheck::Fresh,
-            Some(rec) if rec.digest == digest => OpCheck::Replay(rec.clone()),
-            Some(_) => OpCheck::Conflict,
-        }
-    }
-
-    /// Record a completed operation's outcome (durable once persisted).
-    pub fn record_op(
-        &mut self,
-        operation_id: &str,
-        digest: &str,
-        session: SessionHandle,
-        text: Option<String>,
-        data: Option<serde_json::Value>,
-    ) {
-        self.op_log.insert(
-            operation_id.to_string(),
-            OpRecord {
-                digest: digest.to_string(),
-                session,
-                text,
-                data,
-                effects: Vec::new(),
-            },
-        );
-    }
-
-    /// Mark one effect of a multi-step operation applied (idempotent).
-    pub fn mark_effect_applied(&mut self, operation_id: &str, effect: &str) {
-        if let Some(rec) = self.op_log.get_mut(operation_id)
-            && !rec.effects.iter().any(|e| e == effect)
-        {
-            rec.effects.push(effect.to_string());
-        }
-    }
-
-    /// Whether an effect key was already applied under an operation.
-    pub fn effect_applied(&self, operation_id: &str, effect: &str) -> bool {
-        self.op_log
-            .get(operation_id)
-            .is_some_and(|rec| rec.effects.iter().any(|e| e == effect))
-    }
-
-    fn next_handle(&self) -> SessionHandle {
-        let n = self.handle_gen.fetch_add(1, Ordering::SeqCst);
-        SessionHandle::new(Uuid::from_u128(n as u128))
-    }
-
-    fn key(frontend_id: FrontendId, channel_id: ChannelId) -> (FrontendId, ChannelId) {
-        (frontend_id, channel_id)
-    }
-
-    /// Start (or resume) the legacy session for a channel. Returns the bound
-    /// session handle. Idempotent per channel: a second start on the same
-    /// channel resumes the existing session rather than creating a new one.
-    pub fn start_session(
-        &mut self,
-        frontend_id: FrontendId,
-        channel_id: ChannelId,
-        project: Option<String>,
-        task_type: Option<String>,
-        now_millis: u64,
-    ) -> SessionHandle {
-        let k = Self::key(frontend_id, channel_id);
-        if let Some(b) = self.channels.get(&k)
-            && let Some(h) = b.session
-            && let Some(s) = self.sessions.get(&h)
-            && !s.status.is_terminal()
-        {
-            return h;
-        }
-        let handle = self.next_handle();
-        let session = Session {
-            handle,
-            channel_id,
-            project,
-            task_type,
-            technologies: Vec::new(),
-            status: SessionStatus::Active,
-            attempts: Vec::new(),
-            outcome: None,
-            final_approach: None,
-            lessons: Vec::new(),
-            initial_approach: None,
-            guides_used: Vec::new(),
-            memories_read: Vec::new(),
-            memories_created: Vec::new(),
-            refinement_attempts: 0,
-            self_critique_count: 0,
-            started_at: Instant::new(now_millis),
-            ended_at: None,
-            is_virtual: false,
-        };
-        self.sessions.insert(handle, session);
-        // The channel's virtual session (if any) survives traced cycles:
-        // attribution continuity must not reset on session_start.
-        let virtual_session = self.channels.get(&k).and_then(|b| b.virtual_session);
-        let virtual_lease = self.channels.get(&k).and_then(|b| b.virtual_lease);
-        self.channels.insert(
-            k,
-            ChannelBinding {
-                frontend_id,
-                channel_id,
-                session: Some(handle),
-                virtual_session,
-                lease: None,
-                virtual_lease,
-                explicit: false,
-            },
-        );
-        handle
-    }
-
-    /// Bind an explicit native session handle to a channel.
-    pub fn bind_native_session(
+    /// Bind a channel to a session handle (after the canonical store
+    /// created or verified it). Preserves the channel's virtual session.
+    pub fn bind_session(
         &mut self,
         frontend_id: FrontendId,
         channel_id: ChannelId,
         handle: SessionHandle,
+        explicit: bool,
     ) {
         let k = Self::key(frontend_id, channel_id);
         let existing = self
@@ -253,300 +116,42 @@ impl FrontendRegistry {
                 virtual_session,
                 lease: None,
                 virtual_lease,
-                explicit: true,
+                explicit,
             },
         );
-        self.sessions.entry(handle).or_insert_with(|| Session {
-            handle,
-            channel_id,
-            project: None,
-            task_type: None,
-            technologies: Vec::new(),
-            status: SessionStatus::Active,
-            attempts: Vec::new(),
-            outcome: None,
-            final_approach: None,
-            lessons: Vec::new(),
-            initial_approach: None,
-            guides_used: Vec::new(),
-            memories_read: Vec::new(),
-            memories_created: Vec::new(),
-            refinement_attempts: 0,
-            self_critique_count: 0,
-            started_at: Instant::new(0),
-            ended_at: None,
-            is_virtual: false,
-        });
     }
 
-    /// Legacy `session_start` (WP-09): abandon the channel's existing active
-    /// session (if any) and create a fresh traced session. Returns the new
-    /// handle. Per-channel isolation is preserved (RV-05).
-    pub fn start_legacy_session(
+    fn key(frontend_id: FrontendId, channel_id: ChannelId) -> (FrontendId, ChannelId) {
+        (frontend_id, channel_id)
+    }
+
+    /// Bind an explicit native session handle to a channel. The session
+    /// record itself lives in the canonical store; this only routes.
+    pub fn bind_native_session(
         &mut self,
         frontend_id: FrontendId,
         channel_id: ChannelId,
-        task_type: String,
-        technologies: Vec<String>,
-        now_millis: u64,
-    ) -> SessionHandle {
-        let k = Self::key(frontend_id, channel_id);
-        if let Some(b) = self.channels.get(&k)
-            && let Some(h) = b.session
-            && let Some(s) = self.sessions.get_mut(&h)
-            && s.can_end()
-        {
-            s.status = SessionStatus::Abandoned;
-            s.outcome = Some(TaskOutcome::Abandoned);
-            s.ended_at = Some(Instant::new(now_millis));
-        }
-        let handle = self.next_handle();
-        let session = Session {
-            handle,
-            channel_id,
-            project: None,
-            task_type: Some(task_type),
-            technologies,
-            status: SessionStatus::Active,
-            attempts: Vec::new(),
-            outcome: None,
-            final_approach: None,
-            lessons: Vec::new(),
-            initial_approach: None,
-            guides_used: Vec::new(),
-            memories_read: Vec::new(),
-            memories_created: Vec::new(),
-            refinement_attempts: 0,
-            self_critique_count: 0,
-            started_at: Instant::new(now_millis),
-            ended_at: None,
-            is_virtual: false,
-        };
-        self.sessions.insert(handle, session);
-        // The channel's virtual session (if any) survives traced cycles:
-        // attribution continuity must not reset on session_start.
-        let virtual_session = self.channels.get(&k).and_then(|b| b.virtual_session);
-        let virtual_lease = self.channels.get(&k).and_then(|b| b.virtual_lease);
-        self.channels.insert(
-            k,
-            ChannelBinding {
-                frontend_id,
-                channel_id,
-                session: Some(handle),
-                virtual_session,
-                lease: None,
-                virtual_lease,
-                explicit: false,
-            },
-        );
-        handle
-    }
-
-    /// Record an attempt on the channel's session. Returns the session handle.
-    /// Fails if the channel has no active session. Idempotent on the
-    /// deterministic attempt ID (P1 replay safety): a retried operation with
-    /// the same `operation_id` reuses its UUIDv5 attempt ID, so a second
-    /// record is a no-op returning the same handle — exactly one attempt and
-    /// one counter increment per operation.
-    pub fn record_attempt(
-        &mut self,
-        frontend_id: FrontendId,
-        channel_id: ChannelId,
-        attempt: Attempt,
-    ) -> Option<SessionHandle> {
-        let k = Self::key(frontend_id, channel_id);
-        let handle = self.channels.get(&k)?.session?;
-        let session = self.sessions.get_mut(&handle)?;
-        if !session.can_end() {
-            return Some(handle);
-        }
-        if session.attempts.iter().any(|a| a.id == attempt.id) {
-            return Some(handle);
-        }
-        session.attempts.push(attempt);
-        Some(handle)
-    }
-
-    /// Whether an attempt ID is already recorded on a session (replay check
-    /// for counter increments that live outside `record_attempt`).
-    pub fn has_attempt(
-        &self,
         handle: SessionHandle,
-        attempt_id: crate::domain::id::EntityId,
-    ) -> bool {
-        self.sessions
-            .get(&handle)
-            .is_some_and(|s| s.attempts.iter().any(|a| a.id == attempt_id))
-    }
-
-    /// Track a practiced guide into the channel's active session (lowercased,
-    /// de-duplicated). Best-effort; no-op if no active session.
-    pub fn track_guide_used(
-        &mut self,
-        frontend_id: FrontendId,
-        channel_id: ChannelId,
-        guide: &str,
     ) {
-        let k = Self::key(frontend_id, channel_id);
-        let handle = match self.channels.get(&k).and_then(|b| b.session) {
-            Some(h) => h,
-            None => return,
-        };
-        let session = match self.sessions.get_mut(&handle) {
-            Some(s) => s,
-            None => return,
-        };
-        let lower = guide.to_lowercase();
-        if !session.guides_used.contains(&lower) {
-            session.guides_used.push(lower);
-        }
+        self.bind_session(frontend_id, channel_id, handle, true);
     }
 
-    /// Track read memory IDs into the channel's active session (de-duplicated).
-    pub fn track_memories_read(
-        &mut self,
-        frontend_id: FrontendId,
-        channel_id: ChannelId,
-        ids: &[String],
-    ) {
-        let k = Self::key(frontend_id, channel_id);
-        let handle = match self.channels.get(&k).and_then(|b| b.session) {
-            Some(h) => h,
-            None => return,
-        };
-        let session = match self.sessions.get_mut(&handle) {
-            Some(s) => s,
-            None => return,
-        };
-        for id in ids {
-            if !session.memories_read.contains(id) {
-                session.memories_read.push(id.clone());
-            }
-        }
-    }
-
-    /// Track created memory IDs into the channel's active session.
-    pub fn track_memories_created(
-        &mut self,
-        frontend_id: FrontendId,
-        channel_id: ChannelId,
-        ids: &[String],
-    ) {
-        let k = Self::key(frontend_id, channel_id);
-        let handle = match self.channels.get(&k).and_then(|b| b.session) {
-            Some(h) => h,
-            None => return,
-        };
-        let session = match self.sessions.get_mut(&handle) {
-            Some(s) => s,
-            None => return,
-        };
-        for id in ids {
-            if !session.memories_created.contains(id) {
-                session.memories_created.push(id.clone());
-            }
-        }
-    }
-
-    /// Decay every attempt's confidence by `delta` (floored at 0). Called at
-    /// session start so stale dead-ends lose priority over time.
-    pub fn decay_attempts(&mut self, delta: f64) {
-        for s in self.sessions.values_mut() {
-            for a in &mut s.attempts {
-                a.confidence = (a.confidence - delta).max(0.0);
-            }
-        }
-    }
-
-    /// Boost an attempt's confidence by `delta` (capped at 1) and bump its
-    /// access counters. Best-effort; no-op if not found.
-    pub fn boost_attempt(&mut self, handle: SessionHandle, seq: u32, delta: f64, now: u64) {
-        if let Some(s) = self.sessions.get_mut(&handle)
-            && let Some(a) = s.attempts.iter_mut().find(|a| a.seq == seq)
-        {
-            a.confidence = (a.confidence + delta).min(1.0);
-            a.access_count += 1;
-            a.last_accessed_at = Some(Instant::new(now));
-        }
-    }
-
-    /// Penalize an attempt's confidence by `delta` (floored at 0) and bump its
-    /// access counters. Best-effort; no-op if not found.
-    pub fn penalize_attempt(&mut self, handle: SessionHandle, seq: u32, delta: f64, now: u64) {
-        if let Some(s) = self.sessions.get_mut(&handle)
-            && let Some(a) = s.attempts.iter_mut().find(|a| a.seq == seq)
-        {
-            a.confidence = (a.confidence - delta).max(0.0);
-            a.access_count += 1;
-            a.last_accessed_at = Some(Instant::new(now));
-        }
-    }
-
-    /// All sessions as owned clones (for analytics over the canonical snapshot).
-    pub fn all_sessions_owned(&self) -> Vec<crate::domain::session::Session> {
-        self.sessions.values().cloned().collect()
-    }
-
-    /// End the channel's session. Only affects THIS channel's session — a
-    /// different channel's session is untouched even with a colliding MCP
-    /// request ID. Returns the ended session handle.
-    pub fn end_session(
-        &mut self,
-        frontend_id: FrontendId,
-        channel_id: ChannelId,
-        outcome: TaskOutcome,
-        final_approach: Option<String>,
-        lessons: Vec<String>,
-        now_millis: u64,
-    ) -> Option<SessionHandle> {
-        let k = Self::key(frontend_id, channel_id);
-        let handle = self.channels.get(&k)?.session?;
-        let session = self.sessions.get_mut(&handle)?;
-        if session.can_end() {
-            session.status = SessionStatus::Ended;
-            session.outcome = Some(outcome);
-            session.final_approach = final_approach;
-            session.lessons = lessons;
-            session.ended_at = Some(Instant::new(now_millis));
-        }
-        Some(handle)
-    }
-
-    /// Abandon every live session (restore path): marks non-terminal
-    /// sessions Abandoned with the restore timestamp and returns the count.
-    /// Backup sessions stay abandoned history (upstream parity) — reported,
-    /// never resurrected into live channels.
-    pub fn abandon_all_sessions(&mut self, now_millis: u64) -> usize {
-        let mut abandoned = 0;
-        for session in self.sessions.values_mut() {
-            if session.can_end() {
-                session.status = crate::domain::session::SessionStatus::Abandoned;
-                session.ended_at = Some(crate::domain::memory::Instant::new(now_millis));
-                abandoned += 1;
-            }
-        }
-        abandoned
-    }
-
-    /// Resolve the active session for a channel (None if none or terminal).
-    pub fn resolve_session(
+    /// The session handle a channel is bound to (None if unbound).
+    /// Routing only — liveness comes from the canonical store via
+    /// `Dispatcher::resolve_session`, never from this cache.
+    pub fn channel_session(
         &self,
         frontend_id: FrontendId,
         channel_id: ChannelId,
     ) -> Option<SessionHandle> {
-        let k = Self::key(frontend_id, channel_id);
-        let handle = self.channels.get(&k)?.session?;
-        let session = self.sessions.get(&handle)?;
-        if session.status.is_terminal() {
-            None
-        } else {
-            Some(handle)
-        }
+        self.channels
+            .get(&Self::key(frontend_id, channel_id))?
+            .session
     }
 
     /// The channel's live virtual session, if one is bound (for tests and
     /// session-less attribution). Traced sessions are NOT returned here;
-    /// use `resolve_session` for those.
+    /// use the canonical store (via the dispatcher) for those.
     pub fn virtual_session(
         &self,
         frontend_id: FrontendId,
@@ -554,7 +159,7 @@ impl FrontendRegistry {
     ) -> Option<SessionHandle> {
         let k = Self::key(frontend_id, channel_id);
         let handle = self.channels.get(&k)?.virtual_session?;
-        let session = self.sessions.get(&handle)?;
+        let session = self.virtual_sessions.get(&handle)?;
         if session.is_virtual && !session.status.is_terminal() {
             Some(handle)
         } else {
@@ -563,11 +168,11 @@ impl FrontendRegistry {
     }
 
     /// Ensure session context for a session-less call on a channel
-    /// (per-channel virtual sessions, WP-09): a traced session shadows
-    /// everything and is returned as-is; otherwise the channel's live
-    /// virtual session is returned (lease refreshed); otherwise a fresh
-    /// virtual session is created and bound. Expired virtual sessions are
-    /// swept first, so this never returns a dead handle.
+    /// (per-channel virtual sessions, WP-09). Returns the channel's live
+    /// virtual session (lease refreshed) or creates one. Traced sessions
+    /// are NOT consulted here — callers check the canonical store first
+    /// (via `Dispatcher::resolve_session`) and only fall back to this
+    /// when no traced session is bound.
     pub fn ensure_virtual_session(
         &mut self,
         frontend_id: FrontendId,
@@ -575,12 +180,9 @@ impl FrontendRegistry {
         now_millis: u64,
     ) -> SessionHandle {
         self.sweep_virtual_sessions(now_millis);
-        if let Some(handle) = self.resolve_session(frontend_id, channel_id) {
-            return handle;
-        }
         let k = Self::key(frontend_id, channel_id);
         if let Some(handle) = self.channels.get(&k).and_then(|b| b.virtual_session)
-            && let Some(session) = self.sessions.get(&handle)
+            && let Some(session) = self.virtual_sessions.get(&handle)
             && session.is_virtual
             && !session.status.is_terminal()
             && let Some(binding) = self.channels.get_mut(&k)
@@ -590,7 +192,7 @@ impl FrontendRegistry {
             });
             return handle;
         }
-        let handle = self.next_handle();
+        let handle = SessionHandle::new(Uuid::now_v7());
         let session = Session {
             handle,
             channel_id,
@@ -612,7 +214,7 @@ impl FrontendRegistry {
             ended_at: None,
             is_virtual: true,
         };
-        self.sessions.insert(handle, session);
+        self.virtual_sessions.insert(handle, session);
         let binding = self.channels.entry(k).or_insert(ChannelBinding {
             frontend_id,
             channel_id,
@@ -630,8 +232,8 @@ impl FrontendRegistry {
     }
 
     /// Finalize virtual sessions past idle timeout or lifetime bound.
-    /// Returns finalized handles. Only virtual sessions are touched;
-    /// traced sessions follow the lease path (`expire_leases`) instead.
+    /// Returns finalized handles. Only virtual sessions live here, so
+    /// only they are ever touched.
     pub fn sweep_virtual_sessions(&mut self, now_millis: u64) -> Vec<SessionHandle> {
         let mut finalized = Vec::new();
         let keys: Vec<(FrontendId, ChannelId)> = self.channels.keys().cloned().collect();
@@ -640,7 +242,7 @@ impl FrontendRegistry {
                 Some(h) => h,
                 None => continue,
             };
-            let expired = match self.sessions.get(&handle) {
+            let expired = match self.virtual_sessions.get(&handle) {
                 Some(s) if s.is_virtual && !s.status.is_terminal() => {
                     let idle = match self.channels.get(&k).and_then(|b| b.virtual_lease) {
                         Some(lease) => now_millis >= lease.expires_at,
@@ -655,7 +257,7 @@ impl FrontendRegistry {
             if !expired {
                 continue;
             }
-            if let Some(s) = self.sessions.get_mut(&handle) {
+            if let Some(s) = self.virtual_sessions.get_mut(&handle) {
                 s.status = SessionStatus::Abandoned;
                 s.outcome = Some(TaskOutcome::Abandoned);
                 s.ended_at = Some(Instant::new(now_millis));
@@ -677,26 +279,6 @@ impl FrontendRegistry {
             .get(&Self::key(frontend_id, channel_id))
             .map(|b| b.explicit)
             .unwrap_or(false)
-    }
-
-    /// Abandon sessions whose leases have expired. Returns abandoned handles.
-    pub fn expire_leases(&mut self, now_millis: u64) -> Vec<SessionHandle> {
-        let keys: Vec<(FrontendId, ChannelId)> = self.channels.keys().cloned().collect();
-        let mut abandoned = Vec::new();
-        for k in keys {
-            if let Some(b) = self.channels.get(&k)
-                && let Some(lease) = b.lease
-                && lease.expires_at <= now_millis
-                && let Some(h) = b.session
-                && let Some(s) = self.sessions.get_mut(&h)
-                && s.can_end()
-            {
-                s.status = SessionStatus::Abandoned;
-                s.ended_at = Some(Instant::new(now_millis));
-                abandoned.push(h);
-            }
-        }
-        abandoned
     }
 
     /// Set a lease on a channel.
@@ -736,32 +318,32 @@ impl FrontendRegistry {
         self.live.load(Ordering::SeqCst)
     }
 
-    /// Number of sessions (for health/diagnostics).
-    pub fn session_count(&self) -> usize {
-        self.sessions.len()
+    /// A virtual session record by handle, if present.
+    pub fn virtual_record(&self, handle: SessionHandle) -> Option<&Session> {
+        self.virtual_sessions.get(&handle)
     }
 
-    /// Get a session by handle (for diagnostics/tests).
-    pub fn session(&self, handle: SessionHandle) -> Option<&Session> {
-        self.sessions.get(&handle)
+    /// Record created-memory links on a virtual session (deduped).
+    /// Virtual sessions are routing-ephemeral, so this is best-effort
+    /// attribution, never durability. No-op for unknown handles. (Guides
+    /// used and memories read only ever attach to traced sessions, which
+    /// live in the canonical store.)
+    pub fn track_virtual_created(&mut self, handle: SessionHandle, ids: &[String]) {
+        if let Some(session) = self.virtual_sessions.get_mut(&handle) {
+            for id in ids {
+                if !session.memories_created.contains(id) {
+                    session.memories_created.push(id.clone());
+                }
+            }
+        }
     }
 
-    /// Mutable access to a session by handle (for in-place updates).
-    pub fn session_mut(&mut self, handle: SessionHandle) -> Option<&mut Session> {
-        self.sessions.get_mut(&handle)
-    }
-
-    /// Persist the registry state (sessions, channel bindings, leases,
-    /// operation receipts) to a JSON file so a daemon restart restores
-    /// durable history. Atomic tmp+rename plus file + directory
-    /// synchronization: a crash or power loss mid-write leaves either the
-    /// previous file intact or the new file durable — never a torn
-    /// sessions.json that fails the next load. (File sync is durability,
-    /// not atomicity with Fjall state: cross-store operations still need
-    /// their own idempotency markers, see OpRecord::effects.)
+    /// Persist routing + ephemeral state (channel bindings, leases, virtual
+    /// sessions) to a JSON file. Traced sessions and operation receipts
+    /// live in the canonical store, not here. Atomic tmp+rename plus file
+    /// + directory synchronization, as before.
     pub fn persist(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         let snapshot = RegistrySnapshot {
-            handle_gen: self.handle_gen.load(Ordering::SeqCst),
             channels: self
                 .channels
                 .iter()
@@ -771,38 +353,54 @@ impl FrontendRegistry {
                     binding: b.clone(),
                 })
                 .collect(),
-            sessions: self
-                .sessions
+            virtual_sessions: self
+                .virtual_sessions
                 .iter()
                 .map(|(h, s)| SessionEntry {
                     handle: *h,
                     session: s.clone(),
                 })
                 .collect(),
-            op_log: self.op_log.clone(),
+            // Never written back: legacy read-only shape for old files.
+            sessions: Vec::new(),
+            op_log: HashMap::new(),
         };
         let json = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &json)?;
         // Durability barrier (re-review R1): flush file data before the
-        // rename makes it visible, then flush the directory entry.
+        // rename makes it visible, then flush the directory entry. Every
+        // step participates in the result — a discarded sync error would
+        // let callers acknowledge unflushed state as durable.
         let f = std::fs::File::open(&tmp)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
+        if let Some(parent) = path.parent() {
+            let dir = std::fs::File::open(parent).map_err(|e| {
+                std::io::Error::other(format!("cannot open parent dir for sync: {e}"))
+            })?;
+            dir.sync_all()
+                .map_err(|e| std::io::Error::other(format!("cannot sync parent dir: {e}")))?;
         }
         Ok(())
     }
 
     /// Load the registry state from a JSON file. A missing file yields an
-    /// empty registry (first run).
-    pub fn load(path: &std::path::Path) -> Result<Self, std::io::Error> {
+    /// empty registry (first run). Returns the registry (bindings +
+    /// virtual sessions) plus any pre-migration traced sessions and
+    /// operation receipts, which the daemon imports into the canonical
+    /// store once at startup. Unknown snapshot fields (old `handle_gen`,
+    /// `op_log`, full `sessions`) are tolerated for forward reading.
+    pub fn load(path: &std::path::Path) -> Result<(Self, LegacyPayload), std::io::Error> {
         if !path.exists() {
-            return Ok(Self::new());
+            return Ok((
+                Self::new(),
+                LegacyPayload {
+                    sessions: Vec::new(),
+                    receipts: Vec::new(),
+                },
+            ));
         }
         let bytes = std::fs::read(path)?;
         let snapshot: RegistrySnapshot =
@@ -811,32 +409,74 @@ impl FrontendRegistry {
         for e in snapshot.channels {
             channels.insert((e.frontend_id, e.channel_id), e.binding);
         }
-        let mut sessions = HashMap::new();
-        for e in snapshot.sessions {
-            sessions.insert(e.handle, e.session);
+        let mut virtual_sessions = HashMap::new();
+        let mut legacy_sessions = Vec::new();
+        // Current files carry virtual sessions under their own key;
+        // pre-migration files only have the shared `sessions` list, split
+        // here by the virtual flag.
+        for e in snapshot.virtual_sessions {
+            virtual_sessions.insert(e.handle, e.session);
         }
-        Ok(Self {
-            channels,
-            sessions,
-            handle_gen: AtomicU64::new(snapshot.handle_gen),
-            op_log: snapshot.op_log,
-            // Live connections never persist: a fresh process starts at zero.
-            live: AtomicUsize::new(0),
-        })
+        for e in snapshot.sessions {
+            if e.session.is_virtual {
+                virtual_sessions.insert(e.handle, e.session);
+            } else {
+                legacy_sessions.push(e.session);
+            }
+        }
+        let legacy_receipts = snapshot
+            .op_log
+            .into_iter()
+            .map(|(id, rec)| {
+                (
+                    id,
+                    crate::domain::session::SessionReceipt {
+                        digest: rec.digest,
+                        session: rec.session,
+                        seq: None,
+                    },
+                )
+            })
+            .collect();
+        Ok((
+            Self {
+                channels,
+                virtual_sessions,
+                // Live connections never persist: a fresh process starts at zero.
+                live: AtomicUsize::new(0),
+            },
+            LegacyPayload {
+                sessions: legacy_sessions,
+                receipts: legacy_receipts,
+            },
+        ))
     }
 }
 
 /// A serializable snapshot of the registry for persistence across restarts.
+/// Extra fields from older snapshots (`handle_gen`, full `sessions`,
+/// `op_log`) are ignored on load; only bindings and virtual sessions are
+/// written back.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RegistrySnapshot {
-    handle_gen: u64,
-    channels: Vec<ChannelEntry>,
-    sessions: Vec<SessionEntry>,
-    /// Durable operation receipts (re-review R5). Old snapshots without
-    /// this field load with an empty log (replays then re-execute once —
-    /// attempt IDs and guide op logs still dedup the effects).
     #[serde(default)]
-    op_log: HashMap<String, OpRecord>,
+    channels: Vec<ChannelEntry>,
+    #[serde(default)]
+    virtual_sessions: Vec<SessionEntry>,
+    #[serde(default)]
+    sessions: Vec<SessionEntry>,
+    /// Pre-migration operation receipts, stored as a map exactly like the
+    /// old `op_log`. Unknown entry fields are ignored; only digest and
+    /// session carry over (attempt replays fall back to the imported
+    /// session's attempt list for sequence numbers).
+    #[serde(default)]
+    op_log: HashMap<String, LegacyOpRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LegacyOpRecord {
+    digest: String,
+    session: SessionHandle,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -868,197 +508,159 @@ mod tests {
     fn ch(n: u64) -> ChannelId {
         ChannelId::new(Uuid::from_u128(n as u128))
     }
-
-    fn attempt(id: u64, session: SessionHandle) -> Attempt {
-        Attempt {
-            id: crate::domain::id::EntityId::new(Uuid::from_u128(id as u128)),
-            session_id: session,
-            seq: 1,
-            approach: "try X".into(),
-            outcome: crate::domain::session::AttemptOutcome::Rejected,
-            critique: None,
-            rationale: None,
-            related_memory_id: None,
-            confidence: 1.0,
-            access_count: 0,
-            last_accessed_at: None,
-            created_at: Instant::new(0),
-        }
+    fn hs(n: u128) -> SessionHandle {
+        SessionHandle::new(Uuid::from_u128(n))
     }
 
+    /// Bindings are per-channel routing: one channel's binding never leaks
+    /// into another, and unknown channels bind nothing.
     #[test]
-    fn one_channels_session_end_cannot_end_another() {
+    fn bindings_are_isolated_per_channel() {
         let mut reg = FrontendRegistry::new();
-        // Two channels, same MCP numeric request ID would be reused — but we
-        // route by (frontend, channel), not by request ID.
-        let h_a = reg.start_session(fe(1), ch(1), None, None, 0);
-        let h_b = reg.start_session(fe(1), ch(2), None, None, 0);
-        assert_ne!(h_a, h_b);
-
-        // End channel 1's session.
-        let ended = reg
-            .end_session(fe(1), ch(1), TaskOutcome::Success, None, vec![], 100)
-            .unwrap();
-        assert_eq!(ended, h_a);
-
-        // Channel 2's session must still be active.
-        assert_eq!(reg.resolve_session(fe(1), ch(2)), Some(h_b));
-        // Channel 1's session is now terminal.
-        assert_eq!(reg.resolve_session(fe(1), ch(1)), None);
-    }
-
-    #[test]
-    fn thirty_two_channels_are_isolated() {
-        let mut reg = FrontendRegistry::new();
-        let mut handles = Vec::new();
-        for i in 0..32 {
-            let h = reg.start_session(fe(i as u64), ch(i as u64), None, None, 0);
-            handles.push(h);
-        }
-        // All distinct.
-        let unique = handles.iter().collect::<std::collections::HashSet<_>>();
-        assert_eq!(unique.len(), 32, "32 channels => 32 distinct sessions");
-
-        // Record an attempt on each; each lands on its own session.
-        for i in 0..32 {
-            let h = handles[i as usize];
-            reg.record_attempt(fe(i as u64), ch(i as u64), attempt(i as u64, h));
-        }
-        // End only channel 5; others remain active.
-        reg.end_session(fe(5), ch(5), TaskOutcome::Failure, None, vec![], 100);
-        assert_eq!(reg.resolve_session(fe(5), ch(5)), None);
-        for i in 0..32 {
-            if i != 5 {
-                assert_eq!(
-                    reg.resolve_session(fe(i as u64), ch(i as u64)),
-                    Some(handles[i as usize])
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn no_daemon_global_current_session() {
-        // Starting a session on one channel must not be visible as the
-        // "current" session of another channel.
-        let mut reg = FrontendRegistry::new();
-        let h = reg.start_session(fe(1), ch(1), None, None, 0);
-        // A brand-new channel has no session.
-        assert_eq!(reg.resolve_session(fe(2), ch(99)), None);
-        // And the started handle is only bound to its own channel.
-        assert_eq!(reg.resolve_session(fe(1), ch(1)), Some(h));
-        assert_eq!(reg.resolve_session(fe(1), ch(2)), None);
-    }
-
-    #[test]
-    fn lease_expiry_abandons_only_expired_channels() {
-        let mut reg = FrontendRegistry::new();
-        let h_a = reg.start_session(fe(1), ch(1), None, None, 0);
-        let h_b = reg.start_session(fe(1), ch(2), None, None, 0);
-        // Lease A expires at 100, B at 1000.
-        reg.set_lease(fe(1), ch(1), Lease { expires_at: 100 });
-        reg.set_lease(fe(1), ch(2), Lease { expires_at: 1000 });
-
-        let abandoned = reg.expire_leases(500);
-        assert_eq!(abandoned, vec![h_a]);
-        // A abandoned, B still active.
-        assert_eq!(reg.resolve_session(fe(1), ch(1)), None);
-        assert_eq!(reg.resolve_session(fe(1), ch(2)), Some(h_b));
+        reg.bind_session(fe(1), ch(1), hs(11), false);
+        reg.bind_session(fe(1), ch(2), hs(22), false);
+        assert_eq!(reg.channel_session(fe(1), ch(1)), Some(hs(11)));
+        assert_eq!(reg.channel_session(fe(1), ch(2)), Some(hs(22)));
+        assert_eq!(reg.channel_session(fe(2), ch(99)), None);
+        assert_eq!(reg.channel_session(fe(1), ch(3)), None);
+        // Rebinding a channel moves only that channel.
+        reg.bind_session(fe(1), ch(1), hs(33), false);
+        assert_eq!(reg.channel_session(fe(1), ch(1)), Some(hs(33)));
+        assert_eq!(reg.channel_session(fe(1), ch(2)), Some(hs(22)));
     }
 
     #[test]
     fn native_explicit_binding_is_tracked() {
         let mut reg = FrontendRegistry::new();
-        let native = SessionHandle::new(Uuid::from_u128(999));
+        let native = hs(999);
         reg.bind_native_session(fe(1), ch(1), native);
         assert!(reg.is_explicit(fe(1), ch(1)));
-        assert_eq!(reg.resolve_session(fe(1), ch(1)), Some(native));
+        assert_eq!(reg.channel_session(fe(1), ch(1)), Some(native));
+        assert!(!reg.is_explicit(fe(1), ch(2)));
     }
 
     #[test]
-    fn sessions_persist_and_restore_across_restart() {
+    fn leases_are_settable_per_channel() {
+        let mut reg = FrontendRegistry::new();
+        reg.bind_session(fe(1), ch(1), hs(11), false);
+        reg.set_lease(fe(1), ch(1), Lease { expires_at: 5000 });
+        // Lease expiry no longer abandons sessions here (canonical store
+        // owns terminal state); the lease is routing metadata only.
+        assert_eq!(reg.channel_session(fe(1), ch(1)), Some(hs(11)));
+        assert_eq!(reg.channel_count(), 1);
+    }
+
+    /// Bindings, leases and virtual sessions persist; traced sessions and
+    /// receipts found in an old file split into the legacy payload for the
+    /// canonical import (never into live registry state).
+    #[test]
+    fn persist_restores_bindings_and_splits_legacy_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
 
-        // Start sessions, record attempts, persist.
         let mut reg = FrontendRegistry::new();
-        let h_a = reg.start_session(fe(1), ch(1), Some("proj".into()), Some("debug".into()), 0);
-        let h_b = reg.start_session(fe(1), ch(2), None, None, 0);
-        reg.record_attempt(fe(1), ch(1), attempt(1, h_a));
+        reg.bind_session(fe(1), ch(1), hs(11), false);
+        reg.bind_session(fe(1), ch(2), hs(22), false);
         reg.set_lease(fe(1), ch(1), Lease { expires_at: 5000 });
+        let v = reg.ensure_virtual_session(fe(1), ch(9), 0);
         reg.persist(&path).unwrap();
 
-        // Simulate restart: load into a fresh registry.
-        let mut reg2 = FrontendRegistry::load(&path).unwrap();
-        // Active sessions restored.
-        assert_eq!(reg2.resolve_session(fe(1), ch(1)), Some(h_a));
-        assert_eq!(reg2.resolve_session(fe(1), ch(2)), Some(h_b));
-        // Attempts and lease restored.
-        assert_eq!(reg2.channel_count(), 2);
-        // Live connections never persist: a fresh process starts at zero
-        // even with channel history on disk (restore readiness counts
-        // live connections, never this history).
+        // Simulate restart: bindings + virtual restore, nothing traced.
+        let (reg2, payload) = FrontendRegistry::load(&path).unwrap();
+        assert_eq!(reg2.channel_session(fe(1), ch(1)), Some(hs(11)));
+        assert_eq!(reg2.channel_session(fe(1), ch(2)), Some(hs(22)));
+        assert_eq!(reg2.channel_session(fe(1), ch(99)), None);
+        assert!(payload.sessions.is_empty());
+        assert!(payload.receipts.is_empty());
+        assert!(reg2.virtual_record(v).unwrap().is_virtual);
+        // Live connections never persist.
         assert_eq!(reg2.live_connection_count(), 0);
         reg2.note_live_connect();
-        reg2.note_live_connect();
-        assert_eq!(reg2.live_connection_count(), 2);
-        reg2.note_live_disconnect();
         assert_eq!(reg2.live_connection_count(), 1);
-        // The restored session for ch(1) has its recorded attempt.
-        let s = reg2.session(h_a).unwrap();
-        assert_eq!(s.attempts.len(), 1);
-        assert_eq!(s.project.as_deref(), Some("proj"));
-        // The lease is restored so expiry still applies.
-        let abandoned = reg2.expire_leases(6000);
-        assert_eq!(abandoned, vec![h_a]);
+        reg2.note_live_disconnect();
+        assert_eq!(reg2.live_connection_count(), 0);
     }
 
+    /// A pre-migration snapshot (traced sessions + op receipts + counter)
+    /// loads: bindings restore, traced state splits into the import
+    /// payload, and unknown old fields are tolerated.
     #[test]
-    fn reconnect_restores_only_verified_channel_binding() {
+    fn legacy_snapshot_splits_traced_state_for_import() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
-
-        let mut reg = FrontendRegistry::new();
-        let h_a = reg.start_session(fe(1), ch(1), None, None, 0);
-        reg.persist(&path).unwrap();
-
-        // A reconnecting frontend presents (frontend_id, channel_id). The
-        // daemon restores the binding only if it matches a persisted one.
-        let reg2 = FrontendRegistry::load(&path).unwrap();
-        // Verified: the persisted channel is found.
-        assert_eq!(reg2.resolve_session(fe(1), ch(1)), Some(h_a));
-        // Not verified: an unknown channel has no session (never guessed).
-        assert_eq!(reg2.resolve_session(fe(1), ch(99)), None);
-        // Not verified: a different frontend cannot claim the session.
-        assert_eq!(reg2.resolve_session(fe(2), ch(1)), None);
+        let traced = crate::domain::session::Session {
+            handle: hs(77),
+            channel_id: ch(1),
+            project: Some("proj".into()),
+            task_type: Some("debug".into()),
+            technologies: Vec::new(),
+            status: crate::domain::session::SessionStatus::Active,
+            attempts: Vec::new(),
+            outcome: None,
+            final_approach: None,
+            lessons: Vec::new(),
+            initial_approach: None,
+            guides_used: Vec::new(),
+            memories_read: Vec::new(),
+            memories_created: Vec::new(),
+            refinement_attempts: 0,
+            self_critique_count: 0,
+            started_at: Instant::new(0),
+            ended_at: None,
+            is_virtual: false,
+        };
+        let legacy = serde_json::json!({
+            "handle_gen": 42u64,
+            "channels": [
+                {"frontend_id": fe(1), "channel_id": ch(1),
+                 "binding": {
+                    "frontend_id": fe(1), "channel_id": ch(1),
+                    "session": hs(77), "virtual_session": null,
+                    "virtual_lease": null, "lease": null, "explicit": false,
+                 }},
+            ],
+            "sessions": [{"handle": hs(77), "session": traced}],
+            "op_log": {"op-9": {
+                "digest": "digest-9", "session": hs(77),
+                "text": "text-9", "data": null, "effects": [],
+            }},
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let (reg, payload) = FrontendRegistry::load(&path).unwrap();
+        // Binding restores (routing).
+        assert_eq!(reg.channel_session(fe(1), ch(1)), Some(hs(77)));
+        // Traced state splits out for the canonical import.
+        assert_eq!(payload.sessions.len(), 1);
+        assert_eq!(payload.sessions[0].project.as_deref(), Some("proj"));
+        assert_eq!(payload.receipts.len(), 1);
+        assert_eq!(payload.receipts[0].0, "op-9");
+        assert_eq!(payload.receipts[0].1.digest, "digest-9");
+        assert_eq!(payload.receipts[0].1.session, hs(77));
     }
 
     #[test]
     fn load_missing_file_yields_empty_registry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
-        let reg = FrontendRegistry::load(&path).unwrap();
+        let (reg, payload) = FrontendRegistry::load(&path).unwrap();
         assert_eq!(reg.channel_count(), 0);
-        assert_eq!(reg.session_count(), 0);
+        assert!(payload.sessions.is_empty());
+        assert!(payload.receipts.is_empty());
     }
 
-    /// Virtual sessions are stable per channel, isolated across channels,
-    /// and never shadow a traced session.
+    /// Virtual sessions are stable per channel and isolated across
+    /// channels. Traced shadowing lives in the dispatcher (canonical
+    /// store), not here.
     #[test]
     fn virtual_session_stable_per_channel_and_isolated() {
         let mut reg = FrontendRegistry::new();
         let v1 = reg.ensure_virtual_session(fe(1), ch(1), 0);
-        assert!(reg.session(v1).unwrap().is_virtual);
+        assert!(reg.virtual_record(v1).unwrap().is_virtual);
         // Same channel, still live: same handle.
         assert_eq!(reg.ensure_virtual_session(fe(1), ch(1), 1_000), v1);
         // Another channel gets its own virtual session.
         let v2 = reg.ensure_virtual_session(fe(1), ch(2), 1_000);
         assert_ne!(v1, v2);
-        // Traced sessions shadow virtual ones; resolve_session is untouched.
-        let traced = reg.start_legacy_session(fe(1), ch(1), "debugging".to_string(), vec![], 2_000);
-        assert!(!reg.session(traced).unwrap().is_virtual);
-        assert_eq!(reg.ensure_virtual_session(fe(1), ch(1), 2_000), traced);
-        assert_eq!(reg.resolve_session(fe(1), ch(1)), Some(traced));
     }
 
     /// Virtual sessions idle-finalize after 120s and die after 30min,
@@ -1080,7 +682,10 @@ mod tests {
         // fresh virtual session starts.
         let v2 = reg.ensure_virtual_session(fe(1), ch(1), 321_000);
         assert_ne!(v1, v2);
-        assert!(reg.session(v1).unwrap().status.is_terminal());
+        assert!(
+            reg.virtual_record(v1)
+                .is_none_or(|s| s.status.is_terminal())
+        );
         // Lifetime bound: constant activity still retires at 30 minutes.
         let v3 = reg.ensure_virtual_session(fe(1), ch(2), 0);
         let mut t = 0u64;
@@ -1096,62 +701,23 @@ mod tests {
         );
     }
 
-    /// Re-review R5: the operation log distinguishes fresh, replay and
-    /// conflicting-key reuse, and effect markers are idempotent.
     #[test]
-    fn op_log_fresh_replay_conflict_and_effects() {
-        let mut reg = FrontendRegistry::new();
-        let h = reg.start_session(fe(1), ch(1), None, None, 0);
-        assert!(matches!(reg.check_op("op-1", "d1"), OpCheck::Fresh));
-        reg.record_op("op-1", "d1", h, Some("done".into()), None);
-        match reg.check_op("op-1", "d1") {
-            OpCheck::Replay(rec) => {
-                assert_eq!(rec.session, h);
-                assert_eq!(rec.text.as_deref(), Some("done"));
-            }
-            other => panic!("expected replay, got: {other:?}"),
-        }
-        assert!(matches!(
-            reg.check_op("op-1", "DIFFERENT"),
-            OpCheck::Conflict
-        ));
-        assert!(!reg.effect_applied("op-1", "e1"));
-        reg.mark_effect_applied("op-1", "e1");
-        reg.mark_effect_applied("op-1", "e1");
-        assert!(reg.effect_applied("op-1", "e1"));
-        // Unknown operations have no effects.
-        assert!(!reg.effect_applied("op-unknown", "e1"));
-    }
-
-    /// Re-review R1/R5: the op log persists across restarts (replays stay
-    /// replays after a restart), and old snapshots without the log still
-    /// load (empty log, no failure).
-    #[test]
-    fn op_log_persists_across_restart() {
+    fn reconnect_restores_only_verified_channel_binding() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
+
         let mut reg = FrontendRegistry::new();
-        let h = reg.start_session(fe(1), ch(1), None, None, 0);
-        reg.record_op("op-9", "digest-9", h, Some("text-9".into()), None);
+        reg.bind_session(fe(1), ch(1), hs(11), false);
         reg.persist(&path).unwrap();
-        let reg2 = FrontendRegistry::load(&path).unwrap();
-        match reg2.check_op("op-9", "digest-9") {
-            OpCheck::Replay(rec) => {
-                assert_eq!(rec.session, h);
-                assert_eq!(rec.text.as_deref(), Some("text-9"));
-            }
-            other => panic!("receipt must survive restart, got: {other:?}"),
-        }
-        assert!(matches!(reg2.check_op("op-9", "other"), OpCheck::Conflict));
-        // Hand-written old snapshot without op_log loads fine.
-        let legacy = serde_json::json!({
-            "handle_gen": 1u64,
-            "channels": [],
-            "sessions": [],
-        });
-        let legacy_path = dir.path().join("legacy.json");
-        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let reg3 = FrontendRegistry::load(&legacy_path).unwrap();
-        assert!(matches!(reg3.check_op("anything", "d"), OpCheck::Fresh));
+
+        // A reconnecting frontend presents (frontend_id, channel_id). The
+        // daemon restores the binding only if it matches a persisted one.
+        let (reg2, _) = FrontendRegistry::load(&path).unwrap();
+        // Verified: the persisted channel is found.
+        assert_eq!(reg2.channel_session(fe(1), ch(1)), Some(hs(11)));
+        // Not verified: an unknown channel has no session (never guessed).
+        assert_eq!(reg2.channel_session(fe(1), ch(99)), None);
+        // Not verified: a different frontend cannot claim the session.
+        assert_eq!(reg2.channel_session(fe(2), ch(1)), None);
     }
 }

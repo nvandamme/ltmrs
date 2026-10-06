@@ -13,12 +13,9 @@ use crate::daemon::envelope::{
 use crate::daemon::registry::FrontendRegistry;
 use crate::domain::clock::Clock;
 use crate::domain::command::{DomainError, DomainErrorCode, DomainResult, ReceiptOutcome};
-use crate::domain::id::EntityId;
-use crate::domain::memory::Instant;
-use crate::domain::session::Attempt;
+use crate::domain::id::{ChannelId, FrontendId, SessionHandle};
 use crate::search::backend::SearchBackend;
 use crate::service::repository::CanonicalRepository;
-use uuid::Uuid;
 
 /// Map a namespace-issue failure to its handshake presentation: transient
 /// contention is a typed Busy (retryable, never auth-flavored); fatal
@@ -93,10 +90,6 @@ impl Dispatcher {
             return Err(msg);
         }
         Ok(())
-    }
-
-    fn persist_error(e: String) -> DomainError {
-        DomainError::new(DomainErrorCode::Validation, e)
     }
 
     /// Handle the connect-time handshake: validate protocol + generation,
@@ -183,11 +176,9 @@ impl Dispatcher {
             ));
         }
 
-        // Resolve the channel's active session (never a daemon-global session).
-        let session = {
-            let reg = self.registry.lock().unwrap();
-            reg.resolve_session(envelope.frontend_id, envelope.channel_id)
-        };
+        // Resolve the channel's active session (registry binding +
+        // canonical liveness; never a daemon-global session).
+        let session = self.resolve_session(envelope.frontend_id, envelope.channel_id);
 
         match &envelope.body {
             DomainRequest::ToolCall { tool } => {
@@ -231,60 +222,35 @@ impl Dispatcher {
             } => {
                 let op_id = envelope.operation_id.as_uuid().to_string();
                 let digest = envelope.request_digest()?;
-                // Operation receipt first (re-review R5): a replay returns
-                // success without re-recording; a digest mismatch rejects.
-                // The gate precedes session resolution so replays after a
-                // terminal session still resolve to the recorded outcome.
-                match self.registry.lock().unwrap().check_op(&op_id, &digest) {
-                    crate::daemon::registry::OpCheck::Replay(_) => {
-                        return Ok(IpcResponse::success(
-                            envelope.operation_id,
-                            ReceiptOutcome::Success { affected: vec![] },
-                            DomainPayload::None,
-                        ));
-                    }
-                    crate::daemon::registry::OpCheck::Conflict => {
-                        return Err(DomainError::new(
-                            DomainErrorCode::KeyReuseDifferentInput,
-                            "operation key reused with different input",
-                        ));
-                    }
-                    crate::daemon::registry::OpCheck::Fresh => {}
-                }
                 let session = session.ok_or_else(|| {
                     DomainError::new(DomainErrorCode::Validation, "no active session for channel")
                 })?;
-                let attempt = Attempt {
-                    id: EntityId::new(Uuid::new_v5(
-                        &Uuid::NAMESPACE_URL,
-                        format!("ltmrs:attempt:{}", envelope.operation_id.as_uuid()).as_bytes(),
+                // ONE canonical operation (re-review P1-3): record, counters
+                // and receipt commit together in the store; replay resolves,
+                // digest mismatch rejects, durability failures fail loudly
+                // via the barrier.
+                match self.repo.session_attempt_tx(
+                    &op_id,
+                    &digest,
+                    session,
+                    approach.clone(),
+                    *outcome,
+                    critique.clone(),
+                    rationale.clone(),
+                    *related_memory_id,
+                    self.clock.now_millis(),
+                ) {
+                    Ok(crate::domain::session::SessionOp::Conflict) => Err(DomainError::new(
+                        DomainErrorCode::KeyReuseDifferentInput,
+                        "operation key reused with different input",
                     )),
-                    session_id: session,
-                    seq: 0,
-                    approach: approach.clone(),
-                    outcome: *outcome,
-                    critique: critique.clone(),
-                    rationale: rationale.clone(),
-                    related_memory_id: *related_memory_id,
-                    confidence: 1.0,
-                    access_count: 0,
-                    last_accessed_at: None,
-                    created_at: Instant::new(self.clock.now_millis()),
-                };
-                {
-                    let mut reg = self.registry.lock().unwrap();
-                    reg.record_attempt(envelope.frontend_id, envelope.channel_id, attempt);
-                    reg.record_op(&op_id, &digest, session, None, None);
+                    Ok(_) => Ok(IpcResponse::success(
+                        envelope.operation_id,
+                        ReceiptOutcome::Success { affected: vec![] },
+                        DomainPayload::None,
+                    )),
+                    Err(e) => Err(e),
                 }
-                // Durable before ack, failing loudly (re-review R1): a kill
-                // immediately after success must not lose the attempt, and
-                // a failed save must not report success.
-                self.persist_sessions().map_err(Self::persist_error)?;
-                Ok(IpcResponse::success(
-                    envelope.operation_id,
-                    ReceiptOutcome::Success { affected: vec![] },
-                    DomainPayload::None,
-                ))
             }
             DomainRequest::SessionEnd {
                 outcome,
@@ -293,46 +259,63 @@ impl Dispatcher {
             } => {
                 let op_id = envelope.operation_id.as_uuid().to_string();
                 let digest = envelope.request_digest()?;
-                // Receipt before resolution (re-review R5): replays after a
-                // terminal session still resolve to the recorded outcome.
-                match self.registry.lock().unwrap().check_op(&op_id, &digest) {
-                    crate::daemon::registry::OpCheck::Replay(_) => {
-                        return Ok(IpcResponse::success(
-                            envelope.operation_id,
-                            ReceiptOutcome::Success { affected: vec![] },
-                            DomainPayload::None,
-                        ));
+                // End only THIS channel's session, atomically with its
+                // guide effects and receipt (re-review P1-3). A replay
+                // resolves; a digest mismatch rejects. Ending an
+                // already-terminal session is a recorded no-op, never an
+                // error, so retried ends always resolve.
+                let handle = match session {
+                    Some(h) => h,
+                    None => {
+                        // No live binding: resolve the bound handle (even
+                        // terminal) so the operation still records against
+                        // the channel's session instead of executing
+                        // nowhere. Without any binding there is nothing
+                        // to end.
+                        match self
+                            .registry
+                            .lock()
+                            .unwrap()
+                            .channel_session(envelope.frontend_id, envelope.channel_id)
+                        {
+                            Some(h) => h,
+                            None => {
+                                return Err(DomainError::new(
+                                    DomainErrorCode::Validation,
+                                    "no active session for channel",
+                                ));
+                            }
+                        }
                     }
-                    crate::daemon::registry::OpCheck::Conflict => {
-                        return Err(DomainError::new(
-                            DomainErrorCode::KeyReuseDifferentInput,
-                            "operation key reused with different input",
-                        ));
-                    }
-                    crate::daemon::registry::OpCheck::Fresh => {}
-                }
-                // End only THIS channel's session.
-                let handle = self.registry.lock().unwrap().end_session(
-                    envelope.frontend_id,
-                    envelope.channel_id,
+                };
+                match self.repo.session_end_tx(
+                    &op_id,
+                    &digest,
+                    handle,
                     *outcome,
                     final_approach.clone(),
                     lessons.clone(),
                     self.clock.now_millis(),
-                );
-                if let Some(handle) = handle {
-                    self.registry
-                        .lock()
-                        .unwrap()
-                        .record_op(&op_id, &digest, handle, None, None);
+                ) {
+                    Ok(crate::domain::session::SessionOp::Conflict) => Err(DomainError::new(
+                        DomainErrorCode::KeyReuseDifferentInput,
+                        "operation key reused with different input",
+                    )),
+                    // Fresh end of an already-terminal session: nothing to
+                    // do (matches the tools path's "no active session").
+                    Ok(crate::domain::session::SessionOp::Applied((_, _, false))) => {
+                        Err(DomainError::new(
+                            DomainErrorCode::Validation,
+                            "no active session for channel",
+                        ))
+                    }
+                    Ok(_) => Ok(IpcResponse::success(
+                        envelope.operation_id,
+                        ReceiptOutcome::Success { affected: vec![] },
+                        DomainPayload::None,
+                    )),
+                    Err(e) => Err(e),
                 }
-                // Durable before ack, failing loudly (re-review R1).
-                self.persist_sessions().map_err(Self::persist_error)?;
-                Ok(IpcResponse::success(
-                    envelope.operation_id,
-                    ReceiptOutcome::Success { affected: vec![] },
-                    DomainPayload::None,
-                ))
             }
             // Mutations: route through the canonical command gateway.
             _ => {
@@ -385,6 +368,25 @@ impl Dispatcher {
         self.registry.lock().unwrap()
     }
 
+    /// Resolve the channel's ACTIVE traced session: the registry binding
+    /// plus canonical liveness (None if unbound or terminal). Routing
+    /// comes from the registry; truth comes from the store.
+    pub fn resolve_session(
+        &self,
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+    ) -> Option<SessionHandle> {
+        let handle = self
+            .registry
+            .lock()
+            .unwrap()
+            .channel_session(frontend_id, channel_id)?;
+        match self.repo.get_session(handle) {
+            Ok(Some(s)) if !s.status.is_terminal() => Some(handle),
+            _ => None,
+        }
+    }
+
     /// The protocol version this dispatcher speaks.
     pub fn protocol_version() -> u32 {
         PROTOCOL_VERSION
@@ -397,9 +399,10 @@ mod tests {
     use crate::daemon::envelope::{DomainRequest, IpcEnvelope};
     use crate::domain::clock::FrozenClock;
     use crate::domain::command::Scope;
-    use crate::domain::id::{ChannelId, FrontendId, OperationId, StoreGeneration};
-    use crate::domain::session::TaskOutcome;
+    use crate::domain::id::{ChannelId, FrontendId, OperationId, SessionHandle, StoreGeneration};
+    use crate::domain::session::{SessionOp, TaskOutcome};
     use crate::service::repository::CanonicalRepository;
+    use uuid::Uuid;
 
     fn fe(n: u64) -> FrontendId {
         FrontendId::new(Uuid::from_u128(n as u128))
@@ -457,16 +460,47 @@ mod tests {
         );
     }
 
+    /// Start a traced session in the canonical store and bind the channel
+    /// to it (the two halves of session creation after the migration).
+    fn start_bound(
+        disp: &Dispatcher,
+        fe: FrontendId,
+        ch: ChannelId,
+        seed: u128,
+        op: u64,
+    ) -> SessionHandle {
+        let handle = SessionHandle::new(Uuid::from_u128(seed));
+        let op_id = format!("test-start-{op}");
+        match disp
+            .repo()
+            .session_start_tx(
+                &op_id,
+                "digest",
+                handle,
+                ch,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) | SessionOp::Replayed(h) => {
+                disp.registry().bind_session(fe, ch, h, false);
+                h
+            }
+            SessionOp::Conflict => panic!("test setup conflict"),
+        }
+    }
+
     #[test]
     fn session_end_is_channel_scoped() {
         let disp = test_dispatcher().0;
         // Two channels start sessions.
-        let h_a = disp
-            .registry()
-            .start_session(fe(1), ch(1), None, None, 1000);
-        let h_b = disp
-            .registry()
-            .start_session(fe(1), ch(2), None, None, 1000);
+        let h_a = start_bound(&disp, fe(1), ch(1), 101, 1);
+        let h_b = start_bound(&disp, fe(1), ch(2), 102, 2);
         assert_ne!(h_a, h_b);
 
         // End channel 1's session via the dispatcher.
@@ -483,8 +517,8 @@ mod tests {
         disp.handle(&env).unwrap();
 
         // Channel 1's session ended; channel 2's is still active.
-        assert_eq!(disp.registry().resolve_session(fe(1), ch(1)), None);
-        assert_eq!(disp.registry().resolve_session(fe(1), ch(2)), Some(h_b));
+        assert_eq!(disp.resolve_session(fe(1), ch(1)), None);
+        assert_eq!(disp.resolve_session(fe(1), ch(2)), Some(h_b));
     }
 
     #[test]
@@ -565,9 +599,7 @@ mod tests {
         use crate::domain::session::AttemptOutcome;
 
         let (disp, _dir) = test_dispatcher();
-        let handle = disp
-            .registry()
-            .start_session(fe(1), ch(1), None, None, 1000);
+        let handle = start_bound(&disp, fe(1), ch(1), 142, 1);
         let env = envelope(
             fe(1),
             ch(1),
@@ -582,7 +614,7 @@ mod tests {
         );
         disp.handle(&env).unwrap();
         disp.handle(&env).unwrap();
-        let session = disp.registry().session(handle).unwrap().clone();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
         assert_eq!(
             session.attempts.len(),
             1,
@@ -590,28 +622,20 @@ mod tests {
         );
     }
 
-    /// P1 durability: an acknowledged session_end persists before success
-    /// returns, so a kill (drop without shutdown) loses nothing — the
-    /// reloaded registry holds the outcome and lessons.
+    /// P1 durability: an acknowledged session_end survives a store
+    /// reopen (the process-death equivalent for storage: Fjall recovery
+    /// runs on open). The outcome, lessons and approach come back intact.
     #[test]
-    fn session_end_ack_survives_kill_without_shutdown() {
+    fn session_end_ack_survives_store_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let sessions_file = dir.path().join("sessions.json");
+        let store_path = dir.path().join("store");
+        let store_str = store_path.to_str().unwrap().to_string();
         let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
-        let repo = Arc::new(
-            CanonicalRepository::open_with_clock(
-                dir.path().join("store").to_str().unwrap(),
-                Arc::clone(&clock),
-            )
-            .unwrap(),
-        );
+        let repo =
+            Arc::new(CanonicalRepository::open_with_clock(&store_str, Arc::clone(&clock)).unwrap());
         repo.issue_namespace(fe(1), 1000).unwrap();
         let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock);
-        disp.set_sessions_path(Some(sessions_file.clone()));
-        let handle = disp
-            .registry()
-            .start_session(fe(1), ch(1), None, None, 1000);
-        disp.persist_sessions().unwrap();
+        let handle = start_bound(&disp, fe(1), ch(1), 107, 1);
         let env = envelope(
             fe(1),
             ch(1),
@@ -623,12 +647,15 @@ mod tests {
             },
         );
         disp.handle(&env).unwrap();
-        // Kill: drop without shutdown. Eager persist already wrote the file.
+        // Kill: drop everything without shutdown, then reopen the store
+        // from the same path (recovery runs here).
         let live_handle = handle;
         drop(disp);
-        let restored = FrontendRegistry::load(&sessions_file).unwrap();
-        let session = restored
-            .session(live_handle)
+        let clock2: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(2000));
+        let repo2 = CanonicalRepository::open_with_clock(&store_str, clock2).unwrap();
+        let session = repo2
+            .get_session(live_handle)
+            .unwrap()
             .expect("session must survive kill");
         assert_eq!(session.outcome, Some(TaskOutcome::Success));
         assert_eq!(session.lessons, vec!["check logs".to_string()]);
@@ -639,64 +666,49 @@ mod tests {
         );
     }
 
-    /// Re-review R1: a session-file save failure fails the acknowledgement
-    /// instead of reporting success for unpersisted state. The sessions path
-    /// points inside a nonexistent directory, so every persist fails.
+    /// Re-review R1: a durability-barrier failure fails the acknowledgement
+    /// instead of reporting success for unflushed state — and the identical
+    /// retry fails too (no fabricated durability from a visible receipt).
     #[test]
-    fn session_ack_fails_when_persist_fails() {
+    fn session_ack_fails_when_barrier_fails() {
         use crate::domain::session::AttemptOutcome;
 
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("no-such-dir").join("sessions.json");
-        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
-        let repo = Arc::new(
-            CanonicalRepository::open_with_clock(
-                dir.path().join("store").to_str().unwrap(),
-                Arc::clone(&clock),
+        let (disp, _dir) = test_dispatcher();
+        start_bound(&disp, fe(1), ch(1), 111, 1);
+        let attempt = || {
+            envelope(
+                fe(1),
+                ch(1),
+                11,
+                DomainRequest::SessionAttempt {
+                    approach: "try X".into(),
+                    outcome: AttemptOutcome::Rejected,
+                    critique: None,
+                    rationale: None,
+                    related_memory_id: None,
+                },
             )
-            .unwrap(),
-        );
-        repo.issue_namespace(fe(1), 1000).unwrap();
-        let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock);
-        disp.set_sessions_path(Some(missing));
-        disp.registry()
-            .start_session(fe(1), ch(1), None, None, 1000);
-        // session_attempt must not report success when the save fails.
-        let attempt = envelope(
-            fe(1),
-            ch(1),
-            11,
-            DomainRequest::SessionAttempt {
-                approach: "try X".into(),
-                outcome: AttemptOutcome::Rejected,
-                critique: None,
-                rationale: None,
-                related_memory_id: None,
-            },
-        );
-        let err = disp.handle(&attempt).unwrap_err();
+        };
+        disp.repo().fault_injector().set_persist_failures(1);
+        let err = disp.handle(&attempt()).unwrap_err();
         assert!(
             err.message.contains("persist"),
-            "save failure must fail loudly, got: {}",
+            "barrier failure must fail loudly, got: {}",
             err.message
         );
-        // session_end likewise.
-        let end = envelope(
-            fe(1),
-            ch(1),
-            12,
-            DomainRequest::SessionEnd {
-                outcome: TaskOutcome::Success,
-                final_approach: None,
-                lessons: vec![],
-            },
-        );
-        let err = disp.handle(&end).unwrap_err();
+        // Retry with the barrier STILL failing: must fail again.
+        disp.repo().fault_injector().set_persist_failures(1);
+        let err = disp.handle(&attempt()).unwrap_err();
         assert!(
             err.message.contains("persist"),
-            "save failure must fail loudly, got: {}",
+            "replay without durability must fail loudly, got: {}",
             err.message
         );
+        // Barrier healthy: the identical retry now succeeds, recorded once.
+        disp.handle(&attempt()).unwrap();
+        let sessions = disp.repo().all_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].attempts.len(), 1);
     }
 
     /// Re-review R5: replaying a session_end with changed arguments rejects
@@ -704,8 +716,7 @@ mod tests {
     #[test]
     fn session_end_replay_with_changed_args_rejects() {
         let (disp, _dir) = test_dispatcher();
-        disp.registry()
-            .start_session(fe(1), ch(1), None, None, 1000);
+        start_bound(&disp, fe(1), ch(1), 121, 1);
         let end = |op: u64, lessons: Vec<String>| {
             envelope(
                 fe(1),
