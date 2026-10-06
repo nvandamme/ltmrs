@@ -131,7 +131,45 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   transcripts in bundle. Get-ok counts incomparable by contract;
   our duplicate gate passing salted content is DEV-007, known.
 
-## 2026-10-06 — Canonical sessions and re-review hardening
+## 2026-10-06 — Independent daemon process
+
+### Independent daemon process (spawn-on-demand)
+
+- New `daemon` CLI surface (per Part I §7 `ltmrs daemon --foreground`):
+  bare form ensures serving and exits, `--foreground` serves inline
+  until idle/SIGTERM, `--daemon-idle-ms` overrides the 60s default
+  (0 = forever); `LTMRS_DAEMON_IDLE_MS` env fallback. Parser,
+  conflicts and help text pinned by cli.rs tests.
+- Default stdio frontends are pure clients: ensure (verified probe →
+  detached spawn → bounded wait-ready) then attach. No in-process
+  ownership, no linger tail. Ownership-era machinery removed
+  (`connect_or_spawn`, `is_lock_race`, `await_peer_drain` + tests).
+- Detached spawn: null stdin, stdout/stderr to mode-0600 `daemon.log`
+  (no silent daemons), setsid + never-waited (documented unsafe,
+  async-signal-safe only). Loser children exit `AlreadyRunning` on
+  their own; winner found on retry.
+- Wait loop distinguishes slow boot (refused dials, cheap) from mute
+  owners (consecutive-silence cap), fails fast on child death only
+  when the lock is free (`lock_held` probe, unit-tested), and retries
+  transient handshake errors instead of breaking (the simultaneous-
+  start race this caught). Deterministic rejections fail fast.
+- `run_daemon_foreground`: SIGTERM persists + exits 0; shutdown runs
+  on every exit path including serve errors. Graceful shutdown
+  unlinks the socket while holding the lock, so "socket gone"
+  observably means "daemon gone" (stale recovery still covers
+  crashes).
+- Tests: 6 two-process lifecycle tests incl. SIGKILL survival with
+  stateful proof, simultaneous cold-start race, idle/SIGTERM exits
+  with zero strays; CLI parse + idle-resolution units. TDD RED
+  observed (unknown flag, attach-without-daemon, notification-id
+  and id-less-line harness bugs fixed during GREEN).
+- Plans: WP-10 task line; README command table. Part I already
+  specified the shape — no redesign.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets
+  -- -D warnings`, `cargo test --release` (694 lib + 6 lifecycle +
+  evidence + 2 smoke, 0 failed). Uncommitted.
+
+## b8bcb94 (2026-10-06) — Canonical sessions and re-review hardening
 
 ### P1-3 sessions in Fjall: single-tx session completion
 

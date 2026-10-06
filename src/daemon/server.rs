@@ -397,6 +397,12 @@ impl Daemon {
         if let Some(server) = saborted {
             server.abort();
         }
+        // Unlink our socket while still holding the singleton lock: no new
+        // owner can have bound it yet (binding requires the lock), so this
+        // cannot delete a successor's socket. Graceful exits then leave no
+        // stale file behind, and "socket gone" observably means "daemon
+        // gone". Best-effort: crashes keep the old stale-recovery path.
+        let _ = std::fs::remove_file(&self.paths.socket_path);
     }
 
     /// Build a health/doctor report (no memory contents).

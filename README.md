@@ -151,7 +151,8 @@ There is no config file; behavior comes from flags plus `$HOME`.
 
 | Command | Purpose |
 |---|---|
-| (no args) | Serve MCP over stdio (default) |
+| (no args) | Serve MCP over stdio (default; spawns the daemon on demand) |
+| `daemon [--foreground] [--daemon-idle-ms MS]` | Run the shared daemon (ensure-and-exit; foreground serves until idle/SIGTERM) |
 | `--socket PATH` | Attach stdio to a running daemon instead of starting one |
 | `-lib/--library --store PATH` | Print a knowledge-base snapshot (never creates stores) |
 | `-vis/--visualize [--fg] [-p PORT]` | Run the library visualizer (default port 18721) |

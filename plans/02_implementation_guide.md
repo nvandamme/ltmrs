@@ -381,6 +381,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 ### Tasks
 
 - [x] Implement native commands and the exact claimed legacy aliases, exit codes, stdout/stderr separation and argument errors. (CLI parser + stdio/visualizer/skill/shim wiring; pinned by cli.rs tests and live-binary smoke tests.)
+- [x] Run the shared daemon as its own process (`daemon`: ensure-and-exit; `daemon --foreground`: serve inline until idle/SIGTERM). Default stdio frontends are pure clients that spawn-on-demand; killing one frontend never stops the others (SIGKILL-proven by tests/daemon_lifecycle.rs). Graceful shutdown unlinks the socket while holding the lock, so "socket gone" observably means "daemon gone". (frontend/serve.rs ensure/spawn + cli.rs daemon surface + main dispatch.)
 - [x] Implement managed skill installation, update, ownership/hash markers, atomic writes and explicit replacement of foreign assets. (skills/installer.rs + tests.)
 - [x] Test the pinned upstream skill workflow against the compatibility tool names; keep native multilingual guidance separate and documented. (skill_workflow_tools_match_frozen_names + multilingual section pin in skills/installer.rs tests.)
 - [x] Provide an opt-in legacy executable shim; detect PATH collisions without silently replacing an existing installation. (--install-shim installs ~/.local/bin/lemma symlink; foreign paths refuse; PATH collisions warn; skills/shim.rs tests.)

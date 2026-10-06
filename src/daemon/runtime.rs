@@ -108,6 +108,36 @@ pub fn acquire_singleton(paths: &RuntimePaths) -> Result<DaemonRuntime, RuntimeE
     })
 }
 
+/// Whether another process currently holds the singleton lock, probed
+/// without side effects (shared non-blocking flock: succeeds only when
+/// nobody owns it). Used by spawners to tell "our child died and nobody
+/// serves" (fail fast) apart from "our child lost the race to a live
+/// owner" (keep waiting). Returns `None` when the lock file cannot be
+/// inspected at all (treat as unknown: keep waiting, never fail on it).
+pub fn lock_held(paths: &RuntimePaths) -> Option<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&paths.lock_path)
+        .ok()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    if rc == 0 {
+        // We got a shared lock: no exclusive owner. Release immediately.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        return Some(false);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::AlreadyExists
+        || err.kind() == std::io::ErrorKind::WouldBlock
+    {
+        return Some(true);
+    }
+    None
+}
+
 /// Create the 0700 runtime directory, refusing symlinked paths.
 fn create_runtime_dir(dir: &Path) -> Result<(), RuntimeError> {
     if dir.exists() {
@@ -220,5 +250,20 @@ mod tests {
 
         let result = acquire_singleton(&paths);
         assert!(matches!(result, Err(RuntimeError::UnsafePath(_))));
+    }
+
+    /// The side-effect-free lock probe reports held while an owner lives,
+    /// free after it drops, and unknown when nothing exists to inspect.
+    #[tokio::test]
+    async fn lock_probe_distinguishes_held_free_and_missing() {
+        // Nothing on disk yet: unknown, never a bare false that could
+        // mislead a spawner into failing fast.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        assert_eq!(lock_held(&paths), None);
+        let runtime = acquire_singleton(&paths).unwrap();
+        assert_eq!(lock_held(&paths), Some(true));
+        drop(runtime);
+        assert_eq!(lock_held(&paths), Some(false));
     }
 }

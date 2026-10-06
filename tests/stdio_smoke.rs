@@ -2,7 +2,7 @@
 //! piped stdin/stdout under an isolated HOME, complete MCP `initialize`,
 //! assert our server identity, then close stdin and expect a clean exit.
 //! Proves the default (no-argument) CLI surface serves MCP over stdio backed
-//! by the in-process daemon — not an `Unimplemented` stub.
+//! by the spawned daemon process — not an `Unimplemented` stub.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
@@ -77,7 +77,7 @@ fn stdio_initialize_serves_ltmrs_identity() {
         "ltmrs did not exit after stdin EOF",
     );
     assert!(out.success(), "clean exit after stdin EOF, got: {}", out);
-    // The managed home was created (in-process daemon opened its store).
+    // The managed home was created (spawned daemon opened its store).
     assert!(
         home.path().join(".ltmrs").join("store").exists(),
         "managed store must exist under isolated HOME"

@@ -12,6 +12,12 @@
 pub enum Command {
     /// Serve MCP over stdio (default, no arguments).
     Stdio { socket: Option<String> },
+    /// Run the shared daemon: bare form ensures it is serving and exits,
+    /// `--foreground` serves inline until idle/SIGTERM (supervisors).
+    Daemon {
+        foreground: bool,
+        idle_ms: Option<u64>,
+    },
     /// Print a knowledge-base snapshot from a store.
     Library { store: Option<String> },
     /// Run the visualizer (wired in a later slice).
@@ -73,6 +79,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         InstallSkill,
         InstallShim,
         ProvisionModels,
+        Daemon,
     }
     let mut selected: Option<Selected> = None;
     let mut select = |next: Selected| -> Result<(), CliError> {
@@ -89,6 +96,8 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
     let mut store: Option<String> = None;
     let mut socket: Option<String> = None;
     let mut foreground = false;
+    let mut daemon_foreground = false;
+    let mut daemon_idle_ms: Option<u64> = None;
     let mut port: Option<u16> = None;
     let mut positional: Vec<String> = Vec::new();
 
@@ -99,6 +108,14 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             "--install-skill" => select(Selected::InstallSkill)?,
             "--install-shim" => select(Selected::InstallShim)?,
             "--provision-models" => select(Selected::ProvisionModels)?,
+            "--daemon" => select(Selected::Daemon)?,
+            "--foreground" => daemon_foreground = true,
+            "--daemon-idle-ms" => {
+                let raw = args.next().ok_or_else(|| {
+                    CliError::Usage("--daemon-idle-ms requires a value in milliseconds".to_string())
+                })?;
+                daemon_idle_ms = Some(parse_daemon_idle_ms(raw)?);
+            }
             "--fg" => foreground = true,
             "-p" | "--port" => {
                 let raw = args.next().ok_or_else(|| {
@@ -118,6 +135,8 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                     .ok_or_else(|| CliError::Usage("--socket requires a path".to_string()))?;
                 socket = Some(reject_flag_value("--socket", raw)?);
             }
+            // Daemon subcommand (Part I §7): `ltmrs daemon [--foreground]`.
+            "daemon" => select(Selected::Daemon)?,
             other if other.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown flag: {other}")));
             }
@@ -130,7 +149,25 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             positional.join(" ")
         )));
     }
+    if selected.as_ref().is_some_and(|s| *s != Selected::Daemon)
+        && (daemon_foreground || daemon_idle_ms.is_some())
+    {
+        return Err(CliError::Usage(
+            "--foreground/--daemon-idle-ms require daemon".to_string(),
+        ));
+    }
     match selected {
+        Some(Selected::Daemon) => {
+            if store.is_some() || socket.is_some() || foreground || port.is_some() {
+                return Err(CliError::Usage(
+                    "daemon takes only --foreground and --daemon-idle-ms".to_string(),
+                ));
+            }
+            Ok(Command::Daemon {
+                foreground: daemon_foreground,
+                idle_ms: daemon_idle_ms,
+            })
+        }
         Some(Selected::Library) => {
             if socket.is_some() || foreground || port.is_some() {
                 return Err(CliError::Usage("-lib takes only --store".to_string()));
@@ -205,6 +242,19 @@ fn parse_port(raw: &str) -> Result<u16, CliError> {
     Ok(port as u16)
 }
 
+/// Default daemon idle shutdown: 60s with no connections, then exit.
+/// Zero means serve forever (matches DaemonConfig idle convention).
+pub const DEFAULT_DAEMON_IDLE_MS: u64 = 60_000;
+
+/// Parse `--daemon-idle-ms` (nonnegative integer milliseconds).
+fn parse_daemon_idle_ms(raw: &str) -> Result<u64, CliError> {
+    raw.parse().map_err(|_| {
+        CliError::Usage(format!(
+            "invalid --daemon-idle-ms (nonnegative integer milliseconds): {raw}"
+        ))
+    })
+}
+
 /// Help text: documents every flag (tested to stay complete).
 pub fn help_text() -> String {
     "\
@@ -214,6 +264,8 @@ Usage: ltmrs [command] [options]
 
 Commands (default with no arguments: stdio):
   (no args)               Serve MCP over stdio [--socket PATH]
+  daemon                  Run the shared daemon: ensure serving and exit,
+                          or serve inline with --foreground
   -lib, --library         Print a knowledge-base snapshot [--store PATH]
   -vis, --visualize       Run the visualizer [--fg] [-p PORT | --port PORT]
   --install-skill         Install/update the managed skill
@@ -225,6 +277,9 @@ Commands (default with no arguments: stdio):
 Options:
   --store PATH            Canonical store directory (for -lib)
   --socket PATH           Daemon socket path (for stdio mode)
+  --foreground            Serve the daemon inline (with daemon)
+  --daemon-idle-ms MS    Daemon idle shutdown in ms, 0 = forever
+                          (with daemon; default 60000)
   --fg                    Visualizer in foreground (with -vis)
   -p PORT, --port PORT    Visualizer port 1-65535 (with -vis)
 
@@ -725,5 +780,64 @@ mod tests {
             std::fs::read_link(&link).unwrap(),
             std::env::current_exe().unwrap()
         );
+    }
+
+    /// `daemon` runs the shared daemon process: bare form ensures it is
+    /// serving and exits, `--foreground` serves inline (supervisors).
+    #[test]
+    fn daemon_command_parses() {
+        assert_eq!(
+            parse(&["daemon"]).unwrap(),
+            Command::Daemon {
+                foreground: false,
+                idle_ms: None,
+            }
+        );
+        assert_eq!(
+            parse(&["daemon", "--foreground"]).unwrap(),
+            Command::Daemon {
+                foreground: true,
+                idle_ms: None,
+            }
+        );
+        assert_eq!(
+            parse(&["daemon", "--daemon-idle-ms", "1500"]).unwrap(),
+            Command::Daemon {
+                foreground: false,
+                idle_ms: Some(1500),
+            }
+        );
+    }
+
+    /// Daemon options bind to the daemon command; the daemon conflicts
+    /// with every other command like the rest.
+    #[test]
+    fn daemon_options_and_conflicts() {
+        assert!(parse(&["daemon", "--daemon-idle-ms"]).is_err());
+        assert!(parse(&["daemon", "--daemon-idle-ms", "abc"]).is_err());
+        // 0 = serve forever (matches DaemonConfig idle convention).
+        assert_eq!(
+            parse(&["daemon", "--daemon-idle-ms", "0"]).unwrap(),
+            Command::Daemon {
+                foreground: false,
+                idle_ms: Some(0),
+            }
+        );
+        assert!(parse(&["daemon", "-lib"]).is_err());
+        assert!(parse(&["-lib", "daemon"]).is_err());
+        assert!(parse(&["-vis", "--daemon"]).is_err());
+        assert!(parse(&["--install-skill", "daemon"]).is_err());
+        assert!(parse(&["daemon", "--socket", "/tmp/d.sock"]).is_err());
+        assert!(parse(&["daemon", "--fg"]).is_err());
+        assert!(parse(&["daemon", "extra-positional"]).is_err());
+    }
+
+    /// Help documents the daemon surface.
+    #[test]
+    fn help_documents_daemon() {
+        let help = help_text();
+        for flag in ["daemon", "--foreground", "--daemon-idle-ms"] {
+            assert!(help.contains(flag), "help must document {flag}");
+        }
     }
 }

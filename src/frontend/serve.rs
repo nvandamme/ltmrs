@@ -109,8 +109,16 @@ fn resolve_daemon_embedding(layout: &StdioLayout) -> EmbeddingMode {
     }
 }
 
-/// Start the in-process daemon for stdio mode and return it together with a
-/// frontend client bridged over a `UnixStream` pair. The daemon must be kept
+/// The managed daemon socket for a stdio layout (single definition so
+/// spawners, frontends and status output never disagree on the path).
+pub fn daemon_socket_path(layout: &StdioLayout) -> PathBuf {
+    RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).socket_path
+}
+
+/// Start an in-process daemon and return it together with a frontend
+/// client bridged over a `UnixStream` pair. Single-process mode for
+/// tests and embeddings: production frontends attach to a spawned daemon
+/// process instead (see `ensure_daemon_process`). The daemon must be kept
 /// alive (and `shutdown` at the end) to hold the singleton lock.
 ///
 /// Dense enablement is auto-detect, never silent: when the managed models
@@ -169,12 +177,213 @@ pub async fn connect_remote(socket: &str) -> Result<IpcClient, CliError> {
     Ok(client)
 }
 
-/// Bounded connection retries for the startup lock race (P1): losing the
-/// singleton race means another frontend just became the owner, so dial its
-/// socket instead of failing. Every attempt is handshake-verified: a bare
-/// `connect` can succeed against a bound-but-unaccepted listener (backlog),
-/// which would park the later handshake forever. Attempts that connect but
-/// never handshake are treated as unreachable. Worst case is bounded
+/// Resolve the daemon idle shutdown for a spawned or served daemon:
+/// explicit flag wins, then the `LTMRS_DAEMON_IDLE_MS` environment
+/// override (site-local default without flags; also what tests use to
+/// keep spawned daemons short-lived), then the CLI default. Garbage env
+/// values fall back loudly to the default rather than failing startup.
+pub fn daemon_idle_ms(flag: Option<u64>, env_raw: Option<String>) -> u64 {
+    if let Some(ms) = flag {
+        return ms;
+    }
+    if let Some(ref raw) = env_raw
+        && let Ok(ms) = raw.trim().parse::<u64>()
+    {
+        return ms;
+    }
+    if env_raw.is_some() {
+        eprintln!("ltmrs: ignoring invalid LTMRS_DAEMON_IDLE_MS; using default");
+    }
+    crate::cli::DEFAULT_DAEMON_IDLE_MS
+}
+
+/// Spawn a detached daemon child (`exe daemon --foreground ...`) that
+/// outlives this process: stdin to null, stdout/stderr appended to a
+/// mode-0600 log file in the runtime dir (a silent daemon is
+/// undebuggable; rotation is future work), new session so terminal
+/// signals to our group never reach it, never waited on (reparented on
+/// our exit; it idle-exits on its own).
+pub fn spawn_daemon_child(
+    exe: &Path,
+    idle_ms: u64,
+    log_path: &Path,
+) -> Result<std::process::Child, CliError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Runtime(format!("cannot create daemon runtime dir: {e}")))?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log_path)
+        .map_err(|e| CliError::Runtime(format!("cannot open daemon log: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| CliError::Runtime(format!("cannot duplicate daemon log: {e}")))?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .arg("--foreground")
+        .arg("--daemon-idle-ms")
+        .arg(idle_ms.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    // Detach into a new session so terminal signals to our process group
+    // (Ctrl-C) never reach the daemon, and it is reparented (no zombie)
+    // when we exit. SAFETY: pre_exec runs post-fork/pre-exec; the closure
+    // calls only async-signal-safe libc::setsid with no allocation.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| CliError::Runtime(format!("cannot spawn daemon process: {e}")))
+}
+
+/// Daemon child log file: diagnostics a detached daemon would otherwise
+/// lose to /dev/null (startup failures, projection errors, idle exits).
+pub fn daemon_log_path(layout: &StdioLayout) -> PathBuf {
+    RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY)
+        .runtime_dir
+        .join("daemon.log")
+}
+
+/// Ensure a daemon process serves the managed home, spawning a detached
+/// one when nothing verifiably serves. At most one spawn: whoever loses
+/// the startup race finds the winner serving on retry (the loser's child
+/// exits `AlreadyRunning` on its own). Reaps an exited child best-effort
+/// on the way out so losing spawns never linger as zombies. Probe
+/// handshakes use an ephemeral identity (their namespace is never used
+/// for real calls).
+pub async fn ensure_daemon_process(
+    layout: &StdioLayout,
+    exe: &Path,
+    idle_ms: u64,
+) -> Result<(), CliError> {
+    use std::time::Duration;
+
+    let socket = daemon_socket_path(layout);
+    let probe_id = FrontendIdentity::new(
+        FrontendId::new(Uuid::now_v7()),
+        ChannelId::new(Uuid::now_v7()),
+    );
+    // Fast path: already serving (verified, not merely bound).
+    if let Ok(mut client) = connect_remote(&socket.to_string_lossy()).await
+        && probe_handshake(&mut client, probe_id.frontend_id, probe_id.channel_id)
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
+    let mut child: Option<std::process::Child> =
+        Some(spawn_daemon_child(exe, idle_ms, &daemon_log_path(layout))?);
+    // Wait-ready: bounded verified attach. Refused dials poll cheaply
+    // (covers slow first boot incl. model hashing); backlog-hung dials
+    // burn a handshake timeout each, so cap consecutive silence — a
+    // permanently mute owner fails loudly instead of parking forever.
+    const MAX_ATTEMPTS: usize = 1200;
+    const MAX_SILENT: usize = 24;
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut silent = 0usize;
+    let mut last_err = String::from("daemon did not start serving");
+    // Lock paths for the fast-fail probe below (no side effects).
+    let lock_paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
+    for _ in 0..MAX_ATTEMPTS {
+        // Our spawn may have lost the startup race: an exited child is
+        // reaped (never waited on while live), and only fails fast when
+        // NOBODY holds the lock — i.e. no winner exists to attach to.
+        // (A loser child exiting while the winner serves is the normal
+        // simultaneous-startup case, not a failure.)
+        if let Some(c) = child.as_mut() {
+            match c.try_wait() {
+                Ok(Some(status)) => {
+                    child = None;
+                    if !status.success()
+                        && crate::daemon::runtime::lock_held(&lock_paths) == Some(false)
+                    {
+                        return Err(CliError::Runtime(format!(
+                            "spawned daemon exited during startup: {status}"
+                        )));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    last_err = format!("cannot poll daemon child: {e}");
+                    break;
+                }
+            }
+        }
+        match connect_remote(&socket.to_string_lossy()).await {
+            Ok(mut client) => {
+                match tokio::time::timeout(
+                    PROBE_TIMEOUT,
+                    probe_handshake_inner(&mut client, probe_id.frontend_id, probe_id.channel_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        // Reap a loser child that already exited; a live
+                        // daemon child is left alone (never waited on).
+                        if let Some(mut c) = child {
+                            let _ = c.try_wait();
+                        }
+                        return Ok(());
+                    }
+                    // Transient handshake failures (busy/contention during
+                    // concurrent startup, I/O on a dying socket, a
+                    // generation that flipped mid-probe) retry: only
+                    // deterministic rejections fail fast (same-user
+                    // violation, protocol skew — retrying those is
+                    // pointless).
+                    Ok(Err(crate::daemon::envelope::IpcError::Unauthorized))
+                    | Ok(Err(crate::daemon::envelope::IpcError::UnsupportedProtocol(_))) => {
+                        last_err = "daemon refused frontend handshake".to_string();
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        // A responder answered (busy, I/O hiccup, flipped
+                        // generation): alive, so reset the silence count.
+                        silent = 0;
+                        last_err = e.to_string();
+                    }
+                    Err(_) => {
+                        silent += 1;
+                        last_err = "daemon handshake timed out".to_string();
+                        if silent >= MAX_SILENT {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Nobody listening (yet): cheap poll, reset silence.
+                silent = 0;
+                last_err = e.to_string();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(CliError::Runtime(format!(
+        "daemon at {} never started serving: {last_err}",
+        socket.display()
+    )))
+}
+
+/// Bounded handshake-verified connection retries: losing a startup race
+/// means another frontend just became the owner (or just spawned one),
+/// so dial its socket instead of failing. Every attempt is
+/// handshake-verified: a bare `connect` can succeed against a
+/// bound-but-unaccepted listener (backlog), which would park the later
+/// handshake forever. Attempts that connect but never handshake are
+/// treated as unreachable. Worst case is bounded
 /// (attempts × (dial + 1s handshake + 50ms)); a truly wedged owner fails
 /// loudly instead of hanging.
 pub async fn connect_with_retry(
@@ -201,15 +410,6 @@ pub async fn connect_with_retry(
     )))
 }
 
-/// Whether a daemon-start failure is a lost singleton race (the winner is
-/// serving and should be dialed) as opposed to a real startup fault.
-/// Centralized so the retry branch is tested directly, not by string
-/// matching scattered across call sites.
-pub fn is_lock_race(e: &CliError) -> bool {
-    let msg = e.to_string();
-    msg.contains("already owns the store lock") || msg.contains("AlreadyRunning")
-}
-
 /// Verify a connected client with a real handshake (bounded): proves the
 /// listener actually serves instead of merely accepting into a backlog.
 /// Follows the generation-mismatch retry the bridged path uses, so a
@@ -219,115 +419,104 @@ async fn probe_handshake(
     frontend_id: FrontendId,
     channel_id: ChannelId,
 ) -> Result<(), CliError> {
-    use crate::daemon::envelope::IpcError;
-
-    let attempt = async {
-        let first = HandshakeRequest {
-            protocol_version: PROTOCOL_VERSION,
-            store_generation: StoreGeneration::FIRST,
-            frontend_id,
-            channel_id,
-        };
-        match client.handshake(&first).await {
-            Ok(_) => Ok(()),
-            Err(IpcError::GenerationMismatch { daemon, .. }) => {
-                let retry = HandshakeRequest {
-                    store_generation: StoreGeneration::new(daemon),
-                    ..first
-                };
-                client
-                    .handshake(&retry)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| CliError::Runtime(format!("daemon handshake failed: {e}")))
-            }
-            Err(e) => Err(CliError::Runtime(format!("daemon handshake failed: {e}"))),
-        }
-    };
+    let attempt = probe_handshake_inner(client, frontend_id, channel_id);
     tokio::time::timeout(std::time::Duration::from_secs(1), attempt)
         .await
         .map_err(|_| CliError::Runtime("daemon handshake timed out".into()))?
+        .map_err(|e| CliError::Runtime(format!("daemon handshake failed: {e}")))
 }
 
-/// Connect-or-spawn for the default CLI path (P1 shared-daemon lifecycle):
-/// attach to the managed-home daemon when it verifiably serves, otherwise
-/// start it. A lost lock race falls back to a bounded verified-connection
-/// retry instead of `AlreadyRunning`. Returns the owned daemon when this
-/// process became the owner (`Some`), or `None` when attached to an
-/// existing owner. The caller's identity is used for the verification
-/// handshake; the returned client carries its namespace.
-pub async fn connect_or_spawn(
-    layout: &StdioLayout,
-    identity: &FrontendIdentity,
-) -> Result<(Option<Daemon>, IpcClient), CliError> {
-    let managed_socket = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).socket_path;
-    // Fast path: another frontend already owns the daemon. Verified (not
-    // merely connected): a bound-but-unaccepted socket must not count.
-    if let Ok(mut client) = connect_remote(&managed_socket.to_string_lossy()).await
-        && probe_handshake(&mut client, identity.frontend_id, identity.channel_id)
-            .await
-            .is_ok()
-    {
-        return Ok((None, client));
-    }
-    match start_local_daemon(layout).await {
-        Ok((daemon, client)) => Ok((Some(daemon), client)),
-        Err(e) if is_lock_race(&e) => {
-            // Lost the race after our probe: the winner is serving now —
-            // retry the verified connection instead of failing.
-            let client = connect_with_retry(
-                &managed_socket,
-                20,
-                identity.frontend_id,
-                identity.channel_id,
-            )
-            .await?;
-            Ok((None, client))
+/// The handshake itself, without a timeout: callers that manage their own
+/// budget (e.g. the spawn wait loop, whose silence cap is the bound) use
+/// this directly under their own `timeout`. Returns the raw IPC error so
+/// callers can distinguish deterministic rejections (unauthorized,
+/// protocol skew — fail fast) from transient ones (busy, I/O, generation
+/// flips — retry).
+async fn probe_handshake_inner(
+    client: &mut IpcClient,
+    frontend_id: FrontendId,
+    channel_id: ChannelId,
+) -> Result<(), crate::daemon::envelope::IpcError> {
+    let first = HandshakeRequest {
+        protocol_version: PROTOCOL_VERSION,
+        store_generation: StoreGeneration::FIRST,
+        frontend_id,
+        channel_id,
+    };
+    match client.handshake(&first).await {
+        Ok(_) => Ok(()),
+        Err(crate::daemon::envelope::IpcError::GenerationMismatch { daemon, .. }) => {
+            let retry = HandshakeRequest {
+                store_generation: StoreGeneration::new(daemon),
+                ..first
+            };
+            client.handshake(&retry).await.map(|_| ())
         }
         Err(e) => Err(e),
     }
 }
 
-/// Wait until no live socket peers remain, polling every `poll_interval`
-/// for at most `max_polls` rounds. Returns true when drained. Used by an
-/// owning frontend after its own stdio closes (re-review R4): shutdown
-/// happens only on genuine idleness, never on a fixed budget measured
-/// from the first disconnect. Callers pass an unbounded budget while
-/// peers may remain; the first check runs before any sleep, so an
-/// already-idle daemon returns immediately.
-pub async fn await_peer_drain(
-    daemon: &Daemon,
-    poll_interval: std::time::Duration,
-    max_polls: usize,
-) -> bool {
-    for _ in 0..max_polls {
-        if daemon.dispatcher_arc().registry().live_connection_count() == 0 {
-            return true;
+/// Run the shared daemon in this process until idle shutdown or SIGTERM:
+/// the `daemon --foreground` implementation and the shape supervisors use.
+/// Builds the managed-home config exactly like the spawned path (same
+/// store, sessions, search, embedding detection), serves the bound socket
+/// with maintenance and projection, persists on every shutdown path.
+pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result<(), CliError> {
+    let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
+    let embedding = resolve_daemon_embedding(layout);
+    let config = DaemonConfig {
+        store_path: layout.store_path.clone(),
+        sessions_path: layout.sessions_path.clone(),
+        search_path: layout.search_path.clone(),
+        embedding,
+        idle_timeout_millis: idle_ms,
+        ..Default::default()
+    };
+    let mut daemon = Daemon::start(&paths, config)
+        .await
+        .map_err(|e| CliError::Runtime(format!("cannot start daemon: {e}")))?;
+    // SIGTERM (supervisors, hosts) shuts down gracefully: persist routing
+    // state, stop workers, exit 0. SIGKILL needs no handling (store writes
+    // are barrier-flushed per commit, so acknowledged work survives it).
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| CliError::Runtime(format!("cannot watch for SIGTERM: {e}")))?;
+    let result = tokio::select! {
+        r = daemon.serve() => r,
+        _ = term.recv() => {
+            eprintln!("ltmrs: daemon received SIGTERM, shutting down");
+            Ok(())
         }
-        tokio::time::sleep(poll_interval).await;
-    }
-    daemon.dispatcher_arc().registry().live_connection_count() == 0
+    };
+    // Shutdown on every exit path (including accept-loop errors): persist
+    // routing state and stop workers before releasing the lock.
+    daemon.shutdown();
+    result.map_err(|e| CliError::Runtime(format!("daemon serve failed: {e}")))?;
+    Ok(())
 }
 
-/// Serve MCP over stdio: `socket=None` attaches to the managed-home daemon
-/// when it verifiably serves, otherwise starts it (connect-or-spawn);
-/// `socket=Some` attaches to a running daemon. Runs until stdin closes. An
-/// owning frontend stays alive serving socket clients after its own stdio
-/// closes so a second frontend survives the first disconnect; it shuts
-/// down only on genuine idleness (re-review R4), never on a fixed budget.
-/// A host SIGKILL of the owner still stops service: surviving that needs a
-/// separate daemon process (future work package, documented limitation).
+/// Serve MCP over stdio: `socket=None` ensures the managed-home daemon
+/// process serves and attaches as a pure client; `socket=Some` attaches
+/// to a running daemon. Runs until stdin closes, then exits — the daemon
+/// outlives every frontend by design (it idle-exits on its own), so a
+/// SIGKILLed first frontend can never stop service for the second.
 pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result<(), CliError> {
     let identity = FrontendIdentity::new(
         FrontendId::new(Uuid::now_v7()),
         ChannelId::new(Uuid::now_v7()),
     );
-    let (mut daemon, client) = match socket {
-        Some(path) => (None, connect_remote(&path).await?),
+    let client = match socket {
+        Some(path) => connect_remote(&path).await?,
         None => {
             let base = resolve_home(home)?;
             let layout = stdio_layout(&base);
-            connect_or_spawn(&layout, &identity).await?
+            let exe = std::env::current_exe()
+                .map_err(|e| CliError::Runtime(format!("cannot locate ltmrs binary: {e}")))?;
+            let idle = daemon_idle_ms(None, std::env::var("LTMRS_DAEMON_IDLE_MS").ok());
+            ensure_daemon_process(&layout, &exe, idle).await?;
+            // The daemon is verified serving; attach (bounded, for the
+            // stop-start race where it died between ensure and dial).
+            let sock = daemon_socket_path(&layout);
+            connect_with_retry(&sock, 30, identity.frontend_id, identity.channel_id).await?
         }
     };
     let frontend = LtmrsFrontend::new(identity, client);
@@ -344,14 +533,9 @@ pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result
             "stdio serving ended abnormally: {other:?}"
         ))),
     };
-    // Owned daemon: our bridge is already gone (`waiting` consumed the
-    // service), so the live count holds only socket peers. Linger as the
-    // daemon host until genuinely idle, then shut down (which persists).
-    // Attached frontends (None) simply return — they never owned it.
-    if let Some(daemon) = daemon.as_mut() {
-        await_peer_drain(daemon, std::time::Duration::from_millis(100), usize::MAX).await;
-        daemon.shutdown();
-    }
+    // Pure client: no daemon is owned here, so there is nothing to shut
+    // down or linger for. The daemon process outlives every frontend and
+    // idle-exits on its own.
     result
 }
 
@@ -680,8 +864,6 @@ mod tests {
     /// socket was bound-but-unaccepted and parked forever).
     #[tokio::test]
     async fn socket_second_client_handshakes_after_spawn() {
-        use crate::daemon::client::IpcClient;
-
         let dir = tempfile::tempdir().unwrap();
         let layout = stdio_layout(&dir.path().join(".ltmrs"));
         let (mut daemon, _bridged) = start_local_daemon(&layout).await.unwrap();
@@ -715,124 +897,28 @@ mod tests {
         daemon.shutdown();
     }
 
-    /// P1 connect-or-spawn: when a daemon already owns the managed home, a
-    /// second frontend attaches instead of failing with AlreadyRunning.
-    /// The attach is handshake-verified, so the client is proven serving.
-    #[tokio::test]
-    async fn connect_or_spawn_attaches_to_existing_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = stdio_layout(&dir.path().join(".ltmrs"));
-        let (mut owner, _bridged) = start_local_daemon(&layout).await.unwrap();
-        let id = FrontendIdentity::new(
-            FrontendId::new(Uuid::from_u128(201)),
-            ChannelId::new(Uuid::from_u128(202)),
-        );
-        let (second_daemon, second) = connect_or_spawn(&layout, &id).await.unwrap();
-        assert!(
-            second_daemon.is_none(),
-            "second frontend must attach, not own"
-        );
-        // Already handshake-verified by connect_or_spawn: the retry epoch
-        // is issued, so the client is proven serving without another
-        // handshake round-trip here.
-        assert!(
-            second.retry_epoch().is_some(),
-            "attached client must carry a verified handshake epoch"
-        );
-        owner.shutdown();
-    }
-
-    /// Lock-race classification is centralized and directly tested (the
-    /// end-to-end race below covers the retry branch itself).
+    /// Idle resolution: explicit flag wins, then a valid env override,
+    /// then the default; garbage env falls back loudly to the default.
     #[test]
-    fn lock_race_detection_covers_owner_errors() {
-        assert!(is_lock_race(&CliError::Runtime(
-            "cannot start local daemon: runtime: another daemon already owns the store lock (/x)"
-                .into()
-        )));
-        assert!(is_lock_race(&CliError::Runtime(
-            "Runtime(AlreadyRunning(..))".into()
-        )));
-        assert!(!is_lock_race(&CliError::Runtime(
-            "cannot start local daemon: io error: permission denied".into()
-        )));
-        assert!(!is_lock_race(&CliError::Usage("bad flag".into())));
-    }
-
-    /// Re-review R4: the race LOSER exercises the bounded retry branch, not
-    /// the fast path. The lock is held with no acceptor past the 1s probe
-    /// timeout while a delayed owner starts mid-retry; the loser's start
-    /// then loses the race, and the retry loop attaches once the owner
-    /// serves. Generous margins, no races (~1.5s total).
-    #[tokio::test]
-    async fn lock_race_retries_until_delayed_owner_serves() {
-        use crate::daemon::runtime::acquire_singleton;
-
-        let dir = tempfile::tempdir().unwrap();
-        let layout = stdio_layout(&dir.path().join(".ltmrs"));
-        let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
-        // Bare lock holder: binds the socket with no acceptor. Held past
-        // the 1s probe timeout so the fast probe deterministically times
-        // out (its handshake sits unread in the backlog).
-        let holder = acquire_singleton(&paths).unwrap();
-        let layout2 = layout.clone();
-        let owner_task = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            drop(holder);
-            let (daemon, client) = start_local_daemon(&layout2).await.unwrap();
-            // Forgetting the bridge client keeps only the socket path live;
-            // the daemon (with its accept loop) is what matters here.
-            drop(client);
-            daemon
-        });
-        let id = FrontendIdentity::new(
-            FrontendId::new(Uuid::from_u128(301)),
-            ChannelId::new(Uuid::from_u128(302)),
+    fn daemon_idle_ms_prefers_flag_then_env_then_default() {
+        use crate::cli::DEFAULT_DAEMON_IDLE_MS;
+        assert_eq!(daemon_idle_ms(Some(1500), None), 1500);
+        assert_eq!(
+            daemon_idle_ms(Some(1500), Some("5".to_string())),
+            1500,
+            "flag wins over env"
         );
-        // Fast probe times out on the backlog (~1s), start loses the race
-        // (holder still owns the lock), retry attaches once the delayed
-        // owner serves.
-        let (second_daemon, second) = connect_or_spawn(&layout, &id).await.unwrap();
-        assert!(
-            second_daemon.is_none(),
-            "race loser must attach via bounded retry"
+        assert_eq!(daemon_idle_ms(None, Some("2500".to_string())), 2500);
+        assert_eq!(
+            daemon_idle_ms(None, Some("  3000  ".to_string())),
+            3000,
+            "surrounding whitespace is tolerated"
         );
-        assert!(
-            second.retry_epoch().is_some(),
-            "retried attach must be handshake-verified"
+        assert_eq!(
+            daemon_idle_ms(None, Some("forever".to_string())),
+            DEFAULT_DAEMON_IDLE_MS
         );
-        let mut owner = owner_task.await.unwrap();
-        owner.shutdown();
-    }
-
-    /// Re-review R4: the drain returns at once when idle and waits out a
-    /// held peer within budget — the primitive behind shutdown-on-idle.
-    #[tokio::test]
-    async fn peer_drain_returns_when_idle_and_waits_for_peer() {
-        use crate::daemon::client::IpcClient;
-
-        let dir = tempfile::tempdir().unwrap();
-        let layout = stdio_layout(&dir.path().join(".ltmrs"));
-        let (mut daemon, bridged) = start_local_daemon(&layout).await.unwrap();
-        // Drop our own bridge and let the server side observe EOF.
-        drop(bridged);
-        assert!(
-            await_peer_drain(&daemon, std::time::Duration::from_millis(10), 100).await,
-            "idle daemon must drain immediately"
-        );
-        // A connected socket peer holds the drain inside budget.
-        let socket = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).socket_path;
-        let mut peer = IpcClient::new(socket);
-        peer.connect().await.unwrap();
-        assert!(
-            !await_peer_drain(&daemon, std::time::Duration::from_millis(10), 5).await,
-            "drain must wait while a peer is connected"
-        );
-        drop(peer);
-        assert!(
-            await_peer_drain(&daemon, std::time::Duration::from_millis(10), 100).await,
-            "drain must complete after the peer leaves"
-        );
-        daemon.shutdown();
+        assert_eq!(daemon_idle_ms(None, None), DEFAULT_DAEMON_IDLE_MS);
+        assert_eq!(daemon_idle_ms(Some(0), None), 0, "0 serves forever");
     }
 }

@@ -7,7 +7,10 @@ use ltmrs::cli::{
     CliError, Command, help_text, install_shim_command, install_skill_command, parse_args,
     provision_models_command, run_library, version_text,
 };
-use ltmrs::frontend::serve::serve_stdio;
+use ltmrs::frontend::serve::{
+    daemon_idle_ms, daemon_socket_path, ensure_daemon_process, resolve_home, run_daemon_foreground,
+    serve_stdio, stdio_layout,
+};
 use ltmrs::visualizer::run_visualize;
 
 #[tokio::main]
@@ -33,6 +36,45 @@ async fn main() {
             match serve_stdio(socket, std::env::var("HOME").ok()).await {
                 Ok(()) => 0,
                 Err(e) => fail(&e),
+            }
+        }
+        Ok(Command::Daemon {
+            foreground,
+            idle_ms,
+        }) => {
+            let home = std::env::var("HOME").ok();
+            let idle = daemon_idle_ms(idle_ms, std::env::var("LTMRS_DAEMON_IDLE_MS").ok());
+            match resolve_home(home).map(|base| stdio_layout(&base)) {
+                Err(e) => fail(&e),
+                Ok(layout) => {
+                    if foreground {
+                        match run_daemon_foreground(&layout, idle).await {
+                            Ok(()) => 0,
+                            Err(e) => fail(&e),
+                        }
+                    } else {
+                        let exe = std::env::current_exe();
+                        let result = match exe {
+                            Ok(exe) => match ensure_daemon_process(&layout, &exe, idle).await {
+                                Ok(()) => {
+                                    println!(
+                                        "daemon serving at {}",
+                                        daemon_socket_path(&layout).display()
+                                    );
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            },
+                            Err(e) => Err(CliError::Runtime(format!(
+                                "cannot locate ltmrs binary: {e}"
+                            ))),
+                        };
+                        match result {
+                            Ok(()) => 0,
+                            Err(e) => fail(&e),
+                        }
+                    }
+                }
             }
         }
         Ok(Command::Visualize { foreground, port }) => {
