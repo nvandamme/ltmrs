@@ -434,6 +434,7 @@ impl FrontendRegistry {
                         digest: rec.digest,
                         session: rec.session,
                         seq: None,
+                        response: None,
                     },
                 )
             })

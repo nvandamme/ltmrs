@@ -56,12 +56,31 @@ if [ -n "$CHECKOUT" ]; then
     git worktree add --detach "$CHECKOUT" HEAD >&2
     trap 'git worktree remove --force "$CHECKOUT"' EXIT
     set +e
-    (cd "$CHECKOUT" && bash "$HERE/tools/gen_release_evidence.sh" --$MODE $RELEASE $LOCKED --locked)
+    # Full is the default mode, not a CLI flag: the parser only knows
+    # --quick (full = absence of --quick). Build the recursive args
+    # explicitly so the publishable clean-checkout path never emits the
+    # unsupported `--full` flag. Locked resolution is always on here: a
+    # clean-checkout bundle must stand on its own.
+    args=()
+    if [ "$MODE" = "quick" ]; then
+        args+=(--quick)
+    fi
+    if [ -n "$RELEASE" ]; then
+        args+=(--release)
+    fi
+    args+=(--locked)
+    (cd "$CHECKOUT" && bash "$HERE/tools/gen_release_evidence.sh" "${args[@]}")
     INNER=$?
     set -e
     # Move the bundle back even on failure (the logs are the evidence);
-    # the checkout's reports/ is disposable.
-    NEWEST="$(ls -dt "$CHECKOUT"/reports/release-*/ | head -n 1)"
+    # the checkout's reports/ is disposable. An inner failure before its
+    # first bundle leaves no directory: report that instead of letting
+    # `ls`/`mv` fail opaquely under `set -e`.
+    NEWEST="$(ls -dt "$CHECKOUT"/reports/release-*/ 2>/dev/null | head -n 1 || true)"
+    if [ -z "$NEWEST" ]; then
+        echo "release evidence: inner run produced no bundle dir (exit $INNER)" >&2
+        exit $INNER
+    fi
     mkdir -p reports
     mv "$NEWEST" reports/
     echo "reports/$(basename "$NEWEST")"

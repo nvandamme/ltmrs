@@ -80,11 +80,12 @@ pub struct VerifiedBackup {
     pub snapshot: CanonicalExport,
 }
 
-/// Export one coherent snapshot of `repo` plus registry `sessions` into `dir`
+/// Export one coherent snapshot of `repo` plus canonical `sessions` into `dir`
 /// (created when missing) as `<prefix>-<millis>-<v7>.ltmrs-backup`,
 /// published atomically and verified by re-read before returning.
-/// Sessions are registry-owned runtime state passed in by the caller
-/// (the exec layer reads them from the dispatcher registry).
+/// Sessions are canonical Fjall records read by the caller (the exec layer
+/// passes `all_sessions()`); they ride the envelope so the backup carries
+/// the session history restore puts back.
 pub fn export_backup(
     repo: &CanonicalRepository,
     sessions: &[crate::domain::session::Session],
@@ -468,7 +469,7 @@ mod tests {
     fn export_roundtrips_with_manifest() {
         let (dir, repo, disp) = setup();
         let (_a, _b) = seed_alpha_beta(&disp);
-        // One live session rides the envelope (registry-owned state).
+        // One live session rides the envelope (canonical session history).
         let (fe, ch) = ids();
         let start_env = IpcEnvelope {
             protocol_version: PROTOCOL_VERSION,

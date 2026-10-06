@@ -5,6 +5,81 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2026-10-06 — Review receipts and restore generation cutover
+
+### P1-1 restore follows the session migration into Fjall (true backup restore)
+- `restore_replace` takes backup `sessions`, drains `sessions`/`session_ops`/
+  `guide_ops` alongside the nine existing keyspaces and inserts the backup's
+  sessions in the same durable transaction; `restore_verified` passes
+  `snapshot.sessions` and reports the restored session count (was hardcoded 0).
+- `exec_backup_restore` no longer abandons live sessions after replacing
+  (that destroyed what the backup just restored); report text + structured
+  `restored_sessions` field updated; obsolete `abandon_all_sessions` removed.
+- Stale registry-ownership comments corrected (`backup.rs`, `repository.rs`
+  export docs, `mcp.rs` restore description, end-to-end test comment).
+- RED-first regression test
+  `restore_restores_backup_sessions_and_fences_op_receipts`: failed pre-fix
+  (pre-restore sessions survived, backup sessions ignored), green post-fix;
+  also proves op-X/op-Y receipts no longer replay across the generation cut.
+
+### P2-3 clean-checkout evidence wrapper fixed
+- Recursive invocation builds args explicitly (`--quick` iff quick mode,
+  `--release` iff set, always `--locked`); never emits the unsupported
+  `--full` flag (parser exits 2 on it). Missing-bundle case after an inner
+  failure now reports instead of failing opaquely under `set -e`.
+- Regression tests: `clean_checkout_never_passes_mode_as_flag` (static guard)
+  + `clean_checkout_quick_produces_bundle` (end-to-end quick wrapper).
+
+### P3 daemon spawn polish
+- `pre_exec` checks `setsid()` return and fails spawn loudly on error;
+  misleading "reparented (no zombie)" comment corrected.
+
+### P1-2 tool-operation receipts for all mutating guide tools + suggestion_respond
+- Audit: `guide_create/update/forget/merge` + `suggestion_respond` took no
+  envelope and touched no receipt log (`execute_tool` passed `disp, args`
+  only); every other mutation was already receipted. Read-only tools need
+  none (native dispatcher session paths return content-free payloads).
+- `guide_ops` log generalized: `GuideOpKind` (Create/CreateUpdate/Update/
+  Forget/Merge) + `GuideOpLog` (digest/kind/recorded snapshot/merge
+  sources); practice entries keep their shape with collision → key-reuse
+  rejection. One `guide_mutation_idempotent` single-tx wrapper (log check +
+  apply + log + op_seq + barrier); put/rename/forget/merge bodies extracted
+  verbatim into `*_apply_tx` tx-cores, public methods delegate unchanged.
+- Exec layer replays before planning reads (a concurrent rename/forget can
+  never turn a retry into "not found"); responses rebuilt purely from the
+  recorded outcome (byte-identical first vs replay); merge response builder
+  extracted for shared use.
+- `suggestion_respond`: new `suggestion_ops` keyspace + single-tx
+  `respond_suggestion_idempotent` (status transition + all attempt adjusts
+  + receipt); also added to the restore drain list.
+- RED-first tool-level double-delivery tests (all failed pre-fix with the
+  exact review scenarios, green post-fix): create/forget/merge replay,
+  update no-reapply, suggestion single-adjust.
+
+### P2-1 frozen session responses (stronger contract)
+- `SessionReceipt.response: Option<FrozenToolResponse>` (text + structured
+  + is_error; serde-defaulted so legacy receipts fall back to recompute);
+  `store_session_response` (digest-checked) + `session_receipt` reader.
+- `session_start/attempt/end` exec paths: replay returns the frozen response
+  verbatim with zero side effects (previously re-boosted confidence,
+  re-tracked links, recomputed preload/lines); first executions and legacy
+  replays recompute then freeze (freeze stored last, after suggestion
+  filing, so crashes converge).
+- RED-first tests: start preload freeze (D/E/F vs A/B/C), end improvement
+  lines freeze (rate 0.20 recompute vs 0.00 recorded — bypass-proven to fail
+  without the fix and pass with it).
+
+### Validation (single release run for the batch)
+- `cargo fmt -- --check` clean; `cargo clippy --all-targets -- -D warnings`
+  clean (one new `too_many_arguments` allow on `restore_replace`, same
+  precedent as `session_end_tx`).
+- Release evidence full `--release --locked`:
+  `reports/release-bfe8844fe137-full-zDriR1` — fmt clean, clippy clean,
+  702 lib + 6 lifecycle + 4 evidence + 2 smoke passed, 0 failed.
+- No plan/conformance change: session restore + op-log draining implement
+  RV-19 ("snapshot all canonical state") and the generation-invalidates-keys
+  invariant; frozen replay implements "deterministic receipt replay".
+
 ## faaf731 (2026-09-28) — Final release evidence: quality, waves, tickers
 
 ### Inference parallelism probe: candle already threads (2026-09-28)
@@ -131,7 +206,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   transcripts in bundle. Get-ok counts incomparable by contract;
   our duplicate gate passing salted content is DEV-007, known.
 
-## 2026-10-06 — Independent daemon process
+## bfe8844 (2026-10-06) — Independent daemon process
 
 ### Independent daemon process (spawn-on-demand)
 

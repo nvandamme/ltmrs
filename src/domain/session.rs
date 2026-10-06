@@ -176,7 +176,9 @@ pub struct Suggestion {
 /// file): same operation ID + digest replays the recorded outcome, the same
 /// ID with a different digest rejects as key reuse. Attempts additionally
 /// record their sequence number so replays rebuild responses without
-/// touching session state.
+/// touching session state. The frozen tool response (P2-1) makes a
+/// lost-response retry indistinguishable from the original arriving late;
+/// receipts predating it (None) fall back to recomputing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionReceipt {
     /// The request digest the operation first executed with.
@@ -186,6 +188,18 @@ pub struct SessionReceipt {
     /// The attempt sequence number, for attempt operations only.
     #[serde(default)]
     pub seq: Option<u32>,
+    /// The frozen tool response, stored after first execution.
+    #[serde(default)]
+    pub response: Option<FrozenToolResponse>,
+}
+
+/// A frozen tool response (P2-1): the exact text + structured payload +
+/// error flag returned by the first execution, replayed verbatim.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FrozenToolResponse {
+    pub text: String,
+    pub structured: Option<serde_json::Value>,
+    pub is_error: bool,
 }
 
 /// The outcome of claiming a session operation inside its transaction:

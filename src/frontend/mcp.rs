@@ -1074,7 +1074,7 @@ fn native_backup_preview_tool() -> Tool {
 fn native_backup_restore_tool() -> Tool {
     native_tool(
         "backup_restore",
-        "Restore a previewed ltmrs backup, REPLACING the live store (never merging). NATIVE ltmrs tool: requires the single-use confirmation_token from backup_preview plus explicit confirm=true. A safety backup is written first; active sessions are abandoned. The report includes quarantined references and dropped unknown-key counts for manual repair.",
+        "Restore a previewed ltmrs backup, REPLACING the live store (never merging). NATIVE ltmrs tool: requires the single-use confirmation_token from backup_preview plus explicit confirm=true. A safety backup is written first; canonical sessions restore from the backup while channel bindings and virtual live sessions stay registry-side. The report includes quarantined references and dropped unknown-key counts for manual repair.",
         serde_json::json!({
             "confirmation_token": {
                 "type": "string",

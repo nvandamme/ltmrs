@@ -267,11 +267,12 @@ pub struct ConfirmRequest<'a> {
 
 /// Atomically replace the store's domain records with the backup snapshot:
 /// dangling relations are quarantined (listed, skipped); the store flips in
-/// ONE durable transaction covering data, operational keyspaces and the
-/// generation switch (see `restore_replace`), so a crash lands on the old
-/// store or the new one, never a mixture. Sessions are NOT resurrected here
-/// (the exec layer abandons live ones and reports the backup count as
-/// abandoned history).
+/// ONE durable transaction covering data, canonical sessions, both
+/// operational receipt logs and the generation switch (see
+/// `restore_replace`), so a crash lands on the old store or the new one,
+/// never a mixture. Session history restores from the backup (it is
+/// knowledge for continuity recall and analytics); channel bindings/leases
+/// and virtual live sessions stay registry-side and are never restored.
 pub fn restore_verified(
     repo: &CanonicalRepository,
     backup: &crate::interchange::backup::VerifiedBackup,
@@ -308,6 +309,7 @@ pub fn restore_verified(
         &backup.snapshot.guides,
         &backup.snapshot.feedback,
         &backup.snapshot.suggestions,
+        &backup.snapshot.sessions,
         new_generation,
     )
     .map_err(|e| RestoreError::Store(e.message))?;
@@ -319,12 +321,15 @@ pub fn restore_verified(
     );
     restored.insert("relations".to_string(), count(kept.len()));
     restored.insert("guides".to_string(), count(backup.snapshot.guides.len()));
-    // Replace semantics write exactly these five categories. Sessions are
-    // abandoned by design (never restored into the live store); projects,
+    // Replace semantics write exactly these six categories. Sessions
+    // restore from the backup (continuity/analytics knowledge); projects,
     // archives and history have no storage keyspace. Reporting intake
-    // counts here would claim restores that never happened, so these
-    // report 0 with the reason documented, not the snapshot lengths.
-    restored.insert("sessions".to_string(), 0);
+    // counts for the latter would claim restores that never happened, so
+    // these report 0 with the reason documented, not the snapshot lengths.
+    restored.insert(
+        "sessions".to_string(),
+        count(backup.snapshot.sessions.len()),
+    );
     restored.insert(
         "feedback".to_string(),
         count(backup.snapshot.feedback.len()),
@@ -1224,6 +1229,156 @@ mod tests {
             .collect();
         assert_eq!(actives.len(), 1, "exactly one Active generation");
         assert_eq!(actives[0].generation.as_u64(), 2);
+    }
+
+    /// P1-1 (review of bfe8844): restore must follow the session migration
+    /// into Fjall. `restore_replace` drains memories/guides/receipts but
+    /// leaves `sessions`, `session_ops` and `guide_ops` behind, so old
+    /// sessions survive (merely abandoned) while the backup's sessions are
+    /// ignored, and pre-restore operation receipts can replay across the
+    /// generation cut. True backup restore: sessions come from the backup,
+    /// op receipts never cross a generation.
+    #[test]
+    fn restore_restores_backup_sessions_and_fences_op_receipts() {
+        use crate::domain::id::{ChannelId, SessionHandle};
+        use crate::domain::session::SessionOp;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gateway_repo(&dir);
+        let channel = ChannelId::new(uuid::Uuid::from_u128(9));
+        // Live session A via session op X.
+        let handle_a = SessionHandle::new(uuid::Uuid::from_u128(100));
+        match repo
+            .session_start_tx(
+                "op-X",
+                "digest-X",
+                handle_a,
+                channel,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle_a),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        // Guide op Y: creates + practices guide "git" (usage 1).
+        let guide = repo
+            .practice_guide_idempotent(
+                "op-Y",
+                "digest-Y",
+                "git",
+                "dev-tool",
+                None,
+                &[],
+                &["learn it".to_string()],
+                &[],
+                Some(true),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(guide.usage_count, 1);
+        // Backup B carries a different session.
+        let handle_b = SessionHandle::new(uuid::Uuid::from_u128(200));
+        match repo
+            .session_start_tx(
+                "op-B",
+                "digest-B",
+                handle_b,
+                channel,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle_b),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let session_b = repo
+            .all_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.handle == handle_b)
+            .expect("session B must be live before restore");
+        let snapshot = CanonicalExport {
+            sessions: vec![session_b],
+            ..Default::default()
+        };
+        let backup = crate::interchange::backup::VerifiedBackup {
+            digest: snapshot.digest(),
+            store_generation: 1,
+            counts: BTreeMap::new(),
+            snapshot,
+            unknown_top_level: 0,
+        };
+        restore_verified(&repo, &backup, crate::domain::id::StoreGeneration::new(2)).unwrap();
+
+        // Sessions come from the backup: A gone, B present.
+        let handles: Vec<SessionHandle> = repo
+            .all_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.handle)
+            .collect();
+        assert!(
+            !handles.contains(&handle_a),
+            "pre-restore session A must not survive, got: {handles:?}"
+        );
+        assert!(
+            handles.contains(&handle_b),
+            "backup session B must be restored, got: {handles:?}"
+        );
+        // Session op X fenced: retrying it must execute fresh, never replay
+        // the pre-restore outcome for A.
+        let handle_c = SessionHandle::new(uuid::Uuid::from_u128(300));
+        match repo
+            .session_start_tx(
+                "op-X",
+                "digest-X",
+                handle_c,
+                channel,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle_c),
+            SessionOp::Replayed(h) => panic!("stale session op X replayed {h:?} across restore"),
+            SessionOp::Conflict => panic!("same digest must not conflict"),
+        }
+        // Guide op Y fenced: the guides keyspace was legitimately drained,
+        // so retrying op Y must re-apply (guide persisted again), never
+        // return a detached pre-restore recording.
+        let guide = repo
+            .practice_guide_idempotent(
+                "op-Y",
+                "digest-Y",
+                "git",
+                "dev-tool",
+                None,
+                &[],
+                &["learn it".to_string()],
+                &[],
+                Some(true),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(guide.usage_count, 1);
+        assert!(
+            repo.get_guide("git").unwrap().is_some(),
+            "op-Y retry must re-apply into the restored store, not replay a detached recording"
+        );
     }
 
     /// A writer racing the replace can never tear it: with the barrier, a

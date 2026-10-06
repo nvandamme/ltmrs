@@ -33,6 +33,7 @@ use crate::domain::memory::{Evidence, FragmentType, Instant, Memory, MemorySourc
 use crate::domain::relation::{Relation, RelationType};
 use crate::domain::session::SessionOp;
 use crate::domain::session::{AttemptOutcome, Session, Suggestion, SuggestionStatus, TaskOutcome};
+use crate::service::repository::{GuideMutation, RecordedGuideOp};
 use serde_json::{Value, json};
 
 /// Execute a typed tool call, returning the shaped legacy result.
@@ -55,16 +56,16 @@ pub fn execute_tool(
         ToolArgs::SemanticSearch(args) => exec_semantic_search(disp, envelope, args),
         ToolArgs::GuideGet(args) => exec_guide_get(disp, args),
         ToolArgs::GuidePractice(args) => exec_guide_practice(disp, envelope, args),
-        ToolArgs::GuideCreate(args) => exec_guide_create(disp, args),
+        ToolArgs::GuideCreate(args) => exec_guide_create(disp, envelope, args),
         ToolArgs::GuideDistill(args) => exec_guide_distill(disp, envelope, args),
-        ToolArgs::GuideUpdate(args) => exec_guide_update(disp, args),
-        ToolArgs::GuideForget(args) => exec_guide_forget(disp, args),
-        ToolArgs::GuideMerge(args) => exec_guide_merge(disp, args),
+        ToolArgs::GuideUpdate(args) => exec_guide_update(disp, envelope, args),
+        ToolArgs::GuideForget(args) => exec_guide_forget(disp, envelope, args),
+        ToolArgs::GuideMerge(args) => exec_guide_merge(disp, envelope, args),
         ToolArgs::SessionStart(args) => exec_session_start(disp, envelope, args),
         ToolArgs::SessionAttempt(args) => exec_session_attempt(disp, envelope, args),
         ToolArgs::SessionEnd(args) => exec_session_end(disp, envelope, args),
         ToolArgs::SessionStats(args) => exec_session_stats(disp, envelope, args),
-        ToolArgs::SuggestionRespond(args) => exec_suggestion_respond(disp, args),
+        ToolArgs::SuggestionRespond(args) => exec_suggestion_respond(disp, envelope, args),
         ToolArgs::ConflictScan(args) => exec_conflict_scan(disp, args),
         ToolArgs::ProactiveAnalysis(args) => exec_proactive_analysis(disp, args),
         ToolArgs::ProjectAnalytics(args) => exec_project_analytics(disp, args),
@@ -3277,7 +3278,90 @@ fn exec_guide_practice(
 
 // ---- guide_create ----
 
-fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<DomainPayload> {
+/// Rebuild one guide tool response from its recorded outcome (P1-2): pure
+/// function of the recorded snapshot (+ merge sources), so first execution
+/// and replay return byte-identical responses without re-applying anything.
+fn guide_op_response(recorded: &RecordedGuideOp) -> DomainResult<DomainPayload> {
+    use crate::service::repository::GuideOpKind;
+    let guide = recorded.guide.as_ref().ok_or_else(|| {
+        DomainError::new(
+            DomainErrorCode::Validation,
+            "recorded guide outcome missing",
+        )
+    })?;
+    Ok(match recorded.kind {
+        GuideOpKind::Create => ok_result(
+            format!(
+                "Created new guide \"{}\" ({}) with a detailed manual.",
+                guide.name, guide.category
+            ),
+            json!({ "success": true, "guide": guide.name }),
+        ),
+        GuideOpKind::CreateUpdate => ok_result(
+            format!(
+                "Updated manual for existing guide \"{}\" ({})",
+                guide.name, guide.category
+            ),
+            json!({ "success": true, "guide": guide.name }),
+        ),
+        GuideOpKind::Update => ok_result(
+            format!(
+                "Updated guide \"{}\":\n{}",
+                guide.name,
+                format_guide_detail(guide)
+            ),
+            json!({ "success": true, "guide": guide.name }),
+        ),
+        GuideOpKind::Forget => ok_result(
+            format!("Successfully forgot guide: {}", guide.name),
+            json!({ "success": true, "guide": guide.name }),
+        ),
+        GuideOpKind::Merge => format_guide_merge_response(guide, &recorded.merged_sources),
+    })
+}
+
+/// Map a guide tool receipt outcome to the legacy surface (P1-2): key reuse
+/// and missing guides are tool errors; anything else is a wire error.
+fn map_guide_tool_error(e: DomainError) -> DomainResult<DomainPayload> {
+    if matches!(
+        e.code,
+        DomainErrorCode::NotFound
+            | DomainErrorCode::KeyReuseDifferentInput
+            | DomainErrorCode::RevisionConflict
+            | DomainErrorCode::Validation
+    ) {
+        return Ok(err_result(&e.message));
+    }
+    Err(e)
+}
+
+/// Replay shortcut shared by the receipted guide tools (P1-2): when this
+/// operation already completed, return its recorded response before any
+/// planning read (a concurrent rename/forget/merge must not turn a replay
+/// into a spurious "not found").
+fn replay_recorded_guide_op(
+    repo: &crate::service::repository::CanonicalRepository,
+    operation_id: &str,
+    digest: &str,
+) -> DomainResult<Option<DomainPayload>> {
+    match repo.read_recorded_guide_op(operation_id, digest) {
+        Ok(None) => Ok(None),
+        Ok(Some(recorded)) => Ok(Some(guide_op_response(&recorded)?)),
+        Err(e)
+            if e.code == DomainErrorCode::KeyReuseDifferentInput
+                || e.code == DomainErrorCode::Validation =>
+        {
+            Ok(Some(err_result(&e.message)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn exec_guide_create(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &GuideCreateArgs,
+) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     if args.guide.trim().is_empty()
         || args.category.trim().is_empty()
@@ -3286,6 +3370,13 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
         return Ok(err_result(
             "'guide', 'category', and 'description' parameters are required",
         ));
+    }
+    // Receipted operation (P1-2): same operation ID + digest replays the
+    // recorded response instead of re-executing.
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+        return Ok(replayed);
     }
     let now = disp.clock().now_millis();
 
@@ -3296,20 +3387,18 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
         updated.updated_at = Instant::new(now);
         // Revision-checked: a concurrent mutation since the read rejects
         // instead of being overwritten (re-review P1-2).
-        match repo.put_guide_checked(Some(expected), &updated) {
-            Ok(()) => {}
-            Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
-                return Ok(err_result(&e.message));
-            }
-            Err(e) => return Err(e),
-        }
-        return Ok(ok_result(
-            format!(
-                "Updated manual for existing guide \"{}\" ({})",
-                updated.name, updated.category
-            ),
-            json!({ "success": true, "guide": updated.name }),
-        ));
+        let recorded = match repo.guide_mutation_idempotent(
+            &op_id,
+            &digest,
+            GuideMutation::CreateUpdate {
+                expected: Some(expected),
+                guide: updated,
+            },
+        ) {
+            Ok(recorded) => recorded,
+            Err(e) => return map_guide_tool_error(e),
+        };
+        return guide_op_response(&recorded);
     }
 
     let guides = repo.get_guides()?;
@@ -3323,20 +3412,18 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
         let mut updated = similar.clone();
         updated.description = args.description.clone();
         updated.updated_at = Instant::new(now);
-        match repo.put_guide_checked(Some(expected), &updated) {
-            Ok(()) => {}
-            Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
-                return Ok(err_result(&e.message));
-            }
-            Err(e) => return Err(e),
-        }
-        return Ok(ok_result(
-            format!(
-                "Updated manual for existing guide \"{}\" ({})",
-                updated.name, updated.category
-            ),
-            json!({ "success": true, "guide": updated.name }),
-        ));
+        let recorded = match repo.guide_mutation_idempotent(
+            &op_id,
+            &digest,
+            GuideMutation::CreateUpdate {
+                expected: Some(expected),
+                guide: updated,
+            },
+        ) {
+            Ok(recorded) => recorded,
+            Err(e) => return map_guide_tool_error(e),
+        };
+        return guide_op_response(&recorded);
     }
 
     let new_guide = create_guide(
@@ -3349,20 +3436,15 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
     );
     // Create-if-absent: a concurrent creation wins instead of being
     // overwritten (re-review P1-2).
-    match repo.put_guide_checked(None, &new_guide) {
-        Ok(()) => {}
-        Err(e) if e.code == crate::domain::command::DomainErrorCode::Validation => {
-            return Ok(err_result(&e.message));
-        }
-        Err(e) => return Err(e),
-    }
-    Ok(ok_result(
-        format!(
-            "Created new guide \"{}\" ({}) with a detailed manual.",
-            new_guide.name, new_guide.category
-        ),
-        json!({ "success": true, "guide": new_guide.name }),
-    ))
+    let recorded = match repo.guide_mutation_idempotent(
+        &op_id,
+        &digest,
+        GuideMutation::Create { guide: new_guide },
+    ) {
+        Ok(recorded) => recorded,
+        Err(e) => return map_guide_tool_error(e),
+    };
+    guide_op_response(&recorded)
 }
 
 // ---- guide_distill ----
@@ -3432,10 +3514,21 @@ fn exec_guide_distill(
 
 // ---- guide_update ----
 
-fn exec_guide_update(disp: &Dispatcher, args: &GuideUpdateArgs) -> DomainResult<DomainPayload> {
+fn exec_guide_update(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &GuideUpdateArgs,
+) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     if args.guide.trim().is_empty() {
         return Ok(err_result("'guide' parameter is required"));
+    }
+    // Receipted operation (P1-2): replay before planning, so a retry never
+    // mistakes a concurrently changed store for a failure.
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+        return Ok(replayed);
     }
     let now = disp.clock().now_millis();
     let mut guide = match repo.get_guide(&args.guide)? {
@@ -3488,52 +3581,44 @@ fn exec_guide_update(disp: &Dispatcher, args: &GuideUpdateArgs) -> DomainResult<
     // Rename path (re-review R3, single transaction): the renamed put,
     // memory reference moves and old-key delete commit together — a
     // failure anywhere leaves no half-rename. The planning revision
-    // guards against concurrent updates (re-review P1-2).
-    if !old_name.eq_ignore_ascii_case(&guide.name) {
-        match repo.rename_guide_atomically(&old_name, expected_revision, &guide) {
-            Ok(()) => {}
-            Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
-                return Ok(err_result(&e.message));
-            }
-            Err(e) => return Err(e),
+    // guards against concurrent updates (re-review P1-2). Recorded
+    // atomically with the operation receipt (P1-2): retries replay.
+    let mutation = if !old_name.eq_ignore_ascii_case(&guide.name) {
+        GuideMutation::Update {
+            expected: Some(expected_revision),
+            guide: guide.clone(),
+            old_name: Some(old_name.clone()),
         }
-        // Already stored above; return without a second put.
-        return Ok(ok_result(
-            format!(
-                "Updated guide \"{}\":\n{}",
-                guide.name,
-                format_guide_detail(&guide)
-            ),
-            json!({ "success": true, "guide": guide.name }),
-        ));
-    }
-    // Non-rename update through the revision-checked write (re-review
-    // P1-2): a concurrent mutation since the read above rejects instead
-    // of being overwritten.
-    match repo.put_guide_checked(Some(expected_revision), &guide) {
-        Ok(()) => {}
-        Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
-            return Ok(err_result(&e.message));
+    } else {
+        GuideMutation::Update {
+            expected: Some(expected_revision),
+            guide: guide.clone(),
+            old_name: None,
         }
-        Err(e) => return Err(e),
-    }
-
-    Ok(ok_result(
-        format!(
-            "Updated guide \"{}\":\n{}",
-            guide.name,
-            format_guide_detail(&guide)
-        ),
-        json!({ "success": true, "guide": guide.name }),
-    ))
+    };
+    let recorded = match repo.guide_mutation_idempotent(&op_id, &digest, mutation) {
+        Ok(recorded) => recorded,
+        Err(e) => return map_guide_tool_error(e),
+    };
+    guide_op_response(&recorded)
 }
 
 // ---- guide_forget ----
 
-fn exec_guide_forget(disp: &Dispatcher, args: &GuideForgetArgs) -> DomainResult<DomainPayload> {
+fn exec_guide_forget(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &GuideForgetArgs,
+) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     if args.guide.trim().is_empty() {
         return Ok(err_result("'guide' parameter is required"));
+    }
+    // Receipted operation (P1-2): replay before planning.
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+        return Ok(replayed);
     }
     let existing = repo.get_guide(&args.guide)?;
     if existing.is_none() {
@@ -3541,17 +3626,85 @@ fn exec_guide_forget(disp: &Dispatcher, args: &GuideForgetArgs) -> DomainResult<
     }
     // Single-transaction forget (re-review R3): reference removal and the
     // guide delete commit together — no dangling references to a deleted
-    // guide and no surviving guide with half-removed references.
-    repo.forget_guide_atomically(&args.guide)?;
-    Ok(ok_result(
-        format!("Successfully forgot guide: {}", args.guide),
-        json!({ "success": true, "guide": args.guide }),
-    ))
+    // guide and no surviving guide with half-removed references. Recorded
+    // atomically with the operation receipt (P1-2): retries replay.
+    let recorded = match repo.guide_mutation_idempotent(
+        &op_id,
+        &digest,
+        GuideMutation::Forget {
+            name: args.guide.clone(),
+        },
+    ) {
+        Ok(recorded) => recorded,
+        Err(e) => return map_guide_tool_error(e),
+    };
+    guide_op_response(&recorded)
 }
 
 // ---- guide_merge ----
 
-fn exec_guide_merge(disp: &Dispatcher, args: &GuideMergeArgs) -> DomainResult<DomainPayload> {
+/// Rebuild the merge tool response from the recorded outcome (P1-2): pure
+/// function of the result snapshot + sources, identical on first execution
+/// and on replay.
+fn format_guide_merge_response(result: &Guide, sources: &[String]) -> DomainPayload {
+    let mut response = format!(
+        "Merged {} guides into \"{}\" ({})\n",
+        sources.len(),
+        result.name,
+        result.category
+    );
+    response.push_str(&format!(
+        "Total usage: {}x | Contexts: {} | Learnings: {}\n",
+        result.usage_count,
+        result.contexts.len(),
+        result.learnings.len()
+    ));
+    response.push_str(&format!("Removed: {}", sources.join(", ")));
+
+    let mut hook: Vec<String> = Vec::new();
+    if !result.anti_patterns.is_empty() {
+        hook.push(format!(
+            "Anti-patterns inherited: {}",
+            result.anti_patterns.len()
+        ));
+    }
+    if !result.pitfalls.is_empty() {
+        hook.push(format!("Pitfalls inherited: {}", result.pitfalls.len()));
+    }
+    if !result.source_memories.is_empty() {
+        hook.push(format!(
+            "Source memories linked: {} fragment(s)",
+            result.source_memories.len()
+        ));
+    }
+    if !result.validated_by.is_empty() {
+        hook.push(format!(
+            "Validated by: {} fragment(s)",
+            result.validated_by.len()
+        ));
+    }
+    if !hook.is_empty() {
+        response.push_str("\n\n--- HOOK SUGGESTIONS ---\n");
+        for h in &hook {
+            response.push_str(&format!("{h}\n"));
+        }
+    }
+
+    ok_result(
+        response,
+        json!({
+            "success": true,
+            "guide": result.name,
+            "merged": sources,
+        }),
+    )
+}
+
+fn exec_guide_merge(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &GuideMergeArgs,
+) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     if args.guides.len() < 2 {
         return Ok(err_result(
@@ -3560,6 +3713,13 @@ fn exec_guide_merge(disp: &Dispatcher, args: &GuideMergeArgs) -> DomainResult<Do
     }
     if args.guide.trim().is_empty() || args.category.trim().is_empty() {
         return Ok(err_result("'guide' and 'category' parameters are required"));
+    }
+    // Receipted operation (P1-2): replay before planning, so a retry never
+    // mistakes consumed sources for a failure.
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+        return Ok(replayed);
     }
     let now = disp.clock().now_millis();
 
@@ -3641,72 +3801,25 @@ fn exec_guide_merge(disp: &Dispatcher, args: &GuideMergeArgs) -> DomainResult<Do
     // Atomic single-transaction merge: references, source deletes and the
     // merged put commit together, guarded by the source revisions read
     // during planning (re-review R3). A concurrent source update rejects
-    // explicitly instead of being silently discarded.
+    // explicitly instead of being silently discarded. Recorded atomically
+    // with the operation receipt (P1-2): retries replay.
     let expected: Vec<(String, EntityRevision)> = source_guides
         .iter()
         .map(|g| (g.name.clone(), g.entity_revision))
         .collect();
-    match repo.merge_guides_atomically(&args.guides, &expected, &new_guide) {
-        Ok(()) => {}
-        Err(e) if e.code == crate::domain::command::DomainErrorCode::RevisionConflict => {
-            return Ok(err_result(&e.message));
-        }
-        Err(e) => return Err(e),
-    }
-
-    let mut response = format!(
-        "Merged {} guides into \"{}\" ({})\n",
-        args.guides.len(),
-        new_guide.name,
-        new_guide.category
-    );
-    response.push_str(&format!(
-        "Total usage: {}x | Contexts: {} | Learnings: {}\n",
-        total_usage,
-        contexts.len(),
-        learnings.len()
-    ));
-    response.push_str(&format!("Removed: {}", args.guides.join(", ")));
-
-    let mut hook: Vec<String> = Vec::new();
-    if !anti_patterns.is_empty() {
-        hook.push(format!("Anti-patterns inherited: {}", anti_patterns.len()));
-    }
-    if !pitfalls.is_empty() {
-        hook.push(format!("Pitfalls inherited: {}", pitfalls.len()));
-    }
-    let all_source_mems: Vec<_> = source_guides
-        .iter()
-        .flat_map(|g| g.source_memories.iter())
-        .collect();
-    if !all_source_mems.is_empty() {
-        hook.push(format!(
-            "Source memories linked: {} fragment(s)",
-            all_source_mems.len()
-        ));
-    }
-    let all_validated: Vec<_> = source_guides
-        .iter()
-        .flat_map(|g| g.validated_by.iter())
-        .collect();
-    if !all_validated.is_empty() {
-        hook.push(format!("Validated by: {} fragment(s)", all_validated.len()));
-    }
-    if !hook.is_empty() {
-        response.push_str("\n\n--- HOOK SUGGESTIONS ---\n");
-        for h in &hook {
-            response.push_str(&format!("{h}\n"));
-        }
-    }
-
-    Ok(ok_result(
-        response,
-        json!({
-            "success": true,
-            "guide": new_guide.name,
-            "merged": args.guides,
-        }),
-    ))
+    let recorded = match repo.guide_mutation_idempotent(
+        &op_id,
+        &digest,
+        GuideMutation::Merge {
+            sources: args.guides.clone(),
+            expected,
+            result: new_guide,
+        },
+    ) {
+        Ok(recorded) => recorded,
+        Err(e) => return map_guide_tool_error(e),
+    };
+    guide_op_response(&recorded)
 }
 
 /// Order-preserving deduplication (upstream `[...new Set(...)]`).
@@ -3721,6 +3834,55 @@ fn dedup<T: PartialEq>(items: Vec<T>) -> Vec<T> {
 }
 
 // ---- session_start ----
+
+/// Frozen-response replay for session tools (P2-1): when this operation
+/// already completed with a frozen response, return it verbatim instead of
+/// recomputing from live state. Absent receipts (or legacy receipts without
+/// a frozen response) fall through to the normal path, which recomputes
+/// and then freezes.
+fn replay_frozen_session_response(
+    repo: &crate::service::repository::CanonicalRepository,
+    operation_id: &str,
+) -> DomainResult<Option<DomainPayload>> {
+    match repo.session_receipt(operation_id)? {
+        Some(rec) => Ok(rec.response.map(|r| DomainPayload::ToolResult {
+            text: r.text,
+            structured: r.structured,
+            is_error: r.is_error,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Freeze a freshly computed session tool response into its receipt (P2-1),
+/// so a lost-response retry returns the original verbatim. A digest
+/// mismatch rejects as key reuse; any other failure is a wire error.
+fn freeze_session_response(
+    repo: &crate::service::repository::CanonicalRepository,
+    operation_id: &str,
+    digest: &str,
+    payload: &DomainPayload,
+) -> DomainResult<()> {
+    use crate::domain::session::FrozenToolResponse;
+    let response = match payload {
+        DomainPayload::ToolResult {
+            text,
+            structured,
+            is_error,
+        } => FrozenToolResponse {
+            text: text.clone(),
+            structured: structured.clone(),
+            is_error: *is_error,
+        },
+        _ => {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "only tool results can be frozen",
+            ));
+        }
+    };
+    repo.store_session_response(operation_id, digest, &response)
+}
 
 fn exec_session_start(
     disp: &Dispatcher,
@@ -3757,7 +3919,17 @@ fn exec_session_start(
         abandon,
         now,
     ) {
-        Ok(SessionOp::Applied(h)) | Ok(SessionOp::Replayed(h)) => h,
+        Ok(SessionOp::Applied(h)) => h,
+        Ok(SessionOp::Replayed(h)) => {
+            // Frozen replay (P2-1): a recorded response returns verbatim
+            // instead of being recomputed from live state. Legacy receipts
+            // without one fall through to the normal path, which recomputes
+            // and then freezes.
+            if let Some(frozen) = replay_frozen_session_response(repo, &op_id)? {
+                return Ok(frozen);
+            }
+            h
+        }
         Ok(SessionOp::Conflict) => return key_reuse_result(),
         Err(e) => return Err(e),
     };
@@ -3858,7 +4030,17 @@ fn exec_session_start(
         "guides": guide_names,
         "preloaded_memories": read_ids,
     });
-    Ok(ok_result(response, data))
+    // Freeze the response into the receipt (P2-1): a lost-response retry
+    // returns this verbatim instead of recomputing from live state.
+    let payload = ok_result(response, data);
+    match freeze_session_response(repo, &op_id, &digest, &payload) {
+        Ok(()) => {}
+        Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
+            return key_reuse_result();
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(payload)
 }
 
 /// Continuity recall: dead-ends, lessons and warnings from prior sessions
@@ -4025,6 +4207,8 @@ fn exec_session_attempt(
     // receipt commit together in the store. Replays resolve to the
     // recorded sequence number (the rebuilt response needs no live
     // session); digest mismatch rejects; barrier failures fail loudly.
+    // A frozen response (P2-1) returns verbatim; otherwise the response is
+    // rebuilt and then frozen.
     let seq = match disp.repo().session_attempt_tx(
         &op_id,
         &digest,
@@ -4036,7 +4220,13 @@ fn exec_session_attempt(
         related_memory_id,
         now,
     ) {
-        Ok(SessionOp::Applied((_, seq))) | Ok(SessionOp::Replayed((_, seq))) => seq,
+        Ok(SessionOp::Applied((_, seq))) => seq,
+        Ok(SessionOp::Replayed((_, seq))) => {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &op_id)? {
+                return Ok(frozen);
+            }
+            seq
+        }
         Ok(SessionOp::Conflict) => return key_reuse_result(),
         Err(e) => return Err(e),
     };
@@ -4060,7 +4250,15 @@ fn exec_session_attempt(
         "recorded": true,
         "attempt_id": format!("{}#{}", handle.as_uuid(), seq),
     });
-    Ok(ok_result(response, data))
+    let payload = ok_result(response, data);
+    match freeze_session_response(disp.repo(), &op_id, &digest, &payload) {
+        Ok(()) => {}
+        Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
+            return key_reuse_result();
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(payload)
 }
 
 // ---- session_end ----
@@ -4102,6 +4300,8 @@ fn exec_session_end(
     // transaction. A replay resolves; a digest mismatch rejects; barrier
     // failures fail loudly. Ending an already-terminal session reports
     // "no active session" (nothing was done, so nothing is recorded).
+    // A frozen response (P2-1) returns verbatim with no further effects;
+    // otherwise the response is rebuilt from canonical state and frozen.
     let improvement_lines = match disp.repo().session_end_tx(
         &op_id,
         &digest,
@@ -4111,7 +4311,13 @@ fn exec_session_end(
         args.lessons.clone(),
         now,
     ) {
-        Ok(SessionOp::Applied((_, lines, true))) | Ok(SessionOp::Replayed((_, lines, _))) => lines,
+        Ok(SessionOp::Applied((_, lines, true))) => lines,
+        Ok(SessionOp::Replayed((_, lines, _))) => {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &op_id)? {
+                return Ok(frozen);
+            }
+            lines
+        }
         Ok(SessionOp::Applied((_, _, false))) => {
             return Ok(err_result("No active session to end."));
         }
@@ -4207,7 +4413,17 @@ fn exec_session_end(
     });
     // No separate record/persist tail: the receipt committed atomically
     // with the end transition (and its barrier) in session_end_tx above.
-    Ok(ok_result(response, data))
+    // The response freezes into the receipt (P2-1) so replays return it
+    // verbatim instead of recomputing from live guide state.
+    let payload = ok_result(response, data);
+    match freeze_session_response(disp.repo(), &op_id, &digest, &payload) {
+        Ok(()) => {}
+        Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
+            return key_reuse_result();
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(payload)
 }
 
 // ---- session_stats ----
@@ -4298,6 +4514,7 @@ fn exec_session_stats(
 
 fn exec_suggestion_respond(
     disp: &Dispatcher,
+    envelope: &IpcEnvelope,
     args: &SuggestionRespondArgs,
 ) -> DomainResult<DomainPayload> {
     let action = args.action.to_lowercase();
@@ -4311,39 +4528,21 @@ fn exec_suggestion_respond(
         SuggestionStatus::Dismissed
     };
 
+    // Receipted operation (P1-2): status transition + attempt adjustments
+    // commit atomically with the receipt, so a retry replays instead of
+    // adjusting twice.
     let now = disp.clock().now_millis();
-    let mut suggestion = match repo.get_suggestion(args.id)? {
-        Some(s) => s,
-        None => return Ok(err_result("Could not update this suggestion in the store.")),
-    };
-    suggestion.status = status;
-    suggestion.resolved_at = Some(Instant::new(now));
-    repo.put_suggestion(&suggestion)?;
-
-    // Adjust attempt confidence based on the action (best-effort).
-    if let Some(session_id) = &suggestion.session_id {
-        let handle_uuid = uuid::Uuid::parse_str(session_id).ok();
-        if let Some(h) = handle_uuid {
-            let handle = crate::domain::id::SessionHandle::new(h);
-            let attempts = disp
-                .repo()
-                .get_session(handle)
-                .unwrap_or(None)
-                .map(|s| s.attempts.clone())
-                .unwrap_or_default();
-            for a in &attempts {
-                if action == "dismiss"
-                    && matches!(
-                        a.outcome,
-                        AttemptOutcome::Rejected | AttemptOutcome::Partial
-                    )
-                {
-                    let _ = disp.repo().adjust_attempt(handle, a.seq, -0.02, now);
-                } else if action != "dismiss" && a.outcome == AttemptOutcome::Promising {
-                    let _ = disp.repo().adjust_attempt(handle, a.seq, 0.02, now);
-                }
-            }
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    match repo.respond_suggestion_idempotent(&op_id, &digest, args.id, status, now) {
+        Ok(_) => {}
+        Err(e)
+            if e.code == DomainErrorCode::NotFound
+                || e.code == DomainErrorCode::KeyReuseDifferentInput =>
+        {
+            return Ok(err_result(&e.message));
         }
+        Err(e) => return Err(e),
     }
 
     let message = if action == "accept" {
@@ -4612,8 +4811,9 @@ fn exec_backup_preview(
 
 /// Restore a previewed backup (REPLACE, never merge): re-verify the file,
 /// consume the single-use token, write a safety backup first, replace the
-/// records, bump the generation (invalidating pre-restore pipelines) and
-/// abandon live sessions. Rollback is a second restore of the safety file.
+/// records including canonical sessions, bump the generation (invalidating
+/// pre-restore pipelines and op receipts) and report. Rollback is a second
+/// restore of the safety file.
 fn exec_backup_restore(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
@@ -4701,14 +4901,14 @@ fn exec_backup_restore(
         .map_err(|e| fail(format!("safety backup failed: {e}")))?;
     export_backup_to(&safety_path, &safety_bytes)
         .map_err(|e| fail(format!("safety backup failed: {e}")))?;
-    // Replace, bump, abandon.
+    // Replace + bump in one durable transaction (P1-1): domain records,
+    // canonical sessions from the backup, both op-receipt logs drained so
+    // no pre-restore identity replays across the generation cut.
+    // Rollback is a second restore of the safety file.
     let new_generation = crate::domain::id::StoreGeneration::new(live_generation + 1);
     let report = restore_verified(disp.repo(), &verified, new_generation)
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
-    let abandoned = disp
-        .repo()
-        .abandon_all_sessions(now)
-        .map_err(|e| fail(format!("backup restore failed: {}", e.message)))?;
+    let sessions_restored = report.restored.get("sessions").copied().unwrap_or(0);
     let quarantined = report
         .quarantined
         .iter()
@@ -4716,12 +4916,12 @@ fn exec_backup_restore(
         .collect::<Vec<_>>()
         .join("; ");
     let text = format!(
-        "Restored {} memories, {} guides from {}\nGeneration {} active; {} live sessions abandoned; safety backup at {}.{}{}{}",
+        "Restored {} memories, {} guides, {} sessions from {}\nGeneration {} active; safety backup at {}.{}{}{}",
         report.restored.get("memories").copied().unwrap_or(0),
         report.restored.get("guides").copied().unwrap_or(0),
+        sessions_restored,
         source.display(),
         report.generation,
-        abandoned,
         safety_path.display(),
         if quarantined.is_empty() {
             String::new()
@@ -4752,7 +4952,7 @@ fn exec_backup_restore(
             "unknown_top_level": report.unknown_top_level,
             "generation": report.generation,
             "safety_backup": safety_path.to_string_lossy(),
-            "abandoned_sessions": abandoned,
+            "restored_sessions": sessions_restored,
             "live_writes_since_preview": live_writes_since_preview,
         }),
     ))
@@ -8079,7 +8279,7 @@ mod tests {
 
     /// Full restore cycle with rollback through the safety file: alpha live,
     /// backup alpha, add beta, restore (beta gone), restore safety (beta back).
-    /// Generation advances on every restore; sessions are abandoned.
+    /// Generation advances on every restore; sessions restore from the backup.
     #[test]
     fn backup_restore_end_to_end_with_rollback() {
         let (disp, _dir) = test_dispatcher();
@@ -9859,5 +10059,310 @@ mod tests {
             .unwrap()
             .expect("add enqueues one pending job");
         assert_eq!(job.seq, 1, "single enqueue, no re-point");
+    }
+
+    /// P1-2: a retried `guide_create` (same envelope = lost response +
+    /// transport retry) must replay the recorded success, not fail with
+    /// "already exists".
+    #[test]
+    fn guide_create_retry_replays_recorded_success() {
+        let (disp, _dir) = test_dispatcher();
+        let args = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "alpha".to_string(),
+            category: "dev-tool".to_string(),
+            description: "alpha guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        let env = tool_call(1, args.clone());
+        let first = run(&disp, &env, &args);
+        assert!(
+            !result_is_error(&first),
+            "create failed: {}",
+            result_text(&first)
+        );
+        let second = run(&disp, &env, &args);
+        assert!(
+            !result_is_error(&second),
+            "create retry must replay success, got: {}",
+            result_text(&second)
+        );
+        assert_eq!(result_text(&second), result_text(&first));
+    }
+
+    /// P1-2: a retried `guide_update` must not re-apply the field transform
+    /// (appending the anti-pattern a second time and advancing the revision
+    /// again) — same envelope replays the recorded outcome.
+    #[test]
+    fn guide_update_retry_does_not_reapply_transform() {
+        let (disp, _dir) = test_dispatcher();
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "alpha".to_string(),
+            category: "dev-tool".to_string(),
+            description: "alpha guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        run(&disp, &tool_call(1, create.clone()), &create);
+        let update = ToolArgs::GuideUpdate(GuideUpdateArgs {
+            guide: "alpha".to_string(),
+            new_name: None,
+            category: None,
+            description: None,
+            add_anti_patterns: vec!["don't do X".to_string()],
+            add_pitfalls: vec![],
+            add_depends_on: vec![],
+            add_enables: vec![],
+            superseded_by: None,
+            deprecated: false,
+        });
+        let env = tool_call(2, update.clone());
+        let first = run(&disp, &env, &update);
+        assert!(
+            !result_is_error(&first),
+            "update failed: {}",
+            result_text(&first)
+        );
+        let second = run(&disp, &env, &update);
+        assert!(
+            !result_is_error(&second),
+            "update retry must replay success, got: {}",
+            result_text(&second)
+        );
+        assert_eq!(
+            result_text(&second),
+            result_text(&first),
+            "retry must return the recorded response, not a re-applied one"
+        );
+        let stored = disp.repo().get_guide("alpha").unwrap().unwrap();
+        assert_eq!(
+            stored.anti_patterns,
+            vec!["don't do X".to_string()],
+            "anti-pattern applied exactly once, got: {:?}",
+            stored.anti_patterns
+        );
+    }
+
+    /// P1-2: a retried `guide_forget` must replay "Successfully forgot"
+    /// instead of failing with "not found".
+    #[test]
+    fn guide_forget_retry_replays_recorded_success() {
+        let (disp, _dir) = test_dispatcher();
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "alpha".to_string(),
+            category: "dev-tool".to_string(),
+            description: "alpha guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        run(&disp, &tool_call(1, create.clone()), &create);
+        let forget = ToolArgs::GuideForget(GuideForgetArgs {
+            guide: "alpha".to_string(),
+        });
+        let env = tool_call(2, forget.clone());
+        let first = run(&disp, &env, &forget);
+        assert!(
+            !result_is_error(&first),
+            "forget failed: {}",
+            result_text(&first)
+        );
+        let second = run(&disp, &env, &forget);
+        assert!(
+            !result_is_error(&second),
+            "forget retry must replay success, got: {}",
+            result_text(&second)
+        );
+        assert_eq!(result_text(&second), result_text(&first));
+    }
+
+    /// P1-2: a retried `guide_merge` must replay the recorded merge instead
+    /// of failing on the (now consumed) sources.
+    #[test]
+    fn guide_merge_retry_replays_recorded_success() {
+        let (disp, _dir) = test_dispatcher();
+        for (op, name) in [(1, "alpha"), (2, "beta")] {
+            let create = ToolArgs::GuideCreate(GuideCreateArgs {
+                guide: name.to_string(),
+                category: "dev-tool".to_string(),
+                description: format!("{name} guide"),
+                contexts: vec![],
+                learnings: vec![],
+            });
+            run(&disp, &tool_call(op, create.clone()), &create);
+        }
+        let merge = ToolArgs::GuideMerge(GuideMergeArgs {
+            guides: vec!["alpha".to_string(), "beta".to_string()],
+            guide: "gamma".to_string(),
+            category: "dev-tool".to_string(),
+            description: Some("merged".to_string()),
+            contexts: None,
+            learnings: None,
+        });
+        let env = tool_call(3, merge.clone());
+        let first = run(&disp, &env, &merge);
+        assert!(
+            !result_is_error(&first),
+            "merge failed: {}",
+            result_text(&first)
+        );
+        let second = run(&disp, &env, &merge);
+        assert!(
+            !result_is_error(&second),
+            "merge retry must replay success, got: {}",
+            result_text(&second)
+        );
+        assert_eq!(result_text(&second), result_text(&first));
+    }
+
+    /// P1-2: a retried `suggestion_respond` must not apply the attempt
+    /// confidence adjustment a second time (dismiss + retry penalizes once).
+    /// (The accept path starts at confidence 1.0 where +0.02 clamps
+    /// invisibly, so the dismiss path carries the observable assertion;
+    /// both share the one receipt boundary being added.)
+    #[test]
+    fn suggestion_respond_retry_adjusts_attempt_once() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let start_result = run(&disp, &tool_call(1, start.clone()), &start);
+        assert!(!result_is_error(&start_result));
+        let handle = disp
+            .registry()
+            .channel_session(fe(1), ch(1))
+            .expect("channel must be bound after start");
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: "try X".to_string(),
+            outcome: "rejected".to_string(),
+            critique: None,
+            rationale: None,
+            related_memory_id: None,
+        });
+        let attempt_result = run(&disp, &tool_call(2, attempt.clone()), &attempt);
+        assert!(!result_is_error(&attempt_result));
+        let suggestion = Suggestion {
+            id: 1,
+            session_id: Some(handle.as_uuid().to_string()),
+            suggestion: "Try Y next.".to_string(),
+            status: SuggestionStatus::Pending,
+            created_at: Instant::new(1000),
+            resolved_at: None,
+        };
+        disp.repo().put_suggestion(&suggestion).unwrap();
+        let respond = ToolArgs::SuggestionRespond(SuggestionRespondArgs {
+            id: 1,
+            action: "dismiss".to_string(),
+        });
+        let env = tool_call(3, respond.clone());
+        let first = run(&disp, &env, &respond);
+        assert!(
+            !result_is_error(&first),
+            "respond failed: {}",
+            result_text(&first)
+        );
+        let confidence_after_first =
+            disp.repo().get_session(handle).unwrap().unwrap().attempts[0].confidence;
+        let second = run(&disp, &env, &respond);
+        assert!(
+            !result_is_error(&second),
+            "respond retry must replay success, got: {}",
+            result_text(&second)
+        );
+        let confidence_after_retry =
+            disp.repo().get_session(handle).unwrap().unwrap().attempts[0].confidence;
+        assert_eq!(
+            confidence_after_retry, confidence_after_first,
+            "retry must not adjust confidence twice"
+        );
+    }
+
+    /// P2-1: a retried `session_start` (lost response) must return the
+    /// recorded response verbatim, even when memories added afterwards
+    /// would change a recomputed preload.
+    #[test]
+    fn session_start_retry_returns_frozen_response() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let env = tool_call(1, start.clone());
+        let first = run(&disp, &env, &start);
+        assert!(!result_is_error(&first));
+        // State that would change a recomputed preload response.
+        add_fragment(&disp, 2, "## Preload Changer\n\n### Context\nNew memory.");
+        let second = run(&disp, &env, &start);
+        assert!(!result_is_error(&second));
+        assert_eq!(
+            result_text(&second),
+            result_text(&first),
+            "retry must return the frozen original response"
+        );
+    }
+
+    /// P2-1: a retried `session_end` must return the recorded response
+    /// verbatim, even when guide outcomes recorded afterwards would change
+    /// recomputed improvement lines (success rate 0.00 → 0.25).
+    #[test]
+    fn session_end_retry_returns_frozen_response() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        // Three failures drive the used guide below the improvement
+        // threshold (rate 0.00); practice also links the guide to the
+        // session so `session_end` evaluates it.
+        for op in [2, 3, 4] {
+            let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+                guide: "git".to_string(),
+                category: "dev-tool".to_string(),
+                description: None,
+                contexts: vec![],
+                learnings: vec!["learn it".to_string()],
+                outcome: Some("failure".to_string()),
+            });
+            let result = run(&disp, &tool_call(op, practice.clone()), &practice);
+            assert!(!result_is_error(&result));
+        }
+        let end = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "failure".to_string(),
+            final_approach: None,
+            lessons: vec![],
+        });
+        let env = tool_call(5, end.clone());
+        let first = run(&disp, &env, &end);
+        assert!(
+            !result_is_error(&first),
+            "end failed: {}",
+            result_text(&first)
+        );
+        assert!(
+            result_text(&first).contains("IMPROVEMENT SUGGESTIONS"),
+            "fixture must produce improvement lines, got: {}",
+            result_text(&first)
+        );
+        // A later success changes the rate a recompute would render.
+        let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "git".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec![],
+            learnings: vec!["learn it".to_string()],
+            outcome: Some("success".to_string()),
+        });
+        run(&disp, &tool_call(6, practice.clone()), &practice);
+        let second = run(&disp, &env, &end);
+        assert!(!result_is_error(&second));
+        assert_eq!(
+            result_text(&second),
+            result_text(&first),
+            "retry must return the frozen original response"
+        );
     }
 }

@@ -235,12 +235,16 @@ pub fn spawn_daemon_child(
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     // Detach into a new session so terminal signals to our process group
-    // (Ctrl-C) never reach the daemon, and it is reparented (no zombie)
-    // when we exit. SAFETY: pre_exec runs post-fork/pre-exec; the closure
-    // calls only async-signal-safe libc::setsid with no allocation.
+    // (Ctrl-C) never reach the daemon. The child stays a child of this
+    // process until we exit (reparented by init afterwards, reaped if it
+    // exits first while we still hold the handle); it idle-exits on its
+    // own. SAFETY: pre_exec runs post-fork/pre-exec; the closure calls
+    // only async-signal-safe libc::setsid with no allocation.
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
