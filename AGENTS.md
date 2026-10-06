@@ -6,7 +6,7 @@ Project instructions for coding agents working in this repository.
 
 - Repository: `ltmrs` (Long Term Memory RS) — local MCP memory service for LLM agents.
 - Language: Rust (edition 2024), single Cargo package with library + binary.
-- Default branch: `master`.
+- Default branch: `main` (renamed from `master` 2026-10-03; same history, no rewrite).
 - Toolchain: pinned in `rust-toolchain.toml` (stable, see AD-02 in the plans).
 - Plans in `plans/` are the normative specification. Read them before implementing.
 

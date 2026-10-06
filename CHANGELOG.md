@@ -131,7 +131,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   transcripts in bundle. Get-ok counts incomparable by contract;
   our duplicate gate passing salted content is DEV-007, known.
 
-## 2026-10-03 — P1/P2 review fixes, release evidence, dependency majors
+## 9328347 (2026-10-03) — P1/P2 review fixes, release evidence, dependency majors
 
 ### P1 code-review fixes: shared daemon, durable sessions, atomic guides
 
