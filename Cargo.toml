@@ -14,16 +14,17 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # MCP protocol (frontend stdio boundary + daemon dispatcher).
 # server feature gives the stdio/async-rw transports; avoid auth/reqwest (C code).
-rmcp = { version = "3.4.0", default-features = false, features = ["server", "transport-async-rw", "transport-io"] }
+rmcp = { version = "3.5.0", default-features = false, features = ["server", "transport-async-rw", "transport-io"] }
 
-# Candidate A: LanceDB canonical + retrieval (Lance engine).
+# LanceDB canonical + retrieval (Lance engine comes transitively via lancedb;
+# no direct `lance` pin: zero `lance::` uses in code, and lancedb 0.39
+# already forces the lance 12 line).
 # default-features=false: no cloud/object-store/GPU. zstd (C) is unavoidable.
 # NOTE (WP-00 finding): lancedb 0.38.0 does not compile without `remote` —
 # `pub mod job` is unconditional but `Error::Http` is `remote`-gated. Enabling
 # `remote` pulls reqwest/http/urlencoding (unused in local mode). See
 # baseline/lemma-0.21.0/dependency-native-audit.md.
 lancedb = { version = "0.39.0", default-features = false, features = ["remote"] }
-lance = { version = "12.0.0", default-features = false }
 
 # Candidate B: Fjall canonical KV (pure Rust, no native deps).
 fjall = { version = "3.1.10" }
@@ -42,9 +43,10 @@ tokenizers = { version = "0.22.2" }
 # Already in the graph via lancedb `remote`; making it explicit keeps RQ-21 honest.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
-# OS CSPRNG for the per-boot visualizer access token (no std equivalent;
-# DefaultHasher has fixed keys and is brute-forceable from /proc + port scan).
-getrandom = "0.4"
+# No direct getrandom pin: the per-boot visualizer token uses uuid v4
+# (OS-seeded CSPRNG via rand), so randomness rides the already-direct uuid
+# edge instead of a single-use pin. DefaultHasher is NOT a substitute
+# (fixed keys, brute-forceable from /proc + port scan).
 
 # OS-level primitives: singleton lock (flock), socket/permission control.
 libc = "0.2"
@@ -57,17 +59,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 tracing = "0.1"
-uuid = { version = "1", features = ["v5", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 sha2 = "0.11"
 # Best-effort secret detection for memory_add privacy (design 12.1).
 regex = { version = "1", default-features = false, features = ["std"] }
 
-# Arrow (behind storage/ only). Pinned to the lance/lancedb ecosystem line:
-# lance 12 + lancedb 0.39 + datafusion 54.1 all resolve arrow 58, so a
-# direct 60 pin would fork arrow_array/arrow_schema in our own calls.
-arrow-array = "58"
-arrow-schema = "58"
-arrow-buffer = "58"
+# Arrow types flow through `lancedb::arrow` (behind storage/ and search/
+# modules only): lancedb re-exports its exact arrow line precisely so
+# downstream avoids mismatched direct pins (lancedb issue #3575). No direct
+# arrow-array/arrow-schema/arrow-buffer pins — the version tracks lancedb
+# automatically and can never fork against `lancedb::arrow` again.
 lance-index = { version = "12", default-features = false }
 futures-util = "0.3"
 

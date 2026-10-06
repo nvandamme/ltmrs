@@ -1,6 +1,6 @@
 //! Arrow schemas for LanceDB tables.
 
-use arrow_schema::{DataType, Field, Schema};
+use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
 
 pub fn memories_schema() -> Schema {
     Schema::new(vec![

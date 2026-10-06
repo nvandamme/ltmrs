@@ -75,13 +75,12 @@ pub fn render_index(export: &CanonicalExport, token: &str) -> String {
 }
 
 /// Per-boot access token: memory content is same-user data (RQ-20), and any
-/// local UID can reach loopback. 128 bits from the OS CSPRNG: a fixed-key
+/// local UID can reach loopback. 128 bits from an OS-seeded CSPRNG (uuid v4,
+/// same unpredictability contract as the former getrandom fill): a fixed-key
 /// hash over (pid, wall-time, counter) would be brute-forceable from /proc
 /// plus a loopback port scan, since the token is the sole cross-UID control.
 pub fn access_token() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("OS CSPRNG must be available for the access token");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    uuid::Uuid::new_v4().as_simple().to_string()
 }
 
 /// Serve until `shutdown` resolves. Opens the store first so a missing

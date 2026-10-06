@@ -131,6 +131,120 @@ Content before `---` is instructions — do not modify. Add entries after the `-
   transcripts in bundle. Get-ok counts incomparable by contract;
   our duplicate gate passing salted content is DEV-007, known.
 
+## 2026-10-06 — Dependency hygiene and re-review hardening
+
+### Re-review R1–R7: operation receipts, atomic guide ops, drain, idle lifetime, evidence gating
+
+- Sessions (`registry.rs`, `dispatcher.rs`, `tools.rs`): durable op_log
+  (ID + digest + recorded text/data + effect markers) persisted in
+  sessions.json (old snapshots load with empty log); replays return
+  recorded outcomes (gate precedes session resolution, so post-terminal
+  replays resolve), digest mismatch rejects as key reuse; persist is
+  tmp+rename with file + dir fsync and failures fail the ack loudly
+  (no more best-effort success); session_end applies guide effects
+  FIRST via atomic per-guide markers, then ends; suggestions deduped
+  per session+text.
+- Distill (`repository.rs distill_memory_link`, thin `exec_guide_distill`
+  with envelope for op/digest): memory + guide read fresh in ONE tx,
+  merged, linked and receipted together — no stale clone exists to
+  overwrite concurrent content.
+- Merge/rename/forget/practice: merge validates planning-time source
+  entity_revisions in-tx (stale plan → RevisionConflict, nothing
+  published); practice bumps entity_revision; rename/forget are
+  single-tx (`rename_guide_atomically`, `forget_guide_atomically`,
+  old helpers deleted); practice/distill replays return RECORDED
+  snapshots with digest binding (legacy bare-name entries keep exact
+  old semantics); key reuse is a tool-level error everywhere on the
+  MCP surface.
+- Projection (`server.rs`, `serve.rs`): worker loops while passes hit
+  the 100-job cap (yield between), sleeps on wake-or-interval only
+  below cap (failing jobs never count → no busy loop); stdio path
+  also starts maintenance.
+- Daemon lifetime (`serve.rs`): owner lingers via `await_peer_drain`
+  until genuinely idle (no 60s kill-while-peers); attach paths are
+  handshake-verified (bare connect can hit backlog); race branch
+  covered by delayed-owner test + `is_lock_race` unit test. SIGKILL
+  of the owner still needs a separate daemon process (documented).
+- Evidence (`gen_release_evidence.sh`, acceptance test): timestamped
+  per-mode run dirs (no overwrites), full mode exits nonzero on failed
+  checks. Deliberately NO dirtiness tracking of any kind (flag, digest
+  or refusal): evidence is generated during fixing rounds so such a
+  marker would always read true and could only ever block the release
+  it serves — source identity is HEAD, and the honest contract is
+  regenerating on a clean tree after commit.
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets
+  -- -D warnings`, single `cargo test --release` (691 lib passed, 0
+  failed, 7 ignored; + evidence + 2 smoke). Targeted re-runs only
+  for 4 guide-test failures found in that run (empty GuideCreate
+  descriptions; practice/distill key-reuse mapped to tool-level
+  errors like all sibling validations). No plan change.
+
+### Dep follow-up: futures-util kept, lance removed, rmcp pin honest, re-export rewrite, getrandom via uuid
+
+- futures-util KEPT as a direct dep: 3 of its 4 `TryStreamExt`
+  (`try_collect`) uses are production code (`search/table.rs`
+  `rows_where`/FTS/vector paths; 4th in the WP-02 lance probe).
+  tokio has no `try_collect`/TryStream equivalent, so it cannot
+  substitute; swapping in tokio-stream (already transitive via rmcp)
+  would save nothing since futures-util stays in the graph via
+  lance/datafusion either way.
+- tokio-io deprecation does not apply: `tokio-io` is absent from
+  Cargo.lock, and our futures-util 0.3.34 enables none of the
+  tokio-compat features (deps: futures-*, memchr, pin-project-lite,
+  slab only).
+- `lance` direct pin REMOVED: zero `lance::` uses in src/tests
+  (only `lancedb::` + one `lance_index::scalar::FullTextSearchQuery`,
+  which lancedb does not re-export — so `lance-index` stays).
+  Resolution unchanged (lance 12.0.0 via lancedb 0.39); check + full
+  suite green after removal.
+- rmcp manifest pin 3.4.0→3.5.0 to match the resolved lock.
+- Arrow via re-export (owner-ordered): all 57 `arrow_array::` /
+  `arrow_schema::` / `arrow_buffer::` paths in `search/table.rs`,
+  `storage/lance_backend.rs`, `storage/schema.rs` rewritten to
+  `lancedb::arrow::…`; the 3 direct arrow pins dropped. lancedb
+  re-exports its exact arrow line for this purpose (upstream issue
+  #3575), so the version tracks lancedb automatically and can never
+  fork against `lancedb::arrow` again. Lock confirms arrow 58.4.0
+  single-version, now purely transitive.
+- getrandom pin dropped: visualizer token now
+  `Uuid::new_v4().as_simple()` (uuid v4 → rand 0.10, already in
+  graph; same 128-bit CSPRNG contract, same 32-hex shape; existing
+  uniqueness/comparison tests green). ltmrs declares no getrandom;
+  remaining 0.2/0.3/0.4 lines are ring/ahash/lsm-tree/tempfile edges.
+- Dup audit (34 multi-version crates in Cargo.lock, parents verified):
+  DONE arrow, DONE getrandom; OURS-BUT-STUCK sha2 0.11 vs lancedb's
+  0.10 (no re-export anywhere; downgrading ours cannot unify —
+  datafusion 54 keeps 0.11); INTRA-ECOSYSTEM snafu 0.8/0.9 (lancedb
+  0.39 vs lance 12), object_store 0.13/0.14 + axum 0.7/0.8 +
+  matchit/axum-core (datafusion 54 vs lance 12), tower-http 0.5/0.6
+  (lance-ns-impls vs reqwest), rand 0.9/0.10 (candle+datafusion vs
+  quinn/twox), itertools 0.14/0.15 (datafusion vs object_store
+  0.14), digest/block-buffer/crypto-common/cpufeatures eras (follow
+  sha2), base64 0.13/0.22/0.23 (vendored vs arrow vs serde_with),
+  nom 7/8, darling 0.20/0.24, hashbrown x4, indexmap 1.9
+  (serde_with) vs 2.14, phf 0.12/0.13, schemars 0.9/1.2 (both via
+  serde_with), syn 2/3 (build-only), bitflags 1/2, foldhash,
+  thiserror 1.0 (sysctl) vs 2.0, r-efi/core-foundation/windows-sys
+  (platform-only). serde/regex/serde_json/tempfile/memchr/petgraph/
+  prost/libc/bytes singles were `tree --duplicates` display
+  artifacts, not real dups. Nothing beyond the DONE items is
+  reachable from our manifest (conflicting upstream major reqs
+  cannot be unified downstream).
+- Validation: `cargo fmt --check`, `cargo clippy --all-targets
+  -- -D warnings`, `cargo test` (675 lib passed, 0 failed, 7 ignored;
+  + release_evidence + 2 smoke).
+- Decision (no code change): do NOT drop pins for used crates to
+  "rely on transitive" copies — Rust E0432 forbids `use` of an
+  undeclared crate (proven: removing futures-util fails all three
+  production `try_collect` sites; restored byte-identical, check
+  green). Declared-but-unused is what gets removed
+  (anyhow/indexmap/candle-transformers/lance); every remaining pin
+  has code uses. A shared transitive copy unifies versions, never
+  substitutes for declaration. Cargo docs confirm: only direct deps
+  enter the extern prelude (`--extern`); features select code paths
+  only. The sole exception is `pub use` re-exports through a direct
+  parent (e.g. `lancedb::arrow`).
+
 ## 9328347 (2026-10-03) — P1/P2 review fixes, release evidence, dependency majors
 
 ### P1 code-review fixes: shared daemon, durable sessions, atomic guides

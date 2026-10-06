@@ -79,16 +79,24 @@ impl Dispatcher {
     }
 
     /// Persist registry sessions now, before an acknowledgement returns (P1
-    /// durable sessions). Loud on failure (previous file intact via
-    /// tmp+rename); callers still return success — the loss is bounded to a
-    /// failed disk write, never a silent shutdown-only persist.
-    pub fn persist_sessions(&self) {
+    /// durable sessions). Returns Err on failure: callers must fail the
+    /// acknowledgement, never report success for unpersisted state
+    /// (re-review R1). Loud either way (previous file intact via
+    /// tmp+rename); the loss on error is bounded to a failed disk write.
+    pub fn persist_sessions(&self) -> Result<(), String> {
         let path = self.sessions_path.lock().unwrap().clone();
         if let Some(p) = path
             && let Err(e) = self.registry.lock().unwrap().persist(&p)
         {
-            eprintln!("ltmrs: failed to persist session history: {e:?}");
+            let msg = format!("failed to persist session history: {e:?}");
+            eprintln!("ltmrs: {msg}");
+            return Err(msg);
         }
+        Ok(())
+    }
+
+    fn persist_error(e: String) -> DomainError {
+        DomainError::new(DomainErrorCode::Validation, e)
     }
 
     /// Handle the connect-time handshake: validate protocol + generation,
@@ -221,6 +229,28 @@ impl Dispatcher {
                 rationale,
                 related_memory_id,
             } => {
+                let op_id = envelope.operation_id.as_uuid().to_string();
+                let digest = envelope.request_digest()?;
+                // Operation receipt first (re-review R5): a replay returns
+                // success without re-recording; a digest mismatch rejects.
+                // The gate precedes session resolution so replays after a
+                // terminal session still resolve to the recorded outcome.
+                match self.registry.lock().unwrap().check_op(&op_id, &digest) {
+                    crate::daemon::registry::OpCheck::Replay(_) => {
+                        return Ok(IpcResponse::success(
+                            envelope.operation_id,
+                            ReceiptOutcome::Success { affected: vec![] },
+                            DomainPayload::None,
+                        ));
+                    }
+                    crate::daemon::registry::OpCheck::Conflict => {
+                        return Err(DomainError::new(
+                            DomainErrorCode::KeyReuseDifferentInput,
+                            "operation key reused with different input",
+                        ));
+                    }
+                    crate::daemon::registry::OpCheck::Fresh => {}
+                }
                 let session = session.ok_or_else(|| {
                     DomainError::new(DomainErrorCode::Validation, "no active session for channel")
                 })?;
@@ -241,14 +271,15 @@ impl Dispatcher {
                     last_accessed_at: None,
                     created_at: Instant::new(self.clock.now_millis()),
                 };
-                self.registry.lock().unwrap().record_attempt(
-                    envelope.frontend_id,
-                    envelope.channel_id,
-                    attempt,
-                );
-                // Durable before ack (P1): a kill immediately after success
-                // must not lose the attempt.
-                self.persist_sessions();
+                {
+                    let mut reg = self.registry.lock().unwrap();
+                    reg.record_attempt(envelope.frontend_id, envelope.channel_id, attempt);
+                    reg.record_op(&op_id, &digest, session, None, None);
+                }
+                // Durable before ack, failing loudly (re-review R1): a kill
+                // immediately after success must not lose the attempt, and
+                // a failed save must not report success.
+                self.persist_sessions().map_err(Self::persist_error)?;
                 Ok(IpcResponse::success(
                     envelope.operation_id,
                     ReceiptOutcome::Success { affected: vec![] },
@@ -260,8 +291,28 @@ impl Dispatcher {
                 final_approach,
                 lessons,
             } => {
+                let op_id = envelope.operation_id.as_uuid().to_string();
+                let digest = envelope.request_digest()?;
+                // Receipt before resolution (re-review R5): replays after a
+                // terminal session still resolve to the recorded outcome.
+                match self.registry.lock().unwrap().check_op(&op_id, &digest) {
+                    crate::daemon::registry::OpCheck::Replay(_) => {
+                        return Ok(IpcResponse::success(
+                            envelope.operation_id,
+                            ReceiptOutcome::Success { affected: vec![] },
+                            DomainPayload::None,
+                        ));
+                    }
+                    crate::daemon::registry::OpCheck::Conflict => {
+                        return Err(DomainError::new(
+                            DomainErrorCode::KeyReuseDifferentInput,
+                            "operation key reused with different input",
+                        ));
+                    }
+                    crate::daemon::registry::OpCheck::Fresh => {}
+                }
                 // End only THIS channel's session.
-                self.registry.lock().unwrap().end_session(
+                let handle = self.registry.lock().unwrap().end_session(
                     envelope.frontend_id,
                     envelope.channel_id,
                     *outcome,
@@ -269,8 +320,14 @@ impl Dispatcher {
                     lessons.clone(),
                     self.clock.now_millis(),
                 );
-                // Durable before ack (P1): outcome/lessons survive kill.
-                self.persist_sessions();
+                if let Some(handle) = handle {
+                    self.registry
+                        .lock()
+                        .unwrap()
+                        .record_op(&op_id, &digest, handle, None, None);
+                }
+                // Durable before ack, failing loudly (re-review R1).
+                self.persist_sessions().map_err(Self::persist_error)?;
                 Ok(IpcResponse::success(
                     envelope.operation_id,
                     ReceiptOutcome::Success { affected: vec![] },
@@ -554,7 +611,7 @@ mod tests {
         let handle = disp
             .registry()
             .start_session(fe(1), ch(1), None, None, 1000);
-        disp.persist_sessions();
+        disp.persist_sessions().unwrap();
         let env = envelope(
             fe(1),
             ch(1),
@@ -579,6 +636,94 @@ mod tests {
             session.final_approach.as_deref(),
             Some("fixed"),
             "final approach must survive kill"
+        );
+    }
+
+    /// Re-review R1: a session-file save failure fails the acknowledgement
+    /// instead of reporting success for unpersisted state. The sessions path
+    /// points inside a nonexistent directory, so every persist fails.
+    #[test]
+    fn session_ack_fails_when_persist_fails() {
+        use crate::domain::session::AttemptOutcome;
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").join("sessions.json");
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock);
+        disp.set_sessions_path(Some(missing));
+        disp.registry()
+            .start_session(fe(1), ch(1), None, None, 1000);
+        // session_attempt must not report success when the save fails.
+        let attempt = envelope(
+            fe(1),
+            ch(1),
+            11,
+            DomainRequest::SessionAttempt {
+                approach: "try X".into(),
+                outcome: AttemptOutcome::Rejected,
+                critique: None,
+                rationale: None,
+                related_memory_id: None,
+            },
+        );
+        let err = disp.handle(&attempt).unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "save failure must fail loudly, got: {}",
+            err.message
+        );
+        // session_end likewise.
+        let end = envelope(
+            fe(1),
+            ch(1),
+            12,
+            DomainRequest::SessionEnd {
+                outcome: TaskOutcome::Success,
+                final_approach: None,
+                lessons: vec![],
+            },
+        );
+        let err = disp.handle(&end).unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "save failure must fail loudly, got: {}",
+            err.message
+        );
+    }
+
+    /// Re-review R5: replaying a session_end with changed arguments rejects
+    /// as key reuse instead of re-executing.
+    #[test]
+    fn session_end_replay_with_changed_args_rejects() {
+        let (disp, _dir) = test_dispatcher();
+        disp.registry()
+            .start_session(fe(1), ch(1), None, None, 1000);
+        let end = |op: u64, lessons: Vec<String>| {
+            envelope(
+                fe(1),
+                ch(1),
+                op,
+                DomainRequest::SessionEnd {
+                    outcome: TaskOutcome::Success,
+                    final_approach: None,
+                    lessons,
+                },
+            )
+        };
+        disp.handle(&end(21, vec!["a".into()])).unwrap();
+        // Same operation, different arguments: conflict, never re-executed.
+        let err = disp.handle(&end(21, vec!["b".into()])).unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::KeyReuseDifferentInput
         );
     }
 }

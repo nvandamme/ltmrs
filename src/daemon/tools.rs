@@ -23,6 +23,7 @@ use crate::compatibility::lemma::tool_args::{
 };
 use crate::daemon::dispatcher::Dispatcher;
 use crate::daemon::envelope::{DomainPayload, IpcEnvelope};
+use crate::daemon::registry::OpCheck;
 use crate::domain::command::{
     CommandContext, DomainCommand, DomainError, DomainErrorCode, DomainResult, ForgetMode,
     MemoryPatch,
@@ -57,7 +58,7 @@ pub fn execute_tool(
         ToolArgs::GuideGet(args) => exec_guide_get(disp, args),
         ToolArgs::GuidePractice(args) => exec_guide_practice(disp, envelope, args),
         ToolArgs::GuideCreate(args) => exec_guide_create(disp, args),
-        ToolArgs::GuideDistill(args) => exec_guide_distill(disp, args),
+        ToolArgs::GuideDistill(args) => exec_guide_distill(disp, envelope, args),
         ToolArgs::GuideUpdate(args) => exec_guide_update(disp, args),
         ToolArgs::GuideForget(args) => exec_guide_forget(disp, args),
         ToolArgs::GuideMerge(args) => exec_guide_merge(disp, args),
@@ -91,6 +92,18 @@ fn err_result(message: &str) -> DomainPayload {
         structured: None,
         is_error: true,
     }
+}
+
+/// Persist sessions before ack, failing the tool loudly when the save fails
+/// (re-review R1): a failed save must never report success.
+fn persist_before_ack(disp: &Dispatcher) -> DomainResult<()> {
+    disp.persist_sessions()
+        .map_err(|msg| DomainError::new(DomainErrorCode::Validation, msg))
+}
+
+/// Key-reuse rejection for retried operations with changed arguments.
+fn key_reuse_result() -> DomainResult<DomainPayload> {
+    Ok(err_result("operation key reused with different input"))
 }
 
 /// Build a result honoring the frozen response_format (json => text is the
@@ -3178,21 +3191,21 @@ fn exec_guide_practice(
             .and_then(|h| reg.session(h).map(|s| s.memories_read.clone()))
             .unwrap_or_default()
     };
-    // Session link is durable state too (P1 eager persist).
-    disp.persist_sessions();
+    // Session link is durable state too: persist before the guide
+    // mutation, failing loudly on error (re-review R1).
+    persist_before_ack(disp)?;
     let outcome_bool = match args.outcome.as_deref() {
         Some("success") => Some(true),
         Some("failure") => Some(false),
         _ => None,
     };
-    // Idempotent guide mutation (P1): same operation ID replays without
-    // double-counting usage/success counters.
+    // Idempotent guide mutation: same operation ID + digest replays the
+    // recorded snapshot; a digest mismatch rejects (re-review R5).
     let op_id = envelope.operation_id.as_uuid().to_string();
-    // Pre-check for a practiced-then-forgotten replay: the op log survives
-    // the guide, so replaying after forget is a typed error, not a silent
-    // recreate.
+    let digest = envelope.request_digest()?;
     let updated = match repo.practice_guide_idempotent(
         &op_id,
+        &digest,
         &args.guide,
         &args.category,
         args.description.as_deref(),
@@ -3203,7 +3216,10 @@ fn exec_guide_practice(
         now,
     ) {
         Ok(g) => g,
-        Err(e) if e.code == crate::domain::command::DomainErrorCode::NotFound => {
+        Err(e)
+            if e.code == crate::domain::command::DomainErrorCode::NotFound
+                || e.code == crate::domain::command::DomainErrorCode::KeyReuseDifferentInput =>
+        {
             return Ok(err_result(&e.message));
         }
         Err(e) => return Err(e),
@@ -3310,7 +3326,11 @@ fn exec_guide_create(disp: &Dispatcher, args: &GuideCreateArgs) -> DomainResult<
 
 // ---- guide_distill ----
 
-fn exec_guide_distill(disp: &Dispatcher, args: &GuideDistillArgs) -> DomainResult<DomainPayload> {
+fn exec_guide_distill(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &GuideDistillArgs,
+) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     if args.memory_id.trim().is_empty() || args.guide.trim().is_empty() {
         return Ok(err_result(
@@ -3327,69 +3347,30 @@ fn exec_guide_distill(disp: &Dispatcher, args: &GuideDistillArgs) -> DomainResul
             )));
         }
     };
-    let fragment = match repo.get_memories(&[eid])?.first() {
-        Some(m) => m.clone(),
-        None => {
+    let category = args
+        .category
+        .clone()
+        .unwrap_or_else(|| "dev-tool".to_string());
+    // ONE canonical operation (re-review R2): memory + guide are read fresh
+    // inside the transaction and commit together — no stale clone can
+    // overwrite a concurrent content update. Replay returns the recorded
+    // guide; digest mismatch rejects.
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    let updated = match repo.distill_memory_link(&op_id, &digest, eid, &args.guide, &category, now)
+    {
+        Ok(g) => g,
+        Err(e) if e.code == crate::domain::command::DomainErrorCode::NotFound => {
             return Ok(err_result(&format!(
                 "Memory fragment with ID '{}' not found.",
                 args.memory_id
             )));
         }
-    };
-
-    let category = args
-        .category
-        .clone()
-        .unwrap_or_else(|| "dev-tool".to_string());
-    let mut updated = match repo.get_guide(&args.guide)? {
-        Some(mut g) => {
-            if !g.learnings.contains(&fragment.fragment) {
-                g.learnings.push(fragment.fragment.clone());
-            }
-            let ctx = fragment
-                .project
-                .clone()
-                .unwrap_or_else(|| "global".to_string())
-                .to_lowercase()
-                .trim()
-                .to_string();
-            if !ctx.is_empty() && !g.contexts.contains(&ctx) {
-                g.contexts.push(ctx);
-            }
-            g.usage_count += 1;
-            g.last_used = Some(Instant::new(now));
-            g
+        Err(e) if e.code == crate::domain::command::DomainErrorCode::KeyReuseDifferentInput => {
+            return Ok(err_result(&e.message));
         }
-        None => create_guide(
-            &args.guide,
-            &category,
-            "Created via distillation from memory.",
-            &[fragment
-                .project
-                .clone()
-                .unwrap_or_else(|| "global".to_string())
-                .to_lowercase()
-                .trim()
-                .to_string()],
-            std::slice::from_ref(&fragment.fragment),
-            now,
-        ),
+        Err(e) => return Err(e),
     };
-
-    if !updated.source_memories.contains(&eid) {
-        updated.source_memories.push(eid);
-    }
-    updated.updated_at = Instant::new(now);
-    repo.put_guide(&updated)?;
-
-    // Update the fragment: related_guides + clear distill_candidate.
-    let mut frag = fragment;
-    let normalized_name = args.guide.to_lowercase().trim().to_string();
-    if !frag.related_guides.contains(&normalized_name) {
-        frag.related_guides.push(normalized_name);
-    }
-    frag.distill_candidate = false;
-    repo.put_memory_direct(&frag)?;
 
     let response = format!(
         "Successfully distilled memory [{}] into guide \"{}\" ({}).\n\n{}",
@@ -3459,13 +3440,11 @@ fn exec_guide_update(disp: &Dispatcher, args: &GuideUpdateArgs) -> DomainResult<
     }
     guide.updated_at = Instant::new(now);
 
-    // Rename path (P1 atomic, no tear): put the renamed guide first so a
-    // later failure never loses it, then move references fresh-read, then
-    // delete the old key. Every step propagates errors.
+    // Rename path (re-review R3, single transaction): the renamed put,
+    // memory reference moves and old-key delete commit together — a
+    // failure anywhere leaves no half-rename. Errors propagate.
     if !old_name.eq_ignore_ascii_case(&guide.name) {
-        repo.put_guide(&guide)?;
-        rename_guide_in_memories(repo, &old_name, &guide.name)?;
-        repo.delete_guide(&old_name)?;
+        repo.rename_guide_atomically(&old_name, &guide)?;
         // Already stored above; return without a second put.
         return Ok(ok_result(
             format!(
@@ -3499,11 +3478,10 @@ fn exec_guide_forget(disp: &Dispatcher, args: &GuideForgetArgs) -> DomainResult<
     if existing.is_none() {
         return Ok(err_result(&format!("Guide \"{}\" not found.", args.guide)));
     }
-    // Remove-then-delete (P1, no tear): references go first so a failure
-    // leaves the guide with refs (retryable), never dangling refs to a
-    // deleted guide. Errors propagate.
-    remove_guide_from_memories(repo, &args.guide)?;
-    repo.delete_guide(&args.guide)?;
+    // Single-transaction forget (re-review R3): reference removal and the
+    // guide delete commit together — no dangling references to a deleted
+    // guide and no surviving guide with half-removed references.
+    repo.forget_guide_atomically(&args.guide)?;
     Ok(ok_result(
         format!("Successfully forgot guide: {}", args.guide),
         json!({ "success": true, "guide": args.guide }),
@@ -3599,9 +3577,15 @@ fn exec_guide_merge(disp: &Dispatcher, args: &GuideMergeArgs) -> DomainResult<Do
             .collect::<Vec<_>>(),
     );
 
-    // Atomic single-transaction merge (P1, no tear): references, source
-    // deletes and the merged put commit together. Errors propagate.
-    repo.merge_guides_atomically(&args.guides, &new_guide)?;
+    // Atomic single-transaction merge: references, source deletes and the
+    // merged put commit together, guarded by the source revisions read
+    // during planning (re-review R3). A concurrent source update rejects
+    // explicitly instead of being silently discarded. Errors propagate.
+    let expected: Vec<(String, EntityRevision)> = source_guides
+        .iter()
+        .map(|g| (g.name.clone(), g.entity_revision))
+        .collect();
+    repo.merge_guides_atomically(&args.guides, &expected, &new_guide)?;
 
     let mut response = format!(
         "Merged {} guides into \"{}\" ({})\n",
@@ -3669,26 +3653,6 @@ fn dedup<T: PartialEq>(items: Vec<T>) -> Vec<T> {
     out
 }
 
-/// Rename a guide reference in every memory's `related_guides`
-/// (upstream `core.renameGuideInMemories`). Atomic via fresh-read patch:
-/// concurrent content updates are preserved, errors propagate.
-fn rename_guide_in_memories(
-    repo: &crate::service::repository::CanonicalRepository,
-    old_name: &str,
-    new_name: &str,
-) -> DomainResult<usize> {
-    repo.rename_guide_references(old_name, new_name)
-}
-
-/// Remove a guide reference from every memory's `related_guides`
-/// (upstream `core.removeGuideFromMemories`). Atomic via fresh-read patch.
-fn remove_guide_from_memories(
-    repo: &crate::service::repository::CanonicalRepository,
-    guide_name: &str,
-) -> DomainResult<usize> {
-    repo.remove_guide_references(guide_name)
-}
-
 // ---- session_start ----
 
 fn exec_session_start(
@@ -3705,6 +3669,21 @@ fn exec_session_start(
     // session is project-less (upstream resolves it from cwd, which the daemon
     // does not observe).
     let project: Option<String> = None;
+
+    // Operation receipt first (re-review R5): a replayed start returns the
+    // recorded session instead of abandoning it and creating another; a
+    // digest mismatch rejects instead of executing.
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    match disp.registry().check_op(&op_id, &digest) {
+        OpCheck::Replay(rec) => {
+            let text = rec.text.clone().unwrap_or_default();
+            let data = rec.data.clone().unwrap_or(json!({}));
+            return Ok(ok_result(text, data));
+        }
+        OpCheck::Conflict => return key_reuse_result(),
+        OpCheck::Fresh => {}
+    }
 
     // Abandon any existing active session for this channel; create a fresh one.
     let handle = {
@@ -3758,8 +3737,6 @@ fn exec_session_start(
         let mut reg = disp.registry();
         reg.track_memories_read(envelope.frontend_id, envelope.channel_id, &read_ids);
     }
-    // Durable before ack (P1): a kill after start loses nothing.
-    disp.persist_sessions();
 
     let mut response = format!(
         "Session started: {} ({})\n",
@@ -3814,6 +3791,20 @@ fn exec_session_start(
         "guides": guide_names,
         "preloaded_memories": read_ids,
     });
+    // Record the outcome, then persist before ack (re-review R1/R5): the
+    // receipt makes a replay return this exact response; a failed save
+    // fails loudly instead of reporting success for lost state.
+    {
+        let mut reg = disp.registry();
+        reg.record_op(
+            &op_id,
+            &digest,
+            handle,
+            Some(response.clone()),
+            Some(data.clone()),
+        );
+    }
+    persist_before_ack(disp)?;
     Ok(ok_result(response, data))
 }
 
@@ -3958,11 +3949,63 @@ fn exec_session_attempt(
     let approach_redacted = privacy::redact(&args.approach);
     let critique_redacted = args.critique.as_deref().map(privacy::redact);
 
+    // Operation identity for the receipt check below (re-review R5).
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    let attempt_id = EntityId::new(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("ltmrs:attempt:{}", envelope.operation_id.as_uuid()).as_bytes(),
+    ));
+
     // Resolve the channel's active session.
     let session = {
         let reg = disp.registry();
         reg.resolve_session(envelope.frontend_id, envelope.channel_id)
     };
+    // A recorded replay resolves without touching session state — even
+    // after a terminal session. The sequence number comes from the
+    // recorded data, else from the (possibly terminal) session's attempt
+    // with the deterministic ID. A digest mismatch rejects outright.
+    match disp.registry().check_op(&op_id, &digest) {
+        OpCheck::Conflict => return key_reuse_result(),
+        OpCheck::Replay(rec) => {
+            let seq = rec
+                .data
+                .as_ref()
+                .and_then(|d| d.get("seq"))
+                .and_then(|s| s.as_u64())
+                .map(|s| s as u32)
+                .or_else(|| {
+                    disp.registry()
+                        .session(rec.session)
+                        .and_then(|s| s.attempts.iter().find(|a| a.id == attempt_id))
+                        .map(|a| a.seq)
+                });
+            if let Some(seq) = seq {
+                let value_tag = match outcome {
+                    AttemptOutcome::Rejected => "(dead end — most valuable)",
+                    AttemptOutcome::Partial => "(partial)",
+                    AttemptOutcome::Promising => "(promising)",
+                };
+                let preview = if approach_redacted.len() > 80 {
+                    let mut end = 80;
+                    while !approach_redacted.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}…", &approach_redacted[..end])
+                } else {
+                    approach_redacted.clone()
+                };
+                let response = format!("Recorded attempt #{seq} — {preview} {value_tag}.");
+                let data = json!({
+                    "recorded": true,
+                    "attempt_id": format!("{}#{}", rec.session.as_uuid(), seq),
+                });
+                return Ok(ok_result(response, data));
+            }
+        }
+        OpCheck::Fresh => {}
+    }
     let Some(handle) = session else {
         return Ok(err_result(
             "No active session. Call session_start before recording attempts.",
@@ -3976,15 +4019,13 @@ fn exec_session_attempt(
         .and_then(|id| disp.repo().resolve_id(id).ok());
 
     let now = disp.clock().now_millis();
-    let attempt_id = EntityId::new(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        format!("ltmrs:attempt:{}", envelope.operation_id.as_uuid()).as_bytes(),
-    ));
 
-    // Record the attempt and compute its seq. Replay-safe (P1): the attempt
-    // ID derives deterministically from the operation ID, so a retried
+    // Record the attempt and compute its seq. Replay-safe: the attempt ID
+    // derives deterministically from the operation ID, so a retried
     // operation reuses its ID — `record_attempt` dedups and we skip counter
-    // increments, reporting the original seq.
+    // increments, reporting the original seq. (Same-ID replays with
+    // recorded outcomes returned above; only fresh executions reach here,
+    // plus pre-receipt-era duplicates that dedup by attempt ID.)
     let seq = {
         let mut reg = disp.registry();
         if let Some(existing) = reg
@@ -4024,8 +4065,14 @@ fn exec_session_attempt(
             next_seq
         }
     };
-    // Durable before ack (P1): kill-after-ack loses nothing.
-    disp.persist_sessions();
+    // Record the operation (with its sequence number for session-less
+    // replays), then persist before ack (re-review R1/R5): a failed save
+    // fails loudly instead of reporting success.
+    {
+        let mut reg = disp.registry();
+        reg.record_op(&op_id, &digest, handle, None, Some(json!({"seq": seq})));
+    }
+    persist_before_ack(disp)?;
 
     let value_tag = match outcome {
         AttemptOutcome::Rejected => "(dead end — most valuable)",
@@ -4069,6 +4116,25 @@ fn exec_session_end(
     };
 
     let now = disp.clock().now_millis();
+
+    // Operation receipt first (re-review R5): a replay returns the recorded
+    // response instead of re-ending; a digest mismatch rejects. The gate
+    // precedes session resolution so replays after a terminal session
+    // still resolve to the recorded outcome.
+    let op_id = envelope.operation_id.as_uuid().to_string();
+    let digest = envelope.request_digest()?;
+    match disp.registry().check_op(&op_id, &digest) {
+        OpCheck::Replay(rec) => {
+            let text = rec.text.clone().unwrap_or_default();
+            let data = rec.data.clone().unwrap_or(json!({}));
+            if !text.is_empty() {
+                return Ok(ok_result(text, data));
+            }
+        }
+        OpCheck::Conflict => return key_reuse_result(),
+        OpCheck::Fresh => {}
+    }
+
     let session = {
         let reg = disp.registry();
         reg.resolve_session(envelope.frontend_id, envelope.channel_id)
@@ -4076,6 +4142,40 @@ fn exec_session_end(
     let Some(handle) = session else {
         return Ok(err_result("No active session to end."));
     };
+
+    let repo = disp.repo();
+    let mut improvement_lines: Vec<String> = Vec::new();
+
+    // Guide outcomes BEFORE the terminal transition (re-review R5): each
+    // effect commits atomically with its idempotency marker, so a failure
+    // or retry between steps resumes the missing effects instead of
+    // double-counting completed ones or stranding them unapplied.
+    let guides_used = {
+        let reg = disp.registry();
+        reg.session(handle)
+            .map(|s| s.guides_used.clone())
+            .unwrap_or_default()
+    };
+    for guide_name in &guides_used {
+        if outcome != TaskOutcome::Success && outcome != TaskOutcome::Failure {
+            break;
+        }
+        repo.apply_session_guide_effect(&op_id, guide_name, outcome == TaskOutcome::Success, now)?;
+        if let Some(guide) = repo.get_guide(guide_name)? {
+            if outcome == TaskOutcome::Failure {
+                let total = guide.success_count + guide.failure_count;
+                if total >= 3 {
+                    let rate = guide.success_count as f64 / total as f64;
+                    if rate < 0.4 {
+                        improvement_lines.push(format!(
+                            "  [!] Guide \"{}\" success rate is {:.2} ({}/{total}). Consider refining with guide_update.",
+                            guide.name, rate, guide.success_count
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     // End the session (only this channel's).
     {
@@ -4089,48 +4189,22 @@ fn exec_session_end(
             now,
         );
     }
-    // Durable before ack (P1): outcome/lessons survive kill-after-ack.
-    disp.persist_sessions();
 
-    let repo = disp.repo();
-    let mut improvement_lines: Vec<String> = Vec::new();
-
-    // Evaluate guides used in this session.
-    let guides_used = {
-        let reg = disp.registry();
-        reg.session(handle)
-            .map(|s| s.guides_used.clone())
-            .unwrap_or_default()
-    };
-    for guide_name in &guides_used {
-        if let Some(mut guide) = repo.get_guide(guide_name)? {
-            if outcome == TaskOutcome::Success {
-                guide.success_count += 1;
-            } else if outcome == TaskOutcome::Failure {
-                guide.failure_count += 1;
-                let total = guide.success_count + guide.failure_count;
-                if total >= 3 {
-                    let rate = guide.success_count as f64 / total as f64;
-                    if rate < 0.4 {
-                        improvement_lines.push(format!(
-                            "  [!] Guide \"{}\" success rate is {:.2} ({}/{total}). Consider refining with guide_update.",
-                            guide.name, rate, guide.success_count
-                        ));
-                    }
-                }
-            }
-            guide.updated_at = Instant::new(now);
-            repo.put_guide(&guide)?;
-        }
-    }
-
-    // Persist improvement suggestions (best-effort).
+    // Persist improvement suggestions: deduplicated per session+text so a
+    // retried end does not file the same suggestion twice.
+    let existing_suggestions = repo.get_suggestions()?;
     for line in &improvement_lines {
+        let text = line.trim().to_string();
+        if existing_suggestions.iter().any(|s| {
+            s.session_id.as_deref() == Some(&handle.as_uuid().to_string()) && s.suggestion == text
+        }) {
+            continue;
+        }
         let id = repo.next_suggestion_id()?;
         let suggestion = Suggestion {
             id,
             session_id: Some(handle.as_uuid().to_string()),
-            suggestion: line.trim().to_string(),
+            suggestion: text,
             status: SuggestionStatus::Pending,
             created_at: Instant::new(now),
             resolved_at: None,
@@ -4202,6 +4276,18 @@ fn exec_session_end(
         "outcome_recorded": true,
         "suggestions": improvement_lines,
     });
+    // Record the outcome, then persist before ack (re-review R1/R5).
+    {
+        let mut reg = disp.registry();
+        reg.record_op(
+            &op_id,
+            &digest,
+            handle,
+            Some(response.clone()),
+            Some(data.clone()),
+        );
+    }
+    persist_before_ack(disp)?;
     Ok(ok_result(response, data))
 }
 
@@ -8338,15 +8424,28 @@ mod tests {
     fn guide_rename_keeps_document_revision() {
         let (disp, _dir) = test_dispatcher();
         add_fragment(&disp, 1, "## Linked\n\n### Context\nbody");
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "old".to_string(),
+            category: "dev-tool".to_string(),
+            description: "old guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        let create_env = tool_call(2, create.clone());
+        run(&disp, &create_env, &create);
         let repo = disp.repo();
         let mut m = repo.export_snapshot().unwrap().memories.remove(0);
         m.related_guides = vec!["old".to_string()];
         repo.put_memory_direct(&m).unwrap();
         let rev = m.document_revision;
         let rev_entity = m.entity_revision;
-        rename_guide_in_memories(repo, "old", "new").unwrap();
+        let mut renamed = repo.get_guide("old").unwrap().expect("old exists");
+        renamed.name = "new".to_string();
+        repo.rename_guide_atomically("old", &renamed).unwrap();
         let after = repo.get_memories(&[m.id]).unwrap().remove(0);
         assert_eq!(after.related_guides, vec!["new".to_string()]);
+        assert!(repo.get_guide("old").unwrap().is_none());
+        assert!(repo.get_guide("new").unwrap().is_some());
         assert_eq!(
             after.document_revision, rev,
             "unindexed rename must not churn the revision"
@@ -8364,13 +8463,23 @@ mod tests {
     fn guide_remove_keeps_document_revision() {
         let (disp, _dir) = test_dispatcher();
         add_fragment(&disp, 1, "## Linked\n\n### Context\nbody");
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "old".to_string(),
+            category: "dev-tool".to_string(),
+            description: "old guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        let create_env = tool_call(2, create.clone());
+        run(&disp, &create_env, &create);
         let repo = disp.repo();
         let mut m = repo.export_snapshot().unwrap().memories.remove(0);
         m.related_guides = vec!["old".to_string()];
         repo.put_memory_direct(&m).unwrap();
         let rev = m.document_revision;
         let rev_entity = m.entity_revision;
-        remove_guide_from_memories(repo, "old").unwrap();
+        assert!(repo.forget_guide_atomically("old").unwrap());
+        assert!(repo.get_guide("old").unwrap().is_none());
         let after = repo.get_memories(&[m.id]).unwrap().remove(0);
         assert!(after.related_guides.is_empty());
         assert_eq!(
@@ -8512,7 +8621,18 @@ mod tests {
         let update_result = run(&disp, &update_env, &update);
         assert!(!result_is_error(&update_result));
         // Guide rename after the content commit must keep the new text.
-        rename_guide_in_memories(repo, "old", "new").unwrap();
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "old".to_string(),
+            category: "dev-tool".to_string(),
+            description: "old guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        let create_env = tool_call(3, create.clone());
+        run(&disp, &create_env, &create);
+        let mut renamed = repo.get_guide("old").unwrap().expect("old exists");
+        renamed.name = "new".to_string();
+        repo.rename_guide_atomically("old", &renamed).unwrap();
         let after = repo.get_memories(&[m.id]).unwrap().remove(0);
         assert!(
             after.fragment.contains("new body"),
@@ -9297,6 +9417,258 @@ mod tests {
             sessions[0].self_critique_count, 1,
             "tool replay must not double-count self-critique"
         );
+    }
+
+    /// Re-review R5: replaying session_start returns the recorded session
+    /// instead of abandoning it and creating another; key reuse rejects.
+    #[test]
+    fn session_start_replay_returns_recorded_session() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let env = tool_call(1, start.clone());
+        let first = run(&disp, &env, &start);
+        assert!(!result_is_error(&first));
+        let first_id = result_structured(&first).unwrap()["session_id"].clone();
+        // Same operation again: same session, no replacement.
+        let second = run(&disp, &env, &start);
+        assert!(!result_is_error(&second));
+        assert_eq!(
+            result_structured(&second).unwrap()["session_id"],
+            first_id,
+            "replay must return the recorded session"
+        );
+        assert_eq!(
+            disp.registry().all_sessions_owned().len(),
+            1,
+            "replay must not create another session"
+        );
+        // Same operation ID, different arguments: reject, never execute.
+        // NOTE: a new envelope carries the changed body (the digest binds
+        // the envelope body, so reusing the old envelope would replay).
+        let changed = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "different task".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let changed_env = tool_call(1, changed.clone());
+        let third = run(&disp, &changed_env, &changed);
+        assert!(result_is_error(&third));
+        assert!(result_text(&third).contains("different input"));
+        assert_eq!(disp.registry().all_sessions_owned().len(), 1);
+    }
+
+    /// Re-review R5: replaying session_end returns the recorded response and
+    /// never recounts guide outcomes; key reuse rejects.
+    #[test]
+    fn session_end_replay_returns_recorded_outcome() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "git".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec![],
+            learnings: vec![],
+            outcome: None,
+        });
+        run(&disp, &tool_call(2, practice.clone()), &practice);
+        let end = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "success".to_string(),
+            final_approach: Some("fixed".to_string()),
+            lessons: vec!["check logs".to_string()],
+        });
+        let env = tool_call(3, end.clone());
+        let first = run(&disp, &env, &end);
+        assert!(!result_is_error(&first));
+        let first_text = result_text(&first);
+        // Replay: identical response, guide counted exactly once.
+        let second = run(&disp, &env, &end);
+        assert!(!result_is_error(&second));
+        assert_eq!(result_text(&second), first_text);
+        let guide = disp.repo().get_guide("git").unwrap().unwrap();
+        assert_eq!(guide.success_count, 1);
+        // Same operation ID, different arguments: reject (new envelope so
+        // the digest actually differs — reusing the old one would replay).
+        let changed = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "success".to_string(),
+            final_approach: None,
+            lessons: vec!["different".to_string()],
+        });
+        let changed_env = tool_call(3, changed.clone());
+        let third = run(&disp, &changed_env, &changed);
+        assert!(result_is_error(&third));
+        assert!(result_text(&third).contains("different input"));
+        let guide = disp.repo().get_guide("git").unwrap().unwrap();
+        assert_eq!(guide.success_count, 1);
+    }
+
+    /// Re-review R5: a retried attempt with changed arguments rejects
+    /// instead of recording different content under one identity.
+    #[test]
+    fn session_attempt_replay_with_changed_args_rejects() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: "try X".to_string(),
+            outcome: "rejected".to_string(),
+            critique: None,
+            rationale: None,
+            related_memory_id: None,
+        });
+        let env = tool_call(2, attempt.clone());
+        assert!(!result_is_error(&run(&disp, &env, &attempt)));
+        let changed = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: "try Y instead".to_string(),
+            outcome: "rejected".to_string(),
+            critique: None,
+            rationale: None,
+            related_memory_id: None,
+        });
+        let changed_env = tool_call(2, changed.clone());
+        let result = run(&disp, &changed_env, &changed);
+        assert!(result_is_error(&result));
+        assert!(result_text(&result).contains("different input"));
+        let sessions = disp.registry().all_sessions_owned();
+        assert_eq!(sessions[0].attempts.len(), 1);
+    }
+
+    /// Re-review R1: a session-save failure fails the tool instead of
+    /// reporting success. The sessions path points into a nonexistent
+    /// directory, so every persist fails deterministically. (Dispatcher
+    /// paths are covered in dispatcher.rs tests.)
+    #[test]
+    fn session_tools_fail_when_persist_fails() {
+        let (disp, dir) = test_dispatcher();
+        disp.set_sessions_path(Some(dir.path().join("no-such-dir").join("sessions.json")));
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let env = tool_call(1, start.clone());
+        let err = execute_tool(&disp, &env, &start).unwrap_err();
+        assert!(
+            err.message.contains("persist"),
+            "save failure must fail loudly, got: {}",
+            err.message
+        );
+    }
+
+    /// Re-review R5: practice replay returns the RECORDED snapshot (not
+    /// current contents); key reuse rejects.
+    #[test]
+    fn guide_practice_replay_returns_recorded_snapshot() {
+        let (disp, _dir) = test_dispatcher();
+        let practice = |learning: &str| {
+            ToolArgs::GuidePractice(GuidePracticeArgs {
+                guide: "git".to_string(),
+                category: "dev-tool".to_string(),
+                description: None,
+                contexts: vec![],
+                learnings: vec![learning.to_string()],
+                outcome: Some("success".to_string()),
+            })
+        };
+        let env5 = tool_call(5, practice("first"));
+        let first = run(&disp, &env5, &practice("first"));
+        assert!(!result_is_error(&first));
+        // A different operation moves the guide forward.
+        let env6 = tool_call(6, practice("second"));
+        let _ = run(&disp, &env6, &practice("second"));
+        let live = disp.repo().get_guide("git").unwrap().unwrap();
+        assert_eq!(live.usage_count, 2);
+        // Replaying op 5 resolves to its recorded outcome (usage 1).
+        let replayed = run(&disp, &env5, &practice("first"));
+        assert!(!result_is_error(&replayed));
+        assert_eq!(
+            result_structured(&replayed).unwrap()["usage_count"],
+            serde_json::json!(1),
+            "replay must resolve to the recorded outcome, not current state"
+        );
+        let live = disp.repo().get_guide("git").unwrap().unwrap();
+        assert_eq!(live.usage_count, 2, "replay must not recount");
+        // Same operation ID, different arguments: reject. The changed call
+        // needs its own envelope (same op, changed body) so the digest
+        // actually differs.
+        let changed_env = tool_call(5, practice("changed"));
+        let changed = run(&disp, &changed_env, &practice("changed"));
+        assert!(result_is_error(&changed));
+        assert!(result_text(&changed).contains("different input"));
+    }
+
+    /// Re-review R2: distilling after a concurrent content update preserves
+    /// the new content and still links the guide; distilling first then
+    /// updating keeps both effects as well.
+    #[test]
+    fn guide_distill_preserves_concurrent_content_update() {
+        let (disp, _dir) = test_dispatcher();
+        let mem_id = add_fragment(&disp, 1, "## Linked\n\n### Context\noriginal body");
+        // Concurrent content update through the canonical tool path.
+        let update = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: mem_id.clone(),
+            fragment: Some("## Linked\n\n### Context\nnew body".to_string()),
+            ..Default::default()
+        });
+        let update_env = tool_call(2, update.clone());
+        assert!(!result_is_error(&run(&disp, &update_env, &update)));
+        // Distill after the update: new content must survive with the link.
+        let distill = ToolArgs::GuideDistill(GuideDistillArgs {
+            memory_id: mem_id.clone(),
+            guide: "react".to_string(),
+            category: Some("web-frontend".to_string()),
+        });
+        let env = tool_call(3, distill.clone());
+        let result = run(&disp, &env, &distill);
+        assert!(!result_is_error(&result));
+        let eid = disp.repo().resolve_id(&mem_id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            mems[0].fragment.contains("new body"),
+            "distill must preserve concurrent content, got: {}",
+            mems[0].fragment
+        );
+        assert!(mems[0].related_guides.iter().any(|g| g == "react"));
+        assert!(!mems[0].distill_candidate);
+        let guide = disp.repo().get_guide("react").unwrap().unwrap();
+        assert!(guide.learnings.iter().any(|l| l.contains("new body")));
+        // Replay of the same distill operation: usage counted once.
+        let replayed = run(&disp, &env, &distill);
+        assert!(!result_is_error(&replayed));
+        let guide = disp.repo().get_guide("react").unwrap().unwrap();
+        assert_eq!(guide.usage_count, 1, "distill replay must not recount");
+        // Same operation ID, different arguments: reject.
+        let changed = ToolArgs::GuideDistill(GuideDistillArgs {
+            memory_id: mem_id.clone(),
+            guide: "other".to_string(),
+            category: Some("web-frontend".to_string()),
+        });
+        let changed_env = tool_call(3, changed.clone());
+        let changed_result = run(&disp, &changed_env, &changed);
+        assert!(result_is_error(&changed_result));
+        assert!(result_text(&changed_result).contains("different input"));
+        // Unknown memory: honest error, never success.
+        let bad = ToolArgs::GuideDistill(GuideDistillArgs {
+            memory_id: "m000000000000".to_string(),
+            guide: "react".to_string(),
+            category: None,
+        });
+        let bad_env = tool_call(4, bad.clone());
+        let bad_result = run(&disp, &bad_env, &bad);
+        assert!(result_is_error(&bad_result));
     }
 
     // ---- WP-09: intelligence tools ----

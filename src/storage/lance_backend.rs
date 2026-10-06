@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
+use lancedb::arrow::arrow_array::{
     BooleanArray, Float64Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
 };
-use arrow_schema::SchemaRef;
+use lancedb::arrow::arrow_schema::SchemaRef;
 use lancedb::connect;
 use lancedb::database::CreateTableMode;
 use lancedb::query::ExecutableQuery;
@@ -733,7 +733,7 @@ mod tests {
         let _ = tbl.set_unenforced_primary_key(["id"]).await;
 
         let batch1 = memory_batch(eid(1), "A", "fa", 0.5, 1);
-        let reader1: Box<dyn arrow_array::RecordBatchReader + Send> =
+        let reader1: Box<dyn lancedb::arrow::arrow_array::RecordBatchReader + Send> =
             Box::new(RecordBatchIterator::new(
                 vec![Ok(batch1)],
                 Arc::new(crate::storage::schema::memories_schema()),
@@ -741,7 +741,7 @@ mod tests {
         tbl.add(reader1).execute().await.unwrap();
 
         let batch2 = memory_batch(eid(1), "B", "fb", 0.6, 2);
-        let reader2: Box<dyn arrow_array::RecordBatchReader + Send> =
+        let reader2: Box<dyn lancedb::arrow::arrow_array::RecordBatchReader + Send> =
             Box::new(RecordBatchIterator::new(
                 vec![Ok(batch2)],
                 Arc::new(crate::storage::schema::memories_schema()),

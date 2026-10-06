@@ -1,10 +1,15 @@
 //! P2-2 release evidence (acceptance): the evidence bundle is reproducible
-//! from the working tree and tied to the tested commit.
+//! from the working tree and tied to the tested source.
 //!
 //! Quick mode only (fmt + manifest, no full suite): asserts the script exits
-//! 0, names its bundle dir on stdout, and writes a manifest containing the
-//! current HEAD SHA, toolchain, lock digest and dep versions — with no
-//! absolute local paths (sanitized).
+//! 0, names its timestamped bundle dir on stdout, and writes a manifest
+//! containing the current HEAD SHA, toolchain, lock digest and dep versions
+//! — with no absolute local paths (sanitized). Source identity is HEAD;
+//! there is deliberately no dirtiness tracking (evidence is generated
+//! during fixing rounds, so such a marker would always read true).
+//! Full-mode gating (nonzero exit on failed checks) is exercised against
+//! mock toolchains in developer probes, not here: this test must stay fast
+//! and hermetic.
 
 use std::process::Command;
 
@@ -40,8 +45,8 @@ fn quick_evidence_manifest_ties_to_head() {
     let head = head_sha();
     assert!(manifest.contains(&head), "manifest must tie to HEAD {head}");
     assert!(
-        dir.ends_with(&head[..12]),
-        "bundle dir must carry the short SHA"
+        dir.contains(&head[..12]) && dir.contains("-quick-"),
+        "bundle dir must carry the short SHA and mode, got: {dir}"
     );
     for field in [
         "\"mode\": \"quick\"",

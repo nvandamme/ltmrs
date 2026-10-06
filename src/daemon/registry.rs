@@ -58,11 +58,48 @@ pub struct FrontendRegistry {
     channels: HashMap<(FrontendId, ChannelId), ChannelBinding>,
     sessions: HashMap<SessionHandle, Session>,
     handle_gen: AtomicU64,
+    /// Durable operation receipts for session/tool operations (re-review
+    /// R5): keyed by operation ID, bound to the request digest. A retried
+    /// operation with the same ID + digest replays its recorded outcome;
+    /// the same ID with a different digest is rejected as key reuse.
+    /// Persisted in sessions.json alongside sessions (ephemeral leases and
+    /// live counts stay out, as before).
+    op_log: HashMap<String, OpRecord>,
     /// Live IPC connections serving right now (incremented on connect,
     /// decremented on drop). Restore readiness counts these — never the
     /// persisted channel history, whose dead entries outlive their runs
     /// and would otherwise block every restore after a daemon restart.
     live: AtomicUsize,
+}
+
+/// A durable receipt for one completed session/tool operation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpRecord {
+    /// The request digest the operation first executed with. Replays must
+    /// match; mismatches are key-reuse conflicts, never silent replays.
+    pub digest: String,
+    /// The session this operation acted on.
+    pub session: SessionHandle,
+    /// Recorded response text (tool path), if any.
+    pub text: Option<String>,
+    /// Recorded structured data (tool path), if any.
+    pub data: Option<serde_json::Value>,
+    /// Effect markers for multi-step operations (e.g. session_end guide
+    /// updates): effect keys applied under this operation, so a retry
+    /// resumes the missing effects instead of duplicating completed ones.
+    #[serde(default)]
+    pub effects: Vec<String>,
+}
+
+/// The outcome of consulting the operation log before executing.
+#[derive(Debug, Clone)]
+pub enum OpCheck {
+    /// No record: execute normally, then record the outcome.
+    Fresh,
+    /// Same ID + digest seen before: return the recorded outcome.
+    Replay(OpRecord),
+    /// Same ID, different digest: reject, never execute.
+    Conflict,
 }
 
 impl FrontendRegistry {
@@ -71,8 +108,55 @@ impl FrontendRegistry {
             channels: HashMap::new(),
             sessions: HashMap::new(),
             handle_gen: AtomicU64::new(1),
+            op_log: HashMap::new(),
             live: AtomicUsize::new(0),
         }
+    }
+
+    /// Consult the operation log before executing a session/tool operation.
+    pub fn check_op(&self, operation_id: &str, digest: &str) -> OpCheck {
+        match self.op_log.get(operation_id) {
+            None => OpCheck::Fresh,
+            Some(rec) if rec.digest == digest => OpCheck::Replay(rec.clone()),
+            Some(_) => OpCheck::Conflict,
+        }
+    }
+
+    /// Record a completed operation's outcome (durable once persisted).
+    pub fn record_op(
+        &mut self,
+        operation_id: &str,
+        digest: &str,
+        session: SessionHandle,
+        text: Option<String>,
+        data: Option<serde_json::Value>,
+    ) {
+        self.op_log.insert(
+            operation_id.to_string(),
+            OpRecord {
+                digest: digest.to_string(),
+                session,
+                text,
+                data,
+                effects: Vec::new(),
+            },
+        );
+    }
+
+    /// Mark one effect of a multi-step operation applied (idempotent).
+    pub fn mark_effect_applied(&mut self, operation_id: &str, effect: &str) {
+        if let Some(rec) = self.op_log.get_mut(operation_id)
+            && !rec.effects.iter().any(|e| e == effect)
+        {
+            rec.effects.push(effect.to_string());
+        }
+    }
+
+    /// Whether an effect key was already applied under an operation.
+    pub fn effect_applied(&self, operation_id: &str, effect: &str) -> bool {
+        self.op_log
+            .get(operation_id)
+            .is_some_and(|rec| rec.effects.iter().any(|e| e == effect))
     }
 
     fn next_handle(&self) -> SessionHandle {
@@ -667,10 +751,14 @@ impl FrontendRegistry {
         self.sessions.get_mut(&handle)
     }
 
-    /// Persist the registry state (sessions, channel bindings, leases) to a
-    /// JSON file so a daemon restart restores durable history. Atomic
-    /// tmp+rename: a crash mid-write leaves the previous file intact (never
-    /// a torn sessions.json that fails the next load).
+    /// Persist the registry state (sessions, channel bindings, leases,
+    /// operation receipts) to a JSON file so a daemon restart restores
+    /// durable history. Atomic tmp+rename plus file + directory
+    /// synchronization: a crash or power loss mid-write leaves either the
+    /// previous file intact or the new file durable — never a torn
+    /// sessions.json that fails the next load. (File sync is durability,
+    /// not atomicity with Fjall state: cross-store operations still need
+    /// their own idempotency markers, see OpRecord::effects.)
     pub fn persist(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
         let snapshot = RegistrySnapshot {
             handle_gen: self.handle_gen.load(Ordering::SeqCst),
@@ -691,12 +779,23 @@ impl FrontendRegistry {
                     session: s.clone(),
                 })
                 .collect(),
+            op_log: self.op_log.clone(),
         };
         let json = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, path)
+        // Durability barrier (re-review R1): flush file data before the
+        // rename makes it visible, then flush the directory entry.
+        let f = std::fs::File::open(&tmp)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 
     /// Load the registry state from a JSON file. A missing file yields an
@@ -720,6 +819,7 @@ impl FrontendRegistry {
             channels,
             sessions,
             handle_gen: AtomicU64::new(snapshot.handle_gen),
+            op_log: snapshot.op_log,
             // Live connections never persist: a fresh process starts at zero.
             live: AtomicUsize::new(0),
         })
@@ -732,6 +832,11 @@ struct RegistrySnapshot {
     handle_gen: u64,
     channels: Vec<ChannelEntry>,
     sessions: Vec<SessionEntry>,
+    /// Durable operation receipts (re-review R5). Old snapshots without
+    /// this field load with an empty log (replays then re-execute once —
+    /// attempt IDs and guide op logs still dedup the effects).
+    #[serde(default)]
+    op_log: HashMap<String, OpRecord>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -989,5 +1094,64 @@ mod tests {
             reg.ensure_virtual_session(fe(1), ch(2), 1_800_000),
             "30-minute lifetime bound must retire even active virtual sessions"
         );
+    }
+
+    /// Re-review R5: the operation log distinguishes fresh, replay and
+    /// conflicting-key reuse, and effect markers are idempotent.
+    #[test]
+    fn op_log_fresh_replay_conflict_and_effects() {
+        let mut reg = FrontendRegistry::new();
+        let h = reg.start_session(fe(1), ch(1), None, None, 0);
+        assert!(matches!(reg.check_op("op-1", "d1"), OpCheck::Fresh));
+        reg.record_op("op-1", "d1", h, Some("done".into()), None);
+        match reg.check_op("op-1", "d1") {
+            OpCheck::Replay(rec) => {
+                assert_eq!(rec.session, h);
+                assert_eq!(rec.text.as_deref(), Some("done"));
+            }
+            other => panic!("expected replay, got: {other:?}"),
+        }
+        assert!(matches!(
+            reg.check_op("op-1", "DIFFERENT"),
+            OpCheck::Conflict
+        ));
+        assert!(!reg.effect_applied("op-1", "e1"));
+        reg.mark_effect_applied("op-1", "e1");
+        reg.mark_effect_applied("op-1", "e1");
+        assert!(reg.effect_applied("op-1", "e1"));
+        // Unknown operations have no effects.
+        assert!(!reg.effect_applied("op-unknown", "e1"));
+    }
+
+    /// Re-review R1/R5: the op log persists across restarts (replays stay
+    /// replays after a restart), and old snapshots without the log still
+    /// load (empty log, no failure).
+    #[test]
+    fn op_log_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut reg = FrontendRegistry::new();
+        let h = reg.start_session(fe(1), ch(1), None, None, 0);
+        reg.record_op("op-9", "digest-9", h, Some("text-9".into()), None);
+        reg.persist(&path).unwrap();
+        let reg2 = FrontendRegistry::load(&path).unwrap();
+        match reg2.check_op("op-9", "digest-9") {
+            OpCheck::Replay(rec) => {
+                assert_eq!(rec.session, h);
+                assert_eq!(rec.text.as_deref(), Some("text-9"));
+            }
+            other => panic!("receipt must survive restart, got: {other:?}"),
+        }
+        assert!(matches!(reg2.check_op("op-9", "other"), OpCheck::Conflict));
+        // Hand-written old snapshot without op_log loads fine.
+        let legacy = serde_json::json!({
+            "handle_gen": 1u64,
+            "channels": [],
+            "sessions": [],
+        });
+        let legacy_path = dir.path().join("legacy.json");
+        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let reg3 = FrontendRegistry::load(&legacy_path).unwrap();
+        assert!(matches!(reg3.check_op("anything", "d"), OpCheck::Fresh));
     }
 }

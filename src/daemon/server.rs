@@ -17,7 +17,7 @@ use crate::daemon::registry::FrontendRegistry;
 use crate::daemon::runtime::{DaemonRuntime, RuntimeError, RuntimePaths, acquire_singleton};
 use crate::daemon::scheduler::{EmbeddingScheduler, SchedulerConfig};
 use crate::domain::clock::{Clock, SystemClock};
-use crate::domain::command::{DomainError, DomainErrorCode};
+use crate::domain::command::{DomainError, DomainErrorCode, DomainResult};
 use crate::embeddings::artifacts::ArtifactCache;
 use crate::search::backend::SearchBackend;
 use crate::search::maintenance::{MaintenanceConfig, MaintenanceScheduler};
@@ -486,59 +486,94 @@ impl Daemon {
         let trigger = self.projection_trigger.clone();
         *pw = Some(tokio::spawn(async move {
             loop {
-                let tick = tokio::task::spawn_blocking({
-                    let repo = Arc::clone(&repo);
-                    let table = table.clone();
-                    let adapter = std::sync::Arc::clone(&adapter);
-                    move || {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let driven = crate::search::projector::Projector::project_pending(
-                                &repo,
-                                &table,
-                                Box::new(adapter),
-                                Self::MAX_PROJECTION_JOBS_PER_TICK,
-                            )
-                            .await;
-                            // FTS only after a successful drive: a failing
-                            // table needs repair, not an index build.
-                            let fts = if driven.is_ok() {
-                                Some(table.ensure_fts_index().await)
-                            } else {
-                                None
-                            };
-                            (driven, fts)
-                        })
-                    }
-                })
+                let (driven, fts) = Self::drive_projection_batch(
+                    &repo,
+                    &table,
+                    Box::new(std::sync::Arc::clone(&adapter)),
+                    Self::MAX_PROJECTION_JOBS_PER_TICK,
+                )
                 .await;
-                match tick {
-                    Err(join_err) => eprintln!(
-                        "ltmrs: projection drive panicked ({join_err}); retrying next tick"
-                    ),
-                    Ok((Err(e), _)) => eprintln!(
-                        "ltmrs: projection pass failed ({}); retrying next tick",
-                        e.message
-                    ),
-                    Ok((Ok(resolved), fts)) => {
-                        if resolved > 0 {
-                            eprintln!("ltmrs: projection converged {resolved} job(s)");
-                        }
-                        match fts {
-                            Some(Err(fe)) => eprintln!(
-                                "ltmrs: fts index build failed ({}); retrying next tick",
-                                fe.message
-                            ),
-                            Some(Ok(true)) => eprintln!("ltmrs: fts index built"),
-                            _ => {}
-                        }
+                let resolved = match driven {
+                    Err(e) => {
+                        eprintln!(
+                            "ltmrs: projection pass failed ({}); retrying next tick",
+                            e.message
+                        );
+                        0
                     }
+                    Ok(n) => {
+                        if n > 0 {
+                            eprintln!("ltmrs: projection converged {n} job(s)");
+                        }
+                        n
+                    }
+                };
+                match fts {
+                    Some(Err(fe)) => eprintln!(
+                        "ltmrs: fts index build failed ({}); retrying next tick",
+                        fe.message
+                    ),
+                    Some(Ok(true)) => eprintln!("ltmrs: fts index built"),
+                    _ => {}
                 }
-                // Commit wake or maintenance interval, whichever comes first
-                // (P2-1): new memories drive immediately in a bounded batch;
-                // the interval covers repair/retries of failed passes.
-                trigger.wait(interval).await;
+                // Drain-while-full (re-review R6): a pass that hit the batch
+                // cap likely leaves runnable backlog, so drive again after
+                // yielding instead of sleeping through the interval. A pass
+                // below the cap converged (only stale/failing work remains),
+                // as does any failed pass — those wait on wake-or-interval.
+                // No busy loop: resolutions acknowledge-and-clear their jobs,
+                // so consecutive full passes each retire a full batch.
+                if resolved < Self::MAX_PROJECTION_JOBS_PER_TICK {
+                    // Commit wake or maintenance interval, whichever comes
+                    // first (P2-1): new memories drive immediately in a
+                    // bounded batch; the interval covers repair/retries.
+                    trigger.wait(interval).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
             }
         }));
+    }
+
+    /// One bounded projection pass: drive pending jobs off the Tokio I/O
+    /// workers (inference is synchronous CPU; the spawn_blocking bridge
+    /// keeps it there), then rebuild the FTS index after a successful
+    /// drive. Returns jobs resolved plus the FTS outcome. Extracted so
+    /// drain behavior is unit-testable without the E5 adapter.
+    async fn drive_projection_batch(
+        repo: &Arc<CanonicalRepository>,
+        table: &SearchTable,
+        embedder: Box<dyn crate::search::projector::Embedder + Send>,
+        max_jobs: usize,
+    ) -> (DomainResult<usize>, Option<DomainResult<bool>>) {
+        let repo = Arc::clone(repo);
+        let table = table.clone();
+        let table_fts = table.clone();
+        let driven = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async {
+                crate::search::projector::Projector::project_pending(
+                    &repo, &table, embedder, max_jobs,
+                )
+                .await
+            })
+        })
+        .await;
+        match driven {
+            Err(join_err) => (
+                Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    format!("projection drive panicked ({join_err}); retrying next tick"),
+                )),
+                None,
+            ),
+            Ok(Err(e)) => (Err(e), None),
+            Ok(Ok(resolved)) => {
+                // FTS only after a successful drive: a failing table needs
+                // repair, not an index build.
+                let fts = Some(table_fts.ensure_fts_index().await);
+                (Ok(resolved), fts)
+            }
+        }
     }
 
     /// Whether the projection worker is currently running (diagnostics/tests).
@@ -1736,5 +1771,82 @@ mod tests {
         )
         .await
         .expect("commit wake must fire immediately");
+    }
+
+    /// Re-review R6: more than two batch limits of pending work keeps
+    /// draining across back-to-back bounded passes with no new commits and
+    /// no interval wait. Deterministic: no clock advance between batches.
+    #[tokio::test]
+    async fn projection_drains_past_one_batch_without_sleep() {
+        use crate::domain::command::DomainCommand;
+        use crate::search::projector::FixedEmbedder;
+        use crate::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        repo.issue_namespace(fe(1), 1000).unwrap();
+        let table_dir = dir.path().join("table");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let table = SearchTable::open(table_dir.to_str().unwrap())
+            .await
+            .unwrap();
+        // Seed 250 pending jobs (2.5 batch limits at MAX=100).
+        for n in 1..=250u64 {
+            let ctx = crate::domain::command::CommandContext {
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: fe(1),
+                channel_id: ch(1),
+                session: None,
+                operation_id: OperationId::new(Uuid::from_u128(1000 + n as u128)),
+                request_digest: format!("drain-test-{n}"),
+                deadline_millis: None,
+                scope: Scope::default(),
+                retry_epoch: 1,
+            };
+            repo.apply(
+                &ctx,
+                &DomainCommand::AddMemory {
+                    memory: test_memory(n),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(repo.projection_lag().unwrap(), 250);
+        // Three consecutive bounded batches, no writes and no clock advance
+        // between them: 100 + 100 + 50 proves the worker drains runnable
+        // backlog instead of sleeping after the first batch.
+        let (first, _) = Daemon::drive_projection_batch(
+            &repo,
+            &table,
+            Box::new(FixedEmbedder { dim: 384 }),
+            100,
+        )
+        .await;
+        assert_eq!(first.unwrap(), 100);
+        let (second, _) = Daemon::drive_projection_batch(
+            &repo,
+            &table,
+            Box::new(FixedEmbedder { dim: 384 }),
+            100,
+        )
+        .await;
+        assert_eq!(second.unwrap(), 100);
+        let (third, _) = Daemon::drive_projection_batch(
+            &repo,
+            &table,
+            Box::new(FixedEmbedder { dim: 384 }),
+            100,
+        )
+        .await;
+        assert_eq!(third.unwrap(), 50);
+        assert_eq!(repo.projection_lag().unwrap(), 0);
     }
 }

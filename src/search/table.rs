@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatchIterator, StringArray, UInt64Array};
-use arrow_schema::{DataType, Field, SchemaRef};
+use lancedb::arrow::arrow_array::{RecordBatchIterator, StringArray, UInt64Array};
+use lancedb::arrow::arrow_schema::{DataType, Field, SchemaRef};
 use lancedb::connect;
 use lancedb::database::CreateTableMode;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -49,7 +49,7 @@ impl Default for MaintenanceBudget {
 /// stay stable; tables predating it are refused at open with a rebuild
 /// directive (the projection is derived state, rebuilt from canonical).
 pub fn search_schema(dim: u32) -> SchemaRef {
-    Arc::new(arrow_schema::Schema::new(vec![
+    Arc::new(lancedb::arrow::arrow_schema::Schema::new(vec![
         Field::new("store_generation", DataType::UInt64, false),
         Field::new("memory_id", DataType::Utf8, false),
         Field::new("document_revision", DataType::UInt64, false),
@@ -217,7 +217,7 @@ impl SearchTable {
             .await
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
         use futures_util::TryStreamExt;
-        let batches: Vec<arrow_array::RecordBatch> = stream
+        let batches: Vec<lancedb::arrow::arrow_array::RecordBatch> = stream
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
@@ -259,10 +259,10 @@ impl SearchTable {
         match stream {
             Ok(stream) => {
                 use futures_util::TryStreamExt;
-                let batches: Vec<arrow_array::RecordBatch> =
-                    stream.try_collect::<Vec<_>>().await.map_err(|e| {
-                        DomainError::new(DomainErrorCode::Validation, e.to_string())
-                    })?;
+                let batches: Vec<lancedb::arrow::arrow_array::RecordBatch> = stream
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
                 batches_to_rows(&batches)
             }
             Err(e) => {
@@ -307,7 +307,7 @@ impl SearchTable {
             .await
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
         use futures_util::TryStreamExt;
-        let batches: Vec<arrow_array::RecordBatch> = stream
+        let batches: Vec<lancedb::arrow::arrow_array::RecordBatch> = stream
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
@@ -318,9 +318,10 @@ impl SearchTable {
                 continue;
             }
             let rows = batches_to_rows(std::slice::from_ref(batch))?;
-            let dist = batch
-                .column_by_name("_distance")
-                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
+            let dist = batch.column_by_name("_distance").and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<lancedb::arrow::arrow_array::Float32Array>()
+            });
             for (i, row) in rows.iter().enumerate() {
                 let d = dist.map(|d| d.value(i)).unwrap_or(1.0);
                 out.push((row.clone(), d));
@@ -544,9 +545,12 @@ fn require_chunker_version(schema: &SchemaRef) -> DomainResult<()> {
     Ok(())
 }
 
-fn row_batch(rows: &[SearchRow], schema: &SchemaRef) -> DomainResult<arrow_array::RecordBatch> {
-    use arrow_array::{FixedSizeListArray, Float32Array, UInt32Array};
-    use arrow_buffer::NullBufferBuilder;
+fn row_batch(
+    rows: &[SearchRow],
+    schema: &SchemaRef,
+) -> DomainResult<lancedb::arrow::arrow_array::RecordBatch> {
+    use lancedb::arrow::arrow_array::{FixedSizeListArray, Float32Array, UInt32Array};
+    use lancedb::arrow::arrow_buffer::NullBufferBuilder;
 
     let dim = match schema.field_with_name("embedding") {
         Ok(field) => match field.data_type() {
@@ -587,7 +591,7 @@ fn row_batch(rows: &[SearchRow], schema: &SchemaRef) -> DomainResult<arrow_array
         FixedSizeListArray::try_new(dim.0, dim.1, Arc::new(flat), null_builder.finish())
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
 
-    arrow_array::RecordBatch::try_new(
+    lancedb::arrow::arrow_array::RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(UInt64Array::from_iter_values(
@@ -630,7 +634,7 @@ fn row_batch(rows: &[SearchRow], schema: &SchemaRef) -> DomainResult<arrow_array
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|r| r.chunker_version.clone()),
             )),
-            Arc::new(arrow_array::Float64Array::from_iter_values(
+            Arc::new(lancedb::arrow::arrow_array::Float64Array::from_iter_values(
                 rows.iter().map(|r| r.confidence),
             )),
         ],
@@ -638,8 +642,12 @@ fn row_batch(rows: &[SearchRow], schema: &SchemaRef) -> DomainResult<arrow_array
     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
 }
 
-fn batches_to_rows(batches: &[arrow_array::RecordBatch]) -> DomainResult<Vec<SearchRow>> {
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, Float64Array, UInt32Array};
+fn batches_to_rows(
+    batches: &[lancedb::arrow::arrow_array::RecordBatch],
+) -> DomainResult<Vec<SearchRow>> {
+    use lancedb::arrow::arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Float64Array, UInt32Array,
+    };
     let corrupt = |row: usize, column: &str| {
         DomainError::new(
             DomainErrorCode::Validation,
@@ -987,7 +995,7 @@ mod tests {
         let uri = dir.path().to_str().unwrap().to_string();
         // Craft a pre-confidence table: current schema minus the last column.
         let full = search_schema(EMBEDDING_DIM);
-        let old = Arc::new(arrow_schema::Schema::new(
+        let old = Arc::new(lancedb::arrow::arrow_schema::Schema::new(
             full.fields()[..full.fields().len() - 1].to_vec(),
         ));
         let db = lancedb::connect(&uri).execute().await.unwrap();
@@ -1020,7 +1028,9 @@ mod tests {
         // successor — no chunker_version, no confidence.
         let full = search_schema(EMBEDDING_DIM);
         let slot = full.index_of("chunker_version").unwrap();
-        let old = Arc::new(arrow_schema::Schema::new(full.fields()[..slot].to_vec()));
+        let old = Arc::new(lancedb::arrow::arrow_schema::Schema::new(
+            full.fields()[..slot].to_vec(),
+        ));
         let db = lancedb::connect(&uri).execute().await.unwrap();
         db.create_empty_table(SEARCH_TABLE, old)
             .mode(lancedb::database::CreateTableMode::exist_ok(|req| req))
@@ -1355,14 +1365,16 @@ mod tests {
     /// malformed memory id errors with row identity, never unwraps.
     #[test]
     fn corrupt_rows_error_instead_of_panicking() {
-        use arrow_array::{Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
+        use lancedb::arrow::arrow_array::{
+            Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+        };
         use std::sync::Arc;
         let dim = 2;
         let schema = search_schema(dim);
-        let embedding_type = arrow_schema::DataType::FixedSizeList(
-            Arc::new(arrow_schema::Field::new(
+        let embedding_type = lancedb::arrow::arrow_schema::DataType::FixedSizeList(
+            Arc::new(lancedb::arrow::arrow_schema::Field::new(
                 "item",
-                arrow_schema::DataType::Float32,
+                lancedb::arrow::arrow_schema::DataType::Float32,
                 true,
             )),
             dim as i32,
@@ -1382,7 +1394,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["fact"])),
                 Arc::new(UInt64Array::from(vec![0])),
                 Arc::new(UInt64Array::from(vec![0])),
-                arrow_array::new_null_array(&embedding_type, 1),
+                lancedb::arrow::arrow_array::new_null_array(&embedding_type, 1),
                 Arc::new(StringArray::from(vec!["v1"])),
                 Arc::new(Float64Array::from(vec![0.5])),
             ],
@@ -1400,17 +1412,17 @@ mod tests {
     /// directive) instead of defaulting confidence or misaligning fields.
     #[test]
     fn pre_confidence_schema_errors_naming_confidence() {
-        use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
+        use lancedb::arrow::arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
         use std::sync::Arc;
         let dim = 2;
         let full = search_schema(dim);
         // All columns except the trailing confidence one.
         let fields: Vec<_> = full.fields()[..full.fields().len() - 1].to_vec();
-        let schema = Arc::new(arrow_schema::Schema::new(fields));
-        let embedding_type = arrow_schema::DataType::FixedSizeList(
-            Arc::new(arrow_schema::Field::new(
+        let schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(fields));
+        let embedding_type = lancedb::arrow::arrow_schema::DataType::FixedSizeList(
+            Arc::new(lancedb::arrow::arrow_schema::Field::new(
                 "item",
-                arrow_schema::DataType::Float32,
+                lancedb::arrow::arrow_schema::DataType::Float32,
                 true,
             )),
             dim as i32,
@@ -1431,7 +1443,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["fact"])),
                 Arc::new(UInt64Array::from(vec![0])),
                 Arc::new(UInt64Array::from(vec![0])),
-                arrow_array::new_null_array(&embedding_type, 1),
+                lancedb::arrow::arrow_array::new_null_array(&embedding_type, 1),
                 Arc::new(StringArray::from(vec!["v1"])),
             ],
         )
@@ -1448,39 +1460,95 @@ mod tests {
     /// to identical rows instead of silently misattributing fields.
     #[test]
     fn reordered_columns_parse_by_name() {
-        use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
+        use lancedb::arrow::arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
         use std::sync::Arc;
         // Same fields as search_schema(2) with lexical_text and fragment_type
         // swapped in position.
         let fields = vec![
-            arrow_schema::Field::new("store_generation", arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new("memory_id", arrow_schema::DataType::Utf8, false),
-            arrow_schema::Field::new("document_revision", arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new("model_fingerprint", arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new("chunk_id", arrow_schema::DataType::UInt32, false),
-            arrow_schema::Field::new("fragment_type", arrow_schema::DataType::Utf8, false),
-            arrow_schema::Field::new("char_start", arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new("char_end", arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new("project", arrow_schema::DataType::Utf8, true),
-            arrow_schema::Field::new("lexical_text", arrow_schema::DataType::Utf8, false),
-            arrow_schema::Field::new("created_at_millis", arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new("updated_at_millis", arrow_schema::DataType::UInt64, false),
-            arrow_schema::Field::new(
+            lancedb::arrow::arrow_schema::Field::new(
+                "store_generation",
+                lancedb::arrow::arrow_schema::DataType::UInt64,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "memory_id",
+                lancedb::arrow::arrow_schema::DataType::Utf8,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "document_revision",
+                lancedb::arrow::arrow_schema::DataType::UInt64,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "model_fingerprint",
+                lancedb::arrow::arrow_schema::DataType::UInt64,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "chunk_id",
+                lancedb::arrow::arrow_schema::DataType::UInt32,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "fragment_type",
+                lancedb::arrow::arrow_schema::DataType::Utf8,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "char_start",
+                lancedb::arrow::arrow_schema::DataType::UInt64,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "char_end",
+                lancedb::arrow::arrow_schema::DataType::UInt64,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "project",
+                lancedb::arrow::arrow_schema::DataType::Utf8,
+                true,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "lexical_text",
+                lancedb::arrow::arrow_schema::DataType::Utf8,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "created_at_millis",
+                lancedb::arrow::arrow_schema::DataType::UInt64,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "updated_at_millis",
+                lancedb::arrow::arrow_schema::DataType::UInt64,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
                 "embedding",
-                arrow_schema::DataType::FixedSizeList(
-                    Arc::new(arrow_schema::Field::new(
+                lancedb::arrow::arrow_schema::DataType::FixedSizeList(
+                    Arc::new(lancedb::arrow::arrow_schema::Field::new(
                         "item",
-                        arrow_schema::DataType::Float32,
+                        lancedb::arrow::arrow_schema::DataType::Float32,
                         true,
                     )),
                     2,
                 ),
                 true,
             ),
-            arrow_schema::Field::new("chunker_version", arrow_schema::DataType::Utf8, false),
-            arrow_schema::Field::new("confidence", arrow_schema::DataType::Float64, false),
+            lancedb::arrow::arrow_schema::Field::new(
+                "chunker_version",
+                lancedb::arrow::arrow_schema::DataType::Utf8,
+                false,
+            ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "confidence",
+                lancedb::arrow::arrow_schema::DataType::Float64,
+                false,
+            ),
         ];
-        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(fields));
         let id = "12345678-1234-1234-1234-123456789012";
         let batch = RecordBatch::try_new(
             schema,
@@ -1497,11 +1565,11 @@ mod tests {
                 Arc::new(StringArray::from(vec!["hello world"])),
                 Arc::new(UInt64Array::from(vec![100])),
                 Arc::new(UInt64Array::from(vec![200])),
-                arrow_array::new_null_array(
-                    &arrow_schema::DataType::FixedSizeList(
-                        Arc::new(arrow_schema::Field::new(
+                lancedb::arrow::arrow_array::new_null_array(
+                    &lancedb::arrow::arrow_schema::DataType::FixedSizeList(
+                        Arc::new(lancedb::arrow::arrow_schema::Field::new(
                             "item",
-                            arrow_schema::DataType::Float32,
+                            lancedb::arrow::arrow_schema::DataType::Float32,
                             true,
                         )),
                         2,
@@ -1509,7 +1577,7 @@ mod tests {
                     1,
                 ),
                 Arc::new(StringArray::from(vec!["v1"])),
-                Arc::new(arrow_array::Float64Array::from(vec![0.5])),
+                Arc::new(lancedb::arrow::arrow_array::Float64Array::from(vec![0.5])),
             ],
         )
         .unwrap();
