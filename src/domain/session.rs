@@ -191,6 +191,12 @@ pub struct SessionReceipt {
     /// The frozen tool response, stored after first execution.
     #[serde(default)]
     pub response: Option<FrozenToolResponse>,
+    /// Continuity-recall attempt boosts already applied for this start
+    /// operation (P2-B): the `session_start` continuation boosts recalled
+    /// dead-ends exactly once per operation, so a crash between the boost
+    /// and the response freeze cannot double-apply on continuation.
+    #[serde(default)]
+    pub continuity_boosted: bool,
 }
 
 /// A frozen tool response (P2-1): the exact text + structured payload +

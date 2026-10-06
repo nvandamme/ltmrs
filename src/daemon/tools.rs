@@ -4004,7 +4004,20 @@ fn exec_session_start(
     response.push_str(&format!("\n{formatted_suggestions}"));
 
     // Continuity recall: dead-ends + lessons + warnings from prior sessions.
-    let continuity = build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
+    // Recalled-attempt boosts apply exactly once per operation (P2-B):
+    // claimed through the session receipt flag, so a crash between the
+    // boost and the response freeze cannot double-apply on continuation.
+    let (continuity, boost_targets) =
+        build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
+    if !boost_targets.is_empty() {
+        match repo.claim_continuity_boost(&op_id, &digest, &boost_targets, 0.015, now) {
+            Ok(_) => {}
+            Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
+                return key_reuse_result();
+            }
+            Err(e) => return Err(e),
+        }
+    }
     if !continuity.is_empty() {
         response.push_str(&continuity);
     }
@@ -4049,8 +4062,8 @@ fn build_continuity_recall(
     disp: &Dispatcher,
     task_type: &str,
     project: Option<&str>,
-    now: u64,
-) -> String {
+    _now: u64,
+) -> (String, Vec<(SessionHandle, u32)>) {
     let sessions = disp.repo().all_sessions().unwrap_or_default();
 
     // Layer 1 — dead ends from similar prior sessions.
@@ -4119,23 +4132,22 @@ fn build_continuity_recall(
         .collect();
 
     if dead_ends.is_empty() && lessons.is_empty() && warnings.is_empty() {
-        return String::new();
+        return (String::new(), Vec::new());
     }
 
     let mut block = format!("\n\n## Prior reasoning on similar {task_type} tasks");
+    // Recalled-attempt boost targets (P2-B): this function stays a pure
+    // read — the caller claims each boost exactly once per operation
+    // through the session receipt flag.
+    let mut boosted: Vec<(SessionHandle, u32)> = Vec::new();
     if !dead_ends.is_empty() {
         block.push_str("\n### Dead ends (don't repeat)");
-        let mut boosted: Vec<(SessionHandle, u32)> = Vec::new();
         for (handle, seq, approach, critique) in &dead_ends {
             block.push_str(&format!(
                 "\n- Tried: {approach}. Rejected because: {}",
                 critique.as_deref().unwrap_or("unknown")
             ));
             boosted.push((*handle, *seq));
-        }
-        // Boost recalled attempts (best-effort, canonical store).
-        for (handle, seq) in boosted {
-            let _ = disp.repo().adjust_attempt(handle, seq, 0.015, now);
         }
     }
     if !lessons.is_empty() {
@@ -4155,7 +4167,7 @@ fn build_continuity_recall(
             block.push_str(&format!("\n- {text}"));
         }
     }
-    block
+    (block, boosted)
 }
 
 // ---- session_attempt ----
@@ -4660,10 +4672,10 @@ fn exec_proactive_analysis(
 
 // ---- backup_create (WP-11a; native tool) ----
 
-/// Back up the canonical store plus registry sessions to one verified
-/// native archive. `directory` is required (Usage-style soft error when
-/// absent — ltmrs invents no default backup location, unlike the upstream
-/// default; recorded in the native tool description).
+/// Back up the canonical store to one verified native archive. `directory`
+/// is required (Usage-style soft error when absent — ltmrs invents no
+/// default backup location, unlike the upstream default; recorded in the
+/// native tool description).
 fn exec_backup_create(disp: &Dispatcher, args: &BackupCreateArgs) -> DomainResult<DomainPayload> {
     let dir = match args.directory.as_deref().map(str::trim) {
         Some(d) if !d.is_empty() => d.to_string(),
@@ -4674,10 +4686,8 @@ fn exec_backup_create(disp: &Dispatcher, args: &BackupCreateArgs) -> DomainResul
         }
     };
     let now = disp.clock().now_millis();
-    let sessions = disp.repo().all_sessions().unwrap();
     let report = crate::interchange::backup::export_backup(
         disp.repo(),
-        &sessions,
         std::path::Path::new(&dir),
         "ltmrs",
         now,
@@ -4710,13 +4720,12 @@ fn exec_backup_create(disp: &Dispatcher, args: &BackupCreateArgs) -> DomainResul
 /// Live per-collection counts in manifest shape (for preview comparison).
 fn live_counts(disp: &Dispatcher) -> DomainResult<BTreeMap<String, u64>> {
     let export = disp.repo().export_full()?;
-    let sessions = disp.repo().all_sessions().unwrap();
     let count = |n: usize| n as u64;
     Ok(BTreeMap::from([
         ("memories".to_string(), count(export.memories.len())),
         ("relations".to_string(), count(export.relations.len())),
         ("guides".to_string(), count(export.guides.len())),
-        ("sessions".to_string(), count(sessions.len())),
+        ("sessions".to_string(), count(export.sessions.len())),
         ("feedback".to_string(), count(export.feedback.len())),
         ("suggestions".to_string(), count(export.suggestions.len())),
         ("projects".to_string(), count(export.projects.len())),
@@ -4887,27 +4896,28 @@ fn exec_backup_restore(
             )),
             other => fail(format!("backup restore refused: {other}")),
         })?;
-    // Safety backup of the live store first (rollback source on failure).
+    // Safety backup of the live store first (rollback source on failure):
+    // one coherent snapshot (sessions included), same as a fresh export.
     let safety_path = safety_backup_path(&source, now);
-    let mut live_export = disp
+    let live_export = disp
         .repo()
         .export_full()
-        .map_err(|e| fail(format!("safety backup failed: {}", e.message)))?;
-    live_export.sessions = disp
-        .repo()
-        .all_sessions()
         .map_err(|e| fail(format!("safety backup failed: {}", e.message)))?;
     let (safety_bytes, _, _) = encode_backup(&live_export, live_generation, now)
         .map_err(|e| fail(format!("safety backup failed: {e}")))?;
     export_backup_to(&safety_path, &safety_bytes)
         .map_err(|e| fail(format!("safety backup failed: {e}")))?;
     // Replace + bump in one durable transaction (P1-1): domain records,
-    // canonical sessions from the backup, both op-receipt logs drained so
+    // canonical sessions from the backup, all op-receipt logs drained so
     // no pre-restore identity replays across the generation cut.
     // Rollback is a second restore of the safety file.
     let new_generation = crate::domain::id::StoreGeneration::new(live_generation + 1);
     let report = restore_verified(disp.repo(), &verified, new_generation)
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
+    // Generation cut invalidates every pre-restore execution context (P2-A):
+    // runtime channel bindings are dropped (the next call on each channel
+    // binds fresh); virtual sessions and leases stay routing-ephemeral.
+    let bindings_dropped = disp.registry().clear_bindings();
     let sessions_restored = report.restored.get("sessions").copied().unwrap_or(0);
     let quarantined = report
         .quarantined
@@ -4916,13 +4926,21 @@ fn exec_backup_restore(
         .collect::<Vec<_>>()
         .join("; ");
     let text = format!(
-        "Restored {} memories, {} guides, {} sessions from {}\nGeneration {} active; safety backup at {}.{}{}{}",
+        "Restored {} memories, {} guides, {} sessions from {}\nGeneration {} active; safety backup at {}.{}{}{}{}",
         report.restored.get("memories").copied().unwrap_or(0),
         report.restored.get("guides").copied().unwrap_or(0),
         sessions_restored,
         source.display(),
         report.generation,
         safety_path.display(),
+        if report.sessions_marked_abandoned == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n{} formerly-active session(s) marked abandoned.",
+                report.sessions_marked_abandoned
+            )
+        },
         if quarantined.is_empty() {
             String::new()
         } else {
@@ -4953,6 +4971,8 @@ fn exec_backup_restore(
             "generation": report.generation,
             "safety_backup": safety_path.to_string_lossy(),
             "restored_sessions": sessions_restored,
+            "sessions_marked_abandoned": report.sessions_marked_abandoned,
+            "bindings_dropped": bindings_dropped,
             "live_writes_since_preview": live_writes_since_preview,
         }),
     ))
@@ -10363,6 +10383,93 @@ mod tests {
             result_text(&second),
             result_text(&first),
             "retry must return the frozen original response"
+        );
+    }
+
+    /// P2-B: `session_start` boosts recalled dead-ends through the receipt
+    /// claim (first execution applies once; the frozen replay path applies
+    /// nothing further).
+    #[test]
+    fn session_start_boosts_recalled_dead_end_once() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let handle_a = disp.registry().channel_session(fe(1), ch(1)).unwrap();
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: "try X".to_string(),
+            outcome: "rejected".to_string(),
+            critique: Some("bad idea".to_string()),
+            rationale: None,
+            related_memory_id: None,
+        });
+        run(&disp, &tool_call(2, attempt.clone()), &attempt);
+        // Lower below the ceiling so the recall boost is observable.
+        disp.repo().adjust_attempt(handle_a, 1, -0.5, 1000).unwrap();
+        // A new session on the same task recalls A's dead-end and boosts it.
+        let result = run(&disp, &tool_call(3, start.clone()), &start);
+        assert!(!result_is_error(&result));
+        assert!(
+            result_text(&result).contains("Dead ends"),
+            "continuity must surface the dead-end, got: {}",
+            result_text(&result)
+        );
+        let confidence = disp.repo().get_session(handle_a).unwrap().unwrap().attempts[0].confidence;
+        // 0.5 decayed by the new start (-0.002) then boosted once (+0.015).
+        assert!(
+            (confidence - 0.513).abs() < 1e-9,
+            "recall boost must apply exactly once, got {confidence}"
+        );
+    }
+
+    /// P2-A: a generation cut drops runtime channel bindings. After a
+    /// restore, no pre-restore channel→session route may survive (the next
+    /// call on each channel binds fresh).
+    #[test]
+    fn restore_clears_channel_bindings() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        assert!(
+            disp.registry().channel_session(fe(1), ch(1)).is_some(),
+            "channel must be bound after start"
+        );
+        add_fragment(&disp, 2, "## Restore Me\n\n### Context\nBinding fixture.");
+        let out = tempfile::tempdir().unwrap();
+        let create = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(3, create.clone()), &create);
+        let path = result_structured(&result).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs { path: Some(path) });
+        let result = run(&disp, &tool_call(4, preview.clone()), &preview);
+        let token = result_structured(&result).unwrap()["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token),
+            confirm: Some(true),
+        });
+        let result = run(&disp, &tool_call(5, restore.clone()), &restore);
+        assert!(
+            !result_is_error(&result),
+            "restore failed: {}",
+            result_text(&result)
+        );
+        assert!(
+            disp.registry().channel_session(fe(1), ch(1)).is_none(),
+            "pre-restore binding must not survive the generation cut"
         );
     }
 }

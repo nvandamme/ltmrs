@@ -78,6 +78,9 @@ pub struct RestoreReport {
     /// Unknown top-level keys the backup carried (counted, reported, not
     /// resurrected: untyped data has no keyspace to land in).
     pub unknown_top_level: usize,
+    /// Backup sessions that were non-terminal and restored as Abandoned
+    /// instead (a backup is knowledge, not a live lease).
+    pub sessions_marked_abandoned: u64,
 }
 
 /// Daemon-lifetime preview registry (single-use TTL tokens bound to backup
@@ -303,16 +306,17 @@ pub fn restore_verified(
             });
         }
     }
-    repo.restore_replace(
-        &backup.snapshot.memories,
-        &kept,
-        &backup.snapshot.guides,
-        &backup.snapshot.feedback,
-        &backup.snapshot.suggestions,
-        &backup.snapshot.sessions,
-        new_generation,
-    )
-    .map_err(|e| RestoreError::Store(e.message))?;
+    let sessions_marked_abandoned = repo
+        .restore_replace(
+            &backup.snapshot.memories,
+            &kept,
+            &backup.snapshot.guides,
+            &backup.snapshot.feedback,
+            &backup.snapshot.suggestions,
+            &backup.snapshot.sessions,
+            new_generation,
+        )
+        .map_err(|e| RestoreError::Store(e.message))?;
     let count = |n: usize| n as u64;
     let mut restored = BTreeMap::new();
     restored.insert(
@@ -346,6 +350,7 @@ pub fn restore_verified(
         quarantined,
         generation: new_generation.as_u64(),
         unknown_top_level: backup.unknown_top_level,
+        sessions_marked_abandoned,
     })
 }
 
@@ -460,7 +465,7 @@ mod tests {
             .put_memory_direct(&test_memory(2, "Beta Two"))
             .unwrap();
         let _gen_b = repo_b.store_generation().unwrap().as_u64();
-        let report = export_backup(&repo_b, &[], dir_b.path(), "test", 1700000000000).unwrap();
+        let report = export_backup(&repo_b, dir_b.path(), "test", 1700000000000).unwrap();
         let verified = verify_backup_file(&report.path, MAX_BACKUP_BYTES).unwrap();
 
         let dir_a = tempfile::tempdir().unwrap();
@@ -945,7 +950,7 @@ mod tests {
         use crate::interchange::backup::{MAX_BACKUP_BYTES, export_backup, verify_backup_file};
         let dir = tempfile::tempdir().unwrap();
         let repo = open_repo(&dir);
-        let report = export_backup(&repo, &[], dir.path(), "test", 1700000000000).unwrap();
+        let report = export_backup(&repo, dir.path(), "test", 1700000000000).unwrap();
         // Future-producer simulation: extra top-level snapshot key. The
         // manifest digest covers the snapshot bytes, so re-sign it.
         let mut v: serde_json::Value =
@@ -969,7 +974,7 @@ mod tests {
         use crate::interchange::backup::{MAX_BACKUP_BYTES, export_backup, verify_backup_file};
         let dir = tempfile::tempdir().unwrap();
         let repo = open_repo(&dir);
-        let report = export_backup(&repo, &[], dir.path(), "test", 1700000000000).unwrap();
+        let report = export_backup(&repo, dir.path(), "test", 1700000000000).unwrap();
         let raw = std::fs::read(&report.path).unwrap();
         for cut in [raw.len() / 2, raw.len() - 1] {
             let chopped = dir.path().join(format!("chopped-{cut}.ltmrs-backup"));
@@ -1009,7 +1014,7 @@ mod tests {
         use crate::interchange::backup::{MAX_BACKUP_BYTES, export_backup, verify_backup_file};
         let dir = tempfile::tempdir().unwrap();
         let repo = open_repo(&dir);
-        let report = export_backup(&repo, &[], dir.path(), "test", 1700000000000).unwrap();
+        let report = export_backup(&repo, dir.path(), "test", 1700000000000).unwrap();
         let mut v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&report.path).unwrap()).unwrap();
         v["manifest"]["memories"] = serde_json::json!(999999);
@@ -1046,7 +1051,7 @@ mod tests {
         });
         let mut digests = std::collections::BTreeSet::new();
         for _ in 0..5 {
-            let rep = export_backup(&repo, &[], dir.path(), "race", 1700000000000).unwrap();
+            let rep = export_backup(&repo, dir.path(), "race", 1700000000000).unwrap();
             let verified = verify_backup_file(&rep.path, MAX_BACKUP_BYTES).unwrap();
             // Manifest digest always equals the shipped snapshot's digest.
             assert_eq!(verified.digest, verified.snapshot.digest());
@@ -1229,6 +1234,98 @@ mod tests {
             .collect();
         assert_eq!(actives.len(), 1, "exactly one Active generation");
         assert_eq!(actives[0].generation.as_u64(), 2);
+    }
+
+    /// P2-A: restoring an Active session must not resurrect an unowned live
+    /// execution context. Non-terminal sessions restore as Abandoned
+    /// (history preserved for analytics/continuity); terminal ones pass
+    /// through verbatim. The report counts the marked sessions.
+    #[test]
+    fn restore_marks_restored_active_sessions_abandoned() {
+        use crate::domain::id::{ChannelId, SessionHandle};
+        use crate::domain::session::{SessionOp, SessionStatus, TaskOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gateway_repo(&dir);
+        let channel = ChannelId::new(uuid::Uuid::from_u128(9));
+        for (op, n) in [("op-a", 100u128), ("op-b", 200u128)] {
+            let handle = SessionHandle::new(uuid::Uuid::from_u128(n));
+            match repo
+                .session_start_tx(
+                    op,
+                    "digest",
+                    handle,
+                    channel,
+                    None,
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    1000,
+                )
+                .unwrap()
+            {
+                SessionOp::Applied(h) => assert_eq!(h, handle),
+                other => panic!("expected Applied, got {other:?}"),
+            }
+        }
+        // End B: terminal sessions must pass through untouched.
+        let handle_b = SessionHandle::new(uuid::Uuid::from_u128(200));
+        match repo
+            .session_end_tx(
+                "op-end-b",
+                "digest-end",
+                handle_b,
+                TaskOutcome::Success,
+                None,
+                vec![],
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(_) => {}
+            other => panic!("expected Applied end, got {other:?}"),
+        }
+        let snapshot = CanonicalExport {
+            sessions: repo.all_sessions().unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(snapshot.sessions.len(), 2);
+        let backup = crate::interchange::backup::VerifiedBackup {
+            digest: snapshot.digest(),
+            store_generation: 1,
+            counts: BTreeMap::new(),
+            snapshot,
+            unknown_top_level: 0,
+        };
+        let report =
+            restore_verified(&repo, &backup, crate::domain::id::StoreGeneration::new(2)).unwrap();
+        let handle_a = SessionHandle::new(uuid::Uuid::from_u128(100));
+        let sessions = repo.all_sessions().unwrap();
+        let restored_a = sessions
+            .iter()
+            .find(|s| s.handle == handle_a)
+            .expect("A restored");
+        assert_eq!(
+            restored_a.status,
+            SessionStatus::Abandoned,
+            "restored Active session must be Abandoned, got {:?}",
+            restored_a.status
+        );
+        assert!(
+            restored_a.ended_at.is_some(),
+            "abandoned restore needs an end timestamp"
+        );
+        let restored_b = sessions
+            .iter()
+            .find(|s| s.handle == handle_b)
+            .expect("B restored");
+        assert_eq!(
+            restored_b.status,
+            SessionStatus::Ended,
+            "terminal sessions pass through, got {:?}",
+            restored_b.status
+        );
+        assert_eq!(report.sessions_marked_abandoned, 1);
     }
 
     /// P1-1 (review of bfe8844): restore must follow the session migration

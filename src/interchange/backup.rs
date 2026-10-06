@@ -80,15 +80,14 @@ pub struct VerifiedBackup {
     pub snapshot: CanonicalExport,
 }
 
-/// Export one coherent snapshot of `repo` plus canonical `sessions` into `dir`
-/// (created when missing) as `<prefix>-<millis>-<v7>.ltmrs-backup`,
-/// published atomically and verified by re-read before returning.
-/// Sessions are canonical Fjall records read by the caller (the exec layer
-/// passes `all_sessions()`); they ride the envelope so the backup carries
-/// the session history restore puts back.
+/// Export one coherent snapshot of `repo` into `dir` (created when missing)
+/// as `<prefix>-<millis>-<v7>.ltmrs-backup`, published atomically and
+/// verified by re-read before returning. Everything — memories, guides,
+/// canonical sessions, feedback, suggestions, generation — comes from ONE
+/// Fjall read snapshot, so a concurrent `session_end` can never tear the
+/// archive (an Active session paired with already-bumped guide counts).
 pub fn export_backup(
     repo: &CanonicalRepository,
-    sessions: &[crate::domain::session::Session],
     dir: &Path,
     prefix: &str,
     created_at_millis: u64,
@@ -97,12 +96,11 @@ pub fn export_backup(
         path: path.to_string_lossy().into_owned(),
         message: e.to_string(),
     };
-    // One coherent cut: the full domain export comes from a single read
-    // transaction; registry sessions ride along verbatim.
-    let (mut export, generation) = repo
+    // One coherent cut: the full domain export (sessions included) plus
+    // the live generation come from a single read transaction.
+    let (export, generation) = repo
         .export_full_with_generation()
         .map_err(|e| BackupError::Store(e.message))?;
-    export.sessions = sessions.to_vec();
     let (bytes, _digest, _counts) = encode_backup(&export, generation.as_u64(), created_at_millis)?;
     std::fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
     let name = format!(
@@ -361,6 +359,7 @@ mod tests {
                 store_generation: StoreGeneration::FIRST,
                 frontend_id: fe,
                 channel_id: ch,
+                resume_retry_epoch: None,
             })
             .unwrap();
         assert!(hs.retry_epoch >= 1);
@@ -492,14 +491,14 @@ mod tests {
             },
         };
         let _ = disp.handle(&start_env).unwrap();
-        // One traced session rides along (canonical store). The virtual
-        // session ensured by session-less calls stays routing-ephemeral in
+        // One traced session rides along (canonical store, now read from
+        // the same snapshot as everything else). The virtual session
+        // ensured by session-less calls stays routing-ephemeral in
         // the registry: it carries no durable knowledge worth backing up
         // (and would typically be idle-expired by restore time anyway).
-        let sessions = disp.repo().all_sessions().unwrap();
-        assert_eq!(sessions.len(), 1);
+        assert_eq!(disp.repo().all_sessions().unwrap().len(), 1);
         let out = dir.path().join("backups");
-        let report = export_backup(&repo, &sessions, &out, "test", 1700000000000).unwrap();
+        let report = export_backup(&repo, &out, "test", 1700000000000).unwrap();
         assert_eq!(report.path.extension().unwrap(), BACKUP_EXTENSION);
         assert!(report.path.starts_with(&out), "dir created + used");
         let raw = std::fs::read(&report.path).unwrap();
@@ -525,8 +524,8 @@ mod tests {
         let (dir, repo, disp) = setup();
         let (_a, _b) = seed_alpha_beta(&disp);
         let out = dir.path().join("backups");
-        let first = export_backup(&repo, &[], &out, "test", 1700000000000).unwrap();
-        let second = export_backup(&repo, &[], &out, "test", 1700000000001).unwrap();
+        let first = export_backup(&repo, &out, "test", 1700000000000).unwrap();
+        let second = export_backup(&repo, &out, "test", 1700000000001).unwrap();
         assert_ne!(first.path, second.path, "unique filenames");
         assert_eq!(first.digest, second.digest, "stable snapshot digest");
     }
@@ -536,7 +535,7 @@ mod tests {
     fn verify_rejects_oversize() {
         let (dir, repo, disp) = setup();
         let (_a, _b) = seed_alpha_beta(&disp);
-        let report = export_backup(&repo, &[], dir.path(), "test", 1700000000000).unwrap();
+        let report = export_backup(&repo, dir.path(), "test", 1700000000000).unwrap();
         let err = verify_backup_file(&report.path, 10).unwrap_err();
         assert!(matches!(err, BackupError::TooLarge { .. }), "got: {err}");
     }
@@ -546,7 +545,7 @@ mod tests {
     fn verify_detects_corruption() {
         let (dir, repo, disp) = setup();
         let (_a, _b) = seed_alpha_beta(&disp);
-        let report = export_backup(&repo, &[], dir.path(), "test", 1700000000000).unwrap();
+        let report = export_backup(&repo, dir.path(), "test", 1700000000000).unwrap();
         let mut raw = std::fs::read(&report.path).unwrap();
         let needle = b"Backup Alpha";
         let pos = raw

@@ -218,6 +218,7 @@ impl LtmrsFrontend {
             store_generation: generation,
             frontend_id: self.identity.frontend_id,
             channel_id: self.identity.channel_id,
+            resume_retry_epoch: None,
         };
         match client.handshake(&request(self.identity.generation())).await {
             Ok(hs) => {
@@ -273,8 +274,11 @@ impl LtmrsFrontend {
             scope: Scope::default(),
             body: DomainRequest::ListMemories,
         };
+        // Read-only prefetch: must never disturb the handshake (P1-B) — a
+        // failed prefetch leaves epoch and stream intact so the main call
+        // still sends handshaked instead of drawing a certain StaleReplay.
         let resp = client
-            .roundtrip_or_forget(&env)
+            .roundtrip(&env)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match resp.result {
@@ -304,8 +308,10 @@ impl LtmrsFrontend {
     }
 
     /// Envelope construction shared by tool calls and the resilient
-    /// round-trip: one operation id per attempt, never reused across the
-    /// re-handshake retry.
+    /// round-trip: one operation id per MCP call for the first attempt; a
+    /// transport-ambiguous retry resends the same envelope (P1-B), while the
+    /// post-restore stale-generation retry still mints a fresh one (certain
+    /// no-commit under the retired generation).
     fn envelope_for(&self, body: DomainRequest, retry_epoch: u64) -> IpcEnvelope {
         let op = OperationId::new(Uuid::now_v7());
         IpcEnvelope {
@@ -328,6 +334,13 @@ impl LtmrsFrontend {
     /// re-handshakes (adopting the live generation), and retries once with
     /// a fresh operation id. A second stale answer is returned as-is —
     /// unbounded retry would mask a daemon that never converges.
+    ///
+    /// Transport failures are unknown outcomes (P1-B), NOT fresh attempts:
+    /// the envelope is built ONCE per MCP call and, after reconnect plus a
+    /// resumed same-epoch handshake, the SAME envelope is resent so the
+    /// daemon replays its receipt instead of executing twice. A refused
+    /// resume (or an unreconnectable transport) surfaces an unknown-outcome
+    /// error to the host instead of silently minting a fresh operation.
     async fn roundtrip_with_rehandshake(
         &self,
         body: DomainRequest,
@@ -345,10 +358,16 @@ impl LtmrsFrontend {
             client = self.client.lock().await;
         }
         let epoch = client.retry_epoch().unwrap_or(0);
-        let resp = client
-            .roundtrip_or_forget(&self.envelope_for(body.clone(), epoch))
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let envelope = self.envelope_for(body.clone(), epoch);
+        let resp = match client.roundtrip(&envelope).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                drop(client);
+                return self
+                    .resend_after_reconnect(&envelope, epoch, e.to_string())
+                    .await;
+            }
+        };
         let stale = matches!(
             resp.result,
             IpcResult::Error {
@@ -371,6 +390,111 @@ impl LtmrsFrontend {
             .roundtrip_or_forget(&self.envelope_for(body, epoch))
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// Resend an envelope whose outcome is unknown (P1-B): reconnect, resume
+    /// the SAME retry epoch, and resend the SAME envelope when the generation
+    /// still matches. Never mints a fresh operation for an uncertain
+    /// mutation: a refused resume or a moved generation takes the explicit
+    /// stale/unknown paths instead.
+    async fn resend_after_reconnect(
+        &self,
+        envelope: &IpcEnvelope,
+        epoch: u64,
+        first_error: String,
+    ) -> Result<IpcResponse, McpError> {
+        let mut client = self.client.lock().await;
+        // Drop the possibly half-dead stream and stale epoch; the resume
+        // handshake below re-establishes both or fails explicitly.
+        client.forget_handshake();
+        if let Err(e) = client.connect().await {
+            return Err(McpError::internal_error(
+                format!(
+                    "request failed with unknown outcome ({first_error}) and reconnect failed ({e}); inspect state before retrying as new work"
+                ),
+                None,
+            ));
+        }
+        let resume = HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: envelope.store_generation,
+            frontend_id: self.identity.frontend_id,
+            channel_id: self.identity.channel_id,
+            resume_retry_epoch: Some(epoch),
+        };
+        match client.handshake(&resume).await {
+            Ok(hs) => {
+                self.identity.set_generation(hs.store_generation);
+                if hs.retry_epoch != epoch {
+                    client.close();
+                    return Err(McpError::internal_error(
+                        "reconnect issued a different retry epoch for an uncertain mutation; inspect state before retrying as new work",
+                        None,
+                    ));
+                }
+            }
+            Err(IpcError::GenerationMismatch { .. }) => {
+                // Generation moved: the gate rejects the old envelope before
+                // execution (certain no-commit), so a fresh epoch plus a
+                // fresh operation is safe — the established stale path.
+                drop(client);
+                self.ensure_handshaked().await?;
+                let mut client = self.client.lock().await;
+                let fresh_epoch = client.retry_epoch().unwrap_or(0);
+                let fresh = self.envelope_for(envelope.body.clone(), fresh_epoch);
+                return client
+                    .roundtrip_or_forget(&fresh)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None));
+            }
+            Err(IpcError::StaleNamespace(msg)) => {
+                client.close();
+                return Err(McpError::internal_error(
+                    format!(
+                        "request failed with unknown outcome ({first_error}); retry namespace unavailable ({msg}) — inspect state before retrying as new work"
+                    ),
+                    None,
+                ));
+            }
+            Err(e) => {
+                client.close();
+                return Err(McpError::internal_error(e.to_string(), None));
+            }
+        }
+        // Same generation, same epoch: the daemon resolves the original
+        // operation ID against its receipt (replay) or executes it (if the
+        // first send never arrived). A StaleGeneration answer here means the
+        // generation moved between handshake and resend — take the
+        // established fresh-operation path.
+        match client.roundtrip(envelope).await {
+            Ok(resp) => {
+                let stale = matches!(
+                    resp.result,
+                    IpcResult::Error {
+                        code: DomainErrorCode::StaleGeneration,
+                        ..
+                    }
+                );
+                if !stale {
+                    return Ok(resp);
+                }
+                drop(client);
+                self.ensure_handshaked().await?;
+                let mut client = self.client.lock().await;
+                let fresh_epoch = client.retry_epoch().unwrap_or(0);
+                let fresh = self.envelope_for(envelope.body.clone(), fresh_epoch);
+                client
+                    .roundtrip_or_forget(&fresh)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))
+            }
+            Err(e) => Err(McpError::internal_error(
+                format!(
+                    "resend failed with unknown outcome (first failure: {first_error}; resend: {e}); inspect state before retrying as new work"
+                ),
+                None,
+            )),
+        }
     }
 
     /// The tool list advertised to the host: the 26 frozen tools, served
@@ -1524,6 +1648,174 @@ mod tests {
 
         drop(daemon);
         server_handle.abort();
+    }
+
+    /// P1-B unknown-outcome recovery, end to end: the server commits a
+    /// mutation then drops the connection without responding. The frontend
+    /// must reconnect, resume the SAME retry epoch, and resend the SAME
+    /// envelope — the daemon replays its receipt (a duplicate-ID AddMemory
+    /// would fail as "already exists" if it executed twice). Exactly one
+    /// memory exists afterwards. Deterministic: the drop point is
+    /// server-controlled, not timed.
+    #[tokio::test]
+    async fn unknown_outcome_resends_same_envelope_after_resume() {
+        use crate::daemon::dispatcher::Dispatcher;
+        use crate::daemon::registry::FrontendRegistry;
+        use crate::domain::clock::{Clock, FrozenClock};
+        use crate::service::repository::CanonicalRepository;
+        use tokio::io::AsyncReadExt;
+
+        async fn read_msg(
+            stream: &mut tokio::net::UnixStream,
+        ) -> crate::daemon::envelope::WireMessage {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+        async fn write_msg(
+            stream: &mut tokio::net::UnixStream,
+            reply: &crate::daemon::envelope::WireReply,
+        ) {
+            // Same streaming reply format as the production server
+            // (8-byte total + chunk frames), so the client parses it.
+            let payload = serde_json::to_vec(reply).unwrap();
+            crate::daemon::envelope::write_response_payload(stream, &payload)
+                .await
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        // Epoch 1 will be issued by the first handshake below; the
+        // frontend must resume exactly it after the drop.
+        let dispatcher = Arc::new(Dispatcher::new(
+            Arc::clone(&repo),
+            FrontendRegistry::new(),
+            Arc::clone(&clock),
+        ));
+        let socket = dir.path().join("resend.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        // Connection 1: handshake normally, then commit the request and
+        // drop WITHOUT responding — a deterministic unknown outcome.
+        // Connection 2 serves normally (real server path, including the
+        // resume handshake).
+        let server_task = tokio::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            async move {
+                use crate::daemon::envelope::WireMessage;
+                let (mut conn1, _) = listener.accept().await.unwrap();
+                let m1 = read_msg(&mut conn1).await;
+                let WireMessage::Handshake(hs_req) = m1 else {
+                    panic!("expected handshake first");
+                };
+                assert_eq!(hs_req.resume_retry_epoch, None);
+                let hs = dispatcher.handle_handshake(&hs_req).unwrap();
+                // The epoch the frontend must resume on reconnect.
+                let first_epoch = hs.retry_epoch;
+                write_msg(
+                    &mut conn1,
+                    &crate::daemon::envelope::WireReply::Handshake(hs),
+                )
+                .await;
+                let WireMessage::Request(env) = read_msg(&mut conn1).await else {
+                    panic!("expected snapshot prefetch second");
+                };
+                // Serve the snapshot prefetch normally (it is part of the
+                // frontend handshake path, not the mutation under test).
+                let prefetch_resp = dispatcher.handle(&env).unwrap();
+                write_msg(
+                    &mut conn1,
+                    &crate::daemon::envelope::WireReply::Response(prefetch_resp),
+                )
+                .await;
+                // The actual mutation: commit, then drop WITHOUT responding
+                // — a deterministic unknown outcome.
+                let WireMessage::Request(env) = read_msg(&mut conn1).await else {
+                    panic!("expected mutation request third");
+                };
+                // The operation ID the frontend must resend verbatim.
+                let first_op = env.operation_id;
+                dispatcher.handle(&env).unwrap();
+                drop(conn1);
+                let (mut conn2, _) = listener.accept().await.unwrap();
+                let m2 = read_msg(&mut conn2).await;
+                let WireMessage::Handshake(resume_req) = m2 else {
+                    panic!("expected resume handshake on conn2");
+                };
+                assert_eq!(
+                    resume_req.resume_retry_epoch,
+                    Some(first_epoch),
+                    "reconnect must resume the same epoch"
+                );
+                let hs2 = dispatcher.handle_handshake(&resume_req).unwrap();
+                assert_eq!(hs2.retry_epoch, first_epoch);
+                write_msg(
+                    &mut conn2,
+                    &crate::daemon::envelope::WireReply::Handshake(hs2),
+                )
+                .await;
+                let WireMessage::Request(env2) = read_msg(&mut conn2).await else {
+                    panic!("expected resent request on conn2");
+                };
+                assert_eq!(
+                    env2.operation_id, first_op,
+                    "reconnect must resend the same operation"
+                );
+                let resp = dispatcher.handle(&env2).unwrap();
+                write_msg(
+                    &mut conn2,
+                    &crate::daemon::envelope::WireReply::Response(resp),
+                )
+                .await;
+            }
+        });
+
+        let client = IpcClient::new(socket);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        let mut memory = mem(7, None, 0.5, "Resend Me");
+        memory.external_alias = None;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fe.roundtrip_with_rehandshake(DomainRequest::AddMemory { memory }),
+        )
+        .await
+        .expect("resend must not hang")
+        .expect("unknown-outcome call must resolve");
+        assert!(
+            matches!(resp.result, IpcResult::Success { .. }),
+            "resend must replay the recorded outcome, got {:?}",
+            resp.result
+        );
+        server_task.await.unwrap();
+        // Exactly one memory: the resend replayed, never re-executed (a
+        // second AddMemory with the same ID fails as "already exists").
+        let memories = repo
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .into_iter()
+            .filter(|m| m.title == "Resend Me")
+            .collect::<Vec<_>>();
+        assert_eq!(memories.len(), 1, "exactly one effect allowed");
+
+        drop(fe);
     }
 
     /// Bridged post-restore regression (release Critical): the stdio bridge

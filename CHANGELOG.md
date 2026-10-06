@@ -5,7 +5,61 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-06 — Review receipts and restore generation cutover
+## 2026-10-06 — Coherent backup, IPC resend, restore retirement, boost flag
+
+### P1 backup is one coherent snapshot again
+- `export_full_with_generation` reads canonical sessions from the SAME
+  read snapshot as memories/guides/etc.; `export_backup(repo, ...)` drops
+  the caller-side sessions parameter (and the safety path + `live_counts`
+  stop combining two snapshots). Stale registry-ownership comments fixed.
+- RED-first test `export_full_covers_canonical_sessions` (failed: export
+  carried no sessions; green post-fix).
+
+### P2 restored sessions retire as Abandoned + bindings clear on cut
+- `restore_replace` returns the retired count and marks non-terminal backup
+  sessions Abandoned (status + outcome + ended_at); terminal sessions pass
+  through. `RestoreReport.sessions_marked_abandoned` + report clause +
+  `restored_sessions`/`bindings_dropped` structured fields.
+- New `FrontendRegistry::clear_bindings` (session routes only; virtuals and
+  leases untouched), called after every successful restore.
+- RED-first tests: repo status passthrough + tool-level binding clear
+  (status test bypass-proven).
+
+### P2 session_start continuation boost is receipt-claimed
+- `build_continuity_recall` is now a pure read returning boost targets;
+  new `claim_continuity_boost` (op + digest + targets in ONE tx with a
+  `continuity_boosted` receipt flag) applies exactly once; `adjust_attempt`
+  body extracted into a tx-core, public behavior unchanged.
+- Tests: repo claim-once (+digest-mismatch rejects) and exec-level
+  recall-boost-once (0.513 = decay + single boost).
+
+### P1 IPC unknown-outcome identity + epoch resume
+- Wire: `HandshakeRequest.resume_retry_epoch` (serde-defaulted, compat) +
+  typed `IpcError::StaleNamespace` (kind `stale_namespace` both directions).
+- Daemon: `resume_namespace` (read-only, same epoch, TTL-checked) +
+  `handle_handshake` resume branch (refusals typed; generation check first).
+- Frontend: envelope built ONCE per MCP call; transport failure →
+  reconnect + resume + resend SAME envelope; resumed-epoch mismatch,
+  refused resume, or reconnect failure surface unknown-outcome errors
+  (never a silent fresh op); StaleGeneration anywhere takes the existing
+  fresh-epoch/fresh-op path (certain no-commit). Prefetch no longer
+  forgets the handshake on failure.
+- Tests: repo resume (same epoch, no counter consumed, unknown/expired +
+  cross-frontend refuse), dispatcher resume handshake, client refusal
+  typing, deterministic end-to-end commit-drop-resume-resend (same epoch +
+  same op asserted server-side; duplicate-ID replay proves no re-execution;
+  bypass-proven to fail).
+- Implements plan §174 ("unknown outcomes resolved with the receipt and
+  the same operation key") + 24h TTL policy; no plan/conformance change.
+
+### Validation (single release run for the batch)
+- `cargo fmt -- --check` clean; `cargo clippy --all-targets -- -D warnings`
+  clean.
+- Release evidence full `--release --locked`:
+  `reports/release-e0ca3e542afa-full-NPZ5BN` — fmt clean, clippy clean,
+  712 lib + 6 lifecycle + 4 evidence + 2 smoke passed, 0 failed.
+
+## e0ca3e5 (2026-10-06) — Review receipts and restore generation cutover
 
 ### P1-1 restore follows the session migration into Fjall (true backup restore)
 - `restore_replace` takes backup `sessions`, drains `sessions`/`session_ops`/

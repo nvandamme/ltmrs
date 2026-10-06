@@ -826,6 +826,7 @@ pub async fn handle_connection(
                         let kind = match &e {
                             IpcError::GenerationMismatch { .. } => "generation_mismatch",
                             IpcError::Busy(_) => "daemon_busy",
+                            IpcError::StaleNamespace(_) => "stale_namespace",
                             _ => "handshake_rejected",
                         };
                         let err = WireError {
@@ -1118,6 +1119,7 @@ mod tests {
                 store_generation: StoreGeneration::FIRST,
                 frontend_id: fe,
                 channel_id: ChannelId::new(Uuid::from_u128(2)),
+                resume_retry_epoch: None,
             }),
         )
         .await;
@@ -1308,7 +1310,36 @@ mod tests {
             store_generation: StoreGeneration::FIRST,
             frontend_id: FrontendId::new(Uuid::from_u128(fe_n as u128)),
             channel_id: ChannelId::new(Uuid::from_u128(2)),
+            resume_retry_epoch: None,
         }
+    }
+
+    /// P1-B: resuming a live namespace reissues the SAME epoch (no counter
+    /// bump); unknown epochs refuse as stale-typed errors, never a silent
+    /// fresh epoch.
+    #[test]
+    fn handshake_resume_reissues_same_epoch() {
+        use crate::daemon::limits::{QuotaTracker, ResourceLimits};
+
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = Arc::new(QuotaTracker::new(ResourceLimits::default()));
+        let (dispatcher, _quotas) = test_dispatcher_with_quotas(&dir, quotas);
+        // Epoch 1 was issued at setup.
+        let mut resume = handshake_as(1);
+        resume.resume_retry_epoch = Some(1);
+        let hs = dispatcher.handle_handshake(&resume).unwrap();
+        assert_eq!(hs.retry_epoch, 1);
+        // No counter consumed: the next fresh handshake still yields 2.
+        let fresh = dispatcher.handle_handshake(&handshake_as(1)).unwrap();
+        assert_eq!(fresh.retry_epoch, 2);
+        // Unknown epoch refuses typed.
+        let mut unknown = handshake_as(1);
+        unknown.resume_retry_epoch = Some(99);
+        let err = dispatcher.handle_handshake(&unknown).unwrap_err();
+        assert!(
+            matches!(err, crate::daemon::envelope::IpcError::StaleNamespace(_)),
+            "unknown epoch must refuse stale-typed, got: {err:?}"
+        );
     }
 
     /// A full client table rejects new handshakes instead of over-admitting.
@@ -1508,6 +1539,7 @@ mod tests {
                 store_generation: StoreGeneration::FIRST,
                 frontend_id: fe(1),
                 channel_id: ch(1),
+                resume_retry_epoch: None,
             })
             .await
             .unwrap();
@@ -1749,6 +1781,7 @@ mod tests {
                 store_generation: StoreGeneration::FIRST,
                 frontend_id: fe(1),
                 channel_id: ch(1),
+                resume_retry_epoch: None,
             })
             .await
             .unwrap();

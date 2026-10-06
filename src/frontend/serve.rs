@@ -446,6 +446,7 @@ async fn probe_handshake_inner(
         store_generation: StoreGeneration::FIRST,
         frontend_id,
         channel_id,
+        resume_retry_epoch: None,
     };
     match client.handshake(&first).await {
         Ok(_) => Ok(()),
@@ -651,6 +652,7 @@ mod tests {
                 store_generation: StoreGeneration::FIRST,
                 frontend_id: id.frontend_id,
                 channel_id: id.channel_id,
+                resume_retry_epoch: None,
             })
             .await
             .unwrap();
@@ -727,6 +729,7 @@ mod tests {
             store_generation: StoreGeneration::FIRST,
             frontend_id: id.frontend_id,
             channel_id: id.channel_id,
+            resume_retry_epoch: None,
         };
         assert!(
             matches!(
@@ -819,6 +822,7 @@ mod tests {
                 store_generation: StoreGeneration::FIRST,
                 frontend_id: id.frontend_id,
                 channel_id: id.channel_id,
+                resume_retry_epoch: None,
             })
             .await
             .unwrap();
@@ -892,6 +896,7 @@ mod tests {
                 store_generation: StoreGeneration::FIRST,
                 frontend_id: id.frontend_id,
                 channel_id: id.channel_id,
+                resume_retry_epoch: None,
             }),
         )
         .await

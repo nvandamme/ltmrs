@@ -149,6 +149,22 @@ impl FrontendRegistry {
             .session
     }
 
+    /// Drop every channel→session route (P2-A restore semantics): a
+    /// generation cut invalidates all pre-restore execution contexts, so no
+    /// binding may survive pointing at a replaced session. Virtual sessions
+    /// and leases are routing-ephemeral and stay untouched; the next call on
+    /// each channel binds fresh. Returns the number of routes dropped.
+    pub fn clear_bindings(&mut self) -> usize {
+        let mut dropped = 0;
+        for binding in self.channels.values_mut() {
+            if binding.session.is_some() {
+                binding.session = None;
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
     /// The channel's live virtual session, if one is bound (for tests and
     /// session-less attribution). Traced sessions are NOT returned here;
     /// use the canonical store (via the dispatcher) for those.
@@ -435,6 +451,7 @@ impl FrontendRegistry {
                         session: rec.session,
                         seq: None,
                         response: None,
+                        continuity_boosted: false,
                     },
                 )
             })

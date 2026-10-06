@@ -44,6 +44,8 @@ pub enum IpcError {
     GenerationMismatch { daemon: u64, client: u64 },
     #[error("unauthorized frontend")]
     Unauthorized,
+    #[error("stale retry namespace: {0}")]
+    StaleNamespace(String),
     #[error("daemon busy: {0}")]
     Busy(String),
     #[error("io: {0}")]
@@ -347,6 +349,13 @@ pub struct HandshakeRequest {
     pub store_generation: StoreGeneration,
     pub frontend_id: FrontendId,
     pub channel_id: ChannelId,
+    /// Resume an existing retry namespace instead of minting a new epoch
+    /// (P1-B unknown-outcome recovery): the daemon reissues the same epoch
+    /// when it still exists, belongs to this frontend, and is within TTL.
+    /// Absent (or refused) means a fresh epoch, as before. Old senders omit
+    /// the field and parse fine.
+    #[serde(default)]
+    pub resume_retry_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

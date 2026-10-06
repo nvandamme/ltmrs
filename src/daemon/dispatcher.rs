@@ -104,6 +104,33 @@ impl Dispatcher {
         // Validate protocol version and store generation.
         validate_handshake(req, daemon_gen)?;
 
+        // Unknown-outcome recovery (P1-B): a reconnected frontend may resume
+        // its retry namespace instead of minting a new epoch, so its
+        // pre-failure operation IDs keep resolving to their receipts.
+        // Refusals (expired/unknown, e.g. drained by a restore) are typed
+        // so the frontend surfaces an unknown outcome rather than silently
+        // minting a fresh epoch for an uncertain mutation.
+        if let Some(epoch) = req.resume_retry_epoch {
+            match self
+                .repo
+                .resume_namespace(req.frontend_id, epoch, self.clock.now_millis())
+            {
+                Ok(ns) => {
+                    return Ok(HandshakeResponse {
+                        protocol_version: PROTOCOL_VERSION,
+                        store_generation: daemon_gen,
+                        retry_epoch: ns.retry_epoch,
+                    });
+                }
+                Err(e) if e.code == DomainErrorCode::StaleReplay => {
+                    return Err(IpcError::StaleNamespace(e.message));
+                }
+                Err(e) => {
+                    return Err(map_handshake_issue_error(e));
+                }
+            }
+        }
+
         // Issue (or refresh) the retry namespace for this frontend. This is
         // what makes subsequent mutations valid — without it, apply() rejects
         // every command as StaleReplay. Transient write contention is

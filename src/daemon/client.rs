@@ -24,6 +24,12 @@ fn parse_handshake_error(kind: &str, message: &str) -> Option<IpcError> {
         let inner = message.strip_prefix("daemon busy: ").unwrap_or(message);
         return Some(IpcError::Busy(inner.to_string()));
     }
+    if kind == "stale_namespace" {
+        let inner = message
+            .strip_prefix("stale retry namespace: ")
+            .unwrap_or(message);
+        return Some(IpcError::StaleNamespace(inner.to_string()));
+    }
     parse_generation_mismatch(kind, message)
 }
 
@@ -278,6 +284,7 @@ mod tests {
             store_generation: StoreGeneration::FIRST,
             frontend_id: FrontendId::new(Uuid::from_u128(1)),
             channel_id: ChannelId::new(Uuid::from_u128(2)),
+            resume_retry_epoch: None,
         }
     }
 
@@ -482,5 +489,22 @@ mod tests {
     fn client_reports_not_connected() {
         let client = IpcClient::new(std::path::PathBuf::from("/nonexistent"));
         assert!(!client.is_connected());
+    }
+
+    /// P1-B: a stale-namespace refusal must stay typed across the wire (the
+    /// frontend matches it to surface an unknown outcome instead of minting
+    /// a silent fresh epoch; stringly errors would brick that decision).
+    #[test]
+    fn stale_namespace_refusal_is_typed() {
+        let err = parse_handshake_error("stale_namespace", "stale retry namespace: gone")
+            .expect("stale_namespace must parse");
+        assert!(
+            matches!(err, crate::daemon::envelope::IpcError::StaleNamespace(_)),
+            "refusal must stay typed, got: {err:?}"
+        );
+        assert!(
+            parse_handshake_error("handshake_rejected", "nope").is_none(),
+            "other rejections stay untyped"
+        );
     }
 }

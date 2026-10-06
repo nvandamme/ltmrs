@@ -413,6 +413,32 @@ impl CanonicalRepository {
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
     }
 
+    /// Resume an existing retry namespace for unknown-outcome recovery
+    /// (P1-B): returns the SAME epoch without minting a new one, so a
+    /// reconnected frontend keeps resolving its pre-failure receipts. The
+    /// namespace must exist, belong to this frontend (keyed), and be within
+    /// TTL — otherwise refused as stale (the caller must surface an unknown
+    /// outcome, never silently mint a fresh epoch for an uncertain
+    /// mutation). Read-only: no counter bump, no barrier.
+    pub fn resume_namespace(
+        &self,
+        frontend_id: FrontendId,
+        retry_epoch: u64,
+        now_millis: u64,
+    ) -> DomainResult<RetryNamespace> {
+        match self.lookup_namespace(frontend_id, retry_epoch)? {
+            Some(ns) if ns.is_valid_at(now_millis) => Ok(ns),
+            Some(_) => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "retry namespace expired",
+            )),
+            None => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "unknown retry namespace",
+            )),
+        }
+    }
+
     /// Issue a new retry namespace for a frontend with the default TTL.
     /// Called by the daemon when a frontend authenticates. Epoch allocation
     /// reads inside the write transaction (creating a read dependency), so
@@ -3129,6 +3155,7 @@ impl CanonicalRepository {
                 session: handle,
                 seq: None,
                 response: None,
+                continuity_boosted: false,
             };
             let log_raw = serde_json::to_vec(&receipt)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
@@ -3246,6 +3273,7 @@ impl CanonicalRepository {
                 session: handle,
                 seq: Some(seq),
                 response: None,
+                continuity_boosted: false,
             };
             let log_raw = serde_json::to_vec(&receipt)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
@@ -3427,6 +3455,7 @@ impl CanonicalRepository {
                 session: handle,
                 seq: None,
                 response: None,
+                continuity_boosted: false,
             };
             let log_raw = serde_json::to_vec(&receipt)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
@@ -3525,23 +3554,7 @@ impl CanonicalRepository {
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            let hkey = handle.as_uuid().to_string();
-            let raw = tx
-                .get(&self.sessions, &hkey)
-                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            let Some(raw) = raw else {
-                return Ok(());
-            };
-            let mut session: Session = serde_json::from_slice(raw.as_ref())
-                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            if let Some(a) = session.attempts.iter_mut().find(|a| a.seq == seq) {
-                a.confidence = (a.confidence + delta).clamp(0.0, 1.0);
-                a.access_count += 1;
-                a.last_accessed_at = Some(crate::domain::memory::Instant::new(now_millis));
-            }
-            let raw = serde_json::to_vec(&session)
-                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.sessions, &hkey, raw.as_slice());
+            self.adjust_attempt_tx(&mut tx, handle, seq, delta, now_millis)?;
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -3555,6 +3568,106 @@ impl CanonicalRepository {
             }
         }
         Err(Self::exhausted_contention("attempt adjust conflicted"))
+    }
+
+    /// Attempt confidence adjustment inside the caller's transaction (tx
+    /// core shared by the standalone adjust and the receipt-claimed
+    /// continuity boost). Missing sessions/attempts adjust nothing and
+    /// still succeed, matching the old leniency. Returns whether an
+    /// attempt was adjusted.
+    fn adjust_attempt_tx(
+        &self,
+        tx: &mut OptimisticWriteTx,
+        handle: SessionHandle,
+        seq: u32,
+        delta: f64,
+        now_millis: u64,
+    ) -> DomainResult<bool> {
+        let hkey = handle.as_uuid().to_string();
+        let raw = tx
+            .get(&self.sessions, &hkey)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+        let mut session: Session = serde_json::from_slice(raw.as_ref())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut adjusted = false;
+        if let Some(a) = session.attempts.iter_mut().find(|a| a.seq == seq) {
+            a.confidence = (a.confidence + delta).clamp(0.0, 1.0);
+            a.access_count += 1;
+            a.last_accessed_at = Some(crate::domain::memory::Instant::new(now_millis));
+            adjusted = true;
+        }
+        let raw = serde_json::to_vec(&session)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.insert(&self.sessions, &hkey, raw.as_slice());
+        Ok(adjusted)
+    }
+
+    /// Apply continuity-recall attempt boosts exactly once per session-start
+    /// operation (P2-B): the boost targets plus the claimed flag commit in
+    /// ONE transaction. Returns true when this call applied the boosts,
+    /// false when a previous call already claimed them (crash-window
+    /// continuation must not double-boost). Digest mismatch rejects.
+    pub fn claim_continuity_boost(
+        &self,
+        operation_id: &str,
+        digest: &str,
+        targets: &[(SessionHandle, u32)],
+        delta: f64,
+        now_millis: u64,
+    ) -> DomainResult<bool> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let seq_key = op_seq_key(None);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let raw = tx
+                .get(&self.session_ops, operation_id)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let Some(raw) = raw else {
+                return Err(DomainError::new(
+                    DomainErrorCode::NotFound,
+                    "session operation receipt not found",
+                ));
+            };
+            let mut rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if rec.digest != digest {
+                return Err(DomainError::new(
+                    DomainErrorCode::KeyReuseDifferentInput,
+                    "operation key reused with different input",
+                ));
+            }
+            if rec.continuity_boosted {
+                self.persist_barrier()?;
+                return Ok(false);
+            }
+            for (handle, seq) in targets {
+                self.adjust_attempt_tx(&mut tx, *handle, *seq, delta, now_millis)?;
+            }
+            rec.continuity_boosted = true;
+            let raw = serde_json::to_vec(&rec)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.session_ops, operation_id, raw.as_slice());
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(true);
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention(
+            "continuity boost claim conflicted",
+        ))
     }
 
     /// Read one session by handle.
@@ -3954,12 +4067,10 @@ impl CanonicalRepository {
     }
 
     /// Full domain export for native backup (WP-11): every stored collection
-    /// in one read transaction (memories, relations, guides, feedback,
-    /// suggestions). Sessions travel the envelope separately (canonical
-    /// records supplied by the caller from `all_sessions`, so the backup
-    /// carries the history restore puts back); projects/archives/history
-    /// have no storage yet and stay empty by design (documented, counted
-    /// as zero — never silently dropped).
+    /// in one read transaction (memories, relations, guides, sessions,
+    /// feedback, suggestions). Projects/archives/history have no storage yet
+    /// and stay empty by design (documented, counted as zero — never
+    /// silently dropped).
     pub fn export_full(&self) -> DomainResult<CanonicalExport> {
         Ok(self.export_full_with_generation()?.0)
     }
@@ -3967,6 +4078,11 @@ impl CanonicalRepository {
     /// Coherent cut: the domain export plus the live generation from ONE
     /// read transaction. A concurrent generation flip between two snapshots
     /// would otherwise mislabel data (backup manifest torn from content).
+    /// Sessions ride the same snapshot (P1 follow-up): since b8bcb94 they
+    /// are canonical Fjall records, and a caller-side `all_sessions()` from
+    /// a second snapshot could tear across a concurrent `session_end`
+    /// (an Active session paired with already-bumped guide counts that
+    /// never coexisted).
     pub fn export_full_with_generation(&self) -> DomainResult<(CanonicalExport, StoreGeneration)> {
         let snapshot = self.db.read_tx();
         let read_all = |ks: &OptimisticTxKeyspace| -> DomainResult<Vec<Vec<u8>>> {
@@ -3999,12 +4115,17 @@ impl CanonicalRepository {
             .iter()
             .map(|v| decode::<crate::domain::session::Suggestion>(v))
             .collect::<DomainResult<_>>()?;
+        let sessions: Vec<Session> = read_all(&self.sessions)?
+            .iter()
+            .map(|v| decode::<Session>(v))
+            .collect::<DomainResult<_>>()?;
         let generation = Self::generation_from_snapshot(&snapshot, &self.generations, &self.db)?;
         Ok((
             CanonicalExport {
                 memories,
                 relations,
                 guides,
+                sessions,
                 feedback,
                 suggestions,
                 ..Default::default()
@@ -4079,6 +4200,11 @@ impl CanonicalRepository {
     /// Feedback keys reuse the canonical `feedback:{op}` scheme (the op id
     /// is recovered as event.id XOR 0xF0), so replays cannot double-record
     /// under a divergent key.
+    ///
+    /// Returns the number of restored sessions that were non-terminal and
+    /// marked Abandoned (P2-A): a backup is persistent knowledge, not a
+    /// live lease, so Active sessions must not resurrect as unowned live
+    /// execution contexts. Terminal sessions restore verbatim.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_replace(
         &self,
@@ -4089,7 +4215,7 @@ impl CanonicalRepository {
         suggestions: &[crate::domain::session::Suggestion],
         sessions: &[crate::domain::session::Session],
         new_generation: StoreGeneration,
-    ) -> DomainResult<()> {
+    ) -> DomainResult<u64> {
         let _restore_guard = self.restore_lock.write().unwrap();
         fn drain(tx: &OptimisticWriteTx, ks: &OptimisticTxKeyspace) -> DomainResult<Vec<String>> {
             let mut keys = Vec::new();
@@ -4190,10 +4316,20 @@ impl CanonicalRepository {
         }
         // True backup restore (P1-1): session history is knowledge used by
         // continuity recall and analytics, so the backup's sessions become
-        // the live set. Channel bindings/leases and virtual live sessions
-        // stay registry-side and are never restored here.
+        // the live set. Non-terminal sessions restore as Abandoned (P2-A):
+        // a backup is persistent knowledge, not a live lease. Channel
+        // bindings/leases and virtual live sessions stay registry-side and
+        // are never restored here.
+        let mut sessions_marked_abandoned = 0u64;
         for s in sessions {
-            let raw = serde_json::to_vec(s)
+            let mut s = s.clone();
+            if !s.status.is_terminal() {
+                s.status = crate::domain::session::SessionStatus::Abandoned;
+                s.outcome = Some(crate::domain::session::TaskOutcome::Abandoned);
+                s.ended_at = Some(crate::domain::memory::Instant::new(now));
+                sessions_marked_abandoned += 1;
+            }
+            let raw = serde_json::to_vec(&s)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(
                 &self.sessions,
@@ -4243,7 +4379,7 @@ impl CanonicalRepository {
                 // barrier fault hook cannot fire here and failures stay
                 // untestable. One redundant fsync on a rare op.
                 self.persist_barrier()?;
-                Ok(())
+                Ok(sessions_marked_abandoned)
             }
             Ok(Err(_)) => Err(Self::exhausted_contention(
                 "restore replace conflicted with a concurrent write",
@@ -6847,18 +6983,128 @@ mod tests {
         let before = repo.export_full().unwrap().feedback;
         assert_eq!(before.len(), 1);
         let snapshot = repo.export_full().unwrap();
-        repo.restore_replace(
-            &snapshot.memories,
-            &snapshot.relations,
-            &snapshot.guides,
-            &snapshot.feedback,
-            &snapshot.suggestions,
-            &[],
-            StoreGeneration::new(2),
-        )
-        .unwrap();
+        let marked = repo
+            .restore_replace(
+                &snapshot.memories,
+                &snapshot.relations,
+                &snapshot.guides,
+                &snapshot.feedback,
+                &snapshot.suggestions,
+                &snapshot.sessions,
+                StoreGeneration::new(2),
+            )
+            .unwrap();
+        assert_eq!(marked, 0, "no live sessions to retire here");
         let after = repo.export_full().unwrap().feedback;
         assert_eq!(after, before, "feedback must round-trip identically");
+    }
+
+    /// P1 (bfe8844-review follow-up): the native backup must be one coherent
+    /// cut. Sessions live in Fjall now, so `export_full_with_generation`
+    /// must read them from the SAME snapshot as memories/guides/etc. — a
+    /// caller-side `all_sessions()` from a second snapshot can tear across
+    /// a concurrent `session_end` (Active session + already-bumped guide
+    /// counts that never coexisted).
+    #[test]
+    fn export_full_covers_canonical_sessions() {
+        use crate::domain::id::{ChannelId, SessionHandle};
+        use crate::domain::session::SessionOp;
+        let (repo, _dir) = repo_with_ns();
+        let handle = SessionHandle::new(Uuid::from_u128(100));
+        match repo
+            .session_start_tx(
+                "op-export",
+                "digest-export",
+                handle,
+                ChannelId::new(Uuid::from_u128(9)),
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let (export, _) = repo.export_full_with_generation().unwrap();
+        assert!(
+            export.sessions.iter().any(|s| s.handle == handle),
+            "export must carry live sessions from its own snapshot"
+        );
+    }
+
+    /// P2-B: continuity-recall boosts apply exactly once per session-start
+    /// operation. The first claim applies and returns true; a second claim
+    /// (crash-window continuation) returns false without touching
+    /// confidence; a changed digest rejects.
+    #[test]
+    fn continuity_boost_claim_applies_once() {
+        use crate::domain::id::{ChannelId, SessionHandle};
+        use crate::domain::session::{AttemptOutcome, SessionOp};
+        let (repo, _dir) = repo_with_ns();
+        let handle = SessionHandle::new(Uuid::from_u128(100));
+        match repo
+            .session_start_tx(
+                "op-start",
+                "digest-start",
+                handle,
+                ChannelId::new(Uuid::from_u128(9)),
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match repo
+            .session_attempt_tx(
+                "op-attempt",
+                "digest-attempt",
+                handle,
+                "try X".to_string(),
+                AttemptOutcome::Rejected,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied((_, 1)) => {}
+            other => panic!("expected Applied seq 1, got {other:?}"),
+        }
+        // Lower first: fresh attempts start at the 1.0 ceiling where a
+        // small positive delta clamps invisibly.
+        repo.adjust_attempt(handle, 1, -0.5, 1000).unwrap();
+        let targets = vec![(handle, 1)];
+        assert!(
+            repo.claim_continuity_boost("op-start", "digest-start", &targets, 0.015, 1000)
+                .unwrap()
+        );
+        let after_first = repo.get_session(handle).unwrap().unwrap().attempts[0].confidence;
+        assert!((after_first - 0.515).abs() < 1e-9, "got {after_first}");
+        assert!(
+            !repo
+                .claim_continuity_boost("op-start", "digest-start", &targets, 0.015, 1000)
+                .unwrap()
+        );
+        let after_second = repo.get_session(handle).unwrap().unwrap().attempts[0].confidence;
+        assert_eq!(after_second, after_first, "second claim must not re-boost");
+        let err = repo
+            .claim_continuity_boost("op-start", "DIFFERENT", &targets, 0.015, 1000)
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::KeyReuseDifferentInput
+        );
     }
 
     /// No ACK without a barrier: an injected persist failure must fail the
@@ -6918,6 +7164,49 @@ mod tests {
             err.message.contains("persist"),
             "barrier failure must fail the write, got: {err:?}"
         );
+    }
+
+    /// P1-B: resuming a live retry namespace returns the SAME epoch without
+    /// minting a new one, so a reconnected frontend keeps resolving its
+    /// pre-failure receipts. Unknown or expired namespaces refuse as stale
+    /// (the caller surfaces an unknown outcome, never a silent fresh epoch).
+    #[test]
+    fn resume_namespace_returns_same_epoch() {
+        let (repo, _dir) = repo_with_ns();
+        let fe = crate::domain::id::FrontendId::new(uuid::Uuid::from_u128(1));
+        // repo_with_ns issued epoch 1 at t=1000.
+        let ns = repo.resume_namespace(fe, 1, 1000).unwrap();
+        assert_eq!(ns.retry_epoch, 1);
+        // Resuming does not consume an epoch: the next issue still yields 2.
+        let next = repo.issue_namespace(fe, 1000).unwrap();
+        assert_eq!(next.retry_epoch, 2);
+        // Unknown epoch refuses.
+        let err = repo.resume_namespace(fe, 99, 1000).unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::StaleReplay
+        );
+        // Another frontend's epoch is not resumable here.
+        let other = crate::domain::id::FrontendId::new(uuid::Uuid::from_u128(2));
+        let err = repo.resume_namespace(other, 1, 1000).unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::StaleReplay
+        );
+    }
+
+    /// P1-B: an expired namespace (past the 24h TTL) refuses resume.
+    #[test]
+    fn resume_namespace_rejects_expired_epoch() {
+        let (repo, _dir) = repo_with_ns();
+        let fe = crate::domain::id::FrontendId::new(uuid::Uuid::from_u128(1));
+        let expired_at = 1000 + crate::service::repository::DEFAULT_NAMESPACE_TTL_MILLIS + 1;
+        let err = repo.resume_namespace(fe, 1, expired_at).unwrap_err();
+        assert_eq!(
+            err.code,
+            crate::domain::command::DomainErrorCode::StaleReplay
+        );
+        assert!(err.message.contains("expired"), "got: {err:?}");
     }
 
     /// Concurrent issuance for one frontend must yield distinct epochs
