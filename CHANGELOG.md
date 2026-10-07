@@ -5,7 +5,28 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## DATEPLACEHOLDER (2026-10-07) — Workspace split, review fixes, xtask runner
+## 2026-10-07 — P1 unknown-outcome + generation cut fix
+
+### P1 unknown-outcome + generation cut → surfaced, never re-executed
+- `resend_after_reconnect` (transport-ambiguity path only): a
+  GenerationMismatch on the resume handshake, or a StaleGeneration answer
+  to the resent same envelope, now closes the client and returns an
+  `unknown outcome … inspect state before retrying as new work` error —
+  no fresh mutation is ever minted there. The explicit-stale path
+  (StaleGeneration to a live request, certain no-commit) still retries
+  fresh via `send_fresh_with_resend`, unchanged.
+- RED-first regression
+  `unknown_outcome_generation_cut_surfaces_unknown_without_fresh_mutation`:
+  Feedback X commits, response dropped, generation cut, resume refused —
+  asserts the client errors naming the unknown outcome, sends nothing
+  further (EOF/timeout on the kept-open stream), and the seed reads
+  exactly one Feedback application (positive_feedback 1, 0.515).
+  Pre-fix the client resolved Ok(Success) — the double-apply.
+- Gate: `cargo fmt -- --check` clean,
+  `cargo clippy -p ltmrs-frontend --all-targets -- -D warnings` clean,
+  `cargo test -p ltmrs-frontend` 95 passed.
+
+## 980752bd (2026-10-07) — Workspace split, review fixes, xtask runner
 
 Collapses the 24-commit arc `851ab90..14b5d52` (all local-only) into one
 reviewed unit: full refactor trace plus review-driven fixes plus the private

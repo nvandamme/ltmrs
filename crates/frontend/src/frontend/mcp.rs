@@ -448,23 +448,26 @@ impl LtmrsFrontend {
                     ));
                 }
             }
-            Err(IpcError::GenerationMismatch { .. }) => {
-                // Generation moved: the gate rejects the old envelope before
-                // execution (certain no-commit), so a fresh epoch plus a
-                // fresh operation is safe — the established stale path.
-                // Terminal on transport loss (no nested resend): covering
-                // that triple-fault corner (loss + racing restore + loss
-                // again) would need unbounded retry chaining; the single
-                // resend budget is spent above.
-                drop(client);
-                self.ensure_handshaked().await?;
-                let mut client = self.client.lock().await;
-                let fresh_epoch = client.retry_epoch().unwrap_or(0);
-                let fresh = self.envelope_for(envelope.body.clone(), fresh_epoch);
-                return client
-                    .roundtrip_or_forget(&fresh)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None));
+            Err(IpcError::GenerationMismatch {
+                daemon,
+                client: client_gen,
+            }) => {
+                // The generation moved under an uncertain mutation: the
+                // dropped request may have committed before its response
+                // was lost, and its receipt namespace is no longer
+                // resolvable. A fresh mutation with the same body could
+                // double-apply increment-like operations — surface the
+                // unknown outcome, never mint a fresh operation here.
+                // (Only an explicit StaleGeneration answer to a live
+                // request proves no-commit; transport ambiguity proves
+                // nothing.)
+                client.close();
+                return Err(McpError::internal_error(
+                    format!(
+                        "request failed with unknown outcome ({first_error}); generation moved from {client_gen} to {daemon} before the resume — inspect state before retrying as new work"
+                    ),
+                    None,
+                ));
             }
             Err(IpcError::StaleNamespace(msg)) => {
                 client.close();
@@ -483,8 +486,8 @@ impl LtmrsFrontend {
         // Same generation, same epoch: the daemon resolves the original
         // operation ID against its receipt (replay) or executes it (if the
         // first send never arrived). A StaleGeneration answer here means the
-        // generation moved between handshake and resend — take the
-        // established fresh-operation path.
+        // generation moved between handshake and resend under transport
+        // ambiguity — the outcome is unknown, so surface it (never fresh).
         match client.roundtrip(envelope).await {
             Ok(resp) => {
                 let stale = matches!(
@@ -498,17 +501,16 @@ impl LtmrsFrontend {
                     return Ok(resp);
                 }
                 // Generation moved between resume handshake and resend:
-                // fresh envelope, terminal send (same triple-fault bound
-                // as above — no nested resend).
-                drop(client);
-                self.ensure_handshaked().await?;
-                let mut client = self.client.lock().await;
-                let fresh_epoch = client.retry_epoch().unwrap_or(0);
-                let fresh = self.envelope_for(envelope.body.clone(), fresh_epoch);
-                client
-                    .roundtrip_or_forget(&fresh)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))
+                // the original send may have committed before the
+                // transport loss, so the outcome is unknown — never mint
+                // a fresh mutation, surface it instead.
+                client.close();
+                Err(McpError::internal_error(
+                    format!(
+                        "request failed with unknown outcome ({first_error}); generation moved before the resend — inspect state before retrying as new work"
+                    ),
+                    None,
+                ))
             }
             Err(e) => Err(McpError::internal_error(
                 format!(
@@ -1836,6 +1838,269 @@ mod tests {
             .filter(|m| m.title == "Resend Me")
             .collect::<Vec<_>>();
         assert_eq!(memories.len(), 1, "exactly one effect allowed");
+
+        drop(fe);
+    }
+
+    /// P1 unknown-outcome + generation cut: after a transport loss, a
+    /// restore bumps the generation before the resume handshake. The
+    /// resume is refused as GenerationMismatch — but the dropped request
+    /// may have committed before its response was lost, so a fresh
+    /// mutation with the same body would double-apply increment-like
+    /// operations (Feedback +0.02, with no duplicate-ID guard to hide
+    /// behind). The frontend must surface an unknown-outcome error and
+    /// send nothing further. Deterministic: every drop point is
+    /// server-controlled, not timed (the only timeout proves the absence
+    /// of a reconnect).
+    #[tokio::test]
+    async fn unknown_outcome_generation_cut_surfaces_unknown_without_fresh_mutation() {
+        use ltmrs_daemon::dispatcher::Dispatcher;
+        use ltmrs_daemon::registry::FrontendRegistry;
+        use ltmrs_domain::clock::{Clock, FrozenClock};
+        use ltmrs_service::repository::CanonicalRepository;
+        use tokio::io::AsyncReadExt;
+
+        async fn read_msg(
+            stream: &mut tokio::net::UnixStream,
+        ) -> ltmrs_daemon::envelope::WireMessage {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+        async fn write_msg(
+            stream: &mut tokio::net::UnixStream,
+            reply: &ltmrs_daemon::envelope::WireReply,
+        ) {
+            let payload = serde_json::to_vec(reply).unwrap();
+            ltmrs_daemon::envelope::write_response_payload(stream, &payload)
+                .await
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        // Seed one memory at confidence 0.5: each positive Feedback adds
+        // +0.015 and bumps positive_feedback by 1, so exactly-once reads
+        // (0.515, 1) and a double-apply reads (0.53, 2) — no
+        // duplicate-ID guard to hide behind.
+        let mut seed = mem(7, None, 0.5, "Cut Feedback");
+        seed.external_alias = None;
+        repo.put_memory_direct(&seed).unwrap();
+        let target = seed.id;
+        let dispatcher = Arc::new(Dispatcher::new(
+            Arc::clone(&repo),
+            FrontendRegistry::new(),
+            Arc::clone(&clock),
+        ));
+        let socket = dir.path().join("cut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let server_task = tokio::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            let repo = Arc::clone(&repo);
+            async move {
+                use ltmrs_daemon::envelope::WireMessage;
+                let (mut conn1, _) = listener.accept().await.unwrap();
+                let WireMessage::Handshake(hs_req) = read_msg(&mut conn1).await else {
+                    panic!("expected handshake first");
+                };
+                assert_eq!(hs_req.resume_retry_epoch, None);
+                let hs = dispatcher.handle_handshake(&hs_req).unwrap();
+                let first_epoch = hs.retry_epoch;
+                write_msg(
+                    &mut conn1,
+                    &ltmrs_daemon::envelope::WireReply::Handshake(hs),
+                )
+                .await;
+                let WireMessage::Request(env) = read_msg(&mut conn1).await else {
+                    panic!("expected snapshot prefetch second");
+                };
+                let prefetch_resp = dispatcher.handle(&env).unwrap();
+                write_msg(
+                    &mut conn1,
+                    &ltmrs_daemon::envelope::WireReply::Response(prefetch_resp),
+                )
+                .await;
+                // The mutation under test: commit, then drop WITHOUT
+                // responding — a deterministic unknown outcome.
+                let WireMessage::Request(env) = read_msg(&mut conn1).await else {
+                    panic!("expected mutation request third");
+                };
+                dispatcher.handle(&env).unwrap();
+                drop(conn1);
+                // Generation cut AFTER the commit, BEFORE the reconnect:
+                // the backup/restore the reviewer describes.
+                let live = repo.store_generation().unwrap().as_u64();
+                repo.set_store_generation(ltmrs_domain::id::StoreGeneration::new(live + 1))
+                    .unwrap();
+                // Reconnect with a resume for the pre-cut epoch, served
+                // through the real handshake path (must refuse: the
+                // generation moved under the uncertain mutation).
+                let (mut conn2, _) = listener.accept().await.unwrap();
+                let WireMessage::Handshake(resume_req) = read_msg(&mut conn2).await else {
+                    panic!("expected resume handshake on conn2");
+                };
+                assert_eq!(
+                    resume_req.resume_retry_epoch,
+                    Some(first_epoch),
+                    "reconnect must resume the same epoch"
+                );
+                let handshake_err = dispatcher.handle_handshake(&resume_req).unwrap_err();
+                let ltmrs_daemon::envelope::IpcError::GenerationMismatch { .. } = handshake_err
+                else {
+                    panic!("resume across a generation cut must mismatch");
+                };
+                // Production wire encoding (server.rs): kind tag + the
+                // typed error's Display, which the client parses back.
+                write_msg(
+                    &mut conn2,
+                    &ltmrs_daemon::envelope::WireReply::Error(ltmrs_daemon::envelope::WireError {
+                        kind: "generation_mismatch".to_string(),
+                        message: handshake_err.to_string(),
+                    }),
+                )
+                .await;
+                // Production keeps the stream open after a mismatch
+                // (same-stream retry): serve whatever follows. Pre-fix the
+                // client sends a fresh handshake + prefetch + fresh
+                // mutation here — the defect (a second Feedback
+                // application). Post-fix it closes its end and sends
+                // nothing: EOF (or a quiet timeout) is the fixed-world
+                // signal.
+                let mut len_buf = [0u8; 4];
+                let followed = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::io::AsyncReadExt::read_exact(&mut conn2, &mut len_buf),
+                )
+                .await
+                .is_ok_and(|r| r.is_ok());
+                if !followed {
+                    // Fixed world: nothing further sent.
+                } else {
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut buf = vec![0u8; len];
+                    tokio::io::AsyncReadExt::read_exact(&mut conn2, &mut buf)
+                        .await
+                        .unwrap();
+                    let next: ltmrs_daemon::envelope::WireMessage =
+                        serde_json::from_slice(&buf).unwrap();
+                    match next {
+                        WireMessage::Handshake(fresh_req) => {
+                            assert_eq!(fresh_req.resume_retry_epoch, None);
+                            // The fresh handshake still carries the pre-cut
+                            // generation: production refuses it again (kept
+                            // open), the client adopts the live generation and
+                            // redials. Serve that full dance faithfully.
+                            let second = dispatcher.handle_handshake(&fresh_req).unwrap_err();
+                            assert!(
+                                matches!(
+                                    second,
+                                    ltmrs_daemon::envelope::IpcError::GenerationMismatch { .. }
+                                ),
+                                "fresh handshake at the old generation must mismatch, got {second:?}"
+                            );
+                            write_msg(
+                                &mut conn2,
+                                &ltmrs_daemon::envelope::WireReply::Error(
+                                    ltmrs_daemon::envelope::WireError {
+                                        kind: "generation_mismatch".to_string(),
+                                        message: second.to_string(),
+                                    },
+                                ),
+                            )
+                            .await;
+                            let (mut conn3, _) = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                listener.accept(),
+                            )
+                            .await
+                            .expect("client must redial after adopting the live generation")
+                            .unwrap();
+                            let WireMessage::Handshake(redial_req) = read_msg(&mut conn3).await
+                            else {
+                                panic!("expected redial handshake on conn3");
+                            };
+                            let hs = dispatcher.handle_handshake(&redial_req).unwrap();
+                            write_msg(
+                                &mut conn3,
+                                &ltmrs_daemon::envelope::WireReply::Handshake(hs),
+                            )
+                            .await;
+                            let WireMessage::Request(env) = read_msg(&mut conn3).await else {
+                                panic!("expected prefetch after redial handshake");
+                            };
+                            let prefetch_resp = dispatcher.handle(&env).unwrap();
+                            write_msg(
+                                &mut conn3,
+                                &ltmrs_daemon::envelope::WireReply::Response(prefetch_resp),
+                            )
+                            .await;
+                            let WireMessage::Request(env) = read_msg(&mut conn3).await else {
+                                panic!("expected fresh mutation after prefetch");
+                            };
+                            let fresh_resp = dispatcher.handle(&env).unwrap();
+                            write_msg(
+                                &mut conn3,
+                                &ltmrs_daemon::envelope::WireReply::Response(fresh_resp),
+                            )
+                            .await;
+                        }
+                        _ => panic!("only a fresh handshake may follow a mismatch"),
+                    }
+                }
+            }
+        });
+
+        let client = IpcClient::new(socket);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fe.roundtrip_with_rehandshake(DomainRequest::Feedback {
+                memory_id: target,
+                useful: true,
+            }),
+        )
+        .await
+        .expect("unknown-outcome call must not hang");
+        // Server-side absence proof first: pre-fix this panics with the
+        // defect named (a fresh mutation was sent); post-fix it passes.
+        server_task.await.unwrap();
+        let err = result.expect_err(
+            "generation cut after transport loss must surface unknown outcome, never resolve",
+        );
+        assert!(
+            err.message.contains("unknown outcome"),
+            "error must name the unknown outcome, got: {}",
+            err.message
+        );
+        // Exactly one Feedback application: +0.015 and counter 1 —
+        // never +0.03 / counter 2.
+        let memory = repo.get_memories(&[target]).unwrap().remove(0);
+        assert_eq!(
+            memory.positive_feedback, 1,
+            "exactly one Feedback application allowed"
+        );
+        assert!(
+            (memory.confidence - 0.515).abs() < 1e-9,
+            "exactly one Feedback application allowed, got {}",
+            memory.confidence
+        );
 
         drop(fe);
     }
