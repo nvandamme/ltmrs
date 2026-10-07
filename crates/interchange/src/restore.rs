@@ -281,6 +281,21 @@ pub fn restore_verified(
     backup: &crate::backup::VerifiedBackup,
     new_generation: StoreGeneration,
 ) -> Result<RestoreReport, RestoreError> {
+    let guard = repo.restore_write_guard();
+    restore_verified_guarded(repo, &guard, backup, new_generation)
+}
+
+/// Verified restore under an already-held restore fence (see
+/// `CanonicalRepository::restore_write_guard`): the exec restore flow
+/// holds the fence across confirm → safety snapshot → this call, so no
+/// acknowledged write can land between the safety backup and the
+/// replace. Must not be called without holding the fence.
+pub fn restore_verified_guarded(
+    repo: &CanonicalRepository,
+    guard: &std::sync::RwLockWriteGuard<'_, ()>,
+    backup: &crate::backup::VerifiedBackup,
+    new_generation: StoreGeneration,
+) -> Result<RestoreReport, RestoreError> {
     use std::collections::BTreeSet;
     let present: BTreeSet<String> = backup
         .snapshot
@@ -316,7 +331,7 @@ pub fn restore_verified(
         }
     }
     let sessions_marked_abandoned = repo
-        .restore_replace(
+        .restore_replace_guarded(
             &backup.snapshot.memories,
             &kept,
             &backup.snapshot.guides,
@@ -324,6 +339,7 @@ pub fn restore_verified(
             &backup.snapshot.suggestions,
             &backup.snapshot.sessions,
             new_generation,
+            guard,
         )
         .map_err(|e| RestoreError::Store(e.message))?;
     let count = |n: usize| n as u64;

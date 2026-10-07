@@ -5,7 +5,26 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1 tool replay-before-validation + admission at tool entry
+## 2026-10-07 — P1 exclusive restore fence + P2 single-mutex admit/GC boundary
+
+### P1 exclusive restore fence + P2 single-mutex admit/GC boundary
+- `restore_write_guard` / `try_` variant + `restore_replace_guarded` /
+  `restore_verified_guarded` wrappers: `exec_backup_restore` holds the
+  exclusive fence across confirm → safety snapshot → replace → context
+  reset (released before the sessions-file persist), so no acknowledged
+  write can land between the safety backup and the replace and be
+  drained unseen. In-flight mutations drain into the fence; new ones
+  block briefly, then proceed post-restore (generation mismatch guides
+  re-handshake). No new async locks, no handshake changes — the
+  pre-existing fence discipline does the work.
+- Admission and GC now share one mutex boundary: validate+pin and
+  check-and-collect are mutually exclusive, closing the expiry-edge
+  race before periodic GC is ever wired.
+- RED-first: hammer test (fat store, warm-up, unbounded window) fails
+  without the fence with ACKed writes drained unseen, passes with it;
+  rollback test re-handshakes post-restore (namespaces drain by design).
+
+## 2babb3e (2026-10-07) — P1 tool replay-before-validation + admission at tool entry
 
 ### P1 tool replay-before-validation + admission at tool entry
 - New `replay_primary_subcommand` helper (single sub-command derivation

@@ -5081,7 +5081,7 @@ fn exec_backup_restore(
     use ltmrs_interchange::backup::{
         MAX_BACKUP_BYTES, encode_backup, export_backup_to, verify_backup_file,
     };
-    use ltmrs_interchange::restore::{RestoreError, restore_verified, safety_backup_path};
+    use ltmrs_interchange::restore::{RestoreError, restore_verified_guarded, safety_backup_path};
     let fail = |message: String| DomainError::new(DomainErrorCode::Validation, message);
     let token = match args.confirmation_token.as_deref().map(str::trim) {
         Some(t) if !t.is_empty() => t.to_string(),
@@ -5108,6 +5108,15 @@ fn exec_backup_restore(
     };
     let verified = verify_backup_file(&source, MAX_BACKUP_BYTES)
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
+    // Exclusive restore fence (P1 restore quiescence): held from here
+    // through the context reset, every mutating entry point blocks at
+    // its shared fence instead of committing while this restore runs.
+    // In-flight mutations drain before the fence is granted, so the
+    // safety snapshot below contains every write acknowledged before
+    // it — no acknowledged write can land between the safety backup
+    // and the replace and be drained unseen. Released before the
+    // sessions-file persist (file IO, no store interplay).
+    let restore_guard = disp.repo().restore_write_guard();
     let live_generation = disp
         .repo()
         .store_generation()
@@ -5159,17 +5168,21 @@ fn exec_backup_restore(
     // Replace + bump in one durable transaction (P1-1): domain records,
     // canonical sessions from the backup, all op-receipt logs drained so
     // no pre-restore identity replays across the generation cut.
-    // Rollback is a second restore of the safety file.
+    // Rollback is a second restore of the safety file. Runs under the
+    // exclusive fence acquired above (guard passed through).
     let new_generation = ltmrs_domain::id::StoreGeneration::new(live_generation + 1);
-    let report = restore_verified(disp.repo(), &verified, new_generation)
+    let report = restore_verified_guarded(disp.repo(), &restore_guard, &verified, new_generation)
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
     // Generation cut invalidates every pre-restore execution context (P2-A):
     // traced routes, leases, virtual routes/leases and the virtual session
     // store are all reset (the next call on each channel binds fresh).
-    // The reset state persists with the restore (no-op without a
-    // sessions path; loud failure otherwise — a crash before the next
-    // persist must not reload contexts pointing at drained sessions).
+    // Still under the fence (registry only, no store interplay); the
+    // fence releases before the sessions-file persist below (no-op
+    // without a sessions path; loud failure otherwise — a crash before
+    // the next persist must not reload contexts pointing at drained
+    // sessions).
     let bindings_dropped = disp.registry().reset_execution_contexts();
+    drop(restore_guard);
     disp.persist_sessions()
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
     let sessions_restored = report.restored.get("sessions").copied().unwrap_or(0);
@@ -8654,6 +8667,142 @@ mod tests {
         );
     }
 
+    /// P1 (restore quiescence): writes acknowledged while a restore runs
+    /// must be either in the safety backup or in the post-replace store —
+    /// never ACKed and subsequently drained unseen. A hammer thread writes
+    /// continuously across the restore; the exclusive fence serializes it
+    /// outside the safety→replace window.
+    #[test]
+    fn backup_restore_never_loses_acknowledged_writes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+        let (disp, _dir) = test_dispatcher();
+        let disp = Arc::new(disp);
+        add_fragment(&disp, 1, "## Restore Base\n\n### Context\nQuiescence seed.");
+        // Fat store: a wide safety→replace window so the hammer lands
+        // mid-window writes deterministically (a tiny store would let
+        // the restore slip between two hammer iterations).
+        for n in 2..=200u64 {
+            add_fragment(
+                &disp,
+                n,
+                &format!("## Fatten {n}\n\n### Context\nWindow-widening xorblat{n}."),
+            );
+        }
+        let out = tempfile::tempdir().unwrap();
+        let create = ToolArgs::BackupCreate(BackupCreateArgs {
+            directory: Some(out.path().to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(2, create.clone()), &create);
+        assert!(!result_is_error(&result));
+        let backup_path = result_structured(&result).unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(backup_path.clone()),
+        });
+        let result = run(&disp, &tool_call(3, preview.clone()), &preview);
+        assert!(!result_is_error(&result));
+        let token = result_structured(&result).unwrap()["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Hammer: distinct fragments until the restore returns (unbounded:
+        // the restore call bounds the loop, so mid-window writes are
+        // guaranteed, not timing luck). Dedup may reject near-identical
+        // ones; only ACKed writes count.
+        let stop = Arc::new(AtomicBool::new(false));
+        let next_op = Arc::new(AtomicU64::new(100));
+        let acked: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hammer = {
+            let (disp, stop, next_op, acked) = (
+                Arc::clone(&disp),
+                Arc::clone(&stop),
+                Arc::clone(&next_op),
+                Arc::clone(&acked),
+            );
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::SeqCst) && i < 200000 {
+                    i += 1;
+                    let op = next_op.fetch_add(1, Ordering::SeqCst);
+                    // Mostly-unique token sets per write (Jaccard on
+                    // whitespace tokens): shared words stay far below the
+                    // 0.80 dedup threshold so hammer writes acknowledge.
+                    let nonce: Vec<String> = (0..6).map(|k| format!("xorblat{i}x{k}")).collect();
+                    let fragment = format!(
+                        "## Hammer {i} {op}\n\n### Context\nQuiescence probe {}.",
+                        nonce.join(" ")
+                    );
+                    let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+                        fragment: fragment.clone(),
+                        ..Default::default()
+                    });
+                    let env = tool_call(op, args.clone());
+                    let ok = match execute_tool(&disp, &env, &args) {
+                        Ok(result) => !result_is_error(&result),
+                        Err(_) => false,
+                    };
+                    if ok {
+                        acked.lock().unwrap().push(fragment);
+                    }
+                }
+            })
+        };
+        let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token),
+            confirm: Some(true),
+        });
+        // Warm up: only start the restore once the hammer is actively
+        // acknowledging, so mid-window overlap is structural, not luck.
+        while acked.lock().unwrap().len() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let result = run(&disp, &tool_call(4, restore.clone()), &restore);
+        stop.store(true, Ordering::SeqCst);
+        hammer.join().unwrap();
+        assert!(
+            !result_is_error(&result),
+            "restore failed: {}",
+            result_text(&result)
+        );
+        let safety = result_structured(&result).unwrap()["safety_backup"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let acked = acked.lock().unwrap().clone();
+        assert!(
+            !acked.is_empty(),
+            "hammer must acknowledge writes for the test to mean anything"
+        );
+        // Every ACKed hammer write is either pre-safety (in the safety
+        // backup) or post-replace (in the live store). The fenced window
+        // admits no third outcome.
+        let safety_snap = ltmrs_interchange::backup::verify_backup_file(
+            std::path::Path::new(&safety),
+            ltmrs_interchange::backup::MAX_BACKUP_BYTES,
+        )
+        .unwrap()
+        .snapshot;
+        let live = disp.repo().export_snapshot().unwrap();
+        let mut missing = Vec::new();
+        for fragment in &acked {
+            let in_safety = safety_snap.memories.iter().any(|m| &m.fragment == fragment);
+            let in_live = live.memories.iter().any(|m| &m.fragment == fragment);
+            if !in_safety && !in_live {
+                missing.push(fragment.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "acknowledged writes lost across restore: {missing:?} ({} hammered)",
+            acked.len()
+        );
+    }
+
     /// Full restore cycle with rollback through the safety file: alpha live,
     /// backup alpha, add beta, restore (beta gone), restore safety (beta back).
     /// Generation advances on every restore; sessions restore from the backup.
@@ -8745,6 +8894,10 @@ mod tests {
         );
 
         // Rollback: preview + restore the safety file (beta returns).
+        // The first restore drained all namespaces: like a production
+        // frontend after a generation cut, re-handshake (fresh namespace;
+        // the drained epoch counter restarts at 1) before continuing.
+        disp.repo().issue_namespace(fe(1), ch(1), 1000).unwrap();
         let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
             path: Some(safety.clone()),
         });

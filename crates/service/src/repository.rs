@@ -751,12 +751,21 @@ impl CanonicalRepository {
             &self.guide_ops,
             &self.suggestion_ops,
         ];
+        // Same synchronization boundary as admission: check-and-collect
+        // holds this mutex across the whole collect+commit, so an
+        // admission's validate-and-pin can never interleave between the
+        // pinned check below and the removal. (GC is rare; brief
+        // admission stalls during a collect are acceptable.)
+        let pins = self.ns_pins.lock().unwrap_or_else(|e| e.into_inner());
         for ns in &expired {
             // Pinned namespaces survive expiry: a live admitted operation
             // may still finalize against them (freeze/replay/claim). They
             // collect on a later pass once unpinned. Legacy rows sweep
             // below regardless (unattributable to any live operation).
-            if self.namespace_pinned(ns.frontend_id, ns.retry_epoch) {
+            if pins
+                .get(&Self::ns_pin_key(ns.frontend_id, ns.retry_epoch))
+                .is_some_and(|n| *n > 0)
+            {
                 continue;
             }
             // Remove every operation receipt issued under this retry
@@ -893,12 +902,16 @@ impl CanonicalRepository {
     /// between primary commit and response finalization can never turn
     /// an executed operation into an error.
     pub fn admit_scope(&self, scope: &OperationScope) -> DomainResult<AdmittedScope> {
+        // One synchronization boundary for the namespace lifecycle:
+        // validation and pinning are atomic with respect to GC's
+        // check-and-collect (which holds the same mutex), so GC can
+        // never collect a namespace between this admission's validity
+        // check and its pin.
+        let mut pins = self.ns_pins.lock().unwrap_or_else(|e| e.into_inner());
         self.validate_scope(scope)?;
         let key = Self::ns_pin_key(scope.frontend_id, scope.retry_epoch);
-        {
-            let mut pins = self.ns_pins.lock().unwrap_or_else(|e| e.into_inner());
-            *pins.entry(key.clone()).or_insert(0) += 1;
-        }
+        *pins.entry(key.clone()).or_insert(0) += 1;
+        drop(pins);
         Ok(AdmittedScope {
             scope: scope.clone(),
             _pin: NamespacePin {
@@ -912,16 +925,6 @@ impl CanonicalRepository {
     /// pinning protects the whole epoch's receipts while admitted).
     fn ns_pin_key(frontend_id: FrontendId, retry_epoch: u64) -> String {
         format!("{}:{}", frontend_id.as_uuid(), retry_epoch)
-    }
-
-    /// Whether a retry namespace currently has live admitted operations
-    /// (and must survive `gc_expired` even past TTL).
-    fn namespace_pinned(&self, frontend_id: FrontendId, retry_epoch: u64) -> bool {
-        self.ns_pins
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&Self::ns_pin_key(frontend_id, retry_epoch))
-            .is_some_and(|n| *n > 0)
     }
 
     /// Verify a stored direct receipt belongs to the calling scope.
@@ -4565,6 +4568,25 @@ impl CanonicalRepository {
         }
     }
 
+    /// Acquire the exclusive restore fence (P1 restore quiescence): while
+    /// held, every mutating entry point blocks at its shared fence instead
+    /// of committing, and in-flight mutations drain before the holder
+    /// proceeds. The restore flow holds this across confirm → safety
+    /// snapshot → replacement → context reset, so no acknowledged write
+    /// can land between the safety backup and the replace and be drained
+    /// unseen. All other paths must use the shared (read) fence via the
+    /// normal entry points — never hold this guard except across one
+    /// restore envelope (see `restore_replace_guarded`).
+    pub fn restore_write_guard(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.restore_lock.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Non-blocking variant for tests: `Some` iff no restore holds the
+    /// exclusive fence right now.
+    pub fn try_restore_write_guard(&self) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+        self.restore_lock.try_write().ok()
+    }
+
     /// Atomically replace the store with a verified snapshot (restore): drain
     /// every durable keyspace and insert the snapshot in ONE write
     /// transaction with a durable commit, including the generation flip.
@@ -4605,7 +4627,36 @@ impl CanonicalRepository {
         sessions: &[ltmrs_domain::session::Session],
         new_generation: StoreGeneration,
     ) -> DomainResult<u64> {
-        let _restore_guard = self.restore_lock.write().unwrap();
+        let guard = self.restore_write_guard();
+        self.restore_replace_guarded(
+            memories,
+            relations,
+            guides,
+            feedback,
+            suggestions,
+            sessions,
+            new_generation,
+            &guard,
+        )
+    }
+
+    /// Replacement under an already-held restore fence (see
+    /// `restore_write_guard`): the exec restore flow holds the fence
+    /// across confirm → safety snapshot → this call, so the safety
+    /// backup and the replace are atomic with respect to every mutating
+    /// entry point. Must not be called without holding the fence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_replace_guarded(
+        &self,
+        memories: &[Memory],
+        relations: &[Relation],
+        guides: &[ltmrs_domain::guide::Guide],
+        feedback: &[ltmrs_domain::session::FeedbackEvent],
+        suggestions: &[ltmrs_domain::session::Suggestion],
+        sessions: &[ltmrs_domain::session::Session],
+        new_generation: StoreGeneration,
+        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
+    ) -> DomainResult<u64> {
         fn drain(tx: &OptimisticWriteTx, ks: &OptimisticTxKeyspace) -> DomainResult<Vec<String>> {
             let mut keys = Vec::new();
             for kv in tx.iter(ks) {
