@@ -5,7 +5,24 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1/P2 channel-scoped retry namespaces + receipt replay
+## 2026-10-07 — P1/P2 session_end suggestions exactly once
+
+### P1/P2 session_end suggestions filed exactly once per operation
+- `session_end_tx` now files improvement suggestions inside the end
+  transaction (`file_suggestions_tx`: in-tx session+text dedup, max+1
+  IDs): terminal transition + guide outcomes + suggestions + receipt are
+  one consistency boundary. The tools.rs read-check-file tail (which let
+  two duplicate deliveries both observe "absent" and file twice, after
+  the freeze) is removed; replays return the frozen response with zero
+  side effects. `file_suggestion` stays as the standalone filing API.
+- RED-first regression
+  `session_end_files_suggestions_exactly_once_per_operation`: 8 barrier-
+  released duplicate deliveries of one Failure end → exactly one Applies,
+  rest Replayed, exactly one Suggestion for the line. Pre-fix: zero filed
+  in-tx (filing lived outside) — fails; post-fix green.
+- Gate: fmt clean, workspace clippy clean; service 92, daemon 203 green.
+
+## 32c5881 (2026-10-07) — P1/P2 channel-scoped retry namespaces + receipt replay
 
 ### P1/P2 retry namespaces + receipt replay are channel-scoped
 - `RetryNamespace` gains `channel_id`; `issue_namespace` records the

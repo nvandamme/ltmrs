@@ -4338,23 +4338,11 @@ fn exec_session_end(
         Err(e) => return Err(e),
     };
 
-    // Persist improvement suggestions: deduplicated per session+text so a
-    // retried end does not file the same suggestion twice. IDs allocate
-    // atomically with the insert (lost-write fix): concurrent ends can
-    // never claim the same ID and silently overwrite each other.
-    let existing_suggestions = disp.repo().get_suggestions()?;
-    for line in &improvement_lines {
-        let text = line.trim().to_string();
-        let already = existing_suggestions.iter().any(|s| {
-            s.session_id.as_deref() == Some(&handle.as_uuid().to_string()) && s.suggestion == text
-        });
-        if already {
-            continue;
-        }
-        let _ = disp
-            .repo()
-            .file_suggestion(Some(handle.as_uuid().to_string()), text, now)?;
-    }
+    // Improvement suggestions file inside session_end_tx (same atomic
+    // boundary as the terminal transition): nothing to file here, and a
+    // read-check-file tail would race duplicate deliveries into filing
+    // twice. Replays return the frozen response above without side
+    // effects; a fresh Applied already filed exactly its lines.
 
     // Rebuild the response from canonical state (identical on replay:
     // the session is terminal with the recorded outcome/lessons).

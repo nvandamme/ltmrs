@@ -3480,6 +3480,11 @@ impl CanonicalRepository {
             let raw = serde_json::to_vec(&session)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.sessions, &hkey, raw.as_slice());
+            // Improvement suggestions file in the SAME transaction: the
+            // terminal transition, guide outcomes, suggestions and receipt
+            // are one consistency boundary, so duplicate deliveries of
+            // this operation can never file twice.
+            self.file_suggestions_tx(&mut tx, handle, &improvement_lines, now_millis)?;
             let receipt = SessionReceipt {
                 digest: digest.to_string(),
                 session: handle,
@@ -4070,6 +4075,54 @@ impl CanonicalRepository {
     /// the max-ID scan and the insert commit in ONE transaction, so two
     /// concurrent filers cannot claim the same ID and silently overwrite
     /// each other (optimistic conflict retries recompute the max).
+    /// File improvement suggestions inside the caller's transaction:
+    /// content-deduplicated per session+text, IDs allocated max+1 in-tx.
+    /// Used by `session_end_tx` so the terminal transition, guide outcomes,
+    /// suggestions and receipt commit as one boundary — duplicate
+    /// deliveries of the same end operation can never file twice.
+    fn file_suggestions_tx(
+        &self,
+        tx: &mut OptimisticWriteTx,
+        session: SessionHandle,
+        lines: &[String],
+        now_millis: u64,
+    ) -> DomainResult<()> {
+        let session_key = session.as_uuid().to_string();
+        let mut max: u64 = 0;
+        let mut present = std::collections::HashSet::new();
+        for kv in tx.iter(&self.suggestions) {
+            let (k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            if let Ok(id) = String::from_utf8_lossy(k.as_ref()).parse::<u64>() {
+                max = max.max(id);
+            }
+            if let Ok(s) = serde_json::from_slice::<ltmrs_domain::session::Suggestion>(v.as_ref()) {
+                present.insert((s.session_id, s.suggestion));
+            }
+        }
+        for line in lines {
+            let text = line.trim().to_string();
+            if text.is_empty() || present.contains(&(Some(session_key.clone()), text.clone())) {
+                continue;
+            }
+            max += 1;
+            let suggestion = ltmrs_domain::session::Suggestion {
+                id: max,
+                session_id: Some(session_key.clone()),
+                suggestion: text.clone(),
+                status: ltmrs_domain::session::SuggestionStatus::Pending,
+                created_at: ltmrs_domain::memory::Instant::new(now_millis),
+                resolved_at: None,
+            };
+            let raw = serde_json::to_vec(&suggestion)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.suggestions, suggestion.id.to_string(), raw.as_slice());
+            present.insert((Some(session_key.clone()), text));
+        }
+        Ok(())
+    }
+
     pub fn file_suggestion(
         &self,
         session_id: Option<String>,
@@ -7349,6 +7402,115 @@ mod tests {
         assert!(err.message.contains("another channel"), "got: {err:?}");
         // Exactly one effect: no re-execution slipped through.
         assert_eq!(repo.get_memories(&[eid(1)]).unwrap().len(), 1);
+    }
+
+    /// P1/P2 session_end exactly-once: improvement suggestions are filed
+    /// inside the end transaction, so concurrent duplicate deliveries of
+    /// the same end operation yield exactly one Suggestion per line —
+    /// never one per delivery (file_suggestion's atomic IDs alone only
+    /// prevent overwrites, not duplicates).
+    #[test]
+    fn session_end_files_suggestions_exactly_once_per_operation() {
+        use ltmrs_domain::guide::Guide;
+        use ltmrs_domain::id::{ChannelId, SessionHandle};
+        use ltmrs_domain::memory::Instant;
+        use ltmrs_domain::session::{SessionOp, TaskOutcome};
+        use std::sync::{Arc, Barrier};
+        let (repo, _dir) = repo_with_ns();
+        // Guide with a failing record (total 3, rate 0.00): a Failure end
+        // using it yields exactly one improvement line.
+        repo.put_guide(&Guide {
+            name: "git".into(),
+            category: "dev-tool".into(),
+            description: String::new(),
+            contexts: vec![],
+            learnings: vec![],
+            usage_count: 0,
+            last_used: None,
+            success_count: 0,
+            failure_count: 3,
+            anti_patterns: vec![],
+            pitfalls: vec![],
+            depends_on: vec![],
+            enables: vec![],
+            source_memories: vec![],
+            validated_by: vec![],
+            superseded_by: None,
+            deprecated: false,
+            entity_revision: ltmrs_domain::id::EntityRevision::new(1),
+            created_at: Instant::new(0),
+            updated_at: Instant::new(0),
+        })
+        .unwrap();
+        let handle = SessionHandle::new(Uuid::from_u128(700));
+        match repo
+            .session_start_tx(
+                "op-start-700",
+                "digest-start",
+                handle,
+                ChannelId::new(Uuid::from_u128(2)),
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        repo.track_session_link(handle, SessionLinkField::GuideUsed, &["git".to_string()])
+            .unwrap();
+        // Eight duplicate deliveries of the same end operation, released
+        // together: exactly one Applies, the rest Replay.
+        let repo = Arc::new(repo);
+        let start = Arc::new(Barrier::new(9));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let repo = Arc::clone(&repo);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                repo.session_end_tx(
+                    "op-end-700",
+                    "digest-end",
+                    handle,
+                    TaskOutcome::Failure,
+                    None,
+                    vec![],
+                    1000,
+                )
+                .unwrap()
+            }));
+        }
+        start.wait();
+        let mut applied = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                SessionOp::Applied((_, lines, true)) => {
+                    applied += 1;
+                    assert_eq!(lines.len(), 1, "one improvement line expected");
+                }
+                SessionOp::Replayed((_, lines, _)) => {
+                    assert_eq!(lines.len(), 1, "replay renders the same line");
+                }
+                other => panic!("unexpected end outcome: {other:?}"),
+            }
+        }
+        assert_eq!(applied, 1, "exactly one delivery may apply");
+        // Exactly one Suggestion for the line — never one per delivery.
+        let suggestions = repo.get_suggestions().unwrap();
+        assert_eq!(
+            suggestions.len(),
+            1,
+            "exactly one suggestion per line, got {suggestions:?}"
+        );
+        assert_eq!(
+            suggestions[0].session_id.as_deref(),
+            Some(handle.as_uuid().to_string().as_str())
+        );
     }
 
     /// Concurrent issuance for one frontend must yield distinct epochs
