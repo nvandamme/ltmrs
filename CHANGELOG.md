@@ -5,7 +5,26 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1 merge supersession edges are atomic
+## 2026-10-07 — P1 tool replay-before-validation + admission at tool entry
+
+### P1 tool replay-before-validation + admission at tool entry
+- New `replay_primary_subcommand` helper (single sub-command derivation
+  shared with `sub_command_ctx`): mutating memory tools consult the
+  primary sub-command receipt BEFORE state-dependent planning, so a
+  retried envelope replays instead of rejecting against state its own
+  first execution created (add dedup, relate edge-exists, forget
+  post-delete, merge post-archive). Uniform across add/update/feedback/
+  forget/merge/relate with per-tool response rebuilders (add shares its
+  response tail via `finish_add_response`).
+- Admission moved to `execute_tool` entry for mutating tools (lifetime
+  == tool execution): `memory_add`/`session_start/attempt/end` take the
+  admitted token instead of admitting mid-tool; dispatcher ToolCall-arm
+  check removed (single point), direct session bodies keep theirs.
+- RED-first: same-envelope add/relate replay tests, mid-tool-expiry
+  admission test (advancing clock via commit hook), IPC ToolCall resend
+  test — each probe-verified to fail with the exact reported mode.
+
+## 8041b4d (2026-10-07) — P1 merge supersession edges are atomic
 
 ### P1 merge supersession edges are atomic
 - `DomainCommand::Merge` gains `consolidate: bool`; when true the merge

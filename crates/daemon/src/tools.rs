@@ -24,8 +24,8 @@ use ltmrs_compat::lemma::tool_args::{
     SuggestionRespondArgs, ToolArgs,
 };
 use ltmrs_domain::command::{
-    CommandContext, DomainCommand, DomainError, DomainErrorCode, DomainResult, ForgetMode,
-    MemoryPatch, OperationScope,
+    CommandContext, CommandReceipt, DomainCommand, DomainError, DomainErrorCode, DomainResult,
+    ForgetMode, MemoryPatch, OperationScope,
 };
 use ltmrs_domain::guide::Guide;
 use ltmrs_domain::id::{EntityId, EntityRevision, OperationId, SessionHandle};
@@ -33,6 +33,7 @@ use ltmrs_domain::memory::{Evidence, FragmentType, Instant, Memory, MemorySource
 use ltmrs_domain::relation::{Relation, RelationType};
 use ltmrs_domain::session::SessionOp;
 use ltmrs_domain::session::{AttemptOutcome, Session, SuggestionStatus, TaskOutcome};
+use ltmrs_service::repository::AdmittedScope;
 use ltmrs_service::repository::{GuideMutation, RecordedGuideOp};
 use serde_json::{Value, json};
 
@@ -42,9 +43,30 @@ pub fn execute_tool(
     envelope: &IpcEnvelope,
     tool: &ToolArgs,
 ) -> DomainResult<DomainPayload> {
+    // Admit once at tool entry (RQ-06 admission-once): every mutating
+    // tool executes under this admission, so no step after the first
+    // durable commit can fail on namespace expiry — the admitted
+    // lifetime is exactly the tool-call lifetime. Continuations take
+    // `admitted`; single-primitive tools validate inside as before.
+    // Read-only tools run unadmitted.
+    let admitted = if tool.mutates_store() {
+        Some(
+            disp.repo()
+                .admit_scope(&envelope.operation_scope(envelope.request_digest()?))?,
+        )
+    } else {
+        None
+    };
+    // All mutating tools are admitted above; unwrapping here keeps each
+    // exec signature honest (needs-admission is visible in the type).
+    let adm = || {
+        admitted
+            .as_ref()
+            .expect("execute_tool admits every mutating tool before dispatching it")
+    };
     match tool {
         ToolArgs::MemoryRead(args) => exec_memory_read(disp, envelope, args),
-        ToolArgs::MemoryAdd(args) => exec_memory_add(disp, envelope, args),
+        ToolArgs::MemoryAdd(args) => exec_memory_add(disp, envelope, adm(), args),
         ToolArgs::MemoryUpdate(args) => exec_memory_update(disp, envelope, args),
         ToolArgs::MemoryFeedback(args) => exec_memory_feedback(disp, envelope, args),
         ToolArgs::MemoryForget(args) => exec_memory_forget(disp, envelope, args),
@@ -61,9 +83,9 @@ pub fn execute_tool(
         ToolArgs::GuideUpdate(args) => exec_guide_update(disp, envelope, args),
         ToolArgs::GuideForget(args) => exec_guide_forget(disp, envelope, args),
         ToolArgs::GuideMerge(args) => exec_guide_merge(disp, envelope, args),
-        ToolArgs::SessionStart(args) => exec_session_start(disp, envelope, args),
-        ToolArgs::SessionAttempt(args) => exec_session_attempt(disp, envelope, args),
-        ToolArgs::SessionEnd(args) => exec_session_end(disp, envelope, args),
+        ToolArgs::SessionStart(args) => exec_session_start(disp, envelope, adm(), args),
+        ToolArgs::SessionAttempt(args) => exec_session_attempt(disp, envelope, adm(), args),
+        ToolArgs::SessionEnd(args) => exec_session_end(disp, envelope, adm(), args),
         ToolArgs::SessionStats(args) => exec_session_stats(disp, envelope, args),
         ToolArgs::SuggestionRespond(args) => exec_suggestion_respond(disp, envelope, args),
         ToolArgs::ConflictScan(args) => exec_conflict_scan(disp, args),
@@ -222,21 +244,57 @@ fn word_overlap(a: &str, b: &str) -> f64 {
     inter as f64 / union as f64
 }
 
-/// Build a command context for the Nth sub-command of a tool call.
-///
-/// A tool call may issue several canonical commands (e.g. memory_add also
-/// auto-links). Each needs its own operation key so the receipt ledger cannot
-/// replay the first command in place of the second. The derived keys are
-/// deterministic in the envelope, so a retried tool call replays cleanly.
-fn sub_command_ctx(envelope: &IpcEnvelope, index: u32) -> DomainResult<CommandContext> {
+/// Derived sub-command identity for one tool-call step, shared by the
+/// context builder below and the replay pre-check: the operation id and
+/// digest are deterministic in the envelope, so a retried tool call
+/// replays cleanly.
+fn sub_command_parts(envelope: &IpcEnvelope, index: u32) -> DomainResult<(OperationId, String)> {
     let base_digest = envelope.request_digest()?;
     let op = OperationId::new(uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("{}:cmd{}", envelope.operation_id.as_uuid(), index).as_bytes(),
     ));
-    let mut ctx = envelope.to_command_context(format!("{base_digest}:cmd{index}"));
+    Ok((op, format!("{base_digest}:cmd{index}")))
+}
+
+/// Build a command context for the Nth sub-command of a tool call.
+///
+/// A tool call may issue several canonical commands (e.g. memory_add also
+/// auto-links). Each needs its own operation key so the receipt ledger
+/// cannot replay the first command in place of the second.
+fn sub_command_ctx(envelope: &IpcEnvelope, index: u32) -> DomainResult<CommandContext> {
+    let (op, digest) = sub_command_parts(envelope, index)?;
+    let mut ctx = envelope.to_command_context(digest);
     ctx.operation_id = op;
     Ok(ctx)
+}
+
+/// Replay-before-validation for mutating memory tools (P1): if this
+/// envelope's primary sub-command already committed, rebuild and return
+/// its recorded response INSTEAD of re-running state-dependent planning
+/// (dedup/existence checks) whose outcome the first execution changed.
+/// A stored receipt with a divergent digest rejects as key reuse (same
+/// as the gateway would); absence means fresh execution proceeds.
+fn replay_primary_subcommand(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    index: u32,
+    rebuild: impl FnOnce(&CommandReceipt) -> DomainResult<DomainPayload>,
+) -> DomainResult<Option<DomainPayload>> {
+    let (op, digest) = sub_command_parts(envelope, index)?;
+    match disp.repo().lookup_receipt(
+        envelope.store_generation,
+        envelope.frontend_id,
+        envelope.retry_epoch,
+        op,
+    )? {
+        Some(receipt) if receipt.request_digest == digest => Ok(Some(rebuild(&receipt)?)),
+        Some(_) => Err(DomainError::new(
+            DomainErrorCode::KeyReuseDifferentInput,
+            "operation key reused with different input",
+        )),
+        None => Ok(None),
+    }
 }
 
 /// Record read side effects (RQ-17) via the canonical gateway: confidence
@@ -1067,9 +1125,128 @@ fn render_detail(legacy_id: &str, m: &Memory, resolve: &dyn Fn(&EntityId) -> Str
 
 // ---- memory_add ----
 
+/// Shared add-response tail for fresh and replayed executions: topic
+/// overlaps, auto-link (its own sub-command receipt replays on retry),
+/// privacy/distill notes and the structured payload — all derived from
+/// the recorded memory plus a fresh snapshot. The fresh path calls this
+/// after its apply; the replay path calls it with the memory read back
+/// by receipt, so both render the same text.
+fn finish_add_response(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &MemoryAddArgs,
+    memory: &Memory,
+    final_fragment: &str,
+    has_secrets: bool,
+) -> DomainResult<DomainPayload> {
+    let repo = disp.repo();
+    let export = repo.export_snapshot()?;
+    let legacy_id = legacy_id_of(repo, memory);
+    let eid = memory.id;
+    let project = memory.project.clone();
+    let title = memory.title.clone();
+    let description = memory.description.clone();
+    // Find topic overlaps for auto-linking.
+    let overlaps: Vec<&Memory> = export
+        .memories
+        .iter()
+        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| m.id != eid)
+        .filter(|m| {
+            let score = word_overlap(final_fragment, &m.fragment);
+            (0.25..0.95).contains(&score)
+        })
+        .take(5)
+        .collect();
+
+    // Build response text.
+    let scope_info = project
+        .as_deref()
+        .map(|p| format!(" (project: {p})"))
+        .unwrap_or_else(|| " (global)".to_string());
+    let mut response =
+        format!("Added fragment [{legacy_id}]{scope_info}: \"{title}\"\nSummary: {description}");
+    if memory.distill_candidate {
+        response.push_str(&format!(
+            "\nFlagged as distill candidate (type: {}).",
+            memory.fragment_type.as_str()
+        ));
+    }
+    if has_secrets && !args.confirm {
+        response.push_str(
+            "\n\n⚠️ Privacy: potential secret(s) detected and auto-redacted. Use confirm: true to store as-is.",
+        );
+    }
+
+    // Auto-link to topic overlaps.
+    if !overlaps.is_empty() {
+        let strongest = &overlaps[0];
+        let strongest_id = legacy_id_of(repo, strongest);
+        let rel = new_relation(
+            envelope,
+            eid,
+            strongest.id,
+            RelationType::RelatedTo,
+            Some(format!(
+                "Auto-linked: topic overlap ({:.2})",
+                word_overlap(final_fragment, &strongest.fragment)
+            )),
+        );
+        let rel_cmd = DomainCommand::Relate { relation: rel };
+        let rel_ctx = sub_command_ctx(envelope, 1)?;
+        if disp.repo().apply(&rel_ctx, &rel_cmd).is_ok() {
+            response.push_str("\n\nRelated memories (auto-linked to strongest match):");
+            response.push_str(&format!(
+                "\n  [{strongest_id}] \"{}\" ({:.2}) — AUTO-LINKED",
+                strongest.title, strongest.confidence
+            ));
+            for o in &overlaps[1..] {
+                response.push_str(&format!(
+                    "\n  [{}] \"{}\" ({:.2})",
+                    legacy_id_of(repo, o),
+                    o.title,
+                    o.confidence
+                ));
+            }
+        }
+    }
+
+    // Add suggestions for pattern/lesson.
+    if matches!(
+        memory.fragment_type,
+        FragmentType::Pattern | FragmentType::Lesson
+    ) {
+        response.push_str(&format!(
+            "\n\nSUGGESTED ACTIONS:\n- This is a {}. Consider guide_distill to promote it into a reusable skill.",
+            memory.fragment_type.as_str()
+        ));
+    }
+
+    // Distill candidate count suggestion (the recorded memory is already
+    // in this snapshot, so no +1 adjustment is needed).
+    let distill_count = export
+        .memories
+        .iter()
+        .filter(|m| m.distill_candidate && m.lifecycle.is_recallable())
+        .count();
+    if distill_count >= 3 {
+        response.push_str(&format!(
+            "\n--- SUGGESTIONS ---\n  [*] {distill_count} memories marked as distill candidates. Consider promoting them to guides.\n---"
+        ));
+    }
+
+    let structured = json!({
+        "success": true,
+        "id": legacy_id,
+        "conflicts": [],
+    });
+    Ok(ok_result(response, structured))
+}
+
 fn exec_memory_add(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &MemoryAddArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -1081,6 +1258,40 @@ fn exec_memory_add(
     } else {
         args.fragment.clone()
     };
+
+    // Replay before validation: a retried envelope finds the memory the
+    // first delivery created and would reject itself as a duplicate —
+    // the recorded receipt rebuilds the response instead.
+    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |receipt| {
+        let created = match &receipt.outcome {
+            ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
+                affected.first().copied().ok_or_else(|| {
+                    DomainError::new(
+                        DomainErrorCode::Validation,
+                        "recorded add outcome carries no memory",
+                    )
+                })
+            }
+            _ => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "recorded add outcome is not a success",
+            )),
+        }?;
+        let stored = disp
+            .repo()
+            .get_memories(&[created])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                DomainError::new(
+                    DomainErrorCode::NotFound,
+                    "recorded memory no longer present",
+                )
+            })?;
+        finish_add_response(disp, envelope, args, &stored, &final_fragment, has_secrets)
+    })? {
+        return Ok(replayed);
+    }
 
     // Deduplication: reject if a similar fragment already exists.
     let export = repo.export_snapshot()?;
@@ -1234,111 +1445,16 @@ fn exec_memory_add(
         disp.registry()
             .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id));
     } else {
-        let track_admitted = disp
-            .repo()
-            .admit_scope(&envelope.operation_scope(envelope.request_digest()?))?;
         let _ = disp.repo().track_session_link(
-            &track_admitted,
+            admitted,
             session_handle,
             ltmrs_service::repository::SessionLinkField::MemoryCreated,
             std::slice::from_ref(&legacy_id),
         );
     }
 
-    // Find topic overlaps for auto-linking.
-    let overlaps: Vec<&Memory> = export
-        .memories
-        .iter()
-        .filter(|m| m.lifecycle.is_recallable())
-        .filter(|m| m.id != eid)
-        .filter(|m| {
-            let score = word_overlap(&final_fragment, &m.fragment);
-            (0.25..0.95).contains(&score)
-        })
-        .take(5)
-        .collect();
-
-    // Build response text.
-    let scope_info = project
-        .as_deref()
-        .map(|p| format!(" (project: {p})"))
-        .unwrap_or_else(|| " (global)".to_string());
-    let mut response =
-        format!("Added fragment [{legacy_id}]{scope_info}: \"{title}\"\nSummary: {description}");
-    if memory.distill_candidate {
-        response.push_str(&format!(
-            "\nFlagged as distill candidate (type: {}).",
-            fragment_type.as_str()
-        ));
-    }
-    if has_secrets && !args.confirm {
-        response.push_str(
-            "\n\n⚠️ Privacy: potential secret(s) detected and auto-redacted. Use confirm: true to store as-is.",
-        );
-    }
-
-    // Auto-link to topic overlaps.
-    if !overlaps.is_empty() {
-        let strongest = &overlaps[0];
-        let strongest_id = legacy_id_of(repo, strongest);
-        let rel = new_relation(
-            envelope,
-            eid,
-            strongest.id,
-            RelationType::RelatedTo,
-            Some(format!(
-                "Auto-linked: topic overlap ({:.2})",
-                word_overlap(&final_fragment, &strongest.fragment)
-            )),
-        );
-        let rel_cmd = DomainCommand::Relate { relation: rel };
-        let rel_ctx = sub_command_ctx(envelope, 1)?;
-        if disp.repo().apply(&rel_ctx, &rel_cmd).is_ok() {
-            response.push_str("\n\nRelated memories (auto-linked to strongest match):");
-            response.push_str(&format!(
-                "\n  [{strongest_id}] \"{}\" ({:.2}) — AUTO-LINKED",
-                strongest.title, strongest.confidence
-            ));
-            for o in &overlaps[1..] {
-                response.push_str(&format!(
-                    "\n  [{}] \"{}\" ({:.2})",
-                    legacy_id_of(repo, o),
-                    o.title,
-                    o.confidence
-                ));
-            }
-        }
-    }
-
-    // Add suggestions for pattern/lesson.
-    if matches!(fragment_type, FragmentType::Pattern | FragmentType::Lesson) {
-        response.push_str(&format!(
-            "\n\nSUGGESTED ACTIONS:\n- This is a {}. Consider guide_distill to promote it into a reusable skill.",
-            fragment_type.as_str()
-        ));
-    }
-
-    // Distill candidate count suggestion.
-    let distill_count = export
-        .memories
-        .iter()
-        .filter(|m| m.distill_candidate && m.lifecycle.is_recallable())
-        .count()
-        + 1; // +1 for the new one
-    if distill_count >= 3 {
-        response.push_str(&format!(
-            "\n--- SUGGESTIONS ---\n  [*] {distill_count} memories marked as distill candidates. Consider promoting them to guides.\n---"
-        ));
-    }
-
-    let structured = json!({
-        "success": true,
-        "id": legacy_id,
-        "conflicts": [],
-    });
-    Ok(ok_result(response, structured))
+    finish_add_response(disp, envelope, args, &memory, &final_fragment, has_secrets)
 }
-
 // ---- memory_update ----
 
 fn exec_memory_update(
@@ -1367,6 +1483,49 @@ fn exec_memory_update(
         && !(0.0..=1.0).contains(&c)
     {
         return Ok(err_result("'confidence' must be a number between 0 and 1"));
+    }
+
+    // Replay before validation (uniform tool rule): a retried envelope
+    // replays its recorded response instead of re-planning against
+    // mutated state.
+    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |receipt| {
+        let updated_id = match &receipt.outcome {
+            ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
+                affected.first().copied().ok_or_else(|| {
+                    DomainError::new(
+                        DomainErrorCode::Validation,
+                        "recorded update outcome carries no memory",
+                    )
+                })
+            }
+            _ => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "recorded update outcome is not a success",
+            )),
+        }?;
+        let title = match &args.title {
+            Some(t) => t.clone(),
+            None => disp
+                .repo()
+                .get_memories(&[updated_id])?
+                .into_iter()
+                .next()
+                .map(|m| m.title)
+                .unwrap_or_default(),
+        };
+        let mut response = format!("Updated fragment [{}]: \"{}\"", args.id, title);
+        if args.fragment.is_some() {
+            response.push_str("\nOrphan relations cleaned up after content change.");
+        }
+        Ok(ok_result(
+            response,
+            json!({
+                "success": true,
+                "id": args.id,
+            }),
+        ))
+    })? {
+        return Ok(replayed);
     }
 
     // Duplicate detection on fragment change.
@@ -1428,6 +1587,51 @@ fn exec_memory_feedback(
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
+    // Replay before validation (uniform tool rule).
+    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |receipt| {
+        let fb_id = match &receipt.outcome {
+            ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
+                affected.first().copied().ok_or_else(|| {
+                    DomainError::new(
+                        DomainErrorCode::Validation,
+                        "recorded feedback outcome carries no memory",
+                    )
+                })
+            }
+            _ => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "recorded feedback outcome is not a success",
+            )),
+        }?;
+        let confidence = repo
+            .get_memories(&[fb_id])?
+            .into_iter()
+            .next()
+            .map(|m| m.confidence)
+            .unwrap_or(0.5);
+        let response = if args.useful {
+            format!(
+                "Positive feedback recorded for [{}]. Confidence boosted to {:.2}.",
+                args.id, confidence
+            )
+        } else {
+            format!(
+                "Negative feedback recorded for [{}]. Confidence reduced to {:.2}.",
+                args.id, confidence
+            )
+        };
+        Ok(ok_result(
+            response,
+            json!({
+                "success": true,
+                "id": args.id,
+                "confidence": confidence,
+            }),
+        ))
+    })? {
+        return Ok(replayed);
+    }
+
     let Ok(eid) = resolve_id(repo, &args.id) else {
         return Ok(err_result(&format!(
             "Fragment with ID '{}' not found",
@@ -1482,6 +1686,33 @@ fn exec_memory_forget(
     args: &MemoryForgetArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
+
+    // Replay before validation (uniform tool rule): after a hard
+    // delete the target is gone, so only the receipt can answer.
+    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |_| {
+        let response = if args.invalidate {
+            format!(
+                "Invalidated fragment [{}] — hidden from recall but preserved (content + history kept). Reversible.",
+                args.id
+            )
+        } else if args.consolidate {
+            format!(
+                "Archived fragment [{}] — down-weighted to 0.05 (kept and reversible), not deleted. Pass consolidate=false to hard-delete.",
+                args.id
+            )
+        } else {
+            format!("Forgot fragment with ID: {}", args.id)
+        };
+        Ok(ok_result(
+            response,
+            json!({
+                "success": true,
+                "id": args.id,
+            }),
+        ))
+    })? {
+        return Ok(replayed);
+    }
 
     let Ok(eid) = resolve_id(repo, &args.id) else {
         return Ok(err_result(&format!(
@@ -1557,6 +1788,43 @@ fn exec_memory_merge(
         return Ok(err_result(
             "'ids' must be an array with at least 2 fragment IDs",
         ));
+    }
+
+    // Replay before validation (uniform tool rule): after the first
+    // execution the sources are archived, so resolution would fail —
+    // the recorded receipt rebuilds the response instead.
+    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |_| {
+        let legacy_id = new_legacy_id(envelope);
+        let project = args.project.as_deref().and_then(normalize_project);
+        let scope_info = project
+            .as_ref()
+            .map(|p| format!(" (project: {p})"))
+            .unwrap_or_else(|| " (global)".to_string());
+        let response = if args.consolidate {
+            format!(
+                "Consolidated {} fragments into [{legacy_id}]{scope_info}: \"{}\"\nSuperseded (kept, down-weighted, reversible) IDs: {}",
+                args.ids.len(),
+                args.title,
+                args.ids.join(", ")
+            )
+        } else {
+            format!(
+                "Merged {} fragments into [{legacy_id}]{scope_info}: \"{}\"\nRemoved IDs: {}",
+                args.ids.len(),
+                args.title,
+                args.ids.join(", ")
+            )
+        };
+        Ok(ok_result(
+            response,
+            json!({
+                "success": true,
+                "id": legacy_id,
+                "merged_ids": args.ids,
+            }),
+        ))
+    })? {
+        return Ok(replayed);
     }
 
     // Resolve all source IDs; any missing is a hard error.
@@ -1697,6 +1965,30 @@ fn exec_memory_relate(
 
     if source_eid == target_eid {
         return Ok(err_result("sourceId and targetId cannot be the same"));
+    }
+
+    // Replay before validation: a retried envelope finds the edge the
+    // first delivery created and would reject itself as a duplicate —
+    // the recorded receipt replays instead.
+    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |_| {
+        Ok(ok_result(
+            format!(
+                "Created relation: [{}] --{}--> [{}]{}",
+                args.source_id,
+                args.relation_type,
+                args.target_id,
+                args.note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default()
+            ),
+            json!({
+                "success": true,
+                "relation": args.relation_type,
+            }),
+        ))
+    })? {
+        return Ok(replayed);
     }
 
     if repo.get_memories(&[source_eid])?.is_empty() {
@@ -3871,6 +4163,7 @@ fn freeze_session_response(
 fn exec_session_start(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &SessionStartArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -3889,10 +4182,6 @@ fn exec_session_start(
     // digest mismatch rejects. The registry only (re)binds the channel.
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
-    // Admit once: every continuation below (track, claim, freeze) runs
-    // under this admission, so a namespace expiring after the start
-    // commit can never turn the executed start into an error.
-    let admitted = repo.admit_scope(&scope)?;
     let abandon = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let new_handle = ltmrs_domain::id::SessionHandle::new(uuid::Uuid::now_v7());
     let handle = match repo.session_start_tx(
@@ -3911,7 +4200,7 @@ fn exec_session_start(
             // instead of being recomputed from live state. Legacy receipts
             // without one fall through to the normal path, which recomputes
             // and then freezes.
-            if let Some(frozen) = replay_frozen_session_response(repo, &admitted)? {
+            if let Some(frozen) = replay_frozen_session_response(repo, admitted)? {
                 return Ok(frozen);
             }
             h
@@ -3958,7 +4247,7 @@ fn exec_session_start(
     // Track read memories into the session (canonical store, deduped).
     let read_ids: Vec<String> = relevant.iter().map(|m| legacy_id_of(repo, m)).collect();
     repo.track_session_link(
-        &admitted,
+        admitted,
         handle,
         ltmrs_service::repository::SessionLinkField::MemoryRead,
         &read_ids,
@@ -3997,7 +4286,7 @@ fn exec_session_start(
     let (continuity, boost_targets) =
         build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
     if !boost_targets.is_empty() {
-        match repo.claim_continuity_boost(&admitted, &boost_targets, 0.015, now) {
+        match repo.claim_continuity_boost(admitted, &boost_targets, 0.015, now) {
             Ok(_) => {}
             Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
                 return key_reuse_result();
@@ -4033,7 +4322,7 @@ fn exec_session_start(
     // Freeze the response into the receipt (P2-1): a lost-response retry
     // returns this verbatim instead of recomputing from live state.
     let payload = ok_result(response, data);
-    match freeze_session_response(repo, &admitted, &payload) {
+    match freeze_session_response(repo, admitted, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -4162,6 +4451,7 @@ fn build_continuity_recall(
 fn exec_session_attempt(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &SessionAttemptArgs,
 ) -> DomainResult<DomainPayload> {
     if args.approach.trim().is_empty() || args.outcome.trim().is_empty() {
@@ -4185,10 +4475,6 @@ fn exec_session_attempt(
     // Operation identity for the canonical call below.
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
-    // Admit once: the freeze below runs under this admission, so a
-    // namespace expiring after the attempt commit cannot fail it.
-    let admitted = disp.repo().admit_scope(&scope)?;
-
     // Resolve the channel's active session (canonical liveness).
     let session = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let Some(handle) = session else {
@@ -4223,7 +4509,7 @@ fn exec_session_attempt(
     ) {
         Ok(SessionOp::Applied((_, seq))) => seq,
         Ok(SessionOp::Replayed((_, seq))) => {
-            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &admitted)? {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), admitted)? {
                 return Ok(frozen);
             }
             seq
@@ -4252,7 +4538,7 @@ fn exec_session_attempt(
         "attempt_id": format!("{}#{}", handle.as_uuid(), seq),
     });
     let payload = ok_result(response, data);
-    match freeze_session_response(disp.repo(), &admitted, &payload) {
+    match freeze_session_response(disp.repo(), admitted, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -4267,6 +4553,7 @@ fn exec_session_attempt(
 fn exec_session_end(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &SessionEndArgs,
 ) -> DomainResult<DomainPayload> {
     if args.outcome.trim().is_empty() {
@@ -4286,10 +4573,6 @@ fn exec_session_end(
     // Operation identity for the canonical call below.
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
-    // Admit once: the freeze below runs under this admission, so a
-    // namespace expiring after the end commit cannot fail it.
-    let admitted = disp.repo().admit_scope(&scope)?;
-
     // Resolve the channel's session binding (live or terminal — replays
     // after a terminal session still resolve to the recorded outcome).
     let bound = disp
@@ -4316,7 +4599,7 @@ fn exec_session_end(
     ) {
         Ok(SessionOp::Applied((_, lines, true))) => lines,
         Ok(SessionOp::Replayed((_, lines, _))) => {
-            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &admitted)? {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), admitted)? {
                 return Ok(frozen);
             }
             lines
@@ -4402,7 +4685,7 @@ fn exec_session_end(
     // The response freezes into the receipt (P2-1) so replays return it
     // verbatim instead of recomputing from live guide state.
     let payload = ok_result(response, data);
-    match freeze_session_response(disp.repo(), &admitted, &payload) {
+    match freeze_session_response(disp.repo(), admitted, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -6026,6 +6309,124 @@ mod tests {
         assert!(result_text(&result).contains("Created relation"));
         let structured = result_structured(&result).unwrap();
         assert_eq!(structured["relation"], json!("supports"));
+    }
+
+    /// P1 (admission lifetime): the namespace may expire between the
+    /// primary commit and the tool tail (TTL crossed mid-tool) — the
+    /// admitted tool must still succeed, never report failure for an
+    /// executed mutation. The commit hook advances the clock past the
+    /// TTL right after the primary commit, deterministically.
+    #[test]
+    fn memory_add_survives_namespace_expiry_after_commit() {
+        use std::sync::{Arc, Mutex};
+        struct AdvancingClock(Mutex<u64>);
+        impl ltmrs_domain::clock::Clock for AdvancingClock {
+            fn now_millis(&self) -> u64 {
+                *self.0.lock().unwrap()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<AdvancingClock> = Arc::new(AdvancingClock(Mutex::new(1000)));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().to_str().unwrap(),
+                Arc::clone(&clock) as Arc<dyn ltmrs_domain::clock::Clock + Send + Sync>,
+            )
+            .unwrap(),
+        );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let disp = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::registry::FrontendRegistry::new(),
+            Arc::clone(&clock) as Arc<dyn ltmrs_domain::clock::Clock + Send + Sync>,
+        );
+        // Cross the TTL exactly once, on the first post-commit hook
+        // (i.e. immediately after the primary AddMemory commits).
+        let ticker = Arc::clone(&clock);
+        repo.set_commit_hook(Arc::new(move || {
+            let mut t = ticker.0.lock().unwrap();
+            if *t == 1000 {
+                *t += ltmrs_service::repository::DEFAULT_NAMESPACE_TTL_MILLIS + 1;
+            }
+        }));
+        let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Admitted Add\n\n### Context\nNamespace-expiry fixture.".to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(64, args.clone());
+        let result = run(&disp, &env, &args);
+        assert!(
+            !result_is_error(&result),
+            "admitted tool must succeed despite mid-tool namespace expiry, got: {}",
+            result_text(&result)
+        );
+        let count = disp
+            .repo()
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .iter()
+            .filter(|m| m.fragment.contains("Namespace-expiry fixture"))
+            .count();
+        assert_eq!(count, 1, "exactly one effect allowed");
+    }
+
+    /// P1 (tool replay): the same MemoryAdd envelope twice must replay
+    /// success (exactly one memory) — never fail the second delivery in
+    /// the dedup scan against the memory the first delivery created.
+    #[test]
+    fn memory_add_same_envelope_replays_success() {
+        let (disp, _dir) = test_dispatcher();
+        let fragment = "## Replay Add\n\n### Context\nSame-envelope replay fixture.";
+        let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: fragment.to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(60, args.clone());
+        let first = run(&disp, &env, &args);
+        assert!(!result_is_error(&first));
+        let second = run(&disp, &env, &args);
+        assert!(
+            !result_is_error(&second),
+            "same-envelope replay must succeed, got: {}",
+            result_text(&second)
+        );
+        let count = disp
+            .repo()
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .iter()
+            .filter(|m| m.fragment == fragment)
+            .count();
+        assert_eq!(count, 1, "exactly one memory may exist");
+    }
+
+    /// P1 (tool replay): the same MemoryRelate envelope twice must replay
+    /// success (exactly one edge) — never fail the second delivery on
+    /// the edge the first delivery created. (A *different* op id with the
+    /// same body still rejects as a duplicate; see below.)
+    #[test]
+    fn memory_relate_same_envelope_replays_success() {
+        let (disp, _dir) = test_dispatcher();
+        let id1 = add_fragment(&disp, 61, "## Replay Rel A\n\n### Context\nSource.");
+        let id2 = add_fragment(&disp, 62, "## Replay Rel B\n\n### Context\nTarget.");
+        let tool = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: id1.clone(),
+            target_id: id2.clone(),
+            relation_type: "supports".to_string(),
+            note: None,
+        });
+        let env = tool_call(63, tool.clone());
+        let first = run(&disp, &env, &tool);
+        assert!(!result_is_error(&first));
+        let second = run(&disp, &env, &tool);
+        assert!(
+            !result_is_error(&second),
+            "same-envelope replay must succeed, got: {}",
+            result_text(&second)
+        );
+        assert!(result_text(&second).contains("Created relation"));
     }
 
     #[test]

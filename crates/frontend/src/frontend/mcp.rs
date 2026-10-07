@@ -2105,6 +2105,166 @@ mod tests {
         drop(fe);
     }
 
+    /// P1 (tool replay over IPC): a ToolCall memory_add whose response is
+    /// lost in transport must resolve on resend through the recorded
+    /// receipt — not fail in the compatibility dedup scan against the
+    /// memory the first delivery created. Same shape as the native
+    /// unknown-outcome test, but driving the full ToolCall path.
+    #[tokio::test]
+    async fn toolcall_add_resend_after_resume_replays_success() {
+        use ltmrs_daemon::dispatcher::Dispatcher;
+        use ltmrs_daemon::registry::FrontendRegistry;
+        use ltmrs_domain::clock::{Clock, FrozenClock};
+        use ltmrs_service::repository::CanonicalRepository;
+        use tokio::io::AsyncReadExt;
+
+        async fn read_msg(
+            stream: &mut tokio::net::UnixStream,
+        ) -> ltmrs_daemon::envelope::WireMessage {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+        async fn write_msg(
+            stream: &mut tokio::net::UnixStream,
+            reply: &ltmrs_daemon::envelope::WireReply,
+        ) {
+            let payload = serde_json::to_vec(reply).unwrap();
+            ltmrs_daemon::envelope::write_response_payload(stream, &payload)
+                .await
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        let dispatcher = Arc::new(Dispatcher::new(
+            Arc::clone(&repo),
+            FrontendRegistry::new(),
+            Arc::clone(&clock),
+        ));
+        let socket = dir.path().join("tool-resend.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let server_task = tokio::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            async move {
+                use ltmrs_daemon::envelope::WireMessage;
+                // conn1: handshake, prefetch, ToolCall add → commit, then
+                // drop WITHOUT responding (deterministic unknown outcome).
+                let (mut conn1, _) = listener.accept().await.unwrap();
+                let WireMessage::Handshake(hs_req) = read_msg(&mut conn1).await else {
+                    panic!("expected handshake first");
+                };
+                assert_eq!(hs_req.resume_retry_epoch, None);
+                let hs = dispatcher.handle_handshake(&hs_req).unwrap();
+                let first_epoch = hs.retry_epoch;
+                write_msg(
+                    &mut conn1,
+                    &ltmrs_daemon::envelope::WireReply::Handshake(hs),
+                )
+                .await;
+                let WireMessage::Request(env) = read_msg(&mut conn1).await else {
+                    panic!("expected snapshot prefetch second");
+                };
+                let prefetch_resp = dispatcher.handle(&env).unwrap();
+                write_msg(
+                    &mut conn1,
+                    &ltmrs_daemon::envelope::WireReply::Response(prefetch_resp),
+                )
+                .await;
+                let WireMessage::Request(env) = read_msg(&mut conn1).await else {
+                    panic!("expected ToolCall request third");
+                };
+                let first_op = env.operation_id;
+                dispatcher.handle(&env).unwrap();
+                drop(conn1);
+                // conn2: resume the same epoch; the resent envelope must
+                // replay through the recorded receipt.
+                let (mut conn2, _) = listener.accept().await.unwrap();
+                let WireMessage::Handshake(resume_req) = read_msg(&mut conn2).await else {
+                    panic!("expected resume handshake on conn2");
+                };
+                assert_eq!(
+                    resume_req.resume_retry_epoch,
+                    Some(first_epoch),
+                    "reconnect must resume the same epoch"
+                );
+                let hs2 = dispatcher.handle_handshake(&resume_req).unwrap();
+                assert_eq!(hs2.retry_epoch, first_epoch);
+                write_msg(
+                    &mut conn2,
+                    &ltmrs_daemon::envelope::WireReply::Handshake(hs2),
+                )
+                .await;
+                let WireMessage::Request(env2) = read_msg(&mut conn2).await else {
+                    panic!("expected resent request on conn2");
+                };
+                assert_eq!(
+                    env2.operation_id, first_op,
+                    "reconnect must resend the same operation"
+                );
+                let resp = dispatcher.handle(&env2).unwrap();
+                write_msg(
+                    &mut conn2,
+                    &ltmrs_daemon::envelope::WireReply::Response(resp),
+                )
+                .await;
+            }
+        });
+
+        let client = IpcClient::new(socket);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "IPC resend replay fixture fragment".to_string(),
+            ..Default::default()
+        });
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fe.roundtrip_with_rehandshake(DomainRequest::ToolCall { tool }),
+        )
+        .await
+        .expect("resend must not hang")
+        .expect("unknown-outcome ToolCall must resolve");
+        let text = match &resp.result {
+            ltmrs_daemon::envelope::IpcResult::Success { payload, .. } => match payload {
+                ltmrs_daemon::envelope::DomainPayload::ToolResult { text, .. } => text.clone(),
+                other => panic!("expected tool result, got {other:?}"),
+            },
+            other => panic!("resend must succeed, got {other:?}"),
+        };
+        assert!(
+            text.contains("Added fragment"),
+            "resend must replay the add, got: {text}"
+        );
+        server_task.await.unwrap();
+        let memories = repo
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .into_iter()
+            .filter(|m| m.fragment == "IPC resend replay fixture fragment")
+            .collect::<Vec<_>>();
+        assert_eq!(memories.len(), 1, "exactly one effect allowed");
+
+        drop(fe);
+    }
+
     /// I-2 stale-path resend: after a StaleGeneration answer the frontend
     /// sends a FRESH envelope; when THAT send loses its response in
     /// transport, the frontend must resend the fresh envelope (same op id)

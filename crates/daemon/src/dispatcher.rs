@@ -210,22 +210,16 @@ impl Dispatcher {
         // canonical liveness; never a daemon-global session).
         let session = self.resolve_session(envelope.frontend_id, envelope.channel_id);
 
-        // Retry-namespace gate (RQ-06): a mutating request executes only
-        // under a live namespace for its own channel. The direct
-        // guide/session/suggestion primitives validate again inside;
-        // this single assertion keeps an expired namespace from reaching
-        // any of them even if one primitive forgets its check.
-        // Read-only requests are unaffected.
-        match &envelope.body {
-            DomainRequest::ToolCall { tool } if tool.mutates_store() => {
-                let scope = envelope.operation_scope(envelope.request_digest()?);
-                self.repo.validate_scope(&scope)?;
-            }
-            DomainRequest::SessionAttempt { .. } | DomainRequest::SessionEnd { .. } => {
-                let scope = envelope.operation_scope(envelope.request_digest()?);
-                self.repo.validate_scope(&scope)?;
-            }
-            _ => {}
+        // Retry-namespace gate (RQ-06) for the direct session bodies:
+        // a mutating request executes only under a live namespace for
+        // its own channel. ToolCall bodies admit inside execute_tool
+        // (single admission point); read-only requests are unaffected.
+        if matches!(
+            &envelope.body,
+            DomainRequest::SessionAttempt { .. } | DomainRequest::SessionEnd { .. }
+        ) {
+            let scope = envelope.operation_scope(envelope.request_digest()?);
+            self.repo.validate_scope(&scope)?;
         }
 
         match &envelope.body {
