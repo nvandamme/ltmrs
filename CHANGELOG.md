@@ -5,7 +5,20 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1 direct tool receipts under OperationScope + per-channel watermarks
+## 2026-10-07 — P2 source-identifying evidence: checkout copy + locked discovery
+
+### P2 source-identifying evidence: checkout copy + locked discovery
+- Clean-checkout mode now executes the CHECKOUT's committed script copy
+  (relative invocation after cd), never the outer worktree's bytes: tested
+  code AND evidence procedure come from the same commit. Static regression
+  guard pins the relative invocation.
+- `cargo metadata` / `cargo tree` now honor `$LOCKED` (static guard +
+  byte-identical-Cargo.lock behavioral test); locked runs re-hash the
+  lockfile at the end and fail loudly on drift instead of publishing a
+  manifest whose lock hash is a lie.
+- Gate: `release_evidence.rs` 7 green (4 prior + 3 new).
+
+## bba04ec (2026-10-07) — P1 direct tool receipts under OperationScope + per-channel watermarks
 
 ### P1 direct tool receipts unified under OperationScope (RQ-06)
 - New `OperationScope` (generation/frontend/channel/epoch/op/digest,

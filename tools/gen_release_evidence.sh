@@ -29,7 +29,6 @@
 # not a flag in the artifact.
 set -euo pipefail
 
-HERE="$(pwd)"
 MODE="full"
 RELEASE=""
 LOCKED=""
@@ -50,6 +49,9 @@ done
 # Publishable evidence from a detached clean checkout (re-review P2-2):
 # a pristine HEAD worktree with locked resolution, so the artifact's source
 # identity stands on its own instead of assuming a clean developer tree.
+# The CHECKOUT's own committed script runs (relative invocation after cd),
+# never the outer worktree's copy: tested code AND evidence procedure come
+# from the exact same commit.
 if [ -n "$CHECKOUT" ]; then
     rm -rf "$CHECKOUT"
     mkdir -p "$CHECKOUT"
@@ -69,7 +71,7 @@ if [ -n "$CHECKOUT" ]; then
         args+=(--release)
     fi
     args+=(--locked)
-    (cd "$CHECKOUT" && bash "$HERE/tools/gen_release_evidence.sh" "${args[@]}")
+    (cd "$CHECKOUT" && bash tools/gen_release_evidence.sh "${args[@]}")
     INNER=$?
     set -e
     # Move the bundle back even on failure (the logs are the evidence);
@@ -109,12 +111,13 @@ LOCK_SHA="$(sha256sum Cargo.lock | cut -d' ' -f1)"
 # crate is picked up automatically, and member-owned pins (fjall, candle,
 # lancedb, rmcp, ...) can no longer slip out of the evidence.
 DEPS_TMP="$(mktemp)"
-MEMBERS="$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+# shellcheck disable=SC2086
+MEMBERS="$(cargo metadata $LOCKED --no-deps --format-version 1 2>/dev/null \
     | python3 -c 'import json,sys; print(" ".join(sorted(m["name"] for m in json.load(sys.stdin)["packages"])))'
 )"
 # shellcheck disable=SC2086
 for MEMBER in $MEMBERS; do
-    cargo tree -p "$MEMBER" --depth 1 --prefix none --no-dev-dependencies 2>/dev/null \
+    cargo tree $LOCKED -p "$MEMBER" --depth 1 --prefix none --no-dev-dependencies 2>/dev/null \
         | grep -E '^[^ ]+ v[0-9]' \
         | grep -v ' (' \
         >> "$DEPS_TMP" || true
@@ -157,6 +160,22 @@ else
     PROFILE="dev"
 fi
 if [ -n "$LOCKED" ]; then LOCKED_FLAG=true; else LOCKED_FLAG=false; fi
+
+# Locked runs must not resolve anything: every dependency-resolving
+# invocation above obeyed --locked, so a changed lockfile means the
+# recorded hash no longer describes what was tested. Fail loudly
+# instead of publishing a manifest whose lock hash is a lie.
+if [ -n "$LOCKED" ]; then
+    LOCK_SHA_AFTER="$(sha256sum Cargo.lock | cut -d' ' -f1)"
+    if [ "$LOCK_SHA_AFTER" != "$LOCK_SHA" ]; then
+        echo "release evidence: Cargo.lock changed during locked run" >&2
+        if [ "$MODE" = "full" ]; then
+            FAILED="true"
+        else
+            exit 1
+        fi
+    fi
+fi
 
 python3 - "$DIR/manifest.json" "$HEAD" "$MODE" "$PROFILE" "$LOCKED_FLAG" "$TOOLCHAIN" "$LOCK_SHA" "$FMT_CLEAN" "$CLIPPY_STATUS" "$SUITE_SUMMARY" "$DIR/deps.txt" <<'EOF'
 import json, sys

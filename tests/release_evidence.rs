@@ -97,6 +97,62 @@ fn same_second_runs_never_share_a_directory() {
     }
 }
 
+/// P2-3b: the clean-checkout wrapper must execute the CHECKOUT's
+/// committed script copy (relative invocation after cd), never the outer
+/// worktree's bytes via an absolute path — otherwise uncommitted script
+/// edits would define a bundle claiming HEAD identity. Static guard.
+#[test]
+fn clean_checkout_runs_the_checkout_script_copy() {
+    let script = std::fs::read_to_string("tools/gen_release_evidence.sh")
+        .expect("evidence script must be readable");
+    assert!(
+        !script.contains("$HERE/tools/gen_release_evidence.sh"),
+        "recursive call must not reference the outer worktree script"
+    );
+    assert!(
+        script.contains("bash tools/gen_release_evidence.sh"),
+        "recursive call must run the checkout-relative script copy"
+    );
+}
+
+/// P2-3b: locked dependency discovery must not resolve anything —
+/// quick+locked over a clean tree leaves Cargo.lock byte-identical,
+/// proving metadata/tree obeyed --locked (the script additionally
+/// re-hashes the lockfile and fails a locked run that drifted).
+#[test]
+fn locked_discovery_leaves_cargo_lock_untouched() {
+    let before = std::fs::read("Cargo.lock").expect("Cargo.lock must be readable");
+    let script = Command::new("bash")
+        .args(["tools/gen_release_evidence.sh", "--quick", "--locked"])
+        .output()
+        .expect("evidence script must be runnable");
+    assert!(
+        script.status.success(),
+        "quick locked evidence failed: {}",
+        String::from_utf8_lossy(&script.stderr)
+    );
+    let after = std::fs::read("Cargo.lock").expect("Cargo.lock must be readable");
+    assert_eq!(before, after, "locked discovery must not mutate Cargo.lock");
+}
+
+/// P2-3b static guard: every dependency-resolving invocation in the
+/// script (metadata, tree — not just clippy/test) must honor $LOCKED,
+/// or a stale lockfile would resolve-and-mutate before the locked gates
+/// run while the manifest still claims locked=true.
+#[test]
+fn locked_discovery_commands_honor_the_lock_flag() {
+    let script = std::fs::read_to_string("tools/gen_release_evidence.sh")
+        .expect("evidence script must be readable");
+    assert!(
+        script.contains("cargo metadata $LOCKED"),
+        "cargo metadata must obey $LOCKED"
+    );
+    assert!(
+        script.contains("cargo tree $LOCKED"),
+        "cargo tree must obey $LOCKED"
+    );
+}
+
 /// P2-3: the clean-checkout wrapper must build real CLI flags, never the
 /// internal mode name as a flag (`--full` is not a supported flag and the
 /// parser exits 2 on it). Static guard: the recursive invocation must not
