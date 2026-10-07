@@ -4891,12 +4891,12 @@ fn exec_backup_restore(
     let report = restore_verified(disp.repo(), &verified, new_generation)
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
     // Generation cut invalidates every pre-restore execution context (P2-A):
-    // runtime channel bindings are dropped (the next call on each channel
-    // binds fresh); virtual sessions and leases stay routing-ephemeral.
-    // The cleared routes persist with the restore (no-op without a
+    // traced routes, leases, virtual routes/leases and the virtual session
+    // store are all reset (the next call on each channel binds fresh).
+    // The reset state persists with the restore (no-op without a
     // sessions path; loud failure otherwise — a crash before the next
-    // persist must not reload routes pointing at drained sessions).
-    let bindings_dropped = disp.registry().clear_bindings();
+    // persist must not reload contexts pointing at drained sessions).
+    let bindings_dropped = disp.registry().reset_execution_contexts();
     disp.persist_sessions()
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
     let sessions_restored = report.restored.get("sessions").copied().unwrap_or(0);

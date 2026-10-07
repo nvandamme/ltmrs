@@ -149,19 +149,26 @@ impl FrontendRegistry {
             .session
     }
 
-    /// Drop every channel→session route (P2-A restore semantics): a
-    /// generation cut invalidates all pre-restore execution contexts, so no
-    /// binding may survive pointing at a replaced session. Virtual sessions
-    /// and leases are routing-ephemeral and stay untouched; the next call on
-    /// each channel binds fresh. Returns the number of routes dropped.
-    pub fn clear_bindings(&mut self) -> usize {
+    /// Reset every pre-restore execution context (P2-A restore semantics):
+    /// a generation cut invalidates traced routes, leases, virtual routes,
+    /// virtual leases AND the virtual session store — no runtime context
+    /// may span the cut (a reused virtual session would mix pre- and
+    /// post-restore memories in `memories_created`, and virtual state
+    /// persists in sessions.json across restarts). Channels stay
+    /// registered; the next call on each channel binds fresh. Returns the
+    /// number of traced routes dropped (for the restore report).
+    pub fn reset_execution_contexts(&mut self) -> usize {
         let mut dropped = 0;
         for binding in self.channels.values_mut() {
             if binding.session.is_some() {
                 binding.session = None;
                 dropped += 1;
             }
+            binding.lease = None;
+            binding.virtual_session = None;
+            binding.virtual_lease = None;
         }
+        self.virtual_sessions.clear();
         dropped
     }
 
@@ -555,6 +562,26 @@ mod tests {
         assert!(reg.is_explicit(fe(1), ch(1)));
         assert_eq!(reg.channel_session(fe(1), ch(1)), Some(native));
         assert!(!reg.is_explicit(fe(1), ch(2)));
+    }
+
+    /// Generation cut resets every pre-restore execution context: traced
+    /// routes, leases, virtual routes/leases AND the virtual session
+    /// store. A virtual session must never span a generation boundary
+    /// (its memories_created would mix pre- and post-restore memories).
+    #[test]
+    fn reset_execution_contexts_clears_virtual_state() {
+        let mut reg = FrontendRegistry::new();
+        reg.bind_session(fe(1), ch(1), hs(11), false);
+        reg.set_lease(fe(1), ch(1), Lease { expires_at: 5000 });
+        let v = reg.ensure_virtual_session(fe(1), ch(1), 0);
+        assert!(reg.virtual_session(fe(1), ch(1)).is_some());
+        let dropped = reg.reset_execution_contexts();
+        assert_eq!(dropped, 1);
+        assert_eq!(reg.channel_session(fe(1), ch(1)), None);
+        assert_eq!(reg.virtual_session(fe(1), ch(1)), None);
+        assert!(reg.virtual_record(v).is_none());
+        // Channels stay registered (routes reset, channels kept).
+        assert_eq!(reg.channel_count(), 1);
     }
 
     #[test]

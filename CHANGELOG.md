@@ -5,7 +5,22 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1/P2 session_end suggestions exactly once
+## 2026-10-07 — P2 virtual sessions reset on generation cut
+
+### P2 virtual sessions reset on generation cut
+- `FrontendRegistry::clear_bindings` replaced by
+  `reset_execution_contexts`: a generation cut now clears traced routes,
+  leases, virtual routes/leases AND the virtual session store (a reused
+  virtual would mix pre/post-restore memories in `memories_created` and
+  persists via sessions.json). Channels stay registered; next call binds
+  fresh. Restore path switches to it; the reset state persists with the
+  restore ACK via the existing `persist_sessions`.
+- RED-first regression `reset_execution_contexts_clears_virtual_state`
+  (bind + lease + virtual → reset → all None, store empty, channel kept).
+  Pre-fix: no such method (virtuals intentionally kept) — fails.
+- Gate: fmt clean, daemon clippy clean; daemon 204 green.
+
+## c4fa217 (2026-10-07) — P1/P2 session_end suggestions exactly once
 
 ### P1/P2 session_end suggestions filed exactly once per operation
 - `session_end_tx` now files improvement suggestions inside the end
