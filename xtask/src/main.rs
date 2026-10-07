@@ -368,7 +368,9 @@ fn usage_verb(verb: &str) -> &'static str {
             "cargo xtask evidence --release <version> [--dry-run]\n\
              \n\
              Build the release evidence bundle (bash \
-             tools/gen_release_evidence.sh --release --locked).\n"
+             tools/gen_release_evidence.sh --release --locked \
+             --clean-checkout <throwaway-dir>, from a detached HEAD \
+             checkout — never the worktree).\n"
         }
         _ => usage(),
     }

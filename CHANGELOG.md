@@ -5,7 +5,28 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P2 virtual sessions reset on generation cut
+## 2026-10-07 — P2 release qualification post-split + P3 AGENTS.md truth
+
+### P2 release qualification post-split + P3 AGENTS.md truth
+- Release script Clippy gate is now explicitly
+  `cargo clippy --workspace --all-targets` (a bare root invocation in a
+  non-virtual workspace selects only the root package).
+- `deps.txt` is now the union of every workspace member's direct deps
+  (members enumerated via `cargo metadata`, new crates picked up
+  automatically): fjall, candle-core/tokenizers, lancedb/lance-index,
+  rmcp and the rest are back in the evidence. Verified 38 entries.
+- `cargo xtask evidence` now builds from a detached clean checkout at
+  HEAD (`--clean-checkout` throwaway dir): the bundle is
+  source-identifying, never "tests passed on the tree before this commit
+  existed". Dry-run/help/plan-§20 note updated to the new argv.
+- AGENTS.md: repo line now describes the 9-crate workspace; validation
+  block uses `clippy --workspace` / `test --workspace`.
+- Verified: script `--quick --locked` bundle green (manifest ties to
+  HEAD), `--clean-checkout` path produces a bundle and removes the
+  worktree, `release_evidence.rs` 4 green, xtask 39 green, dry-run/help
+  output correct.
+
+## 17c5a96 (2026-10-07) — P2 virtual sessions reset on generation cut
 
 ### P2 virtual sessions reset on generation cut
 - `FrontendRegistry::clear_bindings` replaced by

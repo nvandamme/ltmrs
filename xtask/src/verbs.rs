@@ -12,12 +12,17 @@ use crate::run::{execute, execute_with_env, write_record};
 ///
 /// The script takes boolean mode flags only; the `<version>` from
 /// `evidence --release <version>` is CLI metadata (the bundle keeps its own
-/// naming per the design), so it intentionally does not appear here.
-fn evidence_argv(_release: &str) -> Vec<String> {
+/// naming per the design), so it intentionally does not appear here. The
+/// bundle always builds from a detached clean checkout at HEAD (never the
+/// possibly-dirty worktree), so the artifact's commit identity stands on
+/// its own.
+fn evidence_argv(_release: &str, checkout: &str) -> Vec<String> {
     vec![
         "tools/gen_release_evidence.sh".to_string(),
         "--release".to_string(),
         "--locked".to_string(),
+        "--clean-checkout".to_string(),
+        checkout.to_string(),
     ]
 }
 
@@ -163,13 +168,24 @@ fn finish(
 }
 
 /// Build the release evidence bundle (or print the command with `dry_run`).
+///
+/// Live runs provision a throwaway checkout dir and pass it as
+/// `--clean-checkout`, so the script generates from a detached HEAD
+/// worktree; dry-run prints `<checkout-tmpdir>` where it would go.
 pub fn run_evidence(release: &str, dry_run: bool) -> Result<i32, String> {
     let program = "bash";
-    let args = evidence_argv(release);
     if dry_run {
-        print_dry_run(program, &args);
+        print_dry_run(program, &evidence_argv(release, "<checkout-tmpdir>"));
         return Ok(0);
     }
+    let checkout =
+        tempfile::tempdir().map_err(|e| format!("cannot provision checkout dir: {e}"))?;
+    let checkout_str = checkout
+        .path()
+        .to_str()
+        .ok_or("checkout path is not UTF-8")?
+        .to_string();
+    let args = evidence_argv(release, &checkout_str);
     let workdir = workspace_root();
     let outcome = execute(program, &args, &workdir);
     let dir = report_dir("evidence")?;
@@ -465,10 +481,16 @@ mod tests {
     };
 
     #[test]
-    fn evidence_argv_is_locked_release() {
+    fn evidence_argv_is_locked_release_from_clean_checkout() {
         assert_eq!(
-            evidence_argv("v0.1"),
-            vec!["tools/gen_release_evidence.sh", "--release", "--locked"]
+            evidence_argv("v0.1", "/tmp/checkout-XYZ"),
+            vec![
+                "tools/gen_release_evidence.sh",
+                "--release",
+                "--locked",
+                "--clean-checkout",
+                "/tmp/checkout-XYZ"
+            ]
         );
     }
 

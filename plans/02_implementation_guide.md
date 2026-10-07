@@ -503,7 +503,9 @@ all seven verbs are implemented as a private `xtask/` workspace member
 (`cargo xtask ...` via the `.cargo/config.toml` alias; `cargo tree -p xtask`
 shows no new packages). Backing per verb:
 - `evidence --release <version>`: `bash tools/gen_release_evidence.sh
-  --release --locked` (the `<version>` is CLI metadata only; the bundle
+  --release --locked --clean-checkout <throwaway-dir>` from a detached HEAD
+  checkout provisioned by the runner (never the worktree, so the bundle is
+  source-identifying; the `<version>` is CLI metadata only, the bundle
   keeps its own naming).
 - `capture-lemma --source <checkout>`: `node tools/capture_lemma.mjs
   --repo <source> --home <sandbox> --out <sandbox>` with child-scoped `HOME`.

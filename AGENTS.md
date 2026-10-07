@@ -5,7 +5,10 @@ Project instructions for coding agents working in this repository.
 ## Repository
 
 - Repository: `ltmrs` (Long Term Memory RS) — local MCP memory service for LLM agents.
-- Language: Rust (edition 2024), single Cargo package with library + binary.
+- Language: Rust (edition 2024) workspace: eight production library crates
+  (`domain`, `service`, `compat`, `embeddings`, `search`, `interchange`,
+  `daemon`, `frontend`), one binary-only root package, plus the private
+  `xtask` runner (see rule 5 below for the crate DAG).
 - Default branch: `main` (renamed from `master` 2026-10-03; same history, no rewrite).
 - Toolchain: pinned in `rust-toolchain.toml` (stable, see AD-02 in the plans).
 - Plans in `plans/` are the normative specification. Read them before implementing.
@@ -60,8 +63,8 @@ Run after code or test edits:
 
 ```bash
 cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo build --release   # for release-claim work
 ```
 

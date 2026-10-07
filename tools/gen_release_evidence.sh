@@ -102,19 +102,35 @@ fi
 
 TOOLCHAIN="$(rustc --version)"
 LOCK_SHA="$(sha256sum Cargo.lock | cut -d' ' -f1)"
-# Direct dependency versions only (names + versions, no paths: the root
-# package line carries its local path and is excluded).
-cargo tree --depth 1 --prefix none --no-dev-dependencies 2>/dev/null \
-    | grep -E '^[^ ]+ v[0-9]' \
-    | grep -v ' (' \
-    | sort -u > "$DIR/deps.txt" || true
+# Workspace-wide direct-dependency inventory: the union of every member's
+# direct deps (names + versions, no paths: local rows carry `(...)` and are
+# excluded). `cargo tree --workspace` renders member roots as already-shown
+# `(*)` stubs, so members are enumerated via cargo metadata instead — a new
+# crate is picked up automatically, and member-owned pins (fjall, candle,
+# lancedb, rmcp, ...) can no longer slip out of the evidence.
+DEPS_TMP="$(mktemp)"
+MEMBERS="$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | python3 -c 'import json,sys; print(" ".join(sorted(m["name"] for m in json.load(sys.stdin)["packages"])))'
+)"
+# shellcheck disable=SC2086
+for MEMBER in $MEMBERS; do
+    cargo tree -p "$MEMBER" --depth 1 --prefix none --no-dev-dependencies 2>/dev/null \
+        | grep -E '^[^ ]+ v[0-9]' \
+        | grep -v ' (' \
+        >> "$DEPS_TMP" || true
+done
+sort -u "$DEPS_TMP" > "$DIR/deps.txt"
+rm -f "$DEPS_TMP"
 
 CLIPPY_STATUS="null"
 SUITE_SUMMARY="null"
 FAILED="false"
 if [ "$MODE" = "full" ]; then
+    # Workspace-wide Clippy gate (all members, all targets): in a
+    # non-virtual workspace a bare root invocation selects only the root
+    # package, so --workspace is load-bearing here.
     # shellcheck disable=SC2086
-    if cargo clippy $LOCKED --all-targets -- -D warnings > "$DIR/clippy.log" 2>&1; then
+    if cargo clippy $LOCKED --workspace --all-targets -- -D warnings > "$DIR/clippy.log" 2>&1; then
         CLIPPY_STATUS='"clean"'
     else
         CLIPPY_STATUS='"failed"'
