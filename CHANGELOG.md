@@ -5,7 +5,44 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P2 release qualification post-split + P3 AGENTS.md truth
+## 2026-10-07 — P1 direct tool receipts under OperationScope + per-channel watermarks
+
+### P1 direct tool receipts unified under OperationScope (RQ-06)
+- New `OperationScope` (generation/frontend/channel/epoch/op/digest,
+  `IpcEnvelope::operation_scope`): every direct guide/session/suggestion
+  primitive takes it instead of bare `(operation_id, digest)` — guide
+  mutation/practice/distill/read, session start/attempt/end, continuity
+  claim, response freeze/replay/receipt, suggestion respond, link track.
+- Receipt keys are now `generation:frontend:epoch:operation` (same shape
+  as canonical receipts) with the scope stored and verified
+  (`check_scope_owner`) on every read; `validate_scope` (existence +
+  channel + TTL) runs first in every primitive and once at dispatch for
+  all mutating tools (`ToolArgs::mutates_store`, exhaustive; reads
+  unaffected). Cross-channel same-op executes in its own scope; expired
+  namespaces refuse everywhere (T1); no cross-channel replay (T2).
+- `gc_expired` sweeps all four receipt logs per expired namespace plus
+  legacy bare-key rows unconditionally (clean key cutover, no dual-read
+  fallback that would reintroduce aliasing; old rows unreachable by new
+  keys). Restore drain is key-agnostic (unchanged); op logs never cross
+  backup (unchanged).
+- Watermarks sharded: interactive writes (canonical `apply` included)
+  bump `op_seq:{frontend}:{channel}`; internal writers use
+  `op_seq:system:{area}`. `op_seq()` still sums by prefix; pre-upgrade
+  rows freeze as a harmless constant offset. Attempt-decay moved
+  post-commit best-effort (changed-only) — its keyspace-wide scan was a
+  second global hotspot under concurrency.
+- RED-first: T1 expiry refusal, T2 per-channel same-op isolation (repo +
+  exec level), sharding white-box proof, 32-channel barrier stress
+  (first-try Applied, no caller retry), decay-preservation, dispatch
+  gate (mutating refused / read serves), classification unit test. Each
+  mechanism probe-verified to fail without its fix.
+- Migration notes: retries of pre-upgrade ops re-execute once (new keys);
+  legacy rows swept by GC; frozen `op_seq:direct`/`op_seq:{fe}` rows are
+  constant offsets.
+- Gate: fmt clean, workspace clippy clean; domain 46, service 96, daemon
+  207, interchange 27, search 169, frontend 95, compat 10, bin 34 green.
+
+## 1c070a5 (2026-10-07) — P2 release qualification post-split + P3 AGENTS.md truth
 
 ### P2 release qualification post-split + P3 AGENTS.md truth
 - Release script Clippy gate is now explicitly

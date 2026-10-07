@@ -330,6 +330,22 @@ mod tests {
         )
     }
 
+    /// Operation scope for the fixture namespace (frontend 1 / channel 2 /
+    /// epoch 1): op ids derive deterministically from their strings.
+    fn fixture_scope(op: &str, digest: &str) -> ltmrs_domain::command::OperationScope {
+        ltmrs_domain::command::OperationScope {
+            store_generation: ltmrs_domain::id::StoreGeneration::FIRST,
+            frontend_id: ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            channel_id: ltmrs_domain::id::ChannelId::new(uuid::Uuid::from_u128(2)),
+            retry_epoch: 1,
+            operation_id: ltmrs_domain::id::OperationId::new(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                op.as_bytes(),
+            )),
+            request_digest: digest.to_string(),
+        }
+    }
+
     /// Repo-only fixture setup (no dispatcher): frozen clock plus an issued
     /// namespace so `apply` writes receipts like production (replicates the
     /// `repo_with_ns` pattern locally; test code is never imported across
@@ -471,8 +487,7 @@ mod tests {
         )
         .unwrap();
         repo.practice_guide_idempotent(
-            "op-14",
-            "digest-14",
+            &fixture_scope("op-14", "digest-14"),
             "backup-guide",
             "test",
             Some("Backup fixture guide."),
@@ -489,14 +504,11 @@ mod tests {
     /// through the dispatcher; the canonical session it created is the single
     /// unit of session backup cargo).
     fn start_traced_session(repo: &ltmrs_service::repository::CanonicalRepository) {
-        let (_, ch) = ids();
         let handle = SessionHandle::new(uuid::Uuid::from_u128(300));
         match repo
             .session_start_tx(
-                "op-20",
-                "digest-20",
+                &fixture_scope("op-20", "digest-20"),
                 handle,
-                ch,
                 None,
                 Some("backup".to_string()),
                 vec![],

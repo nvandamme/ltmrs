@@ -18,7 +18,7 @@ use crate::migrations::{MigrationOutcome, MigrationPlan, MigrationRunner, Migrat
 use crate::repository_internal::{CommandState, TxAction, apply_command};
 use ltmrs_domain::command::{
     CommandContext, CommandReceipt, DomainCommand, DomainError, DomainErrorCode, DomainResult,
-    ReceiptOutcome, RetryNamespace,
+    OperationScope, ReceiptOutcome, RetryNamespace,
 };
 use ltmrs_domain::export::CanonicalExport;
 use ltmrs_domain::id::{
@@ -181,6 +181,8 @@ struct PracticeLog {
     name: String,
     digest: String,
     recorded: ltmrs_domain::guide::Guide,
+    #[serde(default)]
+    scope: Option<OperationScope>,
 }
 
 /// Operation kinds sharing the `guide_ops` idempotency log (P1-2): every
@@ -213,6 +215,8 @@ struct GuideOpLog {
     /// Merge sources, for rebuilding the merge response on replay.
     #[serde(default)]
     merged_sources: Vec<String>,
+    #[serde(default)]
+    scope: Option<OperationScope>,
 }
 
 /// One guide tool mutation, fully planned by the caller (P1-2): the
@@ -265,6 +269,8 @@ struct SuggestionOpLog {
     suggestion_id: u64,
     status: ltmrs_domain::session::SuggestionStatus,
     adjusted: u32,
+    #[serde(default)]
+    scope: Option<OperationScope>,
 }
 
 /// The recorded outcome of one `suggestion_respond` operation (P1-2).
@@ -657,8 +663,25 @@ impl CanonicalRepository {
                 corrupt_keys.push(key_str.to_string());
             }
         }
+        // Legacy direct receipts (pre-scope upgrade): keyed by bare
+        // operation ID, unreachable by scoped keys and unattributable to
+        // any namespace — sweep unconditionally so they cannot replay
+        // across the upgrade or leak forever. Scoped keys carry colons;
+        // bare UUIDs never do.
+        let mut legacy_op_keys: Vec<String> = Vec::new();
+        for ks in [&self.session_ops, &self.guide_ops, &self.suggestion_ops] {
+            for kv in snapshot.iter(ks) {
+                let (k, _) = kv
+                    .into_inner()
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                let key_str = String::from_utf8_lossy(k.as_ref()).to_string();
+                if !key_str.contains(':') {
+                    legacy_op_keys.push(key_str);
+                }
+            }
+        }
 
-        if expired.is_empty() && corrupt_keys.is_empty() {
+        if expired.is_empty() && corrupt_keys.is_empty() && legacy_op_keys.is_empty() {
             return Ok(0);
         }
 
@@ -672,24 +695,44 @@ impl CanonicalRepository {
             .write_tx()
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
         let mut removed = 0;
+        // Keyspaces swept per expired namespace (canonical receipts plus
+        // all three direct op logs — one shared key shape).
+        let sweep = [
+            &self.receipts,
+            &self.session_ops,
+            &self.guide_ops,
+            &self.suggestion_ops,
+        ];
         for ns in &expired {
-            // Remove all receipts issued under this retry_epoch.
-            let mut doomed = Vec::new();
-            for kv in tx.iter(&self.receipts) {
-                let (k, _) = kv
-                    .into_inner()
-                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                let key_str = String::from_utf8_lossy(k.as_ref()).to_string();
-                if receipt_matches_namespace(&key_str, ns) {
-                    doomed.push(key_str);
+            // Remove every operation receipt issued under this retry
+            // epoch: canonical receipts plus all three direct op logs
+            // (they share the generation:frontend:epoch:operation shape).
+            let mut doomed: Vec<(usize, String)> = Vec::new();
+            for (i, ks) in sweep.iter().enumerate() {
+                for kv in tx.iter(ks) {
+                    let (k, _) = kv.into_inner().map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    let key_str = String::from_utf8_lossy(k.as_ref()).to_string();
+                    if receipt_matches_namespace(&key_str, ns) {
+                        doomed.push((i, key_str));
+                    }
                 }
             }
-            for key in doomed {
-                tx.remove(&self.receipts, &key);
+            for (i, key) in doomed {
+                tx.remove(sweep[i], &key);
                 removed += 1;
             }
             let ns_key = ns_key(ns);
             tx.remove(&self.namespaces, &ns_key);
+        }
+        // Legacy bare-key direct receipts: unreachable post-upgrade, swept
+        // here so the keyspaces stay scope-pure.
+        for ks in sweep.iter().skip(1) {
+            for key in &legacy_op_keys {
+                tx.remove(ks, key);
+                removed += 1;
+            }
         }
         // Corrupt records are undecodable everywhere (all readers fail
         // closed on them): removing heals the leak without changing any
@@ -757,6 +800,53 @@ impl CanonicalRepository {
             None => Err(DomainError::new(
                 DomainErrorCode::StaleReplay,
                 "unknown retry namespace",
+            )),
+        }
+    }
+
+    /// Validate one tool operation's scope (RQ-06): the retry namespace
+    /// must exist, belong to this channel, and be within TTL — otherwise
+    /// the mutation is refused as stale instead of executing outside any
+    /// namespace. Every direct guide/session/suggestion primitive calls
+    /// this first, so expiry means the same thing for every MCP mutation.
+    pub fn validate_scope(&self, scope: &OperationScope) -> DomainResult<()> {
+        let now = self.clock.now_millis();
+        match self.lookup_namespace(scope.frontend_id, scope.retry_epoch)? {
+            Some(ns) if ns.channel_id != scope.channel_id => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "retry namespace belongs to another channel",
+            )),
+            Some(ns) if ns.is_valid_at(now) => Ok(()),
+            Some(_) => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "retry namespace expired",
+            )),
+            None => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "unknown retry namespace",
+            )),
+        }
+    }
+
+    /// Verify a stored direct receipt belongs to the calling scope.
+    /// Defense in depth alongside the scoped keys: a receipt replays only
+    /// for the generation/frontend/channel/epoch that recorded it.
+    fn check_scope_owner(
+        record_scope: Option<&OperationScope>,
+        scope: &OperationScope,
+    ) -> DomainResult<()> {
+        match record_scope {
+            Some(s)
+                if s.store_generation == scope.store_generation
+                    && s.frontend_id == scope.frontend_id
+                    && s.channel_id == scope.channel_id
+                    && s.retry_epoch == scope.retry_epoch =>
+            {
+                Ok(())
+            }
+            _ => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "receipt belongs to another scope",
             )),
         }
     }
@@ -887,7 +977,7 @@ impl CanonicalRepository {
         // restore can tell whether the live store moved since the preview.
         // Replays return before this point and advance nothing. Per-frontend
         // key: concurrent frontends never collide on one global counter.
-        self.bump_op_seq_tx(tx, &op_seq_key(Some(ctx.frontend_id)))?;
+        self.bump_op_seq_tx(tx, &op_seq_key_for_scope(ctx.frontend_id, ctx.channel_id))?;
 
         Ok(TxAction::Commit(receipt))
     }
@@ -1733,7 +1823,7 @@ impl CanonicalRepository {
         guide: &ltmrs_domain::guide::Guide,
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -1810,7 +1900,7 @@ impl CanonicalRepository {
         let key = guide.name.to_lowercase();
         let raw = serde_json::to_vec(guide)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -1841,8 +1931,7 @@ impl CanonicalRepository {
     #[allow(clippy::too_many_arguments)]
     pub fn practice_guide_idempotent(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         guide_name: &str,
         category: &str,
         description: Option<&str>,
@@ -1853,7 +1942,9 @@ impl CanonicalRepository {
         now_millis: u64,
     ) -> DomainResult<ltmrs_domain::guide::Guide> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -1861,7 +1952,7 @@ impl CanonicalRepository {
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             // Replay check first: same operation already applied.
             if let Some(raw) = tx
-                .get(&self.guide_ops, operation_id)
+                .get(&self.guide_ops, scope.op_key())
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
                 // New format: digest-bound recorded outcome. The barrier runs
@@ -1869,7 +1960,8 @@ impl CanonicalRepository {
                 // receipt is not proof its flush succeeded — a prior
                 // barrier failure must fail this replay too.
                 if let Ok(log) = serde_json::from_slice::<PracticeLog>(raw.as_ref()) {
-                    if log.digest != digest {
+                    Self::check_scope_owner(log.scope.as_ref(), scope)?;
+                    if log.digest != scope.request_digest {
                         return Err(DomainError::new(
                             DomainErrorCode::KeyReuseDifferentInput,
                             "operation key reused with different input",
@@ -1997,12 +2089,13 @@ impl CanonicalRepository {
             tx.insert(&self.guides, &key, raw.as_slice());
             let log = PracticeLog {
                 name: updated.name.clone(),
-                digest: digest.to_string(),
+                digest: scope.request_digest.clone(),
                 recorded: updated.clone(),
+                scope: Some(scope.clone()),
             };
             let log_raw = serde_json::to_vec(&log)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.guide_ops, operation_id, log_raw.as_slice());
+            tx.insert(&self.guide_ops, &op_key, log_raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -2038,7 +2131,7 @@ impl CanonicalRepository {
     ) -> DomainResult<bool> {
         let _restore_guard = self.restore_lock.read().unwrap();
         let marker = format!("{}:guide:{}", operation_id, guide_name.to_lowercase());
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("session");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2116,28 +2209,30 @@ impl CanonicalRepository {
     #[allow(clippy::too_many_arguments)]
     pub fn distill_memory_link(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         memory_id: ltmrs_domain::id::EntityId,
         guide_name: &str,
         category_default: &str,
         now_millis: u64,
     ) -> DomainResult<ltmrs_domain::guide::Guide> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             if let Some(raw) = tx
-                .get(&self.guide_ops, operation_id)
+                .get(&self.guide_ops, &op_key)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
                 // Recorded outcome — but durability is not inherited from a
                 // visible receipt (re-review P1-1): flush again first.
                 if let Ok(log) = serde_json::from_slice::<PracticeLog>(raw.as_ref()) {
-                    if log.digest != digest {
+                    Self::check_scope_owner(log.scope.as_ref(), scope)?;
+                    if log.digest != scope.request_digest {
                         return Err(DomainError::new(
                             DomainErrorCode::KeyReuseDifferentInput,
                             "operation key reused with different input",
@@ -2250,12 +2345,13 @@ impl CanonicalRepository {
             tx.insert(&self.memories, &mem_key, mem_raw.as_slice());
             let log = PracticeLog {
                 name: updated.name.clone(),
-                digest: digest.to_string(),
+                digest: scope.request_digest.clone(),
                 recorded: updated.clone(),
+                scope: Some(scope.clone()),
             };
             let log_raw = serde_json::to_vec(&log)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.guide_ops, operation_id, log_raw.as_slice());
+            tx.insert(&self.guide_ops, &op_key, log_raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -2281,7 +2377,7 @@ impl CanonicalRepository {
         let key = memory.id.as_uuid().to_string();
         let raw = serde_json::to_vec(memory)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("memory");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2315,7 +2411,7 @@ impl CanonicalRepository {
         if !exists {
             return Ok(false);
         }
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2375,7 +2471,7 @@ impl CanonicalRepository {
         if ids.is_empty() {
             return Ok(0);
         }
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2462,7 +2558,7 @@ impl CanonicalRepository {
         if ids.is_empty() {
             return Ok(0);
         }
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2531,7 +2627,7 @@ impl CanonicalRepository {
         }
         let result_key = result.name.to_lowercase();
         let source_keys: Vec<String> = source_names.iter().map(|n| n.to_lowercase()).collect();
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2674,7 +2770,7 @@ impl CanonicalRepository {
         updated: &ltmrs_domain::guide::Guide,
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2796,7 +2892,7 @@ impl CanonicalRepository {
     /// guide delete commit in ONE transaction. Returns true when removed.
     pub fn forget_guide_atomically(&self, name: &str) -> DomainResult<bool> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("guide");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -2882,18 +2978,19 @@ impl CanonicalRepository {
     /// unlogged, so a retry re-evaluates against current state.
     pub fn guide_mutation_idempotent(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         mutation: GuideMutation,
     ) -> DomainResult<RecordedGuideOp> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            if let Some(recorded) = self.check_guide_op_tx(&tx, operation_id, digest)? {
+            if let Some(recorded) = self.check_guide_op_tx(&tx, scope)? {
                 // Durability is not inherited from a visible receipt
                 // (re-review P1-1): flush again before acknowledging.
                 self.persist_barrier()?;
@@ -2957,14 +3054,15 @@ impl CanonicalRepository {
                 }
             };
             let log = GuideOpLog {
-                digest: digest.to_string(),
+                digest: scope.request_digest.clone(),
                 kind,
                 recorded: guide.clone(),
                 merged_sources: merged_sources.clone(),
+                scope: Some(scope.clone()),
             };
             let raw = serde_json::to_vec(&log)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.guide_ops, operation_id, raw.as_slice());
+            tx.insert(&self.guide_ops, &op_key, raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -2991,19 +3089,20 @@ impl CanonicalRepository {
     /// before acknowledging a replay, matching the in-transaction path.
     pub fn read_recorded_guide_op(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
     ) -> DomainResult<Option<RecordedGuideOp>> {
         let _restore_guard = self.restore_lock.read().unwrap();
+        self.validate_scope(scope)?;
         let snapshot = self.db.read_tx();
         let raw = snapshot
-            .get(&self.guide_ops, operation_id)
+            .get(&self.guide_ops, scope.op_key())
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
         let Some(raw) = raw else {
             return Ok(None);
         };
         if let Ok(log) = serde_json::from_slice::<GuideOpLog>(raw.as_ref()) {
-            if log.digest != digest {
+            Self::check_scope_owner(log.scope.as_ref(), scope)?;
+            if log.digest != scope.request_digest {
                 return Err(DomainError::new(
                     DomainErrorCode::KeyReuseDifferentInput,
                     "operation key reused with different input",
@@ -3037,17 +3136,17 @@ impl CanonicalRepository {
     fn check_guide_op_tx(
         &self,
         tx: &OptimisticWriteTx,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
     ) -> DomainResult<Option<RecordedGuideOp>> {
         let Some(raw) = tx
-            .get(&self.guide_ops, operation_id)
+            .get(&self.guide_ops, scope.op_key())
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
         else {
             return Ok(None);
         };
         if let Ok(log) = serde_json::from_slice::<GuideOpLog>(raw.as_ref()) {
-            if log.digest != digest {
+            Self::check_scope_owner(log.scope.as_ref(), scope)?;
+            if log.digest != scope.request_digest {
                 return Err(DomainError::new(
                     DomainErrorCode::KeyReuseDifferentInput,
                     "operation key reused with different input",
@@ -3080,10 +3179,8 @@ impl CanonicalRepository {
     #[allow(clippy::too_many_arguments)]
     pub fn session_start_tx(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         handle: SessionHandle,
-        channel_id: ChannelId,
         project: Option<String>,
         task_type: Option<String>,
         technologies: Vec<String>,
@@ -3092,19 +3189,22 @@ impl CanonicalRepository {
         now_millis: u64,
     ) -> DomainResult<SessionOp<SessionHandle>> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             if let Some(raw) = tx
-                .get(&self.session_ops, operation_id)
+                .get(&self.session_ops, &op_key)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
                 let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                if rec.digest != digest {
+                Self::check_scope_owner(rec.scope.as_ref(), scope)?;
+                if rec.digest != scope.request_digest {
                     return Ok(SessionOp::Conflict);
                 }
                 // Durability is not inherited from a visible receipt
@@ -3135,29 +3235,12 @@ impl CanonicalRepository {
                     }
                 }
             }
-            // Decay stale dead-ends across sessions (same 0.002 policy the
-            // registry applied at start).
-            let mut all: Vec<(String, Session)> = Vec::new();
-            for kv in tx.iter(&self.sessions) {
-                let (k, v) = kv
-                    .into_inner()
-                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                let key: String = String::from_utf8_lossy(k.as_ref()).into_owned();
-                let mut s: Session = serde_json::from_slice(v.as_ref())
-                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                for a in &mut s.attempts {
-                    a.confidence = (a.confidence - 0.002).max(0.0);
-                }
-                all.push((key, s));
-            }
-            for (key, s) in &all {
-                let raw = serde_json::to_vec(s)
-                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                tx.insert(&self.sessions, key, raw.as_slice());
-            }
+            // Attempt-decay runs post-commit (see below): scanning the
+            // sessions keyspace inside this transaction would turn
+            // independent concurrent starts into optimistic conflicts.
             let session = Session {
                 handle,
-                channel_id,
+                channel_id: scope.channel_id,
                 project: project.clone(),
                 task_type: task_type.clone(),
                 technologies: technologies.clone(),
@@ -3181,20 +3264,35 @@ impl CanonicalRepository {
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.sessions, &hkey, raw.as_slice());
             let receipt = SessionReceipt {
-                digest: digest.to_string(),
+                digest: scope.request_digest.clone(),
                 session: handle,
                 seq: None,
                 response: None,
                 continuity_boosted: false,
+                scope: Some(scope.clone()),
             };
             let log_raw = serde_json::to_vec(&receipt)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.session_ops, operation_id, log_raw.as_slice());
+            tx.insert(&self.session_ops, &op_key, log_raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
                     self.persist_barrier()?;
                     self.fire_commit_hook();
+                    // Stale dead-end decay (same 0.002 policy the registry
+                    // applied at start) runs here, outside the start
+                    // transaction: the scan's keyspace-wide read dependency
+                    // would otherwise turn independent concurrent starts
+                    // into optimistic conflicts. Only sessions whose
+                    // attempts actually change are rewritten; a conflicted
+                    // decay simply skips (the next start retries it) while
+                    // hard errors propagate — the start receipt already
+                    // committed, so a host retry replays instead of
+                    // duplicating.
+                    match self.decay_stale_attempts() {
+                        Ok(()) => {}
+                        Err(e) => return Err(e),
+                    }
                     return Ok(SessionOp::Applied(handle));
                 }
                 Ok(Err(_)) => continue,
@@ -3206,6 +3304,50 @@ impl CanonicalRepository {
         Err(Self::exhausted_contention("session start conflicted"))
     }
 
+    /// One best-effort attempt-dead-end decay pass (0.002 per attempt,
+    /// floored at 0.0) in its own transaction. Returns Ok on a conflicted
+    /// pass (the next session start retries it); hard errors propagate.
+    fn decay_stale_attempts(&self) -> DomainResult<()> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let mut changed: Vec<(String, Session)> = Vec::new();
+        for kv in tx.iter(&self.sessions) {
+            let (k, v) = kv
+                .into_inner()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut s: Session = serde_json::from_slice(v.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut touched = false;
+            for a in &mut s.attempts {
+                let decayed = (a.confidence - 0.002).max(0.0);
+                if decayed != a.confidence {
+                    a.confidence = decayed;
+                    touched = true;
+                }
+            }
+            if touched {
+                changed.push((String::from_utf8_lossy(k.as_ref()).into_owned(), s));
+            }
+        }
+        for (key, s) in &changed {
+            let raw = serde_json::to_vec(s)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.sessions, key, raw.as_slice());
+        }
+        match tx.commit() {
+            Ok(Ok(())) => {
+                self.persist_barrier()?;
+                Ok(())
+            }
+            // Conflicted pass: skip silently, the next start retries it.
+            Ok(Err(_)) => Ok(()),
+            Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+        }
+    }
+
     /// Record a session attempt as ONE canonical operation (re-review P1-3):
     /// the attempt ID derives deterministically from the operation ID, so
     /// retries dedup; counters increment exactly once per operation; the
@@ -3213,8 +3355,7 @@ impl CanonicalRepository {
     #[allow(clippy::too_many_arguments)]
     pub fn session_attempt_tx(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         handle: SessionHandle,
         approach: String,
         outcome: ltmrs_domain::session::AttemptOutcome,
@@ -3224,23 +3365,26 @@ impl CanonicalRepository {
         now_millis: u64,
     ) -> DomainResult<SessionOp<(SessionHandle, u32)>> {
         let _restore_guard = self.restore_lock.read().unwrap();
+        self.validate_scope(scope)?;
         let attempt_id = EntityId::new(uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_URL,
-            format!("ltmrs:attempt:{operation_id}").as_bytes(),
+            format!("ltmrs:attempt:{}", scope.operation_id.as_uuid()).as_bytes(),
         ));
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             if let Some(raw) = tx
-                .get(&self.session_ops, operation_id)
+                .get(&self.session_ops, &op_key)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
                 let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                if rec.digest != digest {
+                Self::check_scope_owner(rec.scope.as_ref(), scope)?;
+                if rec.digest != scope.request_digest {
                     return Ok(SessionOp::Conflict);
                 }
                 self.persist_barrier()?;
@@ -3299,15 +3443,16 @@ impl CanonicalRepository {
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.sessions, &hkey, raw.as_slice());
             let receipt = SessionReceipt {
-                digest: digest.to_string(),
+                digest: scope.request_digest.clone(),
                 session: handle,
                 seq: Some(seq),
                 response: None,
                 continuity_boosted: false,
+                scope: Some(scope.clone()),
             };
             let log_raw = serde_json::to_vec(&receipt)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.session_ops, operation_id, log_raw.as_slice());
+            tx.insert(&self.session_ops, &op_key, log_raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -3376,17 +3521,16 @@ impl CanonicalRepository {
     }
 
     /// End a session as ONE canonical operation (re-review P1-3): required
-    /// guide outcomes, the terminal transition and the operation receipt
-    /// commit in a single transaction — no observable partial completion,
-    /// no mixed outcomes. Replay returns the recorded handle; digest
-    /// mismatch rejects. Improvement lines are derived from the committed
-    /// counts and returned for the response (suggestion filing itself stays
-    /// best-effort, content-deduplicated).
+    /// guide outcomes, the terminal transition, improvement suggestions
+    /// and the operation receipt commit in a single transaction — no
+    /// observable partial completion, no mixed outcomes, no duplicate
+    /// filing on duplicate delivery. Replay returns the recorded handle;
+    /// digest mismatch rejects. Improvement lines are derived from the
+    /// committed counts and returned for the response.
     #[allow(clippy::too_many_arguments)]
     pub fn session_end_tx(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         handle: SessionHandle,
         outcome: ltmrs_domain::session::TaskOutcome,
         final_approach: Option<String>,
@@ -3394,19 +3538,22 @@ impl CanonicalRepository {
         now_millis: u64,
     ) -> DomainResult<SessionOp<(SessionHandle, Vec<String>, bool)>> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             if let Some(raw) = tx
-                .get(&self.session_ops, operation_id)
+                .get(&self.session_ops, &op_key)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
                 let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                if rec.digest != digest {
+                Self::check_scope_owner(rec.scope.as_ref(), scope)?;
+                if rec.digest != scope.request_digest {
                     return Ok(SessionOp::Conflict);
                 }
                 // Rebuild the improvement lines from current guide state so
@@ -3486,15 +3633,16 @@ impl CanonicalRepository {
             // this operation can never file twice.
             self.file_suggestions_tx(&mut tx, handle, &improvement_lines, now_millis)?;
             let receipt = SessionReceipt {
-                digest: digest.to_string(),
+                digest: scope.request_digest.clone(),
                 session: handle,
                 seq: None,
                 response: None,
                 continuity_boosted: false,
+                scope: Some(scope.clone()),
             };
             let log_raw = serde_json::to_vec(&receipt)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.session_ops, operation_id, log_raw.as_slice());
+            tx.insert(&self.session_ops, &op_key, log_raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -3515,12 +3663,14 @@ impl CanonicalRepository {
     /// order-preserving deduplication, committed atomically.
     pub fn track_session_link(
         &self,
+        scope: &OperationScope,
         handle: SessionHandle,
         field: SessionLinkField,
         ids: &[String],
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -3583,7 +3733,7 @@ impl CanonicalRepository {
         now_millis: u64,
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("session");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -3647,21 +3797,22 @@ impl CanonicalRepository {
     /// continuation must not double-boost). Digest mismatch rejects.
     pub fn claim_continuity_boost(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         targets: &[(SessionHandle, u32)],
         delta: f64,
         now_millis: u64,
     ) -> DomainResult<bool> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             let raw = tx
-                .get(&self.session_ops, operation_id)
+                .get(&self.session_ops, &op_key)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             let Some(raw) = raw else {
                 return Err(DomainError::new(
@@ -3671,7 +3822,8 @@ impl CanonicalRepository {
             };
             let mut rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            if rec.digest != digest {
+            Self::check_scope_owner(rec.scope.as_ref(), scope)?;
+            if rec.digest != scope.request_digest {
                 return Err(DomainError::new(
                     DomainErrorCode::KeyReuseDifferentInput,
                     "operation key reused with different input",
@@ -3687,7 +3839,7 @@ impl CanonicalRepository {
             rec.continuity_boosted = true;
             let raw = serde_json::to_vec(&rec)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.session_ops, operation_id, raw.as_slice());
+            tx.insert(&self.session_ops, &op_key, raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -3734,15 +3886,18 @@ impl CanonicalRepository {
         Ok(out)
     }
 
-    /// Read one session operation receipt by ID (P2-1 frozen replay).
-    pub fn session_receipt(&self, operation_id: &str) -> DomainResult<Option<SessionReceipt>> {
+    /// Read one session operation receipt by scope (P2-1 frozen replay):
+    /// a receipt recorded under another scope never resolves here.
+    pub fn session_receipt(&self, scope: &OperationScope) -> DomainResult<Option<SessionReceipt>> {
         let snapshot = self.db.read_tx();
         let raw = snapshot
-            .get(&self.session_ops, operation_id)
+            .get(&self.session_ops, scope.op_key())
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
         raw.map(|raw| {
-            serde_json::from_slice(raw.as_ref())
-                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
+            let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            Self::check_scope_owner(rec.scope.as_ref(), scope)?;
+            Ok(rec)
         })
         .transpose()
     }
@@ -3754,19 +3909,20 @@ impl CanonicalRepository {
     /// resurrecting a stale identity.
     pub fn store_session_response(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         response: &ltmrs_domain::session::FrozenToolResponse,
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             let raw = tx
-                .get(&self.session_ops, operation_id)
+                .get(&self.session_ops, &op_key)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             let Some(raw) = raw else {
                 return Err(DomainError::new(
@@ -3776,7 +3932,8 @@ impl CanonicalRepository {
             };
             let mut rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            if rec.digest != digest {
+            Self::check_scope_owner(rec.scope.as_ref(), scope)?;
+            if rec.digest != scope.request_digest {
                 return Err(DomainError::new(
                     DomainErrorCode::KeyReuseDifferentInput,
                     "operation key reused with different input",
@@ -3793,7 +3950,7 @@ impl CanonicalRepository {
             rec.response = Some(response.clone());
             let raw = serde_json::to_vec(&rec)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.session_ops, operation_id, raw.as_slice());
+            tx.insert(&self.session_ops, &op_key, raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -3821,7 +3978,7 @@ impl CanonicalRepository {
         receipts: Vec<(String, SessionReceipt)>,
     ) -> DomainResult<usize> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("import");
         let mut imported = 0usize;
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
@@ -3910,7 +4067,7 @@ impl CanonicalRepository {
         let key = suggestion.id.to_string();
         let raw = serde_json::to_vec(suggestion)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("suggestion");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -3940,26 +4097,28 @@ impl CanonicalRepository {
     /// reuse. A missing suggestion errors unlogged, so a retry re-evaluates.
     pub fn respond_suggestion_idempotent(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         suggestion_id: u64,
         status: ltmrs_domain::session::SuggestionStatus,
         now_millis: u64,
     ) -> DomainResult<RecordedSuggestionOp> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        self.validate_scope(scope)?;
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             if let Some(raw) = tx
-                .get(&self.suggestion_ops, operation_id)
+                .get(&self.suggestion_ops, &op_key)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
             {
                 let log: SuggestionOpLog = serde_json::from_slice(raw.as_ref())
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                if log.digest != digest {
+                Self::check_scope_owner(log.scope.as_ref(), scope)?;
+                if log.digest != scope.request_digest {
                     return Err(DomainError::new(
                         DomainErrorCode::KeyReuseDifferentInput,
                         "operation key reused with different input",
@@ -4044,14 +4203,15 @@ impl CanonicalRepository {
                 }
             }
             let log = SuggestionOpLog {
-                digest: digest.to_string(),
+                digest: scope.request_digest.clone(),
                 suggestion_id,
                 status,
                 adjusted,
+                scope: Some(scope.clone()),
             };
             let raw = serde_json::to_vec(&log)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            tx.insert(&self.suggestion_ops, operation_id, raw.as_slice());
+            tx.insert(&self.suggestion_ops, &op_key, raw.as_slice());
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -4071,10 +4231,6 @@ impl CanonicalRepository {
         Err(Self::exhausted_contention("suggestion respond conflicted"))
     }
 
-    /// File a suggestion with an atomically allocated ID (lost-write fix):
-    /// the max-ID scan and the insert commit in ONE transaction, so two
-    /// concurrent filers cannot claim the same ID and silently overwrite
-    /// each other (optimistic conflict retries recompute the max).
     /// File improvement suggestions inside the caller's transaction:
     /// content-deduplicated per session+text, IDs allocated max+1 in-tx.
     /// Used by `session_end_tx` so the terminal transition, guide outcomes,
@@ -4130,7 +4286,7 @@ impl CanonicalRepository {
         now_millis: u64,
     ) -> DomainResult<ltmrs_domain::session::Suggestion> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let seq_key = op_seq_key(None);
+        let seq_key = op_seq_key_system("suggestion");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
@@ -4551,11 +4707,22 @@ fn namespace_key(frontend_id: FrontendId) -> String {
 
 /// Mutation-watermark key for a writer: per-frontend for commands (no
 /// cross-frontend contention), shared for the direct-write primitives.
-fn op_seq_key(frontend: Option<FrontendId>) -> String {
-    match frontend {
-        Some(fe) => format!("op_seq:{}", fe.as_uuid()),
-        None => "op_seq:direct".to_string(),
-    }
+/// Mutation-watermark key for one interactive channel: every tool write —
+/// canonical or direct — advances its own channel's counter, so
+/// otherwise-disjoint concurrent agents never contend on a shared key
+/// (Fjall OCC would turn independent work into transient conflicts).
+/// Pre-scope-upgrade rows (`op_seq:{frontend}`, `op_seq:direct`) stop
+/// advancing but stay in the total as a frozen offset: the watermark is
+/// only ever differenced, never reset.
+fn op_seq_key_for_scope(frontend: FrontendId, channel: ChannelId) -> String {
+    format!("op_seq:{}:{}", frontend.as_uuid(), channel.as_uuid())
+}
+
+/// Mutation-watermark key for genuinely internal writers (imports,
+/// maintenance, test fixtures): sharded per area, never the one global
+/// key the per-channel counters replaced.
+fn op_seq_key_system(area: &str) -> String {
+    format!("op_seq:system:{area}")
 }
 
 fn ns_key(ns: &RetryNamespace) -> String {
@@ -4705,6 +4872,23 @@ mod tests {
 
     fn ch(n: u64) -> ChannelId {
         ChannelId::new(Uuid::from_u128(n as u128))
+    }
+
+    /// Operation scope for frontend 1 / channel 2 / epoch 1 (the
+    /// `repo_with_ns` namespace): every direct-primitive test defaults here.
+    fn scope(op_num: u64, digest: &str) -> OperationScope {
+        scope_in(1, 2, op_num, digest)
+    }
+
+    fn scope_in(epoch: u64, ch_n: u64, op_num: u64, digest: &str) -> OperationScope {
+        OperationScope {
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1)),
+            channel_id: ch(ch_n),
+            retry_epoch: epoch,
+            operation_id: OperationId::new(Uuid::from_u128(op_num as u128)),
+            request_digest: digest.to_string(),
+        }
     }
 
     /// Open a repo and issue a namespace for frontend 1 at epoch 1.
@@ -7144,16 +7328,14 @@ mod tests {
     /// counts that never coexisted).
     #[test]
     fn export_full_covers_canonical_sessions() {
-        use ltmrs_domain::id::{ChannelId, SessionHandle};
+        use ltmrs_domain::id::SessionHandle;
         use ltmrs_domain::session::SessionOp;
         let (repo, _dir) = repo_with_ns();
         let handle = SessionHandle::new(Uuid::from_u128(100));
         match repo
             .session_start_tx(
-                "op-export",
-                "digest-export",
+                &scope(100, "digest-export"),
                 handle,
-                ChannelId::new(Uuid::from_u128(9)),
                 None,
                 None,
                 vec![],
@@ -7179,16 +7361,14 @@ mod tests {
     /// confidence; a changed digest rejects.
     #[test]
     fn continuity_boost_claim_applies_once() {
-        use ltmrs_domain::id::{ChannelId, SessionHandle};
+        use ltmrs_domain::id::SessionHandle;
         use ltmrs_domain::session::{AttemptOutcome, SessionOp};
         let (repo, _dir) = repo_with_ns();
         let handle = SessionHandle::new(Uuid::from_u128(100));
         match repo
             .session_start_tx(
-                "op-start",
-                "digest-start",
+                &scope(101, "digest-start"),
                 handle,
-                ChannelId::new(Uuid::from_u128(9)),
                 None,
                 None,
                 vec![],
@@ -7203,8 +7383,7 @@ mod tests {
         }
         match repo
             .session_attempt_tx(
-                "op-attempt",
-                "digest-attempt",
+                &scope(102, "digest-attempt"),
                 handle,
                 "try X".to_string(),
                 AttemptOutcome::Rejected,
@@ -7223,20 +7402,20 @@ mod tests {
         repo.adjust_attempt(handle, 1, -0.5, 1000).unwrap();
         let targets = vec![(handle, 1)];
         assert!(
-            repo.claim_continuity_boost("op-start", "digest-start", &targets, 0.015, 1000)
+            repo.claim_continuity_boost(&scope(101, "digest-start"), &targets, 0.015, 1000)
                 .unwrap()
         );
         let after_first = repo.get_session(handle).unwrap().unwrap().attempts[0].confidence;
         assert!((after_first - 0.515).abs() < 1e-9, "got {after_first}");
         assert!(
             !repo
-                .claim_continuity_boost("op-start", "digest-start", &targets, 0.015, 1000)
+                .claim_continuity_boost(&scope(101, "digest-start"), &targets, 0.015, 1000)
                 .unwrap()
         );
         let after_second = repo.get_session(handle).unwrap().unwrap().attempts[0].confidence;
         assert_eq!(after_second, after_first, "second claim must not re-boost");
         let err = repo
-            .claim_continuity_boost("op-start", "DIFFERENT", &targets, 0.015, 1000)
+            .claim_continuity_boost(&scope(101, "DIFFERENT"), &targets, 0.015, 1000)
             .unwrap_err();
         assert_eq!(
             err.code,
@@ -7404,6 +7583,223 @@ mod tests {
         assert_eq!(repo.get_memories(&[eid(1)]).unwrap().len(), 1);
     }
 
+    /// P2 (T-CONC-02): interactive watermarks shard per channel. After
+    /// writes from two channels of one frontend, each channel owns its
+    /// `op_seq:{frontend}:{channel}` counter and no shared key advances —
+    /// otherwise-disjoint agents never contend on one global sequence.
+    #[test]
+    fn op_seq_watermarks_shard_per_channel() {
+        use ltmrs_domain::id::SessionHandle;
+        use ltmrs_domain::session::SessionOp;
+        let (repo, _dir) = repo_with_ns();
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+        repo.issue_namespace(fe, ch(3), 1000).unwrap();
+        let ha = SessionHandle::new(Uuid::from_u128(910));
+        match repo
+            .session_start_tx(&scope(910, "d-a"), ha, None, None, vec![], None, None, 1000)
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, ha),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let hb = SessionHandle::new(Uuid::from_u128(911));
+        match repo
+            .session_start_tx(
+                &scope_in(2, 3, 911, "d-b"),
+                hb,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, hb),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let snapshot = repo.db.read_tx();
+        let mut keys = Vec::new();
+        for kv in snapshot.iter(&repo.namespaces) {
+            let (k, _) = kv.into_inner().unwrap();
+            let key_str = String::from_utf8_lossy(k.as_ref()).to_string();
+            if key_str.starts_with("op_seq:") {
+                keys.push(key_str);
+            }
+        }
+        drop(snapshot);
+        let fe_hex = fe.as_uuid().to_string();
+        assert!(
+            keys.iter()
+                .any(|k| k == &format!("op_seq:{fe_hex}:{}", ch(2).as_uuid())),
+            "channel-2 watermark missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| k == &format!("op_seq:{fe_hex}:{}", ch(3).as_uuid())),
+            "channel-3 watermark missing, got {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k == "op_seq:direct"),
+            "global watermark must stay untouched, got {keys:?}"
+        );
+    }
+    /// Attempt-decay still runs (post-commit now): starting a second
+    /// session decays the first session's attempts by 0.002. Guards the
+    /// hotspot fix against silently dropping the policy.
+    #[test]
+    fn session_start_still_decays_prior_attempts() {
+        use ltmrs_domain::id::SessionHandle;
+        use ltmrs_domain::session::{AttemptOutcome, SessionOp};
+        let (repo, _dir) = repo_with_ns();
+        let h1 = SessionHandle::new(Uuid::from_u128(810));
+        match repo
+            .session_start_tx(
+                &scope(810, "d-s1"),
+                h1,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, h1),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match repo
+            .session_attempt_tx(
+                &scope(811, "d-a1"),
+                h1,
+                "try X".to_string(),
+                AttemptOutcome::Rejected,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied((_, 1)) => {}
+            other => panic!("expected Applied seq 1, got {other:?}"),
+        }
+        let h2 = SessionHandle::new(Uuid::from_u128(812));
+        match repo
+            .session_start_tx(
+                &scope(813, "d-s2"),
+                h2,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, h2),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        let conf = repo.get_session(h1).unwrap().unwrap().attempts[0].confidence;
+        assert!(
+            (conf - 0.998).abs() < 1e-9,
+            "prior attempt must decay 1.0 -> 0.998, got {conf}"
+        );
+    }
+
+    #[test]
+    fn direct_mutations_refuse_expired_namespace() {
+        use ltmrs_domain::id::SessionHandle;
+        use std::sync::Arc;
+        // Namespace issued at t=1000; the repo clock already reads past
+        // the TTL, so every direct mutation below meets an expired
+        // namespace (validate_scope reads the clock, not the op stamp).
+        let dir = tempfile::tempdir().unwrap();
+        let expired_at = 1000 + crate::repository::DEFAULT_NAMESPACE_TTL_MILLIS + 1;
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(ltmrs_domain::clock::FrozenClock::new(expired_at));
+        let repo =
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock).unwrap();
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+        repo.issue_namespace(fe, ch(2), 1000).unwrap();
+        let handle = SessionHandle::new(Uuid::from_u128(800));
+        let err = repo
+            .session_start_tx(
+                &scope(800, "d-exp"),
+                handle,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                expired_at,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::StaleReplay
+        );
+        assert!(err.message.contains("expired"), "got: {err:?}");
+        assert!(repo.get_session(handle).unwrap().is_none());
+        let err = repo
+            .practice_guide_idempotent(
+                &scope(801, "d-exp"),
+                "git",
+                "dev-tool",
+                None,
+                &[],
+                &[],
+                &[],
+                None,
+                expired_at,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::StaleReplay
+        );
+    }
+
+    /// P1 T2 (channel isolation for direct receipts): channel A starts a
+    /// session with op X; channel B submitting the same op id + digest
+    /// under its own namespace must execute in its own scope — never
+    /// replay A's receipt, never bind B to A's session.
+    #[test]
+    fn direct_session_start_same_op_id_is_scoped_per_channel() {
+        use ltmrs_domain::id::SessionHandle;
+        use ltmrs_domain::session::SessionOp;
+        let (repo, _dir) = repo_with_ns();
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+        // Channel A (epoch 1) starts its session with op X.
+        let ha = SessionHandle::new(Uuid::from_u128(901));
+        match repo
+            .session_start_tx(&scope(900, "d-x"), ha, None, None, vec![], None, None, 1000)
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, ha),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        // Channel B (own namespace, epoch 2), same op id + digest.
+        repo.issue_namespace(fe, ch(3), 1000).unwrap();
+        let scope_b = scope_in(2, 3, 900, "d-x");
+        let hb = SessionHandle::new(Uuid::from_u128(902));
+        match repo
+            .session_start_tx(&scope_b, hb, None, None, vec![], None, None, 1000)
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, hb),
+            other => panic!("B must apply in its own scope, got {other:?}"),
+        }
+        // A's session is untouched; each receipt lives in its own scope.
+        assert!(repo.get_session(ha).unwrap().is_some());
+        assert!(repo.get_session(hb).unwrap().is_some());
+        assert!(repo.session_receipt(&scope(900, "d-x")).unwrap().is_some());
+        assert!(repo.session_receipt(&scope_b).unwrap().is_some());
+    }
+
     /// P1/P2 session_end exactly-once: improvement suggestions are filed
     /// inside the end transaction, so concurrent duplicate deliveries of
     /// the same end operation yield exactly one Suggestion per line —
@@ -7412,7 +7808,7 @@ mod tests {
     #[test]
     fn session_end_files_suggestions_exactly_once_per_operation() {
         use ltmrs_domain::guide::Guide;
-        use ltmrs_domain::id::{ChannelId, SessionHandle};
+        use ltmrs_domain::id::SessionHandle;
         use ltmrs_domain::memory::Instant;
         use ltmrs_domain::session::{SessionOp, TaskOutcome};
         use std::sync::{Arc, Barrier};
@@ -7445,10 +7841,8 @@ mod tests {
         let handle = SessionHandle::new(Uuid::from_u128(700));
         match repo
             .session_start_tx(
-                "op-start-700",
-                "digest-start",
+                &scope(700, "digest-start"),
                 handle,
-                ChannelId::new(Uuid::from_u128(2)),
                 None,
                 None,
                 vec![],
@@ -7461,8 +7855,13 @@ mod tests {
             SessionOp::Applied(h) => assert_eq!(h, handle),
             other => panic!("expected Applied, got {other:?}"),
         }
-        repo.track_session_link(handle, SessionLinkField::GuideUsed, &["git".to_string()])
-            .unwrap();
+        repo.track_session_link(
+            &scope(701, "track"),
+            handle,
+            SessionLinkField::GuideUsed,
+            &["git".to_string()],
+        )
+        .unwrap();
         // Eight duplicate deliveries of the same end operation, released
         // together: exactly one Applies, the rest Replay.
         let repo = Arc::new(repo);
@@ -7474,8 +7873,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 start.wait();
                 repo.session_end_tx(
-                    "op-end-700",
-                    "digest-end",
+                    &scope(702, "digest-end"),
                     handle,
                     TaskOutcome::Failure,
                     None,
@@ -7742,14 +8140,13 @@ mod tests {
     fn session_response_freeze_keeps_first() {
         use ltmrs_domain::session::FrozenToolResponse;
         let (repo, _dir) = repo_with_ns();
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+        repo.issue_namespace(fe, ch(9), 1000).unwrap();
         let handle = SessionHandle::new(Uuid::from_u128(100));
-        let channel = ChannelId::new(Uuid::from_u128(9));
         match repo
             .session_start_tx(
-                "op-freeze",
-                "digest-freeze",
+                &scope_in(2, 9, 800, "digest-freeze"),
                 handle,
-                channel,
                 None,
                 None,
                 vec![],
@@ -7772,12 +8169,11 @@ mod tests {
             structured: None,
             is_error: false,
         };
-        repo.store_session_response("op-freeze", "digest-freeze", &first)
-            .unwrap();
-        repo.store_session_response("op-freeze", "digest-freeze", &second)
-            .unwrap();
+        let fscope = scope_in(2, 9, 800, "digest-freeze");
+        repo.store_session_response(&fscope, &first).unwrap();
+        repo.store_session_response(&fscope, &second).unwrap();
         let stored = repo
-            .session_receipt("op-freeze")
+            .session_receipt(&fscope)
             .unwrap()
             .expect("receipt must exist");
         assert_eq!(
@@ -7799,8 +8195,7 @@ mod tests {
         let rev_beta = repo.get_guide("beta").unwrap().unwrap().entity_revision;
         // Concurrent update AFTER planning (practice bumps the revision).
         repo.practice_guide_idempotent(
-            "practice-1",
-            "digest-1",
+            &scope(900, "digest-1"),
             "alpha",
             "dev-tool",
             None,
@@ -7874,8 +8269,18 @@ mod tests {
         repo.put_guide(&test_guide("g")).unwrap();
         let rev = repo.get_guide("g").unwrap().unwrap().entity_revision;
         // Concurrent writer bumps the revision (practice path).
-        repo.practice_guide_idempotent("p1", "d1", "g", "dev-tool", None, &[], &[], &[], None, 1)
-            .unwrap();
+        repo.practice_guide_idempotent(
+            &scope(901, "d1"),
+            "g",
+            "dev-tool",
+            None,
+            &[],
+            &[],
+            &[],
+            None,
+            1,
+        )
+        .unwrap();
         let mut stale = repo.get_guide("g").unwrap().unwrap();
         // Simulate the stale plan: revision captured before the practice.
         let err = repo.put_guide_checked(Some(rev), &stale).unwrap_err();
@@ -7900,8 +8305,7 @@ mod tests {
         let (repo, _dir) = repo_with_ns();
         let practice = || {
             repo.practice_guide_idempotent(
-                "op-p",
-                "digest-p",
+                &scope(902, "digest-p"),
                 "git",
                 "dev-tool",
                 None,

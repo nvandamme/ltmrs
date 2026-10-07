@@ -459,6 +459,7 @@ impl FrontendRegistry {
                         seq: None,
                         response: None,
                         continuity_boosted: false,
+                        scope: None,
                     },
                 )
             })

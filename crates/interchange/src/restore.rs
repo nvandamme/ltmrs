@@ -461,6 +461,43 @@ mod tests {
         }
     }
 
+    /// Operation scope for the session-channel tests below (channel 9,
+    /// second namespace): op ids derive deterministically from their
+    /// strings, so distinct test ops never share a key.
+    fn gateway_scope(op: &str, digest: &str) -> ltmrs_domain::command::OperationScope {
+        ltmrs_domain::command::OperationScope {
+            store_generation: ltmrs_domain::id::StoreGeneration::FIRST,
+            frontend_id: ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            channel_id: ltmrs_domain::id::ChannelId::new(uuid::Uuid::from_u128(9)),
+            retry_epoch: 2,
+            operation_id: ltmrs_domain::id::OperationId::new(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                op.as_bytes(),
+            )),
+            request_digest: digest.to_string(),
+        }
+    }
+
+    /// Issue the channel-9 namespace the session tests run under.
+    fn issue_session_channel(repo: &CanonicalRepository) {
+        repo.issue_namespace(
+            ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            ltmrs_domain::id::ChannelId::new(uuid::Uuid::from_u128(9)),
+            1000,
+        )
+        .unwrap();
+    }
+
+    /// Post-restore scope: the drain resets the epoch counter, so the
+    /// re-issued channel-9 namespace is epoch 1 under generation 2 — a
+    /// different key from every pre-restore receipt by construction.
+    fn gateway_scope_post(op: &str, digest: &str) -> ltmrs_domain::command::OperationScope {
+        let mut scope = gateway_scope(op, digest);
+        scope.store_generation = ltmrs_domain::id::StoreGeneration::new(2);
+        scope.retry_epoch = 1;
+        scope
+    }
+
     /// Export repo B (2 memories), verify, restore into empty repo A:
     /// content moves, generation advances past A's.
     #[test]
@@ -1288,19 +1325,17 @@ mod tests {
     /// through verbatim. The report counts the marked sessions.
     #[test]
     fn restore_marks_restored_active_sessions_abandoned() {
-        use ltmrs_domain::id::{ChannelId, SessionHandle};
+        use ltmrs_domain::id::SessionHandle;
         use ltmrs_domain::session::{SessionOp, SessionStatus, TaskOutcome};
         let dir = tempfile::tempdir().unwrap();
         let repo = gateway_repo(&dir);
-        let channel = ChannelId::new(uuid::Uuid::from_u128(9));
+        issue_session_channel(&repo);
         for (op, n) in [("op-a", 100u128), ("op-b", 200u128)] {
             let handle = SessionHandle::new(uuid::Uuid::from_u128(n));
             match repo
                 .session_start_tx(
-                    op,
-                    "digest",
+                    &gateway_scope(op, "digest"),
                     handle,
-                    channel,
                     None,
                     None,
                     vec![],
@@ -1318,8 +1353,7 @@ mod tests {
         let handle_b = SessionHandle::new(uuid::Uuid::from_u128(200));
         match repo
             .session_end_tx(
-                "op-end-b",
-                "digest-end",
+                &gateway_scope("op-end-b", "digest-end"),
                 handle_b,
                 TaskOutcome::Success,
                 None,
@@ -1383,19 +1417,17 @@ mod tests {
     /// op receipts never cross a generation.
     #[test]
     fn restore_restores_backup_sessions_and_fences_op_receipts() {
-        use ltmrs_domain::id::{ChannelId, SessionHandle};
+        use ltmrs_domain::id::SessionHandle;
         use ltmrs_domain::session::SessionOp;
         let dir = tempfile::tempdir().unwrap();
         let repo = gateway_repo(&dir);
-        let channel = ChannelId::new(uuid::Uuid::from_u128(9));
+        issue_session_channel(&repo);
         // Live session A via session op X.
         let handle_a = SessionHandle::new(uuid::Uuid::from_u128(100));
         match repo
             .session_start_tx(
-                "op-X",
-                "digest-X",
+                &gateway_scope("op-X", "digest-X"),
                 handle_a,
-                channel,
                 None,
                 None,
                 vec![],
@@ -1411,8 +1443,7 @@ mod tests {
         // Guide op Y: creates + practices guide "git" (usage 1).
         let guide = repo
             .practice_guide_idempotent(
-                "op-Y",
-                "digest-Y",
+                &gateway_scope("op-Y", "digest-Y"),
                 "git",
                 "dev-tool",
                 None,
@@ -1428,10 +1459,8 @@ mod tests {
         let handle_b = SessionHandle::new(uuid::Uuid::from_u128(200));
         match repo
             .session_start_tx(
-                "op-B",
-                "digest-B",
+                &gateway_scope("op-B", "digest-B"),
                 handle_b,
-                channel,
                 None,
                 None,
                 vec![],
@@ -1479,14 +1508,14 @@ mod tests {
             "backup session B must be restored, got: {handles:?}"
         );
         // Session op X fenced: retrying it must execute fresh, never replay
-        // the pre-restore outcome for A.
+        // the pre-restore outcome for A. Fresh namespace post-restore
+        // (the drain took the old one): epoch restarts at 1.
+        issue_session_channel(&repo);
         let handle_c = SessionHandle::new(uuid::Uuid::from_u128(300));
         match repo
             .session_start_tx(
-                "op-X",
-                "digest-X",
+                &gateway_scope_post("op-X", "digest-X"),
                 handle_c,
-                channel,
                 None,
                 None,
                 vec![],
@@ -1505,8 +1534,7 @@ mod tests {
         // return a detached pre-restore recording.
         let guide = repo
             .practice_guide_idempotent(
-                "op-Y",
-                "digest-Y",
+                &gateway_scope_post("op-Y", "digest-Y"),
                 "git",
                 "dev-tool",
                 None,

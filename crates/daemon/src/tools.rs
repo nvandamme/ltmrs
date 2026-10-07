@@ -25,7 +25,7 @@ use ltmrs_compat::lemma::tool_args::{
 };
 use ltmrs_domain::command::{
     CommandContext, DomainCommand, DomainError, DomainErrorCode, DomainResult, ForgetMode,
-    MemoryPatch,
+    MemoryPatch, OperationScope,
 };
 use ltmrs_domain::guide::Guide;
 use ltmrs_domain::id::{EntityId, EntityRevision, OperationId, SessionHandle};
@@ -1234,7 +1234,9 @@ fn exec_memory_add(
         disp.registry()
             .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id));
     } else {
+        let track_scope = envelope.operation_scope(envelope.request_digest()?);
         let _ = disp.repo().track_session_link(
+            &track_scope,
             session_handle,
             ltmrs_service::repository::SessionLinkField::MemoryCreated,
             std::slice::from_ref(&legacy_id),
@@ -3192,6 +3194,8 @@ fn exec_guide_practice(
         return Ok(err_result("'outcome' must be one of: success, failure."));
     }
     let now = disp.clock().now_millis();
+    let digest = envelope.request_digest()?;
+    let scope = envelope.operation_scope(digest.clone());
     // Track into the active session (canonical store, best-effort) before
     // the guide mutation so validated_by links the session's pre-loaded
     // reads. Virtual sessions have no canonical record: their link is a
@@ -3200,6 +3204,7 @@ fn exec_guide_practice(
         match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
             Some(handle) => {
                 let _ = disp.repo().track_session_link(
+                    &scope,
                     handle,
                     ltmrs_service::repository::SessionLinkField::GuideUsed,
                     std::slice::from_ref(&args.guide.to_lowercase().trim().to_string()),
@@ -3220,11 +3225,8 @@ fn exec_guide_practice(
     };
     // Idempotent guide mutation: same operation ID + digest replays the
     // recorded snapshot; a digest mismatch rejects (re-review R5).
-    let op_id = envelope.operation_id.as_uuid().to_string();
-    let digest = envelope.request_digest()?;
     let updated = match repo.practice_guide_idempotent(
-        &op_id,
-        &digest,
+        &scope,
         &args.guide,
         &args.category,
         args.description.as_deref(),
@@ -3342,10 +3344,9 @@ fn map_guide_tool_error(e: DomainError) -> DomainResult<DomainPayload> {
 /// into a spurious "not found").
 fn replay_recorded_guide_op(
     repo: &ltmrs_service::repository::CanonicalRepository,
-    operation_id: &str,
-    digest: &str,
+    scope: &OperationScope,
 ) -> DomainResult<Option<DomainPayload>> {
-    match repo.read_recorded_guide_op(operation_id, digest) {
+    match repo.read_recorded_guide_op(scope) {
         Ok(None) => Ok(None),
         Ok(Some(recorded)) => Ok(Some(guide_op_response(&recorded)?)),
         Err(e)
@@ -3374,9 +3375,9 @@ fn exec_guide_create(
     }
     // Receipted operation (P1-2): same operation ID + digest replays the
     // recorded response instead of re-executing.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+    let scope = envelope.operation_scope(digest.clone());
+    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
         return Ok(replayed);
     }
     let now = disp.clock().now_millis();
@@ -3389,8 +3390,7 @@ fn exec_guide_create(
         // Revision-checked: a concurrent mutation since the read rejects
         // instead of being overwritten (re-review P1-2).
         let recorded = match repo.guide_mutation_idempotent(
-            &op_id,
-            &digest,
+            &scope,
             GuideMutation::CreateUpdate {
                 expected: Some(expected),
                 guide: updated,
@@ -3414,8 +3414,7 @@ fn exec_guide_create(
         updated.description = args.description.clone();
         updated.updated_at = Instant::new(now);
         let recorded = match repo.guide_mutation_idempotent(
-            &op_id,
-            &digest,
+            &scope,
             GuideMutation::CreateUpdate {
                 expected: Some(expected),
                 guide: updated,
@@ -3437,14 +3436,11 @@ fn exec_guide_create(
     );
     // Create-if-absent: a concurrent creation wins instead of being
     // overwritten (re-review P1-2).
-    let recorded = match repo.guide_mutation_idempotent(
-        &op_id,
-        &digest,
-        GuideMutation::Create { guide: new_guide },
-    ) {
-        Ok(recorded) => recorded,
-        Err(e) => return map_guide_tool_error(e),
-    };
+    let recorded =
+        match repo.guide_mutation_idempotent(&scope, GuideMutation::Create { guide: new_guide }) {
+            Ok(recorded) => recorded,
+            Err(e) => return map_guide_tool_error(e),
+        };
     guide_op_response(&recorded)
 }
 
@@ -3479,10 +3475,9 @@ fn exec_guide_distill(
     // inside the transaction and commit together — no stale clone can
     // overwrite a concurrent content update. Replay returns the recorded
     // guide; digest mismatch rejects.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    let updated = match repo.distill_memory_link(&op_id, &digest, eid, &args.guide, &category, now)
-    {
+    let scope = envelope.operation_scope(digest.clone());
+    let updated = match repo.distill_memory_link(&scope, eid, &args.guide, &category, now) {
         Ok(g) => g,
         Err(e) if e.code == ltmrs_domain::command::DomainErrorCode::NotFound => {
             return Ok(err_result(&format!(
@@ -3526,9 +3521,9 @@ fn exec_guide_update(
     }
     // Receipted operation (P1-2): replay before planning, so a retry never
     // mistakes a concurrently changed store for a failure.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+    let scope = envelope.operation_scope(digest.clone());
+    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
         return Ok(replayed);
     }
     let now = disp.clock().now_millis();
@@ -3597,7 +3592,7 @@ fn exec_guide_update(
             old_name: None,
         }
     };
-    let recorded = match repo.guide_mutation_idempotent(&op_id, &digest, mutation) {
+    let recorded = match repo.guide_mutation_idempotent(&scope, mutation) {
         Ok(recorded) => recorded,
         Err(e) => return map_guide_tool_error(e),
     };
@@ -3616,9 +3611,9 @@ fn exec_guide_forget(
         return Ok(err_result("'guide' parameter is required"));
     }
     // Receipted operation (P1-2): replay before planning.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+    let scope = envelope.operation_scope(digest.clone());
+    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
         return Ok(replayed);
     }
     let existing = repo.get_guide(&args.guide)?;
@@ -3630,8 +3625,7 @@ fn exec_guide_forget(
     // guide and no surviving guide with half-removed references. Recorded
     // atomically with the operation receipt (P1-2): retries replay.
     let recorded = match repo.guide_mutation_idempotent(
-        &op_id,
-        &digest,
+        &scope,
         GuideMutation::Forget {
             name: args.guide.clone(),
         },
@@ -3717,9 +3711,9 @@ fn exec_guide_merge(
     }
     // Receipted operation (P1-2): replay before planning, so a retry never
     // mistakes consumed sources for a failure.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    if let Some(replayed) = replay_recorded_guide_op(repo, &op_id, &digest)? {
+    let scope = envelope.operation_scope(digest.clone());
+    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
         return Ok(replayed);
     }
     let now = disp.clock().now_millis();
@@ -3809,8 +3803,7 @@ fn exec_guide_merge(
         .map(|g| (g.name.clone(), g.entity_revision))
         .collect();
     let recorded = match repo.guide_mutation_idempotent(
-        &op_id,
-        &digest,
+        &scope,
         GuideMutation::Merge {
             sources: args.guides.clone(),
             expected,
@@ -3843,9 +3836,9 @@ fn dedup<T: PartialEq>(items: Vec<T>) -> Vec<T> {
 /// and then freezes.
 fn replay_frozen_session_response(
     repo: &ltmrs_service::repository::CanonicalRepository,
-    operation_id: &str,
+    scope: &OperationScope,
 ) -> DomainResult<Option<DomainPayload>> {
-    match repo.session_receipt(operation_id)? {
+    match repo.session_receipt(scope)? {
         Some(rec) => Ok(rec.response.map(|r| DomainPayload::ToolResult {
             text: r.text,
             structured: r.structured,
@@ -3860,8 +3853,7 @@ fn replay_frozen_session_response(
 /// mismatch rejects as key reuse; any other failure is a wire error.
 fn freeze_session_response(
     repo: &ltmrs_service::repository::CanonicalRepository,
-    operation_id: &str,
-    digest: &str,
+    scope: &OperationScope,
     payload: &DomainPayload,
 ) -> DomainResult<()> {
     use ltmrs_domain::session::FrozenToolResponse;
@@ -3882,7 +3874,7 @@ fn freeze_session_response(
             ));
         }
     };
-    repo.store_session_response(operation_id, digest, &response)
+    repo.store_session_response(scope, &response)
 }
 
 fn exec_session_start(
@@ -3904,15 +3896,13 @@ fn exec_session_start(
     // create and receipt commit together in the store. A replay resolves
     // to the recorded handle instead of abandoning and recreating; a
     // digest mismatch rejects. The registry only (re)binds the channel.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
+    let scope = envelope.operation_scope(digest.clone());
     let abandon = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let new_handle = ltmrs_domain::id::SessionHandle::new(uuid::Uuid::now_v7());
     let handle = match repo.session_start_tx(
-        &op_id,
-        &digest,
+        &scope,
         new_handle,
-        envelope.channel_id,
         project.clone(),
         Some(args.task_type.clone()),
         args.technologies.clone(),
@@ -3926,7 +3916,7 @@ fn exec_session_start(
             // instead of being recomputed from live state. Legacy receipts
             // without one fall through to the normal path, which recomputes
             // and then freezes.
-            if let Some(frozen) = replay_frozen_session_response(repo, &op_id)? {
+            if let Some(frozen) = replay_frozen_session_response(repo, &scope)? {
                 return Ok(frozen);
             }
             h
@@ -3973,6 +3963,7 @@ fn exec_session_start(
     // Track read memories into the session (canonical store, deduped).
     let read_ids: Vec<String> = relevant.iter().map(|m| legacy_id_of(repo, m)).collect();
     repo.track_session_link(
+        &scope,
         handle,
         ltmrs_service::repository::SessionLinkField::MemoryRead,
         &read_ids,
@@ -4011,7 +4002,7 @@ fn exec_session_start(
     let (continuity, boost_targets) =
         build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
     if !boost_targets.is_empty() {
-        match repo.claim_continuity_boost(&op_id, &digest, &boost_targets, 0.015, now) {
+        match repo.claim_continuity_boost(&scope, &boost_targets, 0.015, now) {
             Ok(_) => {}
             Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
                 return key_reuse_result();
@@ -4047,7 +4038,7 @@ fn exec_session_start(
     // Freeze the response into the receipt (P2-1): a lost-response retry
     // returns this verbatim instead of recomputing from live state.
     let payload = ok_result(response, data);
-    match freeze_session_response(repo, &op_id, &digest, &payload) {
+    match freeze_session_response(repo, &scope, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -4197,8 +4188,8 @@ fn exec_session_attempt(
     let critique_redacted = args.critique.as_deref().map(privacy::redact);
 
     // Operation identity for the canonical call below.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
+    let scope = envelope.operation_scope(digest.clone());
 
     // Resolve the channel's active session (canonical liveness).
     let session = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
@@ -4223,8 +4214,7 @@ fn exec_session_attempt(
     // A frozen response (P2-1) returns verbatim; otherwise the response is
     // rebuilt and then frozen.
     let seq = match disp.repo().session_attempt_tx(
-        &op_id,
-        &digest,
+        &scope,
         handle,
         approach_redacted.clone(),
         outcome,
@@ -4235,7 +4225,7 @@ fn exec_session_attempt(
     ) {
         Ok(SessionOp::Applied((_, seq))) => seq,
         Ok(SessionOp::Replayed((_, seq))) => {
-            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &op_id)? {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &scope)? {
                 return Ok(frozen);
             }
             seq
@@ -4264,7 +4254,7 @@ fn exec_session_attempt(
         "attempt_id": format!("{}#{}", handle.as_uuid(), seq),
     });
     let payload = ok_result(response, data);
-    match freeze_session_response(disp.repo(), &op_id, &digest, &payload) {
+    match freeze_session_response(disp.repo(), &scope, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -4296,8 +4286,8 @@ fn exec_session_end(
     let now = disp.clock().now_millis();
 
     // Operation identity for the canonical call below.
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
+    let scope = envelope.operation_scope(digest.clone());
 
     // Resolve the channel's session binding (live or terminal — replays
     // after a terminal session still resolve to the recorded outcome).
@@ -4316,8 +4306,7 @@ fn exec_session_end(
     // A frozen response (P2-1) returns verbatim with no further effects;
     // otherwise the response is rebuilt from canonical state and frozen.
     let improvement_lines = match disp.repo().session_end_tx(
-        &op_id,
-        &digest,
+        &scope,
         handle,
         outcome,
         args.final_approach.clone(),
@@ -4326,7 +4315,7 @@ fn exec_session_end(
     ) {
         Ok(SessionOp::Applied((_, lines, true))) => lines,
         Ok(SessionOp::Replayed((_, lines, _))) => {
-            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &op_id)? {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &scope)? {
                 return Ok(frozen);
             }
             lines
@@ -4412,7 +4401,7 @@ fn exec_session_end(
     // The response freezes into the receipt (P2-1) so replays return it
     // verbatim instead of recomputing from live guide state.
     let payload = ok_result(response, data);
-    match freeze_session_response(disp.repo(), &op_id, &digest, &payload) {
+    match freeze_session_response(disp.repo(), &scope, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -4528,9 +4517,9 @@ fn exec_suggestion_respond(
     // commit atomically with the receipt, so a retry replays instead of
     // adjusting twice.
     let now = disp.clock().now_millis();
-    let op_id = envelope.operation_id.as_uuid().to_string();
     let digest = envelope.request_digest()?;
-    match repo.respond_suggestion_idempotent(&op_id, &digest, args.id, status, now) {
+    let scope = envelope.operation_scope(digest.clone());
+    match repo.respond_suggestion_idempotent(&scope, args.id, status, now) {
         Ok(_) => {}
         Err(e)
             if e.code == DomainErrorCode::NotFound
@@ -8009,6 +7998,7 @@ mod tests {
             )
             .unwrap(),
         );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let disp = Dispatcher::new(
             std::sync::Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
@@ -8151,6 +8141,7 @@ mod tests {
     #[test]
     fn backup_preview_ignores_dead_channels() {
         let (disp, _dir) = test_dispatcher();
+        disp.repo().issue_namespace(fe(2), ch(2), 1000).unwrap();
         add_fragment(&disp, 1, "## Preview Me\n\n### Context\nPreview fixture.");
         for (n, op) in [(1u64, 10u64), (2, 11)] {
             let start = ToolArgs::SessionStart(SessionStartArgs {
@@ -9504,6 +9495,115 @@ mod tests {
             mems[0].confidence
         );
         assert_eq!(mems[0].access_count, 1);
+    }
+
+    /// RQ-06 dispatch gate: a mutating tool under an unknown/expired
+    /// namespace is refused before reaching any repository primitive,
+    /// while read-only tools on the same dead epoch still serve.
+    #[test]
+    fn dispatch_gate_refuses_mutating_tool_on_dead_namespace() {
+        let (disp, _dir) = test_dispatcher();
+        // Mutating tool, unknown epoch: refused at the gate (raw error,
+        // never reaching the primitive — run() would unwrap-panic).
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "gated".to_string(),
+            category: "test".to_string(),
+            description: "gated fixture".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        let mut env = tool_call(50, create.clone());
+        env.retry_epoch = 99;
+        let err = execute_tool(&disp, &env, &create).unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::StaleReplay
+        );
+        assert!(disp.repo().get_guide("gated").unwrap().is_none());
+        // Read-only tool, same dead epoch: unaffected.
+        let get = ToolArgs::GuideGet(GuideGetArgs {
+            task: Some("gated".to_string()),
+            ..Default::default()
+        });
+        let mut getenv = tool_call(51, get.clone());
+        getenv.retry_epoch = 99;
+        let result = run(&disp, &getenv, &get);
+        assert!(
+            !result_is_error(&result),
+            "reads stay available without a live namespace"
+        );
+    }
+
+    /// T-CONC-02: 32 channels × independent session starts, barrier
+    /// released, each with its own namespace — every start applies on
+    /// first attempt with no caller-level retry (per-channel watermarks,
+    /// no shared contention key).
+    #[test]
+    fn thirty_two_channels_start_without_contention() {
+        use std::sync::{Arc, Barrier};
+        let (disp, _dir) = test_dispatcher();
+        let disp = Arc::new(disp);
+        for n in 2..=32u64 {
+            disp.repo().issue_namespace(fe(1), ch(n), 1000).unwrap();
+        }
+        let start = Arc::new(Barrier::new(33));
+        let mut handles = Vec::new();
+        for n in 1..=32u64 {
+            let disp = Arc::clone(&disp);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let scope = ltmrs_domain::command::OperationScope {
+                    store_generation: StoreGeneration::FIRST,
+                    frontend_id: fe(1),
+                    channel_id: ch(n),
+                    retry_epoch: n,
+                    operation_id: OperationId::new(Uuid::from_u128(n as u128)),
+                    request_digest: format!("conc-{n}"),
+                };
+                let handle =
+                    ltmrs_domain::id::SessionHandle::new(Uuid::from_u128(1000 + n as u128));
+                disp.repo()
+                    .session_start_tx(&scope, handle, None, None, vec![], None, None, 1000)
+                    .unwrap()
+            }));
+        }
+        start.wait();
+        for (i, h) in handles.into_iter().enumerate() {
+            match h.join().unwrap() {
+                ltmrs_domain::session::SessionOp::Applied(_) => {}
+                other => panic!("channel {} must apply first-try, got {other:?}", i + 1),
+            }
+        }
+        assert_eq!(disp.repo().all_sessions().unwrap().len(), 32);
+    }
+
+    /// Exec-level T2: channel B resubmitting channel A's session-start
+    /// operation ID + body (its own namespace) starts B's OWN session —
+    /// never replays A's receipt, never binds B to A's session.
+    #[test]
+    fn cross_channel_op_reuse_starts_own_session() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let env_a = tool_call(70, start.clone());
+        let ra = run(&disp, &env_a, &start);
+        assert!(!result_is_error(&ra));
+        let ha = disp.resolve_session(fe(1), ch(1)).expect("A bound");
+        // Channel B under its own namespace, same op id + body.
+        disp.repo().issue_namespace(fe(1), ch(2), 1000).unwrap();
+        let mut env_b = tool_call(70, start.clone());
+        env_b.channel_id = ch(2);
+        env_b.retry_epoch = 2;
+        let rb = run(&disp, &env_b, &start);
+        assert!(!result_is_error(&rb));
+        let hb = disp.resolve_session(fe(1), ch(2)).expect("B bound");
+        assert_ne!(ha, hb, "B must own a fresh session, not A's");
+        assert_eq!(disp.resolve_session(fe(1), ch(1)), Some(ha));
+        assert!(disp.repo().get_session(ha).unwrap().is_some());
     }
 
     #[test]

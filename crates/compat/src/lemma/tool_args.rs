@@ -481,6 +481,47 @@ impl ToolArgs {
             Self::BackupRestore(_) => ToolName::BackupRestore,
         }
     }
+
+    /// Whether this tool can mutate canonical store state (data rows,
+    /// receipts, watermarks — including access-count side effects of
+    /// read-shaped tools routed through the command gateway). The
+    /// dispatcher requires a live retry namespace for mutating tools, so
+    /// an expired namespace cannot reach a direct mutation even if one
+    /// repository primitive forgets its own check. Exhaustive: adding a
+    /// variant breaks compile until it is classified here.
+    pub fn mutates_store(&self) -> bool {
+        match self {
+            Self::MemoryRead(_)
+            | Self::MemoryStats(_)
+            | Self::MemoryAudit(_)
+            | Self::MemoryLibrary(_)
+            | Self::SemanticSearch(_)
+            | Self::GuideGet(_)
+            | Self::SessionStats(_)
+            | Self::ConflictScan(_)
+            | Self::ProactiveAnalysis(_)
+            | Self::ProjectAnalytics(_)
+            | Self::BackupCreate(_)
+            | Self::BackupPreview(_) => false,
+            Self::MemoryAdd(_)
+            | Self::MemoryUpdate(_)
+            | Self::MemoryFeedback(_)
+            | Self::MemoryForget(_)
+            | Self::MemoryMerge(_)
+            | Self::MemoryRelate(_)
+            | Self::GuidePractice(_)
+            | Self::GuideCreate(_)
+            | Self::GuideDistill(_)
+            | Self::GuideUpdate(_)
+            | Self::GuideForget(_)
+            | Self::GuideMerge(_)
+            | Self::SessionStart(_)
+            | Self::SessionAttempt(_)
+            | Self::SessionEnd(_)
+            | Self::SuggestionRespond(_)
+            | Self::BackupRestore(_) => true,
+        }
+    }
 }
 
 /// Canonical project key: trimmed + lowercased, path collapsed to basename.
@@ -515,5 +556,52 @@ mod tests {
         assert_eq!(normalize_project("global"), None);
         assert_eq!(normalize_project("  "), None);
         assert_eq!(normalize_project("Home"), Some("home".to_string()));
+    }
+
+    #[test]
+    fn mutates_store_separates_reads_from_mutations() {
+        // Reads (and file-writing backup snapshots, which touch no store
+        // rows) bypass the dispatch namespace gate.
+        assert!(!ToolArgs::MemoryRead(Default::default()).mutates_store());
+        assert!(
+            !ToolArgs::SemanticSearch(SemanticSearchArgs {
+                query: String::new(),
+                project: None,
+                top_k: None,
+                offset: None,
+                hybrid: None,
+                explain: false,
+                response_format: None,
+            })
+            .mutates_store()
+        );
+        assert!(
+            !ToolArgs::GuideGet(GuideGetArgs {
+                category: None,
+                guide: None,
+                task: None,
+                response_format: None,
+            })
+            .mutates_store()
+        );
+        // Every direct-mutation family gates on a live namespace.
+        assert!(
+            ToolArgs::GuideCreate(GuideCreateArgs {
+                guide: String::new(),
+                category: String::new(),
+                description: String::new(),
+                contexts: vec![],
+                learnings: vec![],
+            })
+            .mutates_store()
+        );
+        assert!(
+            ToolArgs::SessionStart(SessionStartArgs {
+                task_type: String::new(),
+                technologies: vec![],
+                initial_approach: None,
+            })
+            .mutates_store()
+        );
     }
 }

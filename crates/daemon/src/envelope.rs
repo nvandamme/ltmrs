@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ltmrs_compat::lemma::tool_args::ToolArgs;
 use ltmrs_domain::command::{
     CommandContext, DomainCommand, DomainError, DomainErrorCode, DomainResult, MemoryPatch,
-    ReceiptOutcome, Scope,
+    OperationScope, ReceiptOutcome, Scope,
 };
 use ltmrs_domain::id::{
     ChannelId, EntityId, EntityRevision, FrontendId, OperationId, SessionHandle, StoreGeneration,
@@ -288,6 +288,21 @@ impl IpcEnvelope {
         let bytes = serde_json::to_vec(&self.body)
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
         Ok(sha256_hex(&bytes))
+    }
+
+    /// Build the tool-operation scope for this envelope (RQ-06): every
+    /// direct guide/session/suggestion primitive takes this instead of a
+    /// bare operation ID, so namespace validation and receipt scoping
+    /// cannot be bypassed per call site.
+    pub fn operation_scope(&self, request_digest: String) -> OperationScope {
+        OperationScope {
+            store_generation: self.store_generation,
+            frontend_id: self.frontend_id,
+            channel_id: self.channel_id,
+            retry_epoch: self.retry_epoch,
+            operation_id: self.operation_id,
+            request_digest,
+        }
     }
 }
 

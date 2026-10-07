@@ -1722,14 +1722,28 @@ mod tests {
         // Start a session through the canonical store so there is durable
         // state, and bind the channel to it.
         let handle = ltmrs_domain::id::SessionHandle::new(uuid::Uuid::from_u128(77));
+        // Namespace under the daemon's real clock (frozen test stamps
+        // would be instantly expired against wall-clock validation).
+        let now = daemon.dispatcher().clock().now_millis();
+        let ns = daemon
+            .dispatcher()
+            .repo()
+            .issue_namespace(fe(1), ch(1), now)
+            .unwrap();
+        let scope = ltmrs_domain::command::OperationScope {
+            store_generation: ltmrs_domain::id::StoreGeneration::FIRST,
+            frontend_id: fe(1),
+            channel_id: ch(1),
+            retry_epoch: ns.retry_epoch,
+            operation_id: OperationId::new(uuid::Uuid::from_u128(1)),
+            request_digest: "digest-1".to_string(),
+        };
         match daemon
             .dispatcher()
             .repo()
             .session_start_tx(
-                "test-op-1",
-                "digest-1",
+                &scope,
                 handle,
-                ch(1),
                 Some("proj".into()),
                 None,
                 vec![],

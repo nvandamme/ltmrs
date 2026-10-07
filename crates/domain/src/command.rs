@@ -155,6 +155,38 @@ pub struct CommandContext {
     pub retry_epoch: u64,
 }
 
+/// The identity of one mutating tool operation (RQ-06): every direct
+/// guide/session/suggestion primitive takes this instead of a bare
+/// `(operation_id, digest)`, so namespace validation, receipt scoping
+/// and watermark sharding cannot be forgotten per call site. Derivable
+/// from an [`crate::id`] envelope plus its request digest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperationScope {
+    pub store_generation: StoreGeneration,
+    pub frontend_id: FrontendId,
+    pub channel_id: ChannelId,
+    pub retry_epoch: u64,
+    pub operation_id: OperationId,
+    pub request_digest: String,
+}
+
+impl OperationScope {
+    /// The receipt key for this operation, shaped exactly like canonical
+    /// command receipts: `generation:frontend:epoch:operation`. Two
+    /// channels (or generations) never share a key, so a cross-channel
+    /// retry executes in its own scope instead of replaying another
+    /// channel's receipt.
+    pub fn op_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.store_generation.as_u64(),
+            self.frontend_id.as_uuid(),
+            self.retry_epoch,
+            self.operation_id.as_uuid()
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandReceipt {
     pub operation_id: OperationId,

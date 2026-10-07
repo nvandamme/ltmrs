@@ -210,6 +210,24 @@ impl Dispatcher {
         // canonical liveness; never a daemon-global session).
         let session = self.resolve_session(envelope.frontend_id, envelope.channel_id);
 
+        // Retry-namespace gate (RQ-06): a mutating request executes only
+        // under a live namespace for its own channel. The direct
+        // guide/session/suggestion primitives validate again inside;
+        // this single assertion keeps an expired namespace from reaching
+        // any of them even if one primitive forgets its check.
+        // Read-only requests are unaffected.
+        match &envelope.body {
+            DomainRequest::ToolCall { tool } if tool.mutates_store() => {
+                let scope = envelope.operation_scope(envelope.request_digest()?);
+                self.repo.validate_scope(&scope)?;
+            }
+            DomainRequest::SessionAttempt { .. } | DomainRequest::SessionEnd { .. } => {
+                let scope = envelope.operation_scope(envelope.request_digest()?);
+                self.repo.validate_scope(&scope)?;
+            }
+            _ => {}
+        }
+
         match &envelope.body {
             DomainRequest::ToolCall { tool } => {
                 let result = crate::tools::execute_tool(self, envelope, tool)?;
@@ -250,8 +268,8 @@ impl Dispatcher {
                 rationale,
                 related_memory_id,
             } => {
-                let op_id = envelope.operation_id.as_uuid().to_string();
                 let digest = envelope.request_digest()?;
+                let scope = envelope.operation_scope(digest);
                 let session = session.ok_or_else(|| {
                     DomainError::new(DomainErrorCode::Validation, "no active session for channel")
                 })?;
@@ -260,8 +278,7 @@ impl Dispatcher {
                 // digest mismatch rejects, durability failures fail loudly
                 // via the barrier.
                 match self.repo.session_attempt_tx(
-                    &op_id,
-                    &digest,
+                    &scope,
                     session,
                     approach.clone(),
                     *outcome,
@@ -287,8 +304,8 @@ impl Dispatcher {
                 final_approach,
                 lessons,
             } => {
-                let op_id = envelope.operation_id.as_uuid().to_string();
                 let digest = envelope.request_digest()?;
+                let scope = envelope.operation_scope(digest);
                 // End only THIS channel's session, atomically with its
                 // guide effects and receipt (re-review P1-3). A replay
                 // resolves; a digest mismatch rejects. Ending an
@@ -319,8 +336,7 @@ impl Dispatcher {
                     }
                 };
                 match self.repo.session_end_tx(
-                    &op_id,
-                    &digest,
+                    &scope,
                     handle,
                     *outcome,
                     final_approach.clone(),
@@ -428,7 +444,7 @@ mod tests {
     use super::*;
     use crate::envelope::{DomainRequest, IpcEnvelope};
     use ltmrs_domain::clock::FrozenClock;
-    use ltmrs_domain::command::Scope;
+    use ltmrs_domain::command::{OperationScope, Scope};
     use ltmrs_domain::id::{ChannelId, FrontendId, OperationId, SessionHandle, StoreGeneration};
     use ltmrs_domain::session::{SessionOp, TaskOutcome};
     use ltmrs_service::repository::CanonicalRepository;
@@ -500,21 +516,20 @@ mod tests {
         op: u64,
     ) -> SessionHandle {
         let handle = SessionHandle::new(Uuid::from_u128(seed));
-        let op_id = format!("test-start-{op}");
+        // Each bound channel gets its own namespace (RQ-06 scoped):
+        // issuing per setup keeps the helper channel-agnostic.
+        let ns = disp.repo().issue_namespace(fe, ch, 1000).unwrap();
+        let scope = OperationScope {
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe,
+            channel_id: ch,
+            retry_epoch: ns.retry_epoch,
+            operation_id: OperationId::new(Uuid::from_u128(op as u128)),
+            request_digest: "digest".to_string(),
+        };
         match disp
             .repo()
-            .session_start_tx(
-                &op_id,
-                "digest",
-                handle,
-                ch,
-                None,
-                None,
-                vec![],
-                None,
-                None,
-                1000,
-            )
+            .session_start_tx(&scope, handle, None, None, vec![], None, None, 1000)
             .unwrap()
         {
             SessionOp::Applied(h) | SessionOp::Replayed(h) => {

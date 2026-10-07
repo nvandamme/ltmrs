@@ -1,5 +1,6 @@
 //! Session, attempt, and feedback event types.
 
+use crate::command::OperationScope;
 use crate::id::{ChannelId, EntityId, SessionHandle};
 use crate::memory::Instant;
 
@@ -197,6 +198,12 @@ pub struct SessionReceipt {
     /// and the response freeze cannot double-apply on continuation.
     #[serde(default)]
     pub continuity_boosted: bool,
+    /// The operation scope that recorded this receipt (RQ-06): a receipt
+    /// replays only for the generation/frontend/channel/epoch that wrote
+    /// it. Absent on pre-scope receipts (never read by scoped keys; swept
+    /// by GC).
+    #[serde(default)]
+    pub scope: Option<OperationScope>,
 }
 
 /// A frozen tool response (P2-1): the exact text + structured payload +
