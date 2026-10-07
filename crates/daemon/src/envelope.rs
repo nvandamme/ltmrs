@@ -151,6 +151,7 @@ impl DomainRequest {
             DomainRequest::Merge { source_ids, result } => Some(DomainCommand::Merge {
                 source_ids: source_ids.clone(),
                 result: result.clone(),
+                consolidate: false,
             }),
             DomainRequest::Forget { id, mode } => Some(DomainCommand::Forget {
                 id: *id,

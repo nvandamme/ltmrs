@@ -65,6 +65,27 @@ pub struct Relation {
 }
 
 impl Relation {
+    /// The consolidation edge for an atomic merge: result→source
+    /// Supersedes, id-bound to the merged pair (stable across retries;
+    /// unique per merge). Both endpoints must be live when it is
+    /// recorded — which is why merge writes it before archiving.
+    pub fn consolidation_edge(result: EntityId, source: EntityId, now: Instant) -> Self {
+        let id = EntityId::new(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("ltmrs:rel:merge:{}:{}", result.as_uuid(), source.as_uuid()).as_bytes(),
+        ));
+        Self {
+            id,
+            source: result,
+            target: source,
+            relation_type: RelationType::Supersedes,
+            note: Some("consolidated".to_string()),
+            created_at: now,
+        }
+    }
+}
+
+impl Relation {
     pub fn new(
         id: EntityId,
         source: EntityId,

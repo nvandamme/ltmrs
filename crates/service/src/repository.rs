@@ -5459,6 +5459,7 @@ mod tests {
             &DomainCommand::Merge {
                 source_ids: vec![eid(1), eid(2)],
                 result: memory(eid(3), "m3"),
+                consolidate: false,
             },
         )
         .unwrap();
@@ -5472,6 +5473,69 @@ mod tests {
         // And the open build is dirty.
         assert!(repo.generation_record(next).unwrap().unwrap().build_dirty);
         assert!(repo.activate_generation(next).is_err());
+    }
+
+    /// P1 (consolidate graph): merge with consolidate=true creates
+    /// result→source Supersedes edges in the SAME transaction that
+    /// archives the sources — never as an ignored post-commit tail (the
+    /// sources are unrecallable by then, so a later Relate rejects).
+    #[test]
+    fn merge_consolidate_creates_supersession_edges_atomically() {
+        use ltmrs_domain::relation::RelationType;
+        let (repo, _dir) = repo_with_ns();
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("m{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), &format!("m{n}")),
+                    session: None,
+                },
+            )
+            .unwrap();
+        }
+        repo.apply(
+            &ctx(3, "merge"),
+            &DomainCommand::Merge {
+                source_ids: vec![eid(1), eid(2)],
+                result: memory(eid(3), "m3"),
+                consolidate: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            repo.get_memories(&[eid(3)])
+                .unwrap()
+                .remove(0)
+                .lifecycle
+                .is_recallable(),
+            "result must stay live"
+        );
+        for s in [eid(1), eid(2)] {
+            assert!(
+                !repo
+                    .get_memories(&[s])
+                    .unwrap()
+                    .remove(0)
+                    .lifecycle
+                    .is_recallable(),
+                "sources must archive"
+            );
+        }
+        let edges: Vec<_> = repo
+            .neighbors(eid(3))
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.relation_type == RelationType::Supersedes)
+            .collect();
+        assert_eq!(
+            edges.len(),
+            2,
+            "exactly two supersession edges, got {edges:?}"
+        );
+        for e in &edges {
+            assert_eq!(e.source, eid(3));
+            assert!(e.target == eid(1) || e.target == eid(2));
+        }
     }
 
     /// Project-only updates change indexed rows (project column), so they
@@ -6754,6 +6818,7 @@ mod tests {
                 &DomainCommand::Merge {
                     source_ids: vec![eid(1)],
                     result: dup,
+                    consolidate: false,
                 },
             )
             .unwrap_err();
@@ -6769,6 +6834,7 @@ mod tests {
             &DomainCommand::Merge {
                 source_ids: vec![eid(1)],
                 result: fresh,
+                consolidate: false,
             },
         )
         .unwrap();

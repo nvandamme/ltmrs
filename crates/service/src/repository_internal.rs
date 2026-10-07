@@ -276,7 +276,11 @@ pub(crate) fn apply_command(
             target,
             relation_type,
         } => apply_unrelate(state, *source, *target, *relation_type),
-        DomainCommand::Merge { source_ids, result } => apply_merge(state, source_ids, result),
+        DomainCommand::Merge {
+            source_ids,
+            result,
+            consolidate,
+        } => apply_merge(state, source_ids, result, *consolidate),
         DomainCommand::Forget { id, mode } => apply_forget(state, *id, *mode),
         DomainCommand::Access {
             memory_ids,
@@ -609,6 +613,7 @@ fn apply_merge(
     state: &mut CommandState<'_>,
     source_ids: &[EntityId],
     result: &Memory,
+    consolidate: bool,
 ) -> DomainResult<ReceiptOutcome> {
     for source_id in source_ids {
         if state.get_memory(*source_id)?.is_none() {
@@ -635,14 +640,6 @@ fn apply_merge(
 
     let now = Instant::new(0);
     let mut affected = Vec::new();
-    for source_id in source_ids {
-        if let Some(mut source) = state.get_memory(*source_id)? {
-            source.lifecycle = MemoryLifecycle::Archived { at: now };
-            source.advance_eligibility();
-            state.put_memory(&source)?;
-            affected.push(*source_id);
-        }
-    }
 
     let mut result = result.clone();
     result.entity_revision = EntityRevision::new(result.entity_revision.as_u64() + 1);
@@ -651,6 +648,31 @@ fn apply_merge(
         state.put_alias(alias, result.id)?;
     }
     affected.push(result.id);
+
+    // Consolidated supersession belongs to this transaction, ordered
+    // before archival: the result is live and the sources are not yet
+    // archived, so edge validation sees live endpoints on both sides.
+    // Creating them afterwards (as a post-commit tail) would reject on
+    // the archived sources.
+    if consolidate {
+        for source_id in source_ids {
+            let edge = ltmrs_domain::relation::Relation::consolidation_edge(
+                result.id,
+                *source_id,
+                Instant::new(state.now_millis),
+            );
+            apply_relate(state, &edge)?;
+        }
+    }
+
+    for source_id in source_ids {
+        if let Some(mut source) = state.get_memory(*source_id)? {
+            source.lifecycle = MemoryLifecycle::Archived { at: now };
+            source.advance_eligibility();
+            state.put_memory(&source)?;
+            affected.push(*source_id);
+        }
+    }
 
     // Merge write set, pending-work half (design §5.3 Merge row also lists
     // required edges/references, which remain unimplemented here and in the

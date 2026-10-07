@@ -5,7 +5,20 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P2/P3 dependency inventory fails loudly on tree failure
+## 2026-10-07 — P1 merge supersession edges are atomic
+
+### P1 merge supersession edges are atomic
+- `DomainCommand::Merge` gains `consolidate: bool`; when true the merge
+  transaction creates result→source Supersedes edges (`Relation::
+  consolidation_edge`, id-bound to the merged pair) while both endpoints
+  are live — before archival. The ignored post-commit Relate tail in
+  `exec_memory_merge` (which always failed on archived endpoints) is
+  removed. Domain interpreter mirrors the behavior for parity.
+- RED-first: `merge_consolidate_creates_supersession_edges_atomically`
+  (result live, sources archived, exactly two edges); probe-verified to
+  fail with zero edges when edge creation is disabled.
+
+## 5add20b (2026-10-07) — P2/P3 dependency inventory fails loudly on tree failure
 
 ### P2/P3 dependency inventory fails loudly on tree failure
 - `cargo tree` output is captured before filtering with `|| exit 1` on

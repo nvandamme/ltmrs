@@ -1626,29 +1626,17 @@ fn exec_memory_merge(
         unknown_fields: std::collections::BTreeMap::new(),
     };
 
-    let source_ids_cloned = source_ids.clone();
-    let cmd = DomainCommand::Merge { source_ids, result };
+    let cmd = DomainCommand::Merge {
+        source_ids,
+        result,
+        consolidate: args.consolidate,
+    };
     let ctx = sub_command_ctx(envelope, 0)?;
     disp.repo().apply(&ctx, &cmd)?;
 
-    // For the consolidate path, record explicit supersession edges from the
-    // merged fragment to each source (upstream marks sources superseded).
-    if args.consolidate {
-        let sources = repo.get_memories(&source_ids_cloned)?;
-        for (i, src) in sources.iter().enumerate() {
-            let rel = new_relation(
-                envelope,
-                eid,
-                src.id,
-                RelationType::Supersedes,
-                Some("consolidated".to_string()),
-            );
-            let rel_ctx = sub_command_ctx(envelope, 1 + i as u32)?;
-            let _ = disp
-                .repo()
-                .apply(&rel_ctx, &DomainCommand::Relate { relation: rel });
-        }
-    }
+    // Consolidation edges record inside the merge transaction above
+    // (sources archive there): no post-commit relation tail, which would
+    // reject on the archived endpoints and silently drop the edges.
 
     let scope_info = project
         .as_ref()

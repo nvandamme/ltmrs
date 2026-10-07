@@ -108,7 +108,11 @@ impl ReferenceInterpreter {
                 target,
                 relation_type,
             } => self.apply_unrelate(*source, *target, *relation_type)?,
-            DomainCommand::Merge { source_ids, result } => self.apply_merge(source_ids, result)?,
+            DomainCommand::Merge {
+                source_ids,
+                result,
+                consolidate,
+            } => self.apply_merge(source_ids, result, *consolidate)?,
             DomainCommand::Forget { id, mode } => self.apply_forget(*id, *mode)?,
             DomainCommand::EndSession {
                 session,
@@ -347,6 +351,7 @@ impl ReferenceInterpreter {
         &mut self,
         source_ids: &[EntityId],
         result: &Memory,
+        consolidate: bool,
     ) -> DomainResult<ReceiptOutcome> {
         for source_id in source_ids {
             if !self.memories.contains_key(source_id) {
@@ -374,6 +379,28 @@ impl ReferenceInterpreter {
         }
 
         let mut affected = Vec::new();
+
+        let mut result = result.clone();
+        result.entity_revision = self.next_revision();
+        if let Some(alias) = &result.external_alias {
+            self.aliases.insert(alias.clone(), result.id);
+        }
+        self.memories.insert(result.id, result.clone());
+        affected.push(result.id);
+
+        // Parity with the canonical gateway: consolidated supersession
+        // edges record while both endpoints are live (before archival).
+        if consolidate {
+            for source_id in source_ids {
+                let edge = Relation::consolidation_edge(
+                    result.id,
+                    *source_id,
+                    Instant::new(self.clock.now_millis()),
+                );
+                self.apply_relate(&edge)?;
+            }
+        }
+
         for source_id in source_ids {
             if let Some(source) = self.memories.get_mut(source_id) {
                 source.lifecycle = MemoryLifecycle::Archived {
@@ -383,14 +410,6 @@ impl ReferenceInterpreter {
                 affected.push(*source_id);
             }
         }
-
-        let mut result = result.clone();
-        result.entity_revision = self.next_revision();
-        if let Some(alias) = &result.external_alias {
-            self.aliases.insert(alias.clone(), result.id);
-        }
-        self.memories.insert(result.id, result.clone());
-        affected.push(result.id);
 
         Ok(ReceiptOutcome::Success { affected })
     }
@@ -893,6 +912,7 @@ mod tests {
         let cmd = DomainCommand::Merge {
             source_ids: vec![m1.id, m2.id],
             result: m3.clone(),
+            consolidate: false,
         };
         let receipt = interp.apply(&test_ctx(3), &cmd).unwrap();
         let affected = match receipt.outcome {
@@ -1425,6 +1445,7 @@ mod tests {
                 &DomainCommand::Merge {
                     source_ids: vec![eid(100)],
                     result: claimed,
+                    consolidate: false,
                 },
             )
             .unwrap_err();
@@ -1436,6 +1457,7 @@ mod tests {
             &DomainCommand::Merge {
                 source_ids: vec![eid(100)],
                 result: fresh,
+                consolidate: false,
             },
         )
         .unwrap();

@@ -61,6 +61,11 @@ pub enum DomainCommand {
     Merge {
         source_ids: Vec<EntityId>,
         result: Memory,
+        /// When true, the merge records result→source Supersedes edges in
+        /// the same transaction (consolidated supersession): the sources
+        /// archive in that transaction, so the edges cannot be created
+        /// afterwards (archived endpoints fail edge validation).
+        consolidate: bool,
     },
     Forget {
         id: EntityId,
