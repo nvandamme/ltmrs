@@ -978,7 +978,13 @@ mod tests {
             ltmrs_service::repository::CanonicalRepository::open_with_clock(repo_path, clock)
                 .unwrap();
         let fe = FrontendId::new(Uuid::from_u128(1));
-        let ns = repo.issue_namespace(fe, 1000).unwrap();
+        let ns = repo
+            .issue_namespace(
+                fe,
+                ltmrs_domain::id::ChannelId::new(Uuid::from_u128(2)),
+                1000,
+            )
+            .unwrap();
         assert_eq!(ns.retry_epoch, 1);
 
         let uri = lance_dir.path().to_str().unwrap().to_string();
@@ -2590,7 +2596,12 @@ mod tests {
         );
         {
             let fe = FrontendId::new(Uuid::from_u128(1));
-            repo.issue_namespace(fe, 1000).unwrap();
+            repo.issue_namespace(
+                fe,
+                ltmrs_domain::id::ChannelId::new(Uuid::from_u128(2)),
+                1000,
+            )
+            .unwrap();
         }
         for (i, m) in fixture.memories.iter().enumerate() {
             add(&repo, (i + 1) as u64, &m.title, &m.fragment, None);
@@ -2760,7 +2771,12 @@ mod tests {
         );
         {
             let fe = FrontendId::new(Uuid::from_u128(1));
-            repo.issue_namespace(fe, 1000).unwrap();
+            repo.issue_namespace(
+                fe,
+                ltmrs_domain::id::ChannelId::new(Uuid::from_u128(2)),
+                1000,
+            )
+            .unwrap();
         }
         let mut doc_n = HashMap::new();
         for (i, doc) in corpus.iter().enumerate() {

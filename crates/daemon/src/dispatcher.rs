@@ -111,10 +111,12 @@ impl Dispatcher {
         // so the frontend surfaces an unknown outcome rather than silently
         // minting a fresh epoch for an uncertain mutation.
         if let Some(epoch) = req.resume_retry_epoch {
-            match self
-                .repo
-                .resume_namespace(req.frontend_id, epoch, self.clock.now_millis())
-            {
+            match self.repo.resume_namespace(
+                req.frontend_id,
+                req.channel_id,
+                epoch,
+                self.clock.now_millis(),
+            ) {
                 Ok(ns) => {
                     return Ok(HandshakeResponse {
                         protocol_version: PROTOCOL_VERSION,
@@ -140,10 +142,11 @@ impl Dispatcher {
         // Fatal errors (corrupt counter, storage) return immediately.
         let mut attempt = 0;
         let ns = loop {
-            match self
-                .repo
-                .issue_namespace(req.frontend_id, self.clock.now_millis())
-            {
+            match self.repo.issue_namespace(
+                req.frontend_id,
+                req.channel_id,
+                self.clock.now_millis(),
+            ) {
                 Ok(ns) => break ns,
                 Err(e) if e.code == DomainErrorCode::Contention && attempt < 2 => {
                     attempt += 1;
@@ -446,7 +449,7 @@ mod tests {
                 .unwrap(),
         );
         // Issue a namespace so apply() validates.
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let registry = FrontendRegistry::new();
         (Dispatcher::new(repo, registry, clock), dir)
     }
@@ -660,7 +663,7 @@ mod tests {
         let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
         let repo =
             Arc::new(CanonicalRepository::open_with_clock(&store_str, Arc::clone(&clock)).unwrap());
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock);
         let handle = start_bound(&disp, fe(1), ch(1), 107, 1);
         let env = envelope(

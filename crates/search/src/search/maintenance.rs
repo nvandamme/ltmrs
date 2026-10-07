@@ -262,7 +262,16 @@ mod tests {
         let repo_path = dir.path().to_str().unwrap();
         let repo = CanonicalRepository::open_with_clock(repo_path, clock).unwrap();
         let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
-        assert_eq!(repo.issue_namespace(fe, 1000).unwrap().retry_epoch, 1);
+        assert_eq!(
+            repo.issue_namespace(
+                fe,
+                ltmrs_domain::id::ChannelId::new(Uuid::from_u128(2)),
+                1000
+            )
+            .unwrap()
+            .retry_epoch,
+            1
+        );
         let uri = lance_dir.path().to_str().unwrap().to_string();
         let table = SearchTable::open(&uri).await.unwrap();
         (Arc::new(repo), table, dir)

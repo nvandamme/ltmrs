@@ -1294,8 +1294,12 @@ mod tests {
             )
             .unwrap(),
         );
-        repo.issue_namespace(FrontendId::new(Uuid::from_u128(1)), 1000)
-            .unwrap();
+        repo.issue_namespace(
+            FrontendId::new(Uuid::from_u128(1)),
+            ChannelId::new(Uuid::from_u128(2)),
+            1000,
+        )
+        .unwrap();
         (
             Arc::new(Dispatcher::new(repo, FrontendRegistry::new(), clock)),
             quotas,
@@ -1337,6 +1341,25 @@ mod tests {
         assert!(
             matches!(err, crate::envelope::IpcError::StaleNamespace(_)),
             "unknown epoch must refuse stale-typed, got: {err:?}"
+        );
+    }
+
+    /// Channel isolation at the wire: resuming epoch 1 (issued to channel
+    /// 2) from sibling channel 3 refuses stale-typed — never adopted.
+    #[test]
+    fn handshake_resume_refuses_cross_channel() {
+        use crate::limits::{QuotaTracker, ResourceLimits};
+
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = Arc::new(QuotaTracker::new(ResourceLimits::default()));
+        let (dispatcher, _quotas) = test_dispatcher_with_quotas(&dir, quotas);
+        let mut resume = handshake_as(1);
+        resume.resume_retry_epoch = Some(1);
+        resume.channel_id = ChannelId::new(Uuid::from_u128(3));
+        let err = dispatcher.handle_handshake(&resume).unwrap_err();
+        assert!(
+            matches!(err, crate::envelope::IpcError::StaleNamespace(_)),
+            "cross-channel resume must refuse stale-typed, got: {err:?}"
         );
     }
 
@@ -1873,7 +1896,7 @@ mod tests {
             )
             .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let table_dir = dir.path().join("table");
         std::fs::create_dir_all(&table_dir).unwrap();
         let table = SearchTable::open(table_dir.to_str().unwrap())

@@ -347,8 +347,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let (fe, _) = ids();
-        let ns = repo.issue_namespace(fe, 1000).unwrap();
+        let (fe, ch) = ids();
+        let ns = repo.issue_namespace(fe, ch, 1000).unwrap();
         assert_eq!(ns.retry_epoch, 1, "first namespace is epoch 1");
         (dir, repo)
     }

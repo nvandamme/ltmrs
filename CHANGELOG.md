@@ -5,7 +5,31 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1 unknown-outcome + generation cut fix
+## 2026-10-07 — P1/P2 channel-scoped retry namespaces + receipt replay
+
+### P1/P2 retry namespaces + receipt replay are channel-scoped
+- `RetryNamespace` gains `channel_id`; `issue_namespace` records the
+  issuing channel, `resume_namespace`/`validate_namespace` refuse a
+  sibling channel as stale ("retry namespace belongs to another
+  channel"), and all three receipt-replay gates (`replay_or_conflict`,
+  in-tx replay, unknown-outcome resolve) enforce receipt ownership via
+  `check_replay_owner`. Dispatcher forwards `req.channel_id` on both
+  issue and resume paths. Storage keys unchanged (no migration):
+  pre-change `ns:` rows fail decode and heal through the existing
+  corrupt-record GC path; namespaces are TTL-ephemeral regardless.
+- RED-first regressions: `resume_namespace_refuses_cross_channel`,
+  `apply_refuses_cross_channel_replay` (repo level; resume proven to
+  fail with the checks disabled), `handshake_resume_refuses_cross_channel`
+  (wire level: StaleNamespace, never adopted).
+- Mechanical call-site updates (channel threaded through all test
+  fixtures): service, daemon (dispatcher/server/tools), search
+  (maintenance/projector/engine), interchange (backup/restore), binary
+  quality bench.
+- Gate: fmt clean, `clippy --workspace --all-targets -D warnings` clean;
+  service 91, daemon 202, interchange 27, domain 46, compat 9,
+  search 169, bin 34 green.
+
+## 01c20ed (2026-10-07) — P1 unknown-outcome + generation cut fix
 
 ### P1 unknown-outcome + generation cut → surfaced, never re-executed
 - `resend_after_reconnect` (transport-ambiguity path only): a

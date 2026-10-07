@@ -439,6 +439,7 @@ mod tests {
                 .unwrap();
         repo.issue_namespace(
             ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            ltmrs_domain::id::ChannelId::new(uuid::Uuid::from_u128(2)),
             1000,
         )
         .unwrap();
@@ -1244,6 +1245,7 @@ mod tests {
         // issued first (the pre-restore epoch was drained with the rest).
         repo.issue_namespace(
             ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            ltmrs_domain::id::ChannelId::new(uuid::Uuid::from_u128(2)),
             1000,
         )
         .unwrap();

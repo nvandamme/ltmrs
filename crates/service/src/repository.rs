@@ -414,17 +414,24 @@ impl CanonicalRepository {
     /// Resume an existing retry namespace for unknown-outcome recovery
     /// (P1-B): returns the SAME epoch without minting a new one, so a
     /// reconnected frontend keeps resolving its pre-failure receipts. The
-    /// namespace must exist, belong to this frontend (keyed), and be within
-    /// TTL — otherwise refused as stale (the caller must surface an unknown
-    /// outcome, never silently mint a fresh epoch for an uncertain
-    /// mutation). Read-only: no counter bump, no barrier.
+    /// namespace must exist, belong to this (frontend, channel) pair
+    /// (keyed + stored), and be within TTL — otherwise refused as stale
+    /// (the caller must surface an unknown outcome, never silently mint a
+    /// fresh epoch for an uncertain mutation). A sibling channel resuming
+    /// the same epoch is refused: retry namespaces are channel-scoped.
+    /// Read-only: no counter bump, no barrier.
     pub fn resume_namespace(
         &self,
         frontend_id: FrontendId,
+        channel_id: ChannelId,
         retry_epoch: u64,
         now_millis: u64,
     ) -> DomainResult<RetryNamespace> {
         match self.lookup_namespace(frontend_id, retry_epoch)? {
+            Some(ns) if ns.channel_id != channel_id => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "retry namespace belongs to another channel",
+            )),
             Some(ns) if ns.is_valid_at(now_millis) => Ok(ns),
             Some(_) => Err(DomainError::new(
                 DomainErrorCode::StaleReplay,
@@ -437,7 +444,7 @@ impl CanonicalRepository {
         }
     }
 
-    /// Issue a new retry namespace for a frontend with the default TTL.
+    /// Issue a new retry namespace for one channel with the default TTL.
     /// Called by the daemon when a frontend authenticates. Epoch allocation
     /// reads inside the write transaction (creating a read dependency), so
     /// concurrent issuers conflict and retry instead of double-issuing the
@@ -446,6 +453,7 @@ impl CanonicalRepository {
     pub fn issue_namespace(
         &self,
         frontend_id: FrontendId,
+        channel_id: ChannelId,
         now_millis: u64,
     ) -> DomainResult<RetryNamespace> {
         let _restore_guard = self.restore_lock.read().unwrap();
@@ -482,6 +490,7 @@ impl CanonicalRepository {
 
             let ns = RetryNamespace::new(
                 frontend_id,
+                channel_id,
                 current_epoch,
                 now_millis,
                 DEFAULT_NAMESPACE_TTL_MILLIS,
@@ -730,11 +739,16 @@ impl CanonicalRepository {
         }
     }
 
-    /// Validate that the command's retry namespace is still valid.
-    /// Expired or unknown namespaces are refused as stale.
+    /// Validate that the command's retry namespace is still valid and
+    /// belongs to the calling channel. Expired, unknown, or cross-channel
+    /// namespaces are refused as stale.
     fn validate_namespace(&self, ctx: &CommandContext) -> DomainResult<()> {
         let now = self.clock.now_millis();
         match self.lookup_namespace(ctx.frontend_id, ctx.retry_epoch)? {
+            Some(ns) if ns.channel_id != ctx.channel_id => Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "retry namespace belongs to another channel",
+            )),
             Some(ns) if ns.is_valid_at(now) => Ok(()),
             Some(_) => Err(DomainError::new(
                 DomainErrorCode::StaleReplay,
@@ -832,6 +846,7 @@ impl CanonicalRepository {
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
         {
             let existing = decode_receipt(raw.as_ref())?;
+            Self::check_replay_owner(&existing, ctx)?;
             if existing.request_digest == ctx.request_digest {
                 return Ok(TxAction::Replay(existing));
             }
@@ -891,6 +906,7 @@ impl CanonicalRepository {
             ctx.operation_id,
         )? {
             Some(r) if r.request_digest == ctx.request_digest => {
+                Self::check_replay_owner(&r, ctx)?;
                 // The write did commit: barrier before acknowledging it.
                 self.persist_barrier()?;
                 Ok(r)
@@ -911,6 +927,7 @@ impl CanonicalRepository {
         existing: CommandReceipt,
         ctx: &CommandContext,
     ) -> DomainResult<CommandReceipt> {
+        Self::check_replay_owner(&existing, ctx)?;
         if existing.request_digest == ctx.request_digest {
             Ok(existing)
         } else {
@@ -919,6 +936,21 @@ impl CanonicalRepository {
                 "operation key reused with different input",
             ))
         }
+    }
+
+    /// Defense-in-depth receipt ownership: a receipt replays only for the
+    /// channel that recorded it. The namespace gates (resume/validate)
+    /// already enforce this — receipts additionally carry their channel so
+    /// a cross-channel replay can never resolve, even if a namespace
+    /// check is ever bypassed.
+    fn check_replay_owner(existing: &CommandReceipt, ctx: &CommandContext) -> DomainResult<()> {
+        if existing.frontend_id != ctx.frontend_id || existing.channel_id != ctx.channel_id {
+            return Err(DomainError::new(
+                DomainErrorCode::StaleReplay,
+                "receipt belongs to another channel",
+            ));
+        }
+        Ok(())
     }
 
     // ---- Snapshot-consistent reads ----
@@ -4618,6 +4650,10 @@ mod tests {
         }
     }
 
+    fn ch(n: u64) -> ChannelId {
+        ChannelId::new(Uuid::from_u128(n as u128))
+    }
+
     /// Open a repo and issue a namespace for frontend 1 at epoch 1.
     fn repo_with_ns() -> (CanonicalRepository, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -4627,7 +4663,11 @@ mod tests {
         let repo =
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock).unwrap();
         let ns = repo
-            .issue_namespace(ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1)), 1000)
+            .issue_namespace(
+                ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1)),
+                ch(2),
+                1000,
+            )
             .unwrap();
         assert_eq!(ns.retry_epoch, 1, "first namespace is epoch 1");
         (repo, dir)
@@ -5586,8 +5626,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = CanonicalRepository::open(dir.path().to_str().unwrap()).unwrap();
         let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
-        let ns1 = repo.issue_namespace(fe, 1000).unwrap();
-        let ns2 = repo.issue_namespace(fe, 2000).unwrap();
+        let ns1 = repo.issue_namespace(fe, ch(2), 1000).unwrap();
+        let ns2 = repo.issue_namespace(fe, ch(2), 2000).unwrap();
         assert_eq!(ns1.retry_epoch, 1);
         assert_eq!(ns2.retry_epoch, 2, "each issue increments the epoch");
         assert!(ns1.is_valid_at(1000));
@@ -5621,7 +5661,7 @@ mod tests {
         let repo =
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock).unwrap();
         let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
-        let ns = repo.issue_namespace(fe, 1000).unwrap();
+        let ns = repo.issue_namespace(fe, ch(2), 1000).unwrap();
 
         // Apply a command under this namespace.
         let mut c = ctx(1, "d1");
@@ -5660,7 +5700,7 @@ mod tests {
         let repo =
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock).unwrap();
         let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
-        let ns = repo.issue_namespace(fe, 1000).unwrap();
+        let ns = repo.issue_namespace(fe, ch(2), 1000).unwrap();
 
         let mut ops = Vec::new();
         for (i, op) in [(1u64, 10u64), (2, 11), (3, 12)] {
@@ -5987,8 +6027,8 @@ mod tests {
         // at different times so A expires before B.
         let fe_a = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
         let fe_b = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(2));
-        let ns_a = repo.issue_namespace(fe_a, 1000).unwrap();
-        let ns_b = repo.issue_namespace(fe_b, 2000).unwrap();
+        let ns_a = repo.issue_namespace(fe_a, ch(2), 1000).unwrap();
+        let ns_b = repo.issue_namespace(fe_b, ch(2), 2000).unwrap();
         assert_eq!(
             ns_a.retry_epoch, ns_b.retry_epoch,
             "precondition: shared epoch"
@@ -6257,7 +6297,7 @@ mod tests {
             let repo =
                 CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock).unwrap();
             let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
-            let ns = repo.issue_namespace(fe, 1000).unwrap();
+            let ns = repo.issue_namespace(fe, ch(2), 1000).unwrap();
             let mut c = ctx(1, "d1");
             c.retry_epoch = ns.retry_epoch;
             repo.apply(
@@ -6571,7 +6611,7 @@ mod tests {
                 let mut epochs = Vec::new();
                 for _ in 0..25 {
                     for _ in 0..20 {
-                        match repo.issue_namespace(fe, 1000) {
+                        match repo.issue_namespace(fe, ch(2), 1000) {
                             Ok(ns) => {
                                 epochs.push(ns.retry_epoch);
                                 break;
@@ -6609,7 +6649,7 @@ mod tests {
         let mut tx = repo.db.write_tx().unwrap();
         tx.insert(&repo.namespaces, namespace_key(fe), [0xFFu8; 3]);
         tx.commit().unwrap().unwrap();
-        let err = repo.issue_namespace(fe, 1000).unwrap_err();
+        let err = repo.issue_namespace(fe, ch(2), 1000).unwrap_err();
         assert_eq!(err.code, DomainErrorCode::Validation);
         assert!(
             err.message.contains("corrupt namespace epoch counter"),
@@ -6702,7 +6742,7 @@ mod tests {
         )
         .unwrap();
         // Second epoch, live: must survive the healing below.
-        let ns2 = repo.issue_namespace(fe, 1000).unwrap();
+        let ns2 = repo.issue_namespace(fe, ch(2), 1000).unwrap();
         assert_eq!(ns2.retry_epoch, 2);
         let mut c2 = ctx(11, "d11");
         c2.retry_epoch = 2;
@@ -6763,7 +6803,7 @@ mod tests {
         let mut tx = repo.db.write_tx().unwrap();
         tx.insert(&repo.namespaces, namespace_key(fe), u64::MAX.to_le_bytes());
         tx.commit().unwrap().unwrap();
-        let err = repo.issue_namespace(fe, 1000).unwrap_err();
+        let err = repo.issue_namespace(fe, ch(2), 1000).unwrap_err();
         assert_eq!(err.code, DomainErrorCode::Validation);
     }
 
@@ -7219,20 +7259,20 @@ mod tests {
         let (repo, _dir) = repo_with_ns();
         let fe = ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1));
         // repo_with_ns issued epoch 1 at t=1000.
-        let ns = repo.resume_namespace(fe, 1, 1000).unwrap();
+        let ns = repo.resume_namespace(fe, ch(2), 1, 1000).unwrap();
         assert_eq!(ns.retry_epoch, 1);
         // Resuming does not consume an epoch: the next issue still yields 2.
-        let next = repo.issue_namespace(fe, 1000).unwrap();
+        let next = repo.issue_namespace(fe, ch(2), 1000).unwrap();
         assert_eq!(next.retry_epoch, 2);
         // Unknown epoch refuses.
-        let err = repo.resume_namespace(fe, 99, 1000).unwrap_err();
+        let err = repo.resume_namespace(fe, ch(2), 99, 1000).unwrap_err();
         assert_eq!(
             err.code,
             ltmrs_domain::command::DomainErrorCode::StaleReplay
         );
         // Another frontend's epoch is not resumable here.
         let other = ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(2));
-        let err = repo.resume_namespace(other, 1, 1000).unwrap_err();
+        let err = repo.resume_namespace(other, ch(2), 1, 1000).unwrap_err();
         assert_eq!(
             err.code,
             ltmrs_domain::command::DomainErrorCode::StaleReplay
@@ -7245,12 +7285,70 @@ mod tests {
         let (repo, _dir) = repo_with_ns();
         let fe = ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1));
         let expired_at = 1000 + crate::repository::DEFAULT_NAMESPACE_TTL_MILLIS + 1;
-        let err = repo.resume_namespace(fe, 1, expired_at).unwrap_err();
+        let err = repo.resume_namespace(fe, ch(2), 1, expired_at).unwrap_err();
         assert_eq!(
             err.code,
             ltmrs_domain::command::DomainErrorCode::StaleReplay
         );
         assert!(err.message.contains("expired"), "got: {err:?}");
+    }
+
+    /// NEW P1/P2 (channel isolation): a retry namespace belongs to the
+    /// (frontend, channel) pair that issued it. A sibling channel resuming
+    /// the same epoch is refused as stale — never silently adopted.
+    #[test]
+    fn resume_namespace_refuses_cross_channel() {
+        let (repo, _dir) = repo_with_ns();
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+        // Same channel resumes fine.
+        let ns = repo.resume_namespace(fe, ch(2), 1, 1000).unwrap();
+        assert_eq!(ns.retry_epoch, 1);
+        assert_eq!(ns.channel_id, ch(2));
+        // Sibling channel is refused.
+        let err = repo.resume_namespace(fe, ch(3), 1, 1000).unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::StaleReplay
+        );
+        assert!(err.message.contains("another channel"), "got: {err:?}");
+    }
+
+    /// Receipt replay is channel-scoped: the same operation retried from a
+    /// sibling channel must neither replay nor re-execute — refused as
+    /// stale at the namespace gate.
+    #[test]
+    fn apply_refuses_cross_channel_replay() {
+        let (repo, _dir) = repo_with_ns();
+        let m = memory(eid(1), "ch-scoped");
+        let mut ca = ctx(1, "cross-channel");
+        ca.channel_id = ch(2);
+        repo.apply(
+            &ca,
+            &DomainCommand::AddMemory {
+                memory: m.clone(),
+                session: None,
+            },
+        )
+        .unwrap();
+        // Same op id + digest from a sibling channel: refused, never replayed.
+        let mut cb = ctx(1, "cross-channel");
+        cb.channel_id = ch(3);
+        let err = repo
+            .apply(
+                &cb,
+                &DomainCommand::AddMemory {
+                    memory: m,
+                    session: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::StaleReplay
+        );
+        assert!(err.message.contains("another channel"), "got: {err:?}");
+        // Exactly one effect: no re-execution slipped through.
+        assert_eq!(repo.get_memories(&[eid(1)]).unwrap().len(), 1);
     }
 
     /// Concurrent issuance for one frontend must yield distinct epochs
@@ -7273,7 +7371,7 @@ mod tests {
                     // Retry on conflicts (concurrent issuance discipline);
                     // duplicates are the bug, conflicts are not.
                     for _ in 0..20 {
-                        match repo.issue_namespace(fe, 1000) {
+                        match repo.issue_namespace(fe, ch(2), 1000) {
                             Ok(ns) => {
                                 epochs.push(ns.retry_epoch);
                                 break;

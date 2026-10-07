@@ -608,7 +608,13 @@ mod tests {
             ltmrs_service::repository::CanonicalRepository::open_with_clock(repo_path, clock)
                 .unwrap();
         let fe = FrontendId::new(Uuid::from_u128(1));
-        let ns = repo.issue_namespace(fe, 1000).unwrap();
+        let ns = repo
+            .issue_namespace(
+                fe,
+                ltmrs_domain::id::ChannelId::new(Uuid::from_u128(2)),
+                1000,
+            )
+            .unwrap();
         assert_eq!(ns.retry_epoch, 1);
 
         let uri = lance_dir.path().to_str().unwrap().to_string();

@@ -712,8 +712,12 @@ mod tests {
         let repo =
             CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
                 .unwrap();
-        repo.issue_namespace(FrontendId::new(uuid::Uuid::from_u128(1)), 1000)
-            .unwrap();
+        repo.issue_namespace(
+            FrontendId::new(uuid::Uuid::from_u128(1)),
+            ChannelId::new(uuid::Uuid::from_u128(2)),
+            1000,
+        )
+        .unwrap();
         let repo = Arc::new(repo);
         let table = SearchTable::open(lance_dir.path().to_str().unwrap())
             .await
@@ -963,8 +967,12 @@ mod tests {
         let repo =
             CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
                 .unwrap();
-        repo.issue_namespace(FrontendId::new(uuid::Uuid::from_u128(1)), 1000)
-            .unwrap();
+        repo.issue_namespace(
+            FrontendId::new(uuid::Uuid::from_u128(1)),
+            ChannelId::new(uuid::Uuid::from_u128(2)),
+            1000,
+        )
+        .unwrap();
         let repo = Arc::new(repo);
         let table = SearchTable::open(lance_dir.path().to_str().unwrap())
             .await
@@ -1105,8 +1113,12 @@ mod tests {
         let repo =
             CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
                 .unwrap();
-        repo.issue_namespace(FrontendId::new(uuid::Uuid::from_u128(1)), 1000)
-            .unwrap();
+        repo.issue_namespace(
+            FrontendId::new(uuid::Uuid::from_u128(1)),
+            ChannelId::new(uuid::Uuid::from_u128(2)),
+            1000,
+        )
+        .unwrap();
         let repo = std::sync::Arc::new(repo);
         let table = SearchTable::open(lance_dir.path().to_str().unwrap())
             .await

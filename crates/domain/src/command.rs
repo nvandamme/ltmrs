@@ -173,17 +173,22 @@ pub enum ReceiptOutcome {
     Rejected { code: DomainErrorCode },
 }
 
-/// A daemon-issued retry namespace for an authenticated frontend.
+/// A daemon-issued retry namespace for one authenticated channel.
 ///
 /// Each namespace has a fixed expiry, separate from the renewable
 /// channel/session binding. Receipts remain until the namespace expires.
 /// Reconnecting can renew a channel but cannot extend an old retry namespace
-/// or transplant its pending operations into a new one. Expired or
-/// resurrected namespaces are refused as stale rather than silently converted
-/// into new work.
+/// or transplant its pending operations into a new one — and a sibling
+/// channel can never resume or replay it. Expired, unknown, or
+/// cross-channel namespaces are refused as stale rather than silently
+/// converted into new work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RetryNamespace {
     pub frontend_id: FrontendId,
+    /// The channel this namespace was issued to: the agent/session
+    /// isolation boundary. Resume, validation and receipt replay all
+    /// require the caller's channel to match.
+    pub channel_id: ChannelId,
     pub retry_epoch: u64,
     /// Issued timestamp in milliseconds.
     pub issued_at: u64,
@@ -193,9 +198,16 @@ pub struct RetryNamespace {
 
 impl RetryNamespace {
     /// Create a new namespace with the given TTL.
-    pub fn new(frontend_id: FrontendId, retry_epoch: u64, issued_at: u64, ttl_millis: u64) -> Self {
+    pub fn new(
+        frontend_id: FrontendId,
+        channel_id: ChannelId,
+        retry_epoch: u64,
+        issued_at: u64,
+        ttl_millis: u64,
+    ) -> Self {
         Self {
             frontend_id,
+            channel_id,
             retry_epoch,
             issued_at,
             expires_at: issued_at + ttl_millis,

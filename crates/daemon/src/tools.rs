@@ -5094,7 +5094,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let registry = crate::registry::FrontendRegistry::new();
         (Dispatcher::new(repo, registry, clock), dir)
     }
@@ -5346,7 +5346,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let seed = Dispatcher::new(
             Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
@@ -5408,7 +5408,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let seed = Dispatcher::new(
             Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
@@ -5554,7 +5554,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
 
         // Three lexically strong memories plus one zero-overlap tail.
         let seed = Dispatcher::new(
@@ -6417,7 +6417,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let seed = Dispatcher::new(
             Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
@@ -6493,7 +6493,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let seed = Dispatcher::new(
             Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
@@ -6600,7 +6600,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let seed = Dispatcher::new(
             Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
@@ -6676,7 +6676,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let seed = Dispatcher::new(
             Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
@@ -6750,7 +6750,7 @@ mod tests {
             CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
                 .unwrap(),
         );
-        repo.issue_namespace(fe(1), 1000).unwrap();
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
         let seed = Dispatcher::new(
             Arc::clone(&repo),
             crate::registry::FrontendRegistry::new(),
