@@ -117,7 +117,12 @@ MEMBERS="$(cargo metadata $LOCKED --no-deps --format-version 1 2>/dev/null \
 )"
 # shellcheck disable=SC2086
 for MEMBER in $MEMBERS; do
-    cargo tree $LOCKED -p "$MEMBER" --depth 1 --prefix none --no-dev-dependencies 2>/dev/null \
+    # Capture first: under `pipefail` a trailing `|| true` would also
+    # swallow a `cargo tree` failure into an incomplete deps.txt, so the
+    # tree run must succeed on its own and only the grep filter may
+    # come up empty.
+    TREE="$(cargo tree $LOCKED -p "$MEMBER" --depth 1 --prefix none --no-dev-dependencies 2>/dev/null)" || exit 1
+    printf '%s\n' "$TREE" \
         | grep -E '^[^ ]+ v[0-9]' \
         | grep -v ' (' \
         >> "$DEPS_TMP" || true

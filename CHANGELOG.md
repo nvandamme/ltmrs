@@ -5,7 +5,16 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1 admission-once (AdmittedScope) + decay purity + classifier truth
+## 2026-10-07 — P2/P3 dependency inventory fails loudly on tree failure
+
+### P2/P3 dependency inventory fails loudly on tree failure
+- `cargo tree` output is captured before filtering with `|| exit 1` on
+  the tree run itself: under `pipefail` the old trailing `|| true`
+  would have swallowed a tree failure into an incomplete `deps.txt`.
+  Only the grep filter may come up empty. Static regression guard.
+- Gate: `release_evidence.rs` 8 green.
+
+## fac253d (2026-10-07) — P1 admission-once (AdmittedScope) + decay purity + classifier truth
 
 ### P1 admission-once: AdmittedScope pins namespaces across commit→finalize
 - New `AdmittedScope` (constructible only via `admit_scope`, which

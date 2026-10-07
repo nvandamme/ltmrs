@@ -201,3 +201,20 @@ fn clean_checkout_quick_produces_bundle() {
         "clean-checkout manifest must tie to HEAD"
     );
 }
+
+/// P2 static guard: a `cargo tree` failure must fail the evidence run,
+/// never degrade into an incomplete deps.txt — only the grep filter may
+/// come up empty (captured output first, `|| exit 1` on the tree run).
+#[test]
+fn dependency_inventory_failure_fails_the_run() {
+    let script = std::fs::read_to_string("tools/gen_release_evidence.sh")
+        .expect("evidence script must be readable");
+    assert!(
+        script.contains("TREE=\"$(cargo tree $LOCKED"),
+        "tree output must be captured before filtering"
+    );
+    assert!(
+        script.contains("--no-dev-dependencies 2>/dev/null)\" || exit 1"),
+        "a failed tree run must exit, not feed an empty filter"
+    );
+}
