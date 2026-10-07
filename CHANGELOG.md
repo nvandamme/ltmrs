@@ -5,7 +5,37 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P2 source-identifying evidence: checkout copy + locked discovery
+## 2026-10-07 — P1 admission-once (AdmittedScope) + decay purity + classifier truth
+
+### P1 admission-once: AdmittedScope pins namespaces across commit→finalize
+- New `AdmittedScope` (constructible only via `admit_scope`, which
+  validates + pins the namespace): continuation steps of one admitted
+  operation — response freeze/replay, continuity claim, link track —
+  take it instead of revalidating, so a namespace expiring between
+  primary commit and response finalization can never turn an executed
+  operation into an error. Exec layer admits once per
+  start/attempt/end; primaries keep validating (pre-commit admission).
+- GC honors pins: expired-but-pinned namespaces and their receipts
+  survive collection; unpinned expiry collects as before.
+- Post-commit decay can never fail `session_start`: hard decay errors
+  are logged loudly, conflicts skip silently (next start retries).
+  Best-effort decay under sustained contention is recorded here (no
+  plan policy names per-start decay; the 0.002 policy itself is
+  unchanged and sequentially preserved).
+- `MemoryRead` classified mutating for admission (its access-count
+  side effects already mutated via apply); frozen MCP annotation
+  untouched.
+- `apply_session_guide_effect` scoped like every other direct
+  primitive; restore comment updated to scoped keys.
+- RED-first: admitted-freeze-past-expiry + GC pin race (advancing
+  clock), decay-failure-still-Applied (hook-armed fault), both
+  probe-verified to fail with the exact reported modes
+  (StaleReplay-after-commit; barrier-refused start).
+- Gate: fmt + workspace clippy clean; service 98, daemon 207,
+  interchange 27, search 169, frontend 95, compat 10, domain 46,
+  bin 34, xtask 39 green.
+
+## 49c1c85 (2026-10-07) — P2 source-identifying evidence: checkout copy + locked discovery
 
 ### P2 source-identifying evidence: checkout copy + locked discovery
 - Clean-checkout mode now executes the CHECKOUT's committed script copy

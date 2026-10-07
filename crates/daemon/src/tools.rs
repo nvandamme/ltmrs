@@ -1234,9 +1234,11 @@ fn exec_memory_add(
         disp.registry()
             .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id));
     } else {
-        let track_scope = envelope.operation_scope(envelope.request_digest()?);
+        let track_admitted = disp
+            .repo()
+            .admit_scope(&envelope.operation_scope(envelope.request_digest()?))?;
         let _ = disp.repo().track_session_link(
-            &track_scope,
+            &track_admitted,
             session_handle,
             ltmrs_service::repository::SessionLinkField::MemoryCreated,
             std::slice::from_ref(&legacy_id),
@@ -3203,8 +3205,9 @@ fn exec_guide_practice(
     let validated: Vec<String> =
         match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
             Some(handle) => {
+                let track_admitted = disp.repo().admit_scope(&scope)?;
                 let _ = disp.repo().track_session_link(
-                    &scope,
+                    &track_admitted,
                     handle,
                     ltmrs_service::repository::SessionLinkField::GuideUsed,
                     std::slice::from_ref(&args.guide.to_lowercase().trim().to_string()),
@@ -3836,9 +3839,9 @@ fn dedup<T: PartialEq>(items: Vec<T>) -> Vec<T> {
 /// and then freezes.
 fn replay_frozen_session_response(
     repo: &ltmrs_service::repository::CanonicalRepository,
-    scope: &OperationScope,
+    admitted: &ltmrs_service::repository::AdmittedScope,
 ) -> DomainResult<Option<DomainPayload>> {
-    match repo.session_receipt(scope)? {
+    match repo.session_receipt(admitted)? {
         Some(rec) => Ok(rec.response.map(|r| DomainPayload::ToolResult {
             text: r.text,
             structured: r.structured,
@@ -3853,7 +3856,7 @@ fn replay_frozen_session_response(
 /// mismatch rejects as key reuse; any other failure is a wire error.
 fn freeze_session_response(
     repo: &ltmrs_service::repository::CanonicalRepository,
-    scope: &OperationScope,
+    admitted: &ltmrs_service::repository::AdmittedScope,
     payload: &DomainPayload,
 ) -> DomainResult<()> {
     use ltmrs_domain::session::FrozenToolResponse;
@@ -3874,7 +3877,7 @@ fn freeze_session_response(
             ));
         }
     };
-    repo.store_session_response(scope, &response)
+    repo.store_session_response(admitted, &response)
 }
 
 fn exec_session_start(
@@ -3898,6 +3901,10 @@ fn exec_session_start(
     // digest mismatch rejects. The registry only (re)binds the channel.
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
+    // Admit once: every continuation below (track, claim, freeze) runs
+    // under this admission, so a namespace expiring after the start
+    // commit can never turn the executed start into an error.
+    let admitted = repo.admit_scope(&scope)?;
     let abandon = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let new_handle = ltmrs_domain::id::SessionHandle::new(uuid::Uuid::now_v7());
     let handle = match repo.session_start_tx(
@@ -3916,7 +3923,7 @@ fn exec_session_start(
             // instead of being recomputed from live state. Legacy receipts
             // without one fall through to the normal path, which recomputes
             // and then freezes.
-            if let Some(frozen) = replay_frozen_session_response(repo, &scope)? {
+            if let Some(frozen) = replay_frozen_session_response(repo, &admitted)? {
                 return Ok(frozen);
             }
             h
@@ -3963,7 +3970,7 @@ fn exec_session_start(
     // Track read memories into the session (canonical store, deduped).
     let read_ids: Vec<String> = relevant.iter().map(|m| legacy_id_of(repo, m)).collect();
     repo.track_session_link(
-        &scope,
+        &admitted,
         handle,
         ltmrs_service::repository::SessionLinkField::MemoryRead,
         &read_ids,
@@ -4002,7 +4009,7 @@ fn exec_session_start(
     let (continuity, boost_targets) =
         build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
     if !boost_targets.is_empty() {
-        match repo.claim_continuity_boost(&scope, &boost_targets, 0.015, now) {
+        match repo.claim_continuity_boost(&admitted, &boost_targets, 0.015, now) {
             Ok(_) => {}
             Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
                 return key_reuse_result();
@@ -4038,7 +4045,7 @@ fn exec_session_start(
     // Freeze the response into the receipt (P2-1): a lost-response retry
     // returns this verbatim instead of recomputing from live state.
     let payload = ok_result(response, data);
-    match freeze_session_response(repo, &scope, &payload) {
+    match freeze_session_response(repo, &admitted, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -4190,6 +4197,9 @@ fn exec_session_attempt(
     // Operation identity for the canonical call below.
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
+    // Admit once: the freeze below runs under this admission, so a
+    // namespace expiring after the attempt commit cannot fail it.
+    let admitted = disp.repo().admit_scope(&scope)?;
 
     // Resolve the channel's active session (canonical liveness).
     let session = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
@@ -4225,7 +4235,7 @@ fn exec_session_attempt(
     ) {
         Ok(SessionOp::Applied((_, seq))) => seq,
         Ok(SessionOp::Replayed((_, seq))) => {
-            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &scope)? {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &admitted)? {
                 return Ok(frozen);
             }
             seq
@@ -4254,7 +4264,7 @@ fn exec_session_attempt(
         "attempt_id": format!("{}#{}", handle.as_uuid(), seq),
     });
     let payload = ok_result(response, data);
-    match freeze_session_response(disp.repo(), &scope, &payload) {
+    match freeze_session_response(disp.repo(), &admitted, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();
@@ -4288,6 +4298,9 @@ fn exec_session_end(
     // Operation identity for the canonical call below.
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
+    // Admit once: the freeze below runs under this admission, so a
+    // namespace expiring after the end commit cannot fail it.
+    let admitted = disp.repo().admit_scope(&scope)?;
 
     // Resolve the channel's session binding (live or terminal — replays
     // after a terminal session still resolve to the recorded outcome).
@@ -4315,7 +4328,7 @@ fn exec_session_end(
     ) {
         Ok(SessionOp::Applied((_, lines, true))) => lines,
         Ok(SessionOp::Replayed((_, lines, _))) => {
-            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &scope)? {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), &admitted)? {
                 return Ok(frozen);
             }
             lines
@@ -4401,7 +4414,7 @@ fn exec_session_end(
     // The response freezes into the receipt (P2-1) so replays return it
     // verbatim instead of recomputing from live guide state.
     let payload = ok_result(response, data);
-    match freeze_session_response(disp.repo(), &scope, &payload) {
+    match freeze_session_response(disp.repo(), &admitted, &payload) {
         Ok(()) => {}
         Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
             return key_reuse_result();

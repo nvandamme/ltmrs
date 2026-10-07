@@ -483,16 +483,17 @@ impl ToolArgs {
     }
 
     /// Whether this tool can mutate canonical store state (data rows,
-    /// receipts, watermarks — including access-count side effects of
-    /// read-shaped tools routed through the command gateway). The
-    /// dispatcher requires a live retry namespace for mutating tools, so
-    /// an expired namespace cannot reach a direct mutation even if one
-    /// repository primitive forgets its own check. Exhaustive: adding a
-    /// variant breaks compile until it is classified here.
+    /// receipts, watermarks — including the access-count side effects of
+    /// read-shaped tools routed through the command gateway, which is why
+    /// `MemoryRead` counts as mutating here even though its frozen MCP
+    /// annotation stays read-only). The dispatcher requires a live retry
+    /// namespace for mutating tools, so an expired namespace cannot reach
+    /// a direct mutation even if one repository primitive forgets its own
+    /// check. Exhaustive: adding a variant breaks compile until it is
+    /// classified here.
     pub fn mutates_store(&self) -> bool {
         match self {
-            Self::MemoryRead(_)
-            | Self::MemoryStats(_)
+            Self::MemoryStats(_)
             | Self::MemoryAudit(_)
             | Self::MemoryLibrary(_)
             | Self::SemanticSearch(_)
@@ -503,7 +504,8 @@ impl ToolArgs {
             | Self::ProjectAnalytics(_)
             | Self::BackupCreate(_)
             | Self::BackupPreview(_) => false,
-            Self::MemoryAdd(_)
+            Self::MemoryRead(_)
+            | Self::MemoryAdd(_)
             | Self::MemoryUpdate(_)
             | Self::MemoryFeedback(_)
             | Self::MemoryForget(_)
@@ -560,9 +562,9 @@ mod tests {
 
     #[test]
     fn mutates_store_separates_reads_from_mutations() {
-        // Reads (and file-writing backup snapshots, which touch no store
-        // rows) bypass the dispatch namespace gate.
-        assert!(!ToolArgs::MemoryRead(Default::default()).mutates_store());
+        // Pure reads (and file-writing backup snapshots, which touch no
+        // store rows) bypass the dispatch namespace gate.
+        assert!(!ToolArgs::MemoryStats(Default::default()).mutates_store());
         assert!(
             !ToolArgs::SemanticSearch(SemanticSearchArgs {
                 query: String::new(),
@@ -581,6 +583,16 @@ mod tests {
                 guide: None,
                 task: None,
                 response_format: None,
+            })
+            .mutates_store()
+        );
+        // `MemoryRead` is read-shaped over MCP but mutates access
+        // counters/confidence through the gateway, so it gates on a
+        // live namespace like every other mutating tool.
+        assert!(
+            ToolArgs::MemoryRead(MemoryReadArgs {
+                query: Some("q".to_string()),
+                ..Default::default()
             })
             .mutates_store()
         );

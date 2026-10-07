@@ -170,6 +170,53 @@ pub struct CanonicalRepository {
     /// entries only; internals and the restore path itself never re-fence
     /// (a write guard is not re-entrant with a waiting writer).
     restore_lock: std::sync::RwLock<()>,
+    /// Live-operation pins per retry namespace (`frontend:epoch` →
+    /// admitted-operation count). Admission pins its namespace so
+    /// `gc_expired` cannot collect it (or its receipts) mid-operation;
+    /// the pin releases when the admitted operation completes. Expired
+    /// && unpinned collects as before.
+    ns_pins: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+/// Proof that a tool operation's scope was admitted (RQ-06): the retry
+/// namespace existed, belonged to the calling channel, and was within
+/// TTL at admission, and stays pinned against GC expiry collection for
+/// the admitted operation's lifetime. Continuation steps of one admitted
+/// operation (response freeze, receipt replay, continuity claim, link
+/// tracking) take this instead of a raw scope, so a namespace expiring
+/// between primary commit and response finalization can never turn an
+/// executed operation into an error. Constructible only via
+/// [`CanonicalRepository::admit_scope`].
+pub struct AdmittedScope {
+    scope: OperationScope,
+    _pin: NamespacePin,
+}
+
+impl AdmittedScope {
+    /// The admitted operation's scope (keys, digests, watermarks).
+    pub fn scope(&self) -> &OperationScope {
+        &self.scope
+    }
+}
+
+/// One live-operation pin on a retry namespace. Cloned per admission;
+/// dropping the last pin for a namespace makes it collectible again.
+#[derive(Clone)]
+struct NamespacePin {
+    pins: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    key: String,
+}
+
+impl Drop for NamespacePin {
+    fn drop(&mut self) {
+        let mut map = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = map.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Digest-bound practice receipt stored in the `guide_ops` log: the recorded
@@ -370,6 +417,7 @@ impl CanonicalRepository {
             fault_injector,
             clock,
             restore_lock: std::sync::RwLock::new(()),
+            ns_pins: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -704,6 +752,13 @@ impl CanonicalRepository {
             &self.suggestion_ops,
         ];
         for ns in &expired {
+            // Pinned namespaces survive expiry: a live admitted operation
+            // may still finalize against them (freeze/replay/claim). They
+            // collect on a later pass once unpinned. Legacy rows sweep
+            // below regardless (unattributable to any live operation).
+            if self.namespace_pinned(ns.frontend_id, ns.retry_epoch) {
+                continue;
+            }
             // Remove every operation receipt issued under this retry
             // epoch: canonical receipts plus all three direct op logs
             // (they share the generation:frontend:epoch:operation shape).
@@ -826,6 +881,47 @@ impl CanonicalRepository {
                 "unknown retry namespace",
             )),
         }
+    }
+
+    /// Admit one tool operation (RQ-06): validates its scope (existence +
+    /// channel + TTL) and pins the namespace against GC expiry collection
+    /// for the admitted operation's lifetime. The dispatch gate and every
+    /// primary-transaction primitive admit implicitly by validating;
+    /// continuation steps of the same admitted operation (response
+    /// freeze, receipt replay, continuity claim, link tracking) take the
+    /// returned token instead of revalidating, so a namespace expiring
+    /// between primary commit and response finalization can never turn
+    /// an executed operation into an error.
+    pub fn admit_scope(&self, scope: &OperationScope) -> DomainResult<AdmittedScope> {
+        self.validate_scope(scope)?;
+        let key = Self::ns_pin_key(scope.frontend_id, scope.retry_epoch);
+        {
+            let mut pins = self.ns_pins.lock().unwrap_or_else(|e| e.into_inner());
+            *pins.entry(key.clone()).or_insert(0) += 1;
+        }
+        Ok(AdmittedScope {
+            scope: scope.clone(),
+            _pin: NamespacePin {
+                pins: std::sync::Arc::clone(&self.ns_pins),
+                key,
+            },
+        })
+    }
+
+    /// Pin-map key for a retry namespace (matches regardless of channel:
+    /// pinning protects the whole epoch's receipts while admitted).
+    fn ns_pin_key(frontend_id: FrontendId, retry_epoch: u64) -> String {
+        format!("{}:{}", frontend_id.as_uuid(), retry_epoch)
+    }
+
+    /// Whether a retry namespace currently has live admitted operations
+    /// (and must survive `gc_expired` even past TTL).
+    fn namespace_pinned(&self, frontend_id: FrontendId, retry_epoch: u64) -> bool {
+        self.ns_pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Self::ns_pin_key(frontend_id, retry_epoch))
+            .is_some_and(|n| *n > 0)
     }
 
     /// Verify a stored direct receipt belongs to the calling scope.
@@ -2113,24 +2209,24 @@ impl CanonicalRepository {
 
     /// Apply one session_end guide outcome atomically with its idempotency
     /// marker (re-review R5, hardened re-review P1-3): the success/failure
-    /// count bump and the `{op}:guide:{name}` marker commit in ONE
+    /// count bump and the scoped `{key}:guide:{name}` marker commit in ONE
     /// transaction. Returns true when newly applied, false when the marker
     /// was already present for the same arguments (retry resumes without
     /// double-counting) or the guide is gone (forget wins — no marker
-    /// written, so a later retry re-checks). The marker binds the request
-    /// digest AND outcome: a retry with changed arguments after partial
+    /// written, so a later retry re-checks). The marker binds the scope
+    /// AND outcome: a retry with changed arguments after partial
     /// effects rejects as key reuse instead of completing a mixed outcome.
     /// Entity revision advances so concurrent merges observe the change.
     pub fn apply_session_guide_effect(
         &self,
-        operation_id: &str,
-        digest: &str,
+        scope: &OperationScope,
         guide_name: &str,
         success: bool,
         now_millis: u64,
     ) -> DomainResult<bool> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        let marker = format!("{}:guide:{}", operation_id, guide_name.to_lowercase());
+        self.validate_scope(scope)?;
+        let marker = format!("{}:guide:{}", scope.op_key(), guide_name.to_lowercase());
         let seq_key = op_seq_key_system("session");
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
@@ -2146,7 +2242,8 @@ impl CanonicalRepository {
                 // — a mixed-outcome completion can never assemble.
                 let marked: serde_json::Value = serde_json::from_slice(raw.as_ref())
                     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                let same = marked.get("digest").and_then(|d| d.as_str()) == Some(digest)
+                let same = marked.get("digest").and_then(|d| d.as_str())
+                    == Some(scope.request_digest.as_str())
                     && marked.get("success").and_then(|s| s.as_bool()) == Some(success);
                 if same {
                     return Ok(false);
@@ -2177,7 +2274,7 @@ impl CanonicalRepository {
             tx.insert(&self.guides, &guide_key, raw.as_slice());
             let marker_raw = serde_json::to_vec(&serde_json::json!({
                 "applied": true,
-                "digest": digest,
+                "digest": scope.request_digest,
                 "success": success,
             }))
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
@@ -3283,15 +3380,15 @@ impl CanonicalRepository {
                     // applied at start) runs here, outside the start
                     // transaction: the scan's keyspace-wide read dependency
                     // would otherwise turn independent concurrent starts
-                    // into optimistic conflicts. Only sessions whose
-                    // attempts actually change are rewritten; a conflicted
-                    // decay simply skips (the next start retries it) while
-                    // hard errors propagate — the start receipt already
-                    // committed, so a host retry replays instead of
-                    // duplicating.
-                    match self.decay_stale_attempts() {
-                        Ok(()) => {}
-                        Err(e) => return Err(e),
+                    // into optimistic conflicts. Best-effort by contract:
+                    // the start receipt already committed, so a decay
+                    // failure must never turn this executed start into an
+                    // error (a host retry would safely replay, but must
+                    // never be invited by a post-commit failure).
+                    // Loud on hard errors; conflicts skip silently with
+                    // the next start retrying the pass.
+                    if let Err(e) = self.decay_stale_attempts() {
+                        eprintln!("ltmrs: post-commit attempt decay skipped: {}", e.message);
                     }
                     return Ok(SessionOp::Applied(handle));
                 }
@@ -3663,13 +3760,13 @@ impl CanonicalRepository {
     /// order-preserving deduplication, committed atomically.
     pub fn track_session_link(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
         handle: SessionHandle,
         field: SessionLinkField,
         ids: &[String],
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
+        let scope = admitted.scope();
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
@@ -3797,13 +3894,13 @@ impl CanonicalRepository {
     /// continuation must not double-boost). Digest mismatch rejects.
     pub fn claim_continuity_boost(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
         targets: &[(SessionHandle, u32)],
         delta: f64,
         now_millis: u64,
     ) -> DomainResult<bool> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
+        let scope = admitted.scope();
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
@@ -3888,7 +3985,11 @@ impl CanonicalRepository {
 
     /// Read one session operation receipt by scope (P2-1 frozen replay):
     /// a receipt recorded under another scope never resolves here.
-    pub fn session_receipt(&self, scope: &OperationScope) -> DomainResult<Option<SessionReceipt>> {
+    pub fn session_receipt(
+        &self,
+        admitted: &AdmittedScope,
+    ) -> DomainResult<Option<SessionReceipt>> {
+        let scope = admitted.scope();
         let snapshot = self.db.read_tx();
         let raw = snapshot
             .get(&self.session_ops, scope.op_key())
@@ -3909,11 +4010,11 @@ impl CanonicalRepository {
     /// resurrecting a stale identity.
     pub fn store_session_response(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
         response: &ltmrs_domain::session::FrozenToolResponse,
     ) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
+        let scope = admitted.scope();
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
@@ -4532,9 +4633,10 @@ impl CanonicalRepository {
             &self.projections,
             // Canonical sessions + all three op-receipt logs (P1-1/P1-2):
             // traced sessions are Fjall data since b8bcb94, and session_ops /
-            // guide_ops / suggestion_ops are keyed by bare operation ID.
-            // Leaving any behind would preserve pre-restore state and let
-            // stale receipts replay across the generation cut.
+            // guide_ops / suggestion_ops carry scoped
+            // generation:frontend:epoch:operation keys. Leaving any behind
+            // would preserve pre-restore state and let stale receipts replay
+            // across the generation cut.
             &self.sessions,
             &self.session_ops,
             &self.guide_ops,
@@ -4878,6 +4980,11 @@ mod tests {
     /// `repo_with_ns` namespace): every direct-primitive test defaults here.
     fn scope(op_num: u64, digest: &str) -> OperationScope {
         scope_in(1, 2, op_num, digest)
+    }
+
+    /// Admit a scope for continuation-path tests (validates + pins).
+    fn admit(repo: &CanonicalRepository, op_num: u64, digest: &str) -> AdmittedScope {
+        repo.admit_scope(&scope(op_num, digest)).unwrap()
     }
 
     fn scope_in(epoch: u64, ch_n: u64, op_num: u64, digest: &str) -> OperationScope {
@@ -7402,20 +7509,20 @@ mod tests {
         repo.adjust_attempt(handle, 1, -0.5, 1000).unwrap();
         let targets = vec![(handle, 1)];
         assert!(
-            repo.claim_continuity_boost(&scope(101, "digest-start"), &targets, 0.015, 1000)
+            repo.claim_continuity_boost(&admit(&repo, 101, "digest-start"), &targets, 0.015, 1000)
                 .unwrap()
         );
         let after_first = repo.get_session(handle).unwrap().unwrap().attempts[0].confidence;
         assert!((after_first - 0.515).abs() < 1e-9, "got {after_first}");
         assert!(
             !repo
-                .claim_continuity_boost(&scope(101, "digest-start"), &targets, 0.015, 1000)
+                .claim_continuity_boost(&admit(&repo, 101, "digest-start"), &targets, 0.015, 1000)
                 .unwrap()
         );
         let after_second = repo.get_session(handle).unwrap().unwrap().attempts[0].confidence;
         assert_eq!(after_second, after_first, "second claim must not re-boost");
         let err = repo
-            .claim_continuity_boost(&scope(101, "DIFFERENT"), &targets, 0.015, 1000)
+            .claim_continuity_boost(&admit(&repo, 101, "DIFFERENT"), &targets, 0.015, 1000)
             .unwrap_err();
         assert_eq!(
             err.code,
@@ -7710,6 +7817,147 @@ mod tests {
         );
     }
 
+    /// Advancing test clock (interior mutability so the repo's shared
+    /// Arc can move time forward between a primary commit and its
+    /// response finalization — exactly the TTL-boundary race).
+    struct AdvancingClock(std::sync::Mutex<u64>);
+
+    impl AdvancingClock {
+        fn advance(&self, millis: u64) {
+            *self.0.lock().unwrap() += millis;
+        }
+    }
+
+    impl ltmrs_domain::clock::Clock for AdvancingClock {
+        fn now_millis(&self) -> u64 {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    /// P1 (admission contract): an operation admitted while its namespace
+    /// is live completes even if the namespace expires between primary
+    /// commit and response freeze — and GC cannot collect the pinned
+    /// namespace or its receipts mid-operation. Unpinned, the same
+    /// expiry collects normally.
+    #[test]
+    fn admitted_operation_survives_expiry_and_gc() {
+        use ltmrs_domain::id::SessionHandle;
+        use ltmrs_domain::session::{AttemptOutcome, SessionOp};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(AdvancingClock(std::sync::Mutex::new(1000)));
+        let repo = CanonicalRepository::open_with_clock(
+            dir.path().to_str().unwrap(),
+            Arc::clone(&clock) as Arc<dyn ltmrs_domain::clock::Clock + Send + Sync>,
+        )
+        .unwrap();
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+        repo.issue_namespace(fe, ch(2), 1000).unwrap();
+        let late = 1000 + crate::repository::DEFAULT_NAMESPACE_TTL_MILLIS + 1;
+        // Primary effects commit while live.
+        let handle = SessionHandle::new(Uuid::from_u128(830));
+        match repo
+            .session_start_tx(
+                &scope(830, "d-s"),
+                handle,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match repo
+            .session_attempt_tx(
+                &scope(831, "d-a"),
+                handle,
+                "try X".to_string(),
+                AttemptOutcome::Rejected,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied((_, 1)) => {}
+            other => panic!("expected Applied seq 1, got {other:?}"),
+        }
+        // Admit the attempt scope, then cross the TTL boundary.
+        let admitted = repo.admit_scope(&scope(831, "d-a")).unwrap();
+        clock.advance(late - 1000);
+        // Response freeze under admission: no revalidation is possible,
+        // so expiry cannot fail the executed attempt.
+        repo.store_session_response(
+            &admitted,
+            &ltmrs_domain::session::FrozenToolResponse {
+                text: "done".to_string(),
+                structured: None,
+                is_error: false,
+            },
+        )
+        .unwrap();
+        // GC at the boundary: pinned namespace + receipts survive
+        // collection (resume still refuses: expiry refusal is not
+        // collection — the receipts stay replayable under admission).
+        let removed = repo.gc_expired(late).unwrap();
+        assert!(
+            repo.lookup_namespace(fe, 1).unwrap().is_some(),
+            "pinned namespace must survive GC, removed={removed}"
+        );
+        assert!(
+            repo.session_receipt(&admitted).unwrap().is_some(),
+            "pinned receipt must survive GC"
+        );
+        // Unpinned, the same expiry collects normally.
+        drop(admitted);
+        repo.gc_expired(late).unwrap();
+        assert!(
+            repo.lookup_namespace(fe, 1).unwrap().is_none(),
+            "unpinned expired namespace must collect"
+        );
+    }
+
+    /// P1 (post-commit purity): a hard decay failure after the start
+    /// receipt committed must never turn the executed start into an
+    /// error. The persist fault is armed from the post-commit hook, so
+    /// it strikes decay's barrier — never the start's.
+    #[test]
+    fn session_start_applies_despite_post_commit_decay_failure() {
+        use ltmrs_domain::id::SessionHandle;
+        use ltmrs_domain::session::SessionOp;
+        use std::sync::Arc;
+        let (repo, _dir) = repo_with_ns();
+        let repo = Arc::new(repo);
+        let armer = Arc::clone(&repo);
+        repo.set_commit_hook(Arc::new(move || {
+            armer.fault_injector().set_persist_failures(1);
+        }));
+        let handle = SessionHandle::new(Uuid::from_u128(820));
+        match repo
+            .session_start_tx(
+                &scope(820, "d-decay"),
+                handle,
+                None,
+                None,
+                vec![],
+                None,
+                None,
+                1000,
+            )
+            .unwrap()
+        {
+            SessionOp::Applied(h) => assert_eq!(h, handle),
+            other => panic!("decay failure must not fail the start, got {other:?}"),
+        }
+        assert!(repo.get_session(handle).unwrap().is_some());
+    }
+
     #[test]
     fn direct_mutations_refuse_expired_namespace() {
         use ltmrs_domain::id::SessionHandle;
@@ -7796,8 +8044,16 @@ mod tests {
         // A's session is untouched; each receipt lives in its own scope.
         assert!(repo.get_session(ha).unwrap().is_some());
         assert!(repo.get_session(hb).unwrap().is_some());
-        assert!(repo.session_receipt(&scope(900, "d-x")).unwrap().is_some());
-        assert!(repo.session_receipt(&scope_b).unwrap().is_some());
+        assert!(
+            repo.session_receipt(&repo.admit_scope(&scope(900, "d-x")).unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.session_receipt(&repo.admit_scope(&scope_b).unwrap())
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// P1/P2 session_end exactly-once: improvement suggestions are filed
@@ -7856,7 +8112,7 @@ mod tests {
             other => panic!("expected Applied, got {other:?}"),
         }
         repo.track_session_link(
-            &scope(701, "track"),
+            &admit(&repo, 701, "track"),
             handle,
             SessionLinkField::GuideUsed,
             &["git".to_string()],
@@ -8093,28 +8349,28 @@ mod tests {
         let (repo, _dir) = repo_with_ns();
         repo.put_guide(&test_guide("git")).unwrap();
         assert!(
-            repo.apply_session_guide_effect("end-1", "digest-1", "git", true, 1000)
+            repo.apply_session_guide_effect(&scope(920, "digest-1"), "git", true, 1000)
                 .unwrap()
         );
         assert_eq!(repo.get_guide("git").unwrap().unwrap().success_count, 1);
         // Same operation again: marker hit, no recount.
         assert!(
             !repo
-                .apply_session_guide_effect("end-1", "digest-1", "git", true, 1000)
+                .apply_session_guide_effect(&scope(920, "digest-1"), "git", true, 1000)
                 .unwrap()
         );
         assert_eq!(repo.get_guide("git").unwrap().unwrap().success_count, 1);
         // Same operation with changed arguments after a partial effect:
         // reject, never complete a mixed outcome (re-review P1-3).
         let err = repo
-            .apply_session_guide_effect("end-1", "digest-CHANGED", "git", false, 1000)
+            .apply_session_guide_effect(&scope_in(1, 2, 920, "digest-CHANGED"), "git", false, 1000)
             .unwrap_err();
         assert_eq!(err.code, DomainErrorCode::KeyReuseDifferentInput);
         let g = repo.get_guide("git").unwrap().unwrap();
         assert_eq!((g.success_count, g.failure_count), (1, 0));
         // Same guide, different operation: applies (independent outcome).
         assert!(
-            repo.apply_session_guide_effect("end-2", "digest-2", "git", false, 1000)
+            repo.apply_session_guide_effect(&scope(921, "digest-2"), "git", false, 1000)
                 .unwrap()
         );
         let g = repo.get_guide("git").unwrap().unwrap();
@@ -8122,12 +8378,12 @@ mod tests {
         // Missing guide: skip, no marker (a later retry re-checks).
         assert!(
             !repo
-                .apply_session_guide_effect("end-3", "digest-3", "gone", true, 1000)
+                .apply_session_guide_effect(&scope(922, "digest-3"), "gone", true, 1000)
                 .unwrap()
         );
         assert!(
             !repo
-                .apply_session_guide_effect("end-3", "digest-3", "gone", true, 1000)
+                .apply_session_guide_effect(&scope(922, "digest-3"), "gone", true, 1000)
                 .unwrap()
         );
     }
@@ -8170,10 +8426,11 @@ mod tests {
             is_error: false,
         };
         let fscope = scope_in(2, 9, 800, "digest-freeze");
-        repo.store_session_response(&fscope, &first).unwrap();
-        repo.store_session_response(&fscope, &second).unwrap();
+        let admitted = repo.admit_scope(&fscope).unwrap();
+        repo.store_session_response(&admitted, &first).unwrap();
+        repo.store_session_response(&admitted, &second).unwrap();
         let stored = repo
-            .session_receipt(&fscope)
+            .session_receipt(&admitted)
             .unwrap()
             .expect("receipt must exist");
         assert_eq!(
