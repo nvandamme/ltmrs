@@ -1,0 +1,20 @@
+[package]
+name = "ltmrs-embeddings"
+version = "0.1.0-alpha"
+edition = "2024"
+
+[dependencies]
+ltmrs-domain = { path = "../domain" }
+candle-core = { version = "0.11.0" }
+candle-nn = { version = "0.11.0" }
+tokenizers = { version = "0.22.2" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "sync", "time"] }
+tracing = "0.1"
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+sha2 = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+ltmrs-search = { path = "../search" }

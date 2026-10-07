@@ -1,0 +1,11 @@
+[package]
+name = "ltmrs-compat"
+version = "0.1.0-alpha"
+edition = "2024"
+
+[dependencies]
+ltmrs-domain = { path = "../domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = { version = "1", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }

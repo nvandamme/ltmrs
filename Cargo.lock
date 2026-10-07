@@ -3955,17 +3955,75 @@ dependencies = [
 name = "ltmrs"
 version = "0.1.0-alpha"
 dependencies = [
+ "libc",
+ "ltmrs-compat",
+ "ltmrs-daemon",
+ "ltmrs-domain",
+ "ltmrs-embeddings",
+ "ltmrs-frontend",
+ "ltmrs-interchange",
+ "ltmrs-search",
+ "ltmrs-service",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ltmrs-compat"
+version = "0.1.0-alpha"
+dependencies = [
+ "ltmrs-domain",
+ "regex",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "ltmrs-daemon"
+version = "0.1.0-alpha"
+dependencies = [
+ "libc",
+ "ltmrs-compat",
+ "ltmrs-domain",
+ "ltmrs-embeddings",
+ "ltmrs-interchange",
+ "ltmrs-search",
+ "ltmrs-service",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ltmrs-domain"
+version = "0.1.0-alpha"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "ltmrs-embeddings"
+version = "0.1.0-alpha"
+dependencies = [
  "candle-core",
  "candle-nn",
- "fjall",
- "futures-util",
- "lance-index",
- "lancedb",
- "libc",
- "regex",
+ "ltmrs-domain",
+ "ltmrs-search",
  "reqwest",
- "rmcp",
- "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
@@ -3973,6 +4031,69 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ltmrs-frontend"
+version = "0.1.0-alpha"
+dependencies = [
+ "libc",
+ "ltmrs-compat",
+ "ltmrs-daemon",
+ "ltmrs-domain",
+ "ltmrs-embeddings",
+ "ltmrs-service",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ltmrs-interchange"
+version = "0.1.0-alpha"
+dependencies = [
+ "ltmrs-domain",
+ "ltmrs-service",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "ltmrs-search"
+version = "0.1.0-alpha"
+dependencies = [
+ "futures-util",
+ "lance-index",
+ "lancedb",
+ "ltmrs-domain",
+ "ltmrs-embeddings",
+ "ltmrs-service",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ltmrs-service"
+version = "0.1.0-alpha"
+dependencies = [
+ "fjall",
+ "ltmrs-domain",
+ "serde",
+ "serde_json",
+ "tempfile",
  "uuid",
 ]
 
@@ -6745,6 +6866,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0-alpha"
+dependencies = [
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

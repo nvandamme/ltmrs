@@ -1,0 +1,29 @@
+[package]
+name = "ltmrs-frontend"
+version = "0.1.0-alpha"
+edition = "2024"
+
+[dependencies]
+ltmrs-domain = { path = "../domain" }
+ltmrs-service = { path = "../service" }
+ltmrs-compat = { path = "../compat" }
+ltmrs-daemon = { path = "../daemon" }
+ltmrs-embeddings = { path = "../embeddings" }
+# MCP protocol (stdio boundary). server feature gives the stdio/async-rw
+# transports; avoid auth/reqwest (C code).
+rmcp = { version = "3.5.0", default-features = false, features = ["server", "transport-async-rw", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: legacy wire objects must serialize in upstream insertion
+# order, not BTreeMap-alphabetical.
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+sha2 = "0.11"
+# Daemon-spawn detach (setsid in serve.rs).
+libc = "0.2"
+# Artifact fetch (model downloads). rustls-tls only — pure Rust, no native TLS.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"

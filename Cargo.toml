@@ -2,7 +2,7 @@
 name = "ltmrs"
 # Pre-release per §2.3: the useful vertical slice ships as v0.1-alpha;
 # the full v0.1 compatibility release stays gated. (Skill recipe versions
-# are independent dotted numerics; see skills::installer::SKILL_VERSION.)
+# are independent dotted numerics; see ltmrs-frontend's skills::installer::SKILL_VERSION.)
 version = "0.1.0-alpha"
 edition = "2024"
 description = "Local MCP memory service for LLM agents (Lemma 0.21.0 API/workflow target; compatibility gated on release qualification)."
@@ -12,37 +12,6 @@ license = "MIT OR Apache-2.0"
 # (WP-02). CPU-first, offline-capable: no GPU features, no cloud features.
 # See baseline/lemma-0.21.0/dependency-native-audit.md for the native-code audit.
 [dependencies]
-# MCP protocol (frontend stdio boundary + daemon dispatcher).
-# server feature gives the stdio/async-rw transports; avoid auth/reqwest (C code).
-rmcp = { version = "3.5.0", default-features = false, features = ["server", "transport-async-rw", "transport-io"] }
-
-# LanceDB canonical + retrieval (Lance engine comes transitively via lancedb;
-# no direct `lance` pin: zero `lance::` uses in code, and lancedb 0.39
-# already forces the lance 12 line).
-# default-features=false: no cloud/object-store/GPU. zstd (C) is unavoidable.
-# NOTE (WP-00 finding): lancedb 0.38.0 does not compile without `remote` —
-# `pub mod job` is unconditional but `Error::Http` is `remote`-gated. Enabling
-# `remote` pulls reqwest/http/urlencoding (unused in local mode). See
-# baseline/lemma-0.21.0/dependency-native-audit.md.
-lancedb = { version = "0.39.0", default-features = false, features = ["remote"] }
-
-# Candidate B: Fjall canonical KV (pure Rust, no native deps).
-fjall = { version = "3.1.10" }
-
-# Candle embeddings (CPU). default features = CPU baseline; onig_sys (C) is a
-# hard transitive dep via tokenizers. Do NOT enable cuda/metal/mkl.
-# NOTE: candle-transformers is intentionally NOT a dependency — E5 uses the
-# local bert_impl (avoids its position-embedding bug); pulling the crate
-# would add an unused dep to the graph.
-candle-core = { version = "0.11.0" }
-candle-nn = { version = "0.11.0" }
-# Match candle-core 0.11.0's tokenizers to avoid a duplicate version in the graph.
-tokenizers = { version = "0.22.2" }
-
-# Artifact fetch (model downloads). rustls-tls only — pure Rust, no native TLS.
-# Already in the graph via lancedb `remote`; making it explicit keeps RQ-21 honest.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-
 # No direct getrandom pin: the per-boot visualizer token uses uuid v4
 # (OS-seeded CSPRNG via rand), so randomness rides the already-direct uuid
 # edge instead of a single-use pin. DefaultHasher is NOT a substitute
@@ -52,25 +21,22 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 libc = "0.2"
 
 # Core async runtime + utilities.
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "io-std", "net", "signal", "time", "sync", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "io-std", "net", "signal", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: legacy wire objects (e.g. memory_stats by_source/by_project)
 # must serialize in upstream insertion order, not BTreeMap-alphabetical.
 serde_json = { version = "1", features = ["preserve_order"] }
-thiserror = "2"
-tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 sha2 = "0.11"
-# Best-effort secret detection for memory_add privacy (design 12.1).
-regex = { version = "1", default-features = false, features = ["std"] }
 
-# Arrow types flow through `lancedb::arrow` (behind storage/ and search/
-# modules only): lancedb re-exports its exact arrow line precisely so
-# downstream avoids mismatched direct pins (lancedb issue #3575). No direct
-# arrow-array/arrow-schema/arrow-buffer pins — the version tracks lancedb
-# automatically and can never fork against `lancedb::arrow` again.
-lance-index = { version = "12", default-features = false }
-futures-util = "0.3"
+ltmrs-domain = { path = "crates/domain" }
+ltmrs-service = { path = "crates/service" }
+ltmrs-compat = { path = "crates/compat" }
+ltmrs-embeddings = { path = "crates/embeddings" }
+ltmrs-search = { path = "crates/search" }
+ltmrs-interchange = { path = "crates/interchange" }
+ltmrs-daemon = { path = "crates/daemon" }
+ltmrs-frontend = { path = "crates/frontend" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -87,3 +53,7 @@ lto = "thin"
 
 [profile.release]
 lto = "thin"
+
+[workspace]
+resolver = "2"
+members = [".", "crates/domain", "crates/service", "crates/compat", "crates/embeddings", "crates/search", "crates/interchange", "crates/daemon", "crates/frontend", "xtask"]

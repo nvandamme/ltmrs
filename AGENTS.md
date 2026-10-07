@@ -35,6 +35,7 @@ Project instructions for coding agents working in this repository.
 2. **Split by intent/domain, not by size alone** — When a file grows beyond ~600–800 lines or mixes distinct concerns, split it per intent/domain. When a domain has multiple related modules, make it a subpackage. *Example: `geo_graph/policy/` is a subpackage because it has ≥2 related modules (assembly, builder, contract, dto, etc.).*
 3. **No code duplication** — Never duplicate logic across modules. Maintain shared functions/features in a single owning module and import them. If a helper is used by ≥2 modules, it belongs in a shared/common module for that domain (or a cross-module utility if truly generic). Before writing a helper, search for an existing one.
 4. **These rules are permanent** — They apply to the whole repository and all future work. Do not violate them for convenience; restructure existing code to comply when you touch it.
+5. **Workspace crates own their domains; the crate DAG stays acyclic** — The workspace is `crates/domain`, `crates/service`, `crates/compat`, `crates/embeddings`, `crates/search` (search+retrieval, one crate: the prod `search`↔`retrieval` cycle cannot be cut without a trait-extraction refactor), `crates/interchange`, `crates/daemon`, `crates/frontend`, plus the binary-only root `ltmrs`. New code lives in the owning crate, never duplicated or scattered at the workspace root. Cross-crate production dependencies must keep the DAG acyclic, bottom-up: `domain` → `service`/`compat` → `embeddings` → `search` → `interchange` → `daemon` → `frontend` → binary. Heavy-dependency ownership is fixed: `fjall` lives in `ltmrs-service`; candle/tokenizers live in `ltmrs-embeddings`; `lancedb`/`lance-index` live in `ltmrs-search`; `rmcp` lives in `ltmrs-frontend`. `lancedb::arrow` stays inside `ltmrs-search` — no other crate may name Arrow types. `skills/` lives in `ltmrs-frontend` alongside `cli.rs` (which names `crate::skills`; co-location is the only sane resolution — adjudicated Task 10 deviation from the superseded "skills stays in the binary" plan text). Test-only upward edges via dev-dependencies are allowed but must be called out in the owning manifest (precedent: the embeddings→search bridge-test dev-dependency). Dropping a dependency pin requires per-pin grep proof of zero users, each way (`^use` lines plus full-path uses).
 
 ## Rust Rules
 
@@ -43,7 +44,7 @@ Project instructions for coding agents working in this repository.
 - Prefer strict types: no `any`/`unknown` equivalents; define concrete types,
   newtypes for IDs and validated domain types. `unsafe` requires a documented
   safety argument and a test.
-- Keep database crates and Arrow types behind `storage/` and `search/` modules.
+- Keep database crates and Arrow types behind the `search/` module.
   Expose domain types to the rest of ltmrs.
 - No comments unless they explain non-obvious invariants, contracts or protocol
   details. No backward-compatibility shims.

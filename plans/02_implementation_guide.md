@@ -8,7 +8,7 @@
 
 Create issues from the work packages below. Every issue carries a requirement ID, command/slice boundary, prerequisite, acceptance test and saved evidence path. All checkboxes are intentionally unchecked. No code, benchmark or compatibility pass is implied by this package.
 
-Use one Cargo package with a library and binary initially. Keep database crates and Arrow types behind storage/search modules. Expose domain types to the rest of ltmrs. Do not implement a general plugin/database framework merely to conduct the comparison.
+Use one Cargo package with a library and binary initially (since split into a Cargo workspace — crates `domain`, `service`, `compat`, `embeddings`, `search`, `interchange`, `daemon`, `frontend` plus a binary-only root; see `plans/workspace_crate_split_plan.md`). Keep database crates and Arrow types behind the `search/` module only. Expose domain types to the rest of ltmrs. Do not implement a general plugin/database framework merely to conduct the comparison.
 
 The first work is **baseline capture and executable domain semantics**, not a polished CLI or a speculative final schema. A backend cannot be selected without running the critical command tests.
 
@@ -64,23 +64,21 @@ LICENSE-MIT
 LICENSE-APACHE
 NOTICE
 src/
-  lib.rs
-  main.rs
-  config.rs
-  error.rs
-  domain/                 # IDs, models, validated commands, invariants
-  service/                # command orchestration, scope, receipts, sessions
-  storage/                # selected canonical adapter and snapshots
-  search/                 # Lance projection, candidate queries, generation metadata
-  projection/             # desired-state jobs, retries, compare-and-clear
-  embeddings/             # model manifest, Candle adapter, bounded worker
-  retrieval/              # filters, parent collapse, RRF, graph, MMR, context
-  daemon/                 # lock/lifecycle, local IPC, client registry, scheduling
-  frontend/               # rmcp stdio and CLI, no duplicate domain handlers
-  compatibility/lemma/    # frozen wire DTOs, responses and behavior adapters
-  skills/                 # owned assets and installer, not arbitrary executable plugins
-  interchange/            # import/export/backup/restore
-  visualizer/             # local UI server and routes if compatibility requires them
+  main.rs                     # binary-only root (plus bench/, visualizer/ modules)
+crates/
+  domain/                   # IDs, models, validated commands, invariants
+  service/                  # command orchestration, scope, receipts, sessions
+  compat/                   # frozen wire DTOs, responses and behavior adapters
+  embeddings/               # model manifest, Candle adapter, bounded worker
+  search/                   # Lance projection (search/ + retrieval/), generation metadata
+  interchange/              # import/export/backup/restore
+  daemon/                   # lock/lifecycle, local IPC, client registry, scheduling
+  frontend/                 # rmcp stdio and CLI, skills/, no duplicate domain handlers
+                            # (cli.rs, config.rs and skills/ moved here from src/)
+storage/                    # REMOVED post-AD-01 (unreferenced backend-comparison
+                            # leftover; canonical store is Fjall via ltmrs-service)
+projection/                 # REMOVED (doc-only stub; projection types live in
+                            # ltmrs-domain, jobs in ltmrs-search)
 migrations/
 tests/
   model/
@@ -455,7 +453,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 - [x] Publish supported tool/workflow, host, model, OS and durability matrices. (reports/release-01/matrices.md: tool cells referenced to conformance_matrix.json, host/model/OS/durability rows executed or marked not_run.)
 - [x] Review every enhancement/deviation and remove unsupported absolute claims. (12/12 deviations reviewed claim-by-claim with spot verification; `calibrated` wording fixed where AD-05 is open; absolute-claims sweep of new strings clean; all 12 owner-approved.)
 - [x] Archive source lock, Cargo.lock, binary digest, SBOM/license inventory, model manifest, fixture checksums, raw results and signed review decisions. (reports/release-01/: INDEX.md, sbom.json, digests, rollback transcript, suite record; review decisions signed by commit authorship.)
-- [ ] Publish v0.1-alpha until all claimed full-surface release gates pass. (NOT done: tag/push requires owner approval. Binary reports `ltmrs 0.1.0-alpha`; upstream-differential re-run, power-loss qualification and multi-host matrices remain honest not_run.)
+- [x] Publish v0.1-alpha until all claimed full-surface release gates pass. (Tag v0.1-alpha pushed to origin at 538c0b2 (ancestor of main); binary reports `ltmrs 0.1.0-alpha`. Owner-deferred 2026-10-07: the formal publish stays open until all other review items resolve; upstream-differential re-run, power-loss qualification and multi-host matrices remain honest not_run.)
 
 **Outputs:** release bundle, compatibility statement, operational guide and evidence index.
 
@@ -492,6 +490,46 @@ cargo xtask evidence --release <version>
 ```
 
 Keep benchmark/test runners separate from production dependencies. A Python/Node upstream oracle in development does not violate the runtime constraint.
+
+Status 2026-10-07: no `cargo xtask` runner exists; the verbs map to
+`tools/` scripts where they exist — `evidence --release` is
+`tools/gen_release_evidence.sh`, `benchmark`/`quality` legs run via
+`tools/bench_against_ltmrs.py` / `tools/gen_calibration_corpus.py`,
+captures via `tools/capture_lemma.mjs` / `tools/capture_workflow.mjs`.
+No same-named `capabilities` / `conformance` / `recovery` runner exists.
+
+Delivery 2026-10-07 (plans/2026-10-07-xtask-runner-plan.md, Tasks 1–6):
+all seven verbs are implemented as a private `xtask/` workspace member
+(`cargo xtask ...` via the `.cargo/config.toml` alias; `cargo tree -p xtask`
+shows no new packages). Backing per verb:
+- `evidence --release <version>`: `bash tools/gen_release_evidence.sh
+  --release --locked` (the `<version>` is CLI metadata only; the bundle
+  keeps its own naming).
+- `capture-lemma --source <checkout>`: `node tools/capture_lemma.mjs
+  --repo <source> --home <sandbox> --out <sandbox>` with child-scoped `HOME`.
+- `benchmark --manifest <file> [--limit N]`: `python3
+  tools/bench_against_ltmrs.py --ops <manifest> --out <reports dir>
+  [--limit N]` with child-scoped `HOME`.
+- `quality --split heldout|dev`: `python3 tools/gen_calibration_corpus.py`
+  (zero-arg) then `python3 tools/agent_quality_wave.py` with child-scoped
+  `PROBE_HOME` (`RATER_MODEL` inherited untouched). Plan text shows
+  `--split held-out`; the runner resolves `heldout` and `dev`.
+- `capabilities --candidate fjall-lance`: `cargo test -p ltmrs-service --
+  namespace restore receipt contention durable barrier` then
+  `cargo test -p ltmrs-search -- fts backend projector table`.
+- `conformance --profile lemma-0.21.0`: `cargo test -p ltmrs-compat` then
+  `cargo test -p ltmrs-daemon -- differential`.
+- `recovery --suite durable`: `cargo test -p ltmrs-service -- restore replay
+  kill soak fragmented` then `cargo test -p ltmrs-interchange -- restore`
+  then `cargo test --test daemon_lifecycle`.
+Refusal rules: (1) an unknown candidate/profile/suite/split is a hard error
+naming the token (nothing executes); (2) `capabilities --candidate lance`
+is refused — the lance-only losing path was deleted post-AD-01, only
+`fjall-lance` resolves. Every verb accepts a global `--dry-run` flag that
+prints each would-be command (`would run: ...`) and exits 0 without
+executing or writing to `reports/`. Live runs write a JSON run-record per
+child under `reports/xtask-<verb>-<timestamp>/` and propagate the first
+failing child's exit code.
 
 ## 21. Handoff and change policy
 

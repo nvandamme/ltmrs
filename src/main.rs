@@ -1,17 +1,24 @@
-//! ltmrs binary: CLI dispatch over the library's argument parser.
+//! ltmrs binary: CLI dispatch over the frontend crate's argument parser.
 //!
 //! stdout carries protocol data and help/version text; diagnostics and
 //! errors go to stderr. Exit codes follow `CliError::exit_code`.
 
-use ltmrs::cli::{
+// Benchmark harness (WP-12): exercised by its own unit tests, wired to no
+// CLI command. Kept compiled in every profile; the allow covers its
+// unreachable-from-`main` public items so `-D warnings` stays green.
+#[allow(dead_code)]
+mod bench;
+mod visualizer;
+
+use crate::visualizer::run_visualize;
+use ltmrs_frontend::cli::{
     CliError, Command, help_text, install_shim_command, install_skill_command, parse_args,
     provision_models_command, run_library, version_text,
 };
-use ltmrs::frontend::serve::{
+use ltmrs_frontend::frontend::serve::{
     daemon_idle_ms, daemon_socket_path, ensure_daemon_process, resolve_home, run_daemon_foreground,
     serve_stdio, stdio_layout,
 };
-use ltmrs::visualizer::run_visualize;
 
 #[tokio::main]
 async fn main() {

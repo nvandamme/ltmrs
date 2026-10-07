@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::bench::{HistoryRecorder, WorkloadOp, WorkloadRng};
-use crate::service::repository::CanonicalRepository;
+use ltmrs_service::repository::CanonicalRepository;
 
 /// Arrival process for open-loop offered load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +98,9 @@ pub struct MeasuredOp {
 /// where blind overwrites at fixed revisions would clobber real state.
 pub fn execute_storage_op(repo: &CanonicalRepository, op: &WorkloadOp) -> (u64, bool, String) {
     use crate::bench::experiment::workload_memory;
-    use crate::domain::id::EntityId;
+    use ltmrs_domain::id::EntityId;
     enum Prepared {
-        Put(Box<crate::domain::memory::Memory>),
+        Put(Box<ltmrs_domain::memory::Memory>),
         Get(EntityId),
     }
     let prepared = match op {

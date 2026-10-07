@@ -14,8 +14,8 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::cli::CliError;
-use crate::domain::export::CanonicalExport;
+use ltmrs_domain::export::CanonicalExport;
+use ltmrs_frontend::cli::CliError;
 
 /// Default visualizer port. ltmrs-native (no upstream default is recorded
 /// in the baseline), pinned by test so changes are deliberate.
@@ -85,6 +85,9 @@ pub fn access_token() -> String {
 
 /// Serve until `shutdown` resolves. Opens the store first so a missing
 /// store fails fast with `no store at ...` instead of serving 500s.
+/// Test-only: every production path passes an explicit token via
+/// `serve_with_token`; only the missing-store test uses this wrapper.
+#[cfg(test)]
 pub async fn serve(
     listener: TcpListener,
     store_path: String,
@@ -258,7 +261,7 @@ fn library_export(store_path: &str) -> Result<CanonicalExport, String> {
         return Err(format!("no store at {store_path}"));
     }
     let repo =
-        crate::service::repository::CanonicalRepository::open(store_path).map_err(|e| e.message)?;
+        ltmrs_service::repository::CanonicalRepository::open(store_path).map_err(|e| e.message)?;
     repo.export_snapshot().map_err(|e| e.message)
 }
 
@@ -448,8 +451,8 @@ pub async fn run_visualize(
     port: Option<u16>,
     home: Option<String>,
 ) -> Result<String, CliError> {
-    let base = crate::frontend::serve::resolve_home(home)?;
-    let store = crate::frontend::serve::stdio_layout(&base).store_path;
+    let base = ltmrs_frontend::frontend::serve::resolve_home(home)?;
+    let store = ltmrs_frontend::frontend::serve::stdio_layout(&base).store_path;
     if !Path::new(&store).exists() {
         return Err(CliError::Usage(format!("no store at {store}")));
     }
@@ -484,10 +487,10 @@ mod tests {
         );
     }
 
-    fn hostile_memory() -> crate::domain::memory::Memory {
-        use crate::domain::id::{DocumentRevision, EligibilityRevision, EntityId, EntityRevision};
-        use crate::domain::memory::Instant;
-        use crate::domain::memory::{FragmentType, Memory, MemoryLifecycle, MemorySource};
+    fn hostile_memory() -> ltmrs_domain::memory::Memory {
+        use ltmrs_domain::id::{DocumentRevision, EligibilityRevision, EntityId, EntityRevision};
+        use ltmrs_domain::memory::Instant;
+        use ltmrs_domain::memory::{FragmentType, Memory, MemoryLifecycle, MemorySource};
         Memory {
             id: EntityId::new(uuid::Uuid::from_u128(9)),
             external_alias: None,
@@ -557,9 +560,7 @@ mod tests {
     async fn serves_index_api_404_405_over_loopback() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store").to_str().unwrap().to_string();
-        drop(crate::service::repository::CanonicalRepository::open(
-            &store,
-        ));
+        drop(ltmrs_service::repository::CanonicalRepository::open(&store));
         let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(
@@ -672,9 +673,7 @@ mod tests {
     async fn library_denied_without_token() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store").to_str().unwrap().to_string();
-        drop(crate::service::repository::CanonicalRepository::open(
-            &store,
-        ));
+        drop(ltmrs_service::repository::CanonicalRepository::open(&store));
         let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -733,12 +732,12 @@ mod tests {
     /// JSONL content type, filename pinned.
     #[tokio::test]
     async fn export_serves_jsonl_attachment() {
-        use crate::domain::id::{DocumentRevision, EligibilityRevision, EntityId, EntityRevision};
-        use crate::domain::memory::{FragmentType, Instant, Memory, MemoryLifecycle, MemorySource};
+        use ltmrs_domain::id::{DocumentRevision, EligibilityRevision, EntityId, EntityRevision};
+        use ltmrs_domain::memory::{FragmentType, Instant, Memory, MemoryLifecycle, MemorySource};
 
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store").to_str().unwrap().to_string();
-        let repo = crate::service::repository::CanonicalRepository::open(&store).unwrap();
+        let repo = ltmrs_service::repository::CanonicalRepository::open(&store).unwrap();
         repo.put_memory_direct(&Memory {
             id: EntityId::new(uuid::Uuid::from_u128(1)),
             external_alias: None,

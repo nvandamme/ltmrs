@@ -5,7 +5,74 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-06 — Coherent backup, IPC resend, restore retirement, boost flag
+## DATEPLACEHOLDER (2026-10-07) — Workspace split, review fixes, xtask runner
+
+Collapses the 24-commit arc `851ab90..14b5d52` (all local-only) into one
+reviewed unit: full refactor trace plus review-driven fixes plus the private
+xtask runner. No product-plan, wire, receipt or durability semantic change
+beyond what each entry below records; crate paths, receipts and restores
+behave identically, only better isolated and receipted.
+
+### Workspace crate split (single 52k-LOC package → 9 crates)
+- Scaffolding, then one crate per commit, each green-gated: `domain`,
+  `service`, `compat`, storage deletion (1709 LOC unreferenced
+  backend-comparison leftover), `embeddings` (candle isolated),
+  `search`+`retrieval` (arrow confined), `interchange` (daemon-free),
+  `daemon` (16k hub), `frontend` + binary-only root (`skills/` adjudicated
+  into `ltmrs-frontend`; projection stub deleted as doc-only).
+- Dev-profile thin LTO kept per measurement (noise-scale delta).
+- AGENTS.md rule 5 records the crate DAG, heavy-dep ownership and the
+  pin-drop proof rule; per-pin hygiene drops proven by grep.
+
+### Before/after timing (Task 0 baseline `reports/crate-split-baseline.txt`)
+
+| Measurement | Before (single crate) | After (workspace) |
+| clean check | 10.6s (package-clean, deps warm) | 2.9s, warm |
+| leaf-touch check (`domain/memory.rs`) | 4.9s | 0.29s (`-p ltmrs-domain`, ~17x) |
+| hub-touch check (`daemon/tools.rs`) | 1.3s | 0.83s (`-p ltmrs-daemon`) |
+| per-edit test-link, warm (`daemon/tools.rs` touch) | 270.7s (`--lib --no-run`) | 119.5s (`-p ltmrs-daemon`, ~2.3x) |
+
+### Double-review fix wave vs `plans/02_implementation_guide.md`
+- I-2 stale-path resend via `send_fresh_with_resend` (same op id,
+  resume-capable; nested resends terminal, triple-fault corner documented).
+- I-3 atomic suggestion filing (`file_suggestion`, max+1 in-tx with retry,
+  fail-loud; `next_suggestion_id` removed); RED-first 8x50-thread test,
+  negative-controlled.
+- M-1 first-freeze-wins; M-2 dual-missing quarantine names both ends;
+  M-3 bindings persist with the restore via `persist_sessions`.
+- I-1 safety-backup tear claim downgraded with generation-stability
+  reasoning (residual double-restore race noted as pathological).
+- Formal: WP-00..WP-11 covered, WP-12 honest-partial; plan-text deviations
+  (layout, xtask naming, evidence pointer, publish box) documented for
+  adjudication below rather than silently fixed.
+
+### Adjudicated plan-truth updates (owner-ordered, no code)
+- WP-13 publish box checked (tag v0.1-alpha on origin at 538c0b2; formal
+  publish deferred per owner decision); bulk-drive plan relocated
+  `docs/superpowers/plans/` → `plans/`.
+- Part II §1 + §3 rewritten to the workspace reality; §20 xtask mapped to
+  `tools/` equivalents with gaps named; Part III evidence_status.json
+  pointer clarified as never-created.
+
+### Private xtask runner (all seven §20 verbs)
+- Scaffolding (alias, arg parsing, `--help`), run-record core
+  (`execute`/`write_record`, exit-code fidelity), `--dry-run` purity.
+- Verbs: evidence (locked release script), capture-lemma (sandboxed HOME,
+  product archived under the report dir), benchmark (out-file `result.jsonl`),
+  quality (corpus + wave, sandboxed PROBE_HOME, dev-split warning),
+  capabilities (fjall-lance only, AD-01 refusal), conformance
+  (lemma-0.21.0 only), recovery (durable only); unknown tokens hard-error.
+- Parser hardening (dup-flag errors, `--` end-of-flags, per-flag dash-value
+  validation, underscore normalization, per-verb help, quoted dry-run
+  output); records carry tails, atomic temp+rename writes, pid-suffixed
+  dirs, evidence version meta. §20 delivery note amended in-plan.
+
+### Validation (single release run for the collapsed unit)
+- `cargo fmt -- --check` clean; `cargo clippy --all-targets -- -D warnings`
+  clean (fresh per-crate rechecks, unmasked exits).
+- Release evidence full `--release --locked`:
+  `reports/release-719a666b8e32-full-ZZ3yVW` — 707 passed, 0 failed.
+## a97e831 (2026-10-06) — Coherent backup, IPC resend, restore retirement, boost flag
 
 ### P1 backup is one coherent snapshot again
 - `export_full_with_generation` reads canonical sessions from the SAME

@@ -481,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn safety_fixture_passes_lexical_subset() {
         use crate::bench::experiment::search_row_for;
-        use crate::search::table::SearchTable;
+        use ltmrs_search::search::table::SearchTable;
         use std::collections::HashMap;
         let raw = std::fs::read_to_string(
             crate::bench::crate_root().join("experiments/quality/safety-cases.json"),
@@ -519,13 +519,13 @@ mod tests {
             executed += 1;
             // The canonical scope builds the predicate (same builder the
             // engine uses: project scope plus declared time bounds).
-            let scope = crate::domain::command::Scope {
+            let scope = ltmrs_domain::command::Scope {
                 project: Some(case.project.clone()),
                 after: case.after_millis,
                 before: case.before_millis,
                 ..Default::default()
             };
-            let filter = crate::retrieval::scope::EffectiveScope::resolve(&scope)
+            let filter = ltmrs_search::retrieval::scope::EffectiveScope::resolve(&scope)
                 .unwrap()
                 .to_lance_filter();
             let hits = table
@@ -594,17 +594,17 @@ mod tests {
 
     impl HashQueryEmbedder {
         fn hash_vec(text: &str) -> Vec<f32> {
-            crate::search::projector::hash_embed_vec(text, BENCH_EMBED_DIM)
+            ltmrs_search::search::projector::hash_embed_vec(text, BENCH_EMBED_DIM)
         }
     }
 
-    impl crate::retrieval::engine::QueryEmbedder for HashQueryEmbedder {
+    impl ltmrs_search::retrieval::engine::QueryEmbedder for HashQueryEmbedder {
         fn embed_query<'a>(
             &'a self,
             query: &'a str,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = crate::domain::command::DomainResult<Vec<f32>>>
+                dyn std::future::Future<Output = ltmrs_domain::command::DomainResult<Vec<f32>>>
                     + Send
                     + 'a,
             >,
@@ -619,19 +619,19 @@ mod tests {
     /// Only cross-language matching needs real embedding semantics (E5 leg).
     #[tokio::test]
     async fn safety_fixture_passes_engine_leg() {
-        use crate::domain::command::{CommandContext, DomainCommand, Scope};
-        use crate::domain::id::{
+        use ltmrs_domain::command::{CommandContext, DomainCommand, Scope};
+        use ltmrs_domain::id::{
             ChannelId, DocumentRevision, EligibilityRevision, EntityId, EntityRevision, FrontendId,
             ModelFingerprint, OperationId, StoreGeneration,
         };
-        use crate::domain::memory::{
+        use ltmrs_domain::memory::{
             FragmentType, Instant as DomainInstant, Memory, MemoryLifecycle, MemorySource,
         };
-        use crate::domain::relation::{Relation, RelationType};
-        use crate::retrieval::engine::{Engine, RetrievalRequest};
-        use crate::search::projector::{FixedEmbedder, Projector};
-        use crate::search::table::SearchTable;
-        use crate::service::repository::CanonicalRepository;
+        use ltmrs_domain::relation::{Relation, RelationType};
+        use ltmrs_search::retrieval::engine::{Engine, RetrievalRequest};
+        use ltmrs_search::search::projector::{FixedEmbedder, Projector};
+        use ltmrs_search::search::table::SearchTable;
+        use ltmrs_service::repository::CanonicalRepository;
         use std::sync::Arc;
 
         fn eid(n: u64) -> EntityId {
@@ -708,7 +708,7 @@ mod tests {
         let lance_dir = tempfile::tempdir().unwrap();
         // Frozen clock: retry namespaces carry a 24h TTL, so a real-clock
         // store outlives a fixed issuance instant before the first apply.
-        let clock = std::sync::Arc::new(crate::domain::clock::FrozenClock::new(1000));
+        let clock = std::sync::Arc::new(ltmrs_domain::clock::FrozenClock::new(1000));
         let repo =
             CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
                 .unwrap();
@@ -862,12 +862,12 @@ mod tests {
     /// Passage + query bridges: real E5 semantics behind both seams. One
     /// shared adapter (single model load per test), roles kept separate.
     struct E5SharedEmbedder {
-        adapter: std::sync::Arc<std::sync::Mutex<crate::embeddings::e5_small::E5SmallAdapter>>,
+        adapter: std::sync::Arc<std::sync::Mutex<ltmrs_embeddings::e5_small::E5SmallAdapter>>,
     }
 
-    impl crate::search::projector::Embedder for E5SharedEmbedder {
+    impl ltmrs_search::search::projector::Embedder for E5SharedEmbedder {
         fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
-            use crate::embeddings::recipe::Role;
+            use ltmrs_embeddings::recipe::Role;
             self.adapter
                 .lock()
                 .expect("embedder alive")
@@ -882,32 +882,32 @@ mod tests {
             &self,
             title: &str,
             fragment: &str,
-        ) -> Vec<crate::search::projector::TextChunk> {
+        ) -> Vec<ltmrs_search::search::projector::TextChunk> {
             let chunks = self
                 .adapter
                 .lock()
                 .expect("embedder alive")
                 .chunk_passage(title, fragment);
-            crate::search::backend::e5_chunks_to_text_chunks(title, &chunks)
+            ltmrs_search::search::backend::e5_chunks_to_text_chunks(title, &chunks)
         }
 
         fn chunker_version(&self) -> String {
-            crate::search::backend::E5_CHUNK_VERSION.to_string()
+            ltmrs_search::search::backend::E5_CHUNK_VERSION.to_string()
         }
     }
 
-    impl crate::retrieval::engine::QueryEmbedder for E5SharedEmbedder {
+    impl ltmrs_search::retrieval::engine::QueryEmbedder for E5SharedEmbedder {
         fn embed_query<'a>(
             &'a self,
             query: &'a str,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = crate::domain::command::DomainResult<Vec<f32>>>
+                dyn std::future::Future<Output = ltmrs_domain::command::DomainResult<Vec<f32>>>
                     + Send
                     + 'a,
             >,
         > {
-            use crate::embeddings::recipe::Role;
+            use ltmrs_embeddings::recipe::Role;
             Box::pin(async move {
                 self.adapter
                     .lock()
@@ -915,8 +915,8 @@ mod tests {
                     .embed(query, Role::Query)
                     .map(|seq| seq.vector)
                     .map_err(|e| {
-                        crate::domain::command::DomainError::new(
-                            crate::domain::command::DomainErrorCode::Validation,
+                        ltmrs_domain::command::DomainError::new(
+                            ltmrs_domain::command::DomainErrorCode::Validation,
                             format!("{e:?}"),
                         )
                     })
@@ -930,18 +930,18 @@ mod tests {
     /// without network), following the e5_small precedent.
     #[tokio::test]
     async fn safety_fixture_passes_real_e5_leg() {
-        use crate::domain::command::{CommandContext, DomainCommand, Scope};
-        use crate::domain::id::{
+        use ltmrs_domain::command::{CommandContext, DomainCommand, Scope};
+        use ltmrs_domain::id::{
             ChannelId, DocumentRevision, EligibilityRevision, EntityId, EntityRevision, FrontendId,
             ModelFingerprint, OperationId, StoreGeneration,
         };
-        use crate::domain::memory::{
+        use ltmrs_domain::memory::{
             FragmentType, Instant as DomainInstant, Memory, MemoryLifecycle, MemorySource,
         };
-        use crate::retrieval::engine::{Engine, RetrievalRequest};
-        use crate::search::projector::Projector;
-        use crate::search::table::SearchTable;
-        use crate::service::repository::CanonicalRepository;
+        use ltmrs_search::retrieval::engine::{Engine, RetrievalRequest};
+        use ltmrs_search::search::projector::Projector;
+        use ltmrs_search::search::table::SearchTable;
+        use ltmrs_service::repository::CanonicalRepository;
         use std::sync::Arc;
 
         let artifacts_dir = crate::bench::crate_root().join("tmp/e5-artifacts");
@@ -959,7 +959,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lance_dir = tempfile::tempdir().unwrap();
-        let clock = std::sync::Arc::new(crate::domain::clock::FrozenClock::new(1000));
+        let clock = std::sync::Arc::new(ltmrs_domain::clock::FrozenClock::new(1000));
         let repo =
             CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
                 .unwrap();
@@ -970,7 +970,7 @@ mod tests {
             .await
             .unwrap();
         let shared = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::embeddings::e5_small::E5SmallAdapter::load_verified(artifacts)
+            ltmrs_embeddings::e5_small::E5SmallAdapter::load_verified(artifacts)
                 .expect("pinned artifacts load"),
         ));
         let mut projector = Projector::new(
@@ -1081,17 +1081,17 @@ mod tests {
     /// override: a long document yields multiple rows (greedy units).
     #[tokio::test]
     async fn e5_leg_uses_production_chunking() {
-        use crate::domain::command::{CommandContext, DomainCommand, Scope};
-        use crate::domain::id::{
+        use ltmrs_domain::command::{CommandContext, DomainCommand, Scope};
+        use ltmrs_domain::id::{
             ChannelId, DocumentRevision, EligibilityRevision, EntityId, EntityRevision, FrontendId,
             ModelFingerprint, OperationId, StoreGeneration,
         };
-        use crate::domain::memory::{
+        use ltmrs_domain::memory::{
             FragmentType, Instant as DomainInstant, Memory, MemoryLifecycle, MemorySource,
         };
-        use crate::search::projector::Projector;
-        use crate::search::table::SearchTable;
-        use crate::service::repository::CanonicalRepository;
+        use ltmrs_search::search::projector::Projector;
+        use ltmrs_search::search::table::SearchTable;
+        use ltmrs_service::repository::CanonicalRepository;
 
         let artifacts_dir = crate::bench::crate_root().join("tmp/e5-artifacts");
         let artifacts = artifacts_dir.as_path();
@@ -1101,7 +1101,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let lance_dir = tempfile::tempdir().unwrap();
-        let clock = std::sync::Arc::new(crate::domain::clock::FrozenClock::new(1000));
+        let clock = std::sync::Arc::new(ltmrs_domain::clock::FrozenClock::new(1000));
         let repo =
             CanonicalRepository::open_with_clock(dir.path().join("store").to_str().unwrap(), clock)
                 .unwrap();
@@ -1112,7 +1112,7 @@ mod tests {
             .await
             .unwrap();
         let shared = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::embeddings::e5_small::E5SmallAdapter::load_verified(artifacts)
+            ltmrs_embeddings::e5_small::E5SmallAdapter::load_verified(artifacts)
                 .expect("pinned artifacts load"),
         ));
         let mut projector = Projector::new(

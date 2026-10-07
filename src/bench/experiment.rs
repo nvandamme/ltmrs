@@ -22,12 +22,12 @@ use crate::bench::{
     GeneratorConfig, Histogram, HistoryRecord, HistoryRecorder, OpGenerator, WorkloadOp,
     config_digest, read_history,
 };
-use crate::domain::id::{ChunkId, DocumentRevision, EntityId, ModelFingerprint, StoreGeneration};
-use crate::domain::memory::{
+use ltmrs_domain::id::{ChunkId, DocumentRevision, EntityId, ModelFingerprint, StoreGeneration};
+use ltmrs_domain::memory::{
     FragmentType, Instant as DomainInstant, Memory, MemoryLifecycle, MemorySource,
 };
-use crate::search::table::SearchTable;
-use crate::service::repository::CanonicalRepository;
+use ltmrs_search::search::table::SearchTable;
+use ltmrs_service::repository::CanonicalRepository;
 
 /// Storage experiment configuration (serialized into the report).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -71,7 +71,7 @@ pub struct ExperimentSummary {
 /// Deterministic workload memory: id and title derive from the key, the
 /// fragment pads to `bytes` so value sizes stay workload-controlled.
 pub fn workload_memory(key: u64, bytes: usize) -> Memory {
-    use crate::domain::id::{DocumentRevision, EligibilityRevision, EntityRevision};
+    use ltmrs_domain::id::{DocumentRevision, EligibilityRevision, EntityRevision};
     let title = format!("Workload {key}");
     let mut fragment = format!("{title} body text. ");
     while fragment.len() < bytes {
@@ -280,8 +280,8 @@ pub fn run_put_get(
 
 /// Lexical search row for a workload key: deterministic ids and revisions,
 /// embedding-free (storage-only: the FTS leg never runs inference).
-pub fn search_row_for(key: u64, text: &str) -> crate::search::row::SearchRow {
-    crate::search::row::SearchRow {
+pub fn search_row_for(key: u64, text: &str) -> ltmrs_search::search::row::SearchRow {
+    ltmrs_search::search::row::SearchRow {
         store_generation: StoreGeneration::FIRST,
         memory_id: EntityId::new(uuid::Uuid::from_u128(u128::from(key))),
         document_revision: DocumentRevision::new(1),
@@ -547,7 +547,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn storage_experiment_reference_run() {
-        use crate::search::projector::render_text;
+        use ltmrs_search::search::projector::render_text;
         let out = crate::bench::crate_root().join("reports/wp12-storage-01");
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(out.join("store")).unwrap();

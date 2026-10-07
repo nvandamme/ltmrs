@@ -21,7 +21,7 @@ A failure in the first two cannot be offset by higher throughput. Retrieval qual
 
 Every matrix cell is one of `not_run`, `inspected`, `passed`, `failed`, `blocked`, or `waived_with_reason`. Source inspection is not execution. A waiver cannot cover acknowledged knowledge loss, partial canonical commands, unsafe restore, scope leakage, or a falsely claimed compatible tool.
 
-This package's [evidence_status.json](evidence_status.json) reports only the work actually performed while writing the specification. The conformance matrix is a planned inventory. No latency result, crash pass or Candle output has been invented.
+This package's [evidence_status.json](evidence_status.json) reports only the work actually performed while writing the specification. The conformance matrix is a planned inventory. No latency result, crash pass or Candle output has been invented. (Note 2026-10-07: that file was never created; executed evidence accumulates under `reports/release-*/INDEX.md` alongside `plans/conformance_matrix.json` and `plans/traceability.json`.)
 
 ### 1.2 Test levels
 
