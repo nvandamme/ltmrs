@@ -324,10 +324,13 @@ fn relation_exists(
     target: EntityId,
     rtype: RelationType,
 ) -> DomainResult<bool> {
-    Ok(repo
-        .all_relations()?
-        .iter()
-        .any(|r| r.source == source && r.target == target && r.relation_type == rtype))
+    Ok(repo.all_relations()?.iter().any(|r| {
+        r.relation_type == rtype
+            && ((r.source == source && r.target == target)
+                // Symmetric relations keep one canonical edge: the reverse
+                // endpoint order duplicates it (mirrors validate_new_edge).
+                || (rtype.is_symmetric() && r.source == target && r.target == source))
+    }))
 }
 
 /// Create a relation with a deterministic ID derived from the operation.
@@ -6440,6 +6443,47 @@ mod tests {
             result_text(&second)
         );
         assert!(result_text(&second).contains("Created relation"));
+    }
+
+    /// P1 (symmetric uniqueness): A related_to B followed by B related_to A
+    /// (different operations) must reject as a duplicate — one canonical
+    /// edge per logical symmetric relation, never two directional rows.
+    #[test]
+    fn memory_relate_rejects_reversed_symmetric_duplicate() {
+        let (disp, _dir) = test_dispatcher();
+        // Near-disjoint token sets (Jaccard ~0.14): no auto-link may
+        // pre-create either direction, isolating the reported scenario.
+        let id1 = add_fragment(
+            &disp,
+            1,
+            "## Zebras\n\n### Context\nPhotovoltaic inverters hummed quietly midnight zebra stripes savanna voltage.",
+        );
+        let id2 = add_fragment(
+            &disp,
+            2,
+            "## Quilts\n\n### Context\nSourdough fermentation bubbles kitchen quilt stitching grandmother yeast.",
+        );
+        let forward = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: id1.clone(),
+            target_id: id2.clone(),
+            relation_type: "related_to".to_string(),
+            note: None,
+        });
+        let result = run(&disp, &tool_call(3, forward.clone()), &forward);
+        assert!(!result_is_error(&result));
+        let backward = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: id2.clone(),
+            target_id: id1.clone(),
+            relation_type: "related_to".to_string(),
+            note: None,
+        });
+        let result = run(&disp, &tool_call(4, backward.clone()), &backward);
+        assert!(result_is_error(&result));
+        assert!(
+            result_text(&result).contains("already exists"),
+            "reversed symmetric edge must reject as duplicate, got: {}",
+            result_text(&result)
+        );
     }
 
     #[test]

@@ -29,6 +29,15 @@ pub fn validate_new_edge<'a>(
         {
             return GraphValidation::Reject(DomainErrorCode::DuplicateEdge);
         }
+        // Symmetric relations store one canonical edge per logical
+        // relation: the reverse endpoint order duplicates it.
+        if new.relation_type.is_symmetric()
+            && e.source == new.target
+            && e.target == new.source
+            && e.relation_type == new.relation_type
+        {
+            return GraphValidation::Reject(DomainErrorCode::DuplicateEdge);
+        }
     }
     if new.relation_type.is_supersession()
         && forms_supersession_cycle(new, existing.iter().copied())
@@ -115,6 +124,25 @@ mod tests {
         assert_eq!(
             validate_new_edge(&e, existing.iter(), all_live),
             GraphValidation::Reject(DomainErrorCode::DuplicateEdge)
+        );
+    }
+
+    #[test]
+    fn rejects_reversed_symmetric_duplicate() {
+        // RelatedTo is symmetric: B→A duplicates an existing A→B.
+        let existing = [edge(1, 2, RelationType::RelatedTo)];
+        let reversed = edge(2, 1, RelationType::RelatedTo);
+        assert_eq!(
+            validate_new_edge(&reversed, existing.iter(), all_live),
+            GraphValidation::Reject(DomainErrorCode::DuplicateEdge)
+        );
+        // Directional supersession pairs are still caught, by cycle
+        // detection rather than duplicate rejection.
+        let existing = [edge(1, 2, RelationType::SupersededBy)];
+        let other = edge(2, 1, RelationType::SupersededBy);
+        assert_eq!(
+            validate_new_edge(&other, existing.iter(), all_live),
+            GraphValidation::Reject(DomainErrorCode::SupersessionCycle)
         );
     }
 

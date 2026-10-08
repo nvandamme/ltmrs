@@ -5,7 +5,19 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-07 — P1 exclusive restore fence + P2 single-mutex admit/GC boundary
+## 2026-10-08 — P1/P2 symmetric relations keep one canonical edge
+
+### P1/P2 symmetric relations keep one canonical edge
+- `validate_new_edge` rejects reverse endpoint order for symmetric
+  types (`Supports`/`Contradicts`/`RelatedTo`); the `relation_exists`
+  compatibility preflight mirrors it. Directional supersession pairs
+  stay cycle-checked as before.
+- RED-first: reversed-duplicate rejection at exec level (fixtures
+  proven auto-link-free after catching a false-pass where setup
+  auto-link created the reverse edge first) + validator unit test
+  documenting both behaviors.
+
+## 691ef0d (2026-10-07) — P1 exclusive restore fence + P2 single-mutex admit/GC boundary
 
 ### P1 exclusive restore fence + P2 single-mutex admit/GC boundary
 - `restore_write_guard` / `try_` variant + `restore_replace_guarded` /
