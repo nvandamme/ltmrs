@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --quiet -p xtask --"
+
+# NOTE: fast-linker selection lives in each member's build.rs (shared
+# probe at tools/detect_linker.rs), not here: cargo has no conditional
+# config, and a hardcoded -fuse-ld breaks checkouts without that linker.
+# Override per-build with LTMRS_LINKER=mold|wild|system.

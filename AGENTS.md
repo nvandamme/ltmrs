@@ -70,6 +70,35 @@ cargo build --release   # for release-claim work
 
 Include the exact validation commands used in the report or `DONE.md`.
 
+### Fast iteration (STRICT — build time is expensive here)
+
+The daemon test binary links candle/lance/arrow; unoptimized builds
+take minutes per touch rebuild. Iterate cheaply, qualify fully:
+
+- During development, scope to the crate under test and lib targets
+  only: `cargo test -p <crate> --lib`. Never run bare `cargo test`
+  (builds the root binary incl. `src/bench/quality.rs`) or
+  `--workspace` (builds every member) for iteration.
+- Run `cargo check -p <crate> --all-targets` before `cargo test`
+  when iterating on compile errors (no codegen, no link).
+- Do not run `cargo clean`, wipe `target/`, or reinstall the
+  toolchain to "fix" build issues — ask first. Stale-cache pruning
+  goes through `cargo sweep` (see below), never ad-hoc deletion.
+- `target/` hygiene: if `target/debug` exceeds ~50GB, run
+  `cargo sweep --time 30` to prune artifacts unused for 30+ days
+  (never plain `cargo clean`, which forces a full candle/lance
+  rebuild).
+- Dev-tool installs (sweep, nextest, linkers, …) go through
+  `cargo binstall`, never `cargo install` — prebuilt binaries,
+  no toolchain compile time. Library dependencies always compile
+  from source; that is not what binstall is for.
+- Linker selection is automatic per member (`build.rs` + shared probe
+  in `tools/detect_linker.rs`): mold if present, else wild, else the
+  system default — no setup needed, and checkouts without either
+  still build. Override per-build with `LTMRS_LINKER=mold|wild|system`
+  (also the escape hatch if the probe goes stale after installing or
+  removing a linker).
+
 ## Code Search — Always Use CCC (MCP Tools First, Then Skill)
 
 - **Rule:** For all code search, semantic search, LOC boundary extraction and

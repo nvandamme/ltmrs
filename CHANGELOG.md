@@ -5,7 +5,30 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-08 — P1/P2 frozen tool results + side-effect-free replay
+## 2026-10-08 — Build speed: profiles, auto-detected fast linker, hygiene rules
+
+### Build speed: profiles, auto-detected fast linker, hygiene rules
+- `[profile.dev]`: `lto = false` (was thin — re-optimized the whole
+  candle/lance tree on every test link), `debug = 1` (line tables),
+  `codegen-units = 64` (was 16, feeds 32 cores). Release keeps thin LTO.
+- Linker auto-detection: thin per-member `build.rs` shims sharing one
+  probe (`tools/detect_linker.rs`) — mold, else wild, else system
+  default via real link probe; `LTMRS_LINKER` override; Linux-only.
+  Replaces hardcoded mold flags in `.cargo/config.toml` (which broke
+  checkouts without mold). Verified per-package stamps + fallback +
+  override paths; daemon 216 and service 99 green.
+- Measured: daemon touch-rebuild 2m25s → ~3s steady state; full clean
+  workspace build ~4m11s. Wild A/B-tested and rejected (tied full
+  build, +0.5s touch — not worth the youth risk); verdict recorded.
+- Hygiene: `cargo sweep` reclaimed ~141GB (`target/` 294GB → 22GB
+  after clean rebuild); dep-duplicate audit found all 34 cross-major
+  pairs upstream-pinned (no safe unification).
+- AGENTS.md: Fast iteration rule (scoped `--lib` testing, check-first,
+  sweep-only pruning, binstall-first tools) + linker scheme note.
+- Gate: fmt clean, workspace clippy clean; mold-linked binaries
+  verified via `.comment` stamps.
+
+## 58b8184 (2026-10-08) — P1/P2 frozen tool results + side-effect-free replay
 
 ### P1/P2 frozen tool results + side-effect-free replay
 - New `tool_results` keyspace + `freeze_tool_result` /
