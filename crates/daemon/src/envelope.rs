@@ -122,6 +122,7 @@ impl DomainRequest {
             DomainRequest::AddMemory { memory } => Some(DomainCommand::AddMemory {
                 memory: memory.clone(),
                 session,
+                auto_link: None,
             }),
             DomainRequest::UpdateMemory {
                 id,

@@ -155,6 +155,11 @@ pub struct CanonicalRepository {
     /// committed atomically with the status transition + attempt
     /// adjustments so a retried respond replays instead of adjusting twice.
     suggestion_ops: OptimisticTxKeyspace,
+    /// Frozen compatibility-tool results, keyed by the primary
+    /// sub-command's scoped receipt key: the exact tool response bytes
+    /// rendered at first execution. Replay returns them verbatim —
+    /// no planning, no mutation, no recomputation.
+    tool_results: OptimisticTxKeyspace,
     /// Post-commit wake-up hook (P2-1 projection latency): fired once per
     /// committed mutation so the projection worker drives the new job
     /// immediately instead of waiting out its maintenance interval. Replays
@@ -320,6 +325,31 @@ struct SuggestionOpLog {
     scope: Option<OperationScope>,
 }
 
+/// Frozen compatibility-tool result: the exact response bytes rendered
+/// at first execution, replayed verbatim (no planning, no mutation, no
+/// recomputation). Keyed by the primary sub-command's scoped receipt
+/// key, alongside its receipt.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FrozenToolRecord {
+    digest: String,
+    response: ltmrs_domain::session::FrozenToolResponse,
+    #[serde(default)]
+    scope: Option<OperationScope>,
+}
+
+/// One read of a tool operation's replay state (see
+/// `check_tool_replay`).
+#[derive(Debug)]
+pub enum ToolReplayStatus {
+    /// Never ran (or collected): fresh execution proceeds.
+    Miss,
+    /// Ran and froze: return the response verbatim (barrier already run).
+    Frozen(ltmrs_domain::session::FrozenToolResponse),
+    /// Ran but froze nothing yet (crash window): rebuild from the
+    /// recorded receipt, freeze, and return.
+    Unfrozen(CommandReceipt),
+}
+
 /// The recorded outcome of one `suggestion_respond` operation (P1-2).
 #[derive(Debug, Clone)]
 pub struct RecordedSuggestionOp {
@@ -396,6 +426,7 @@ impl CanonicalRepository {
         let sessions = Self::keyspace(&db, "sessions")?;
         let session_ops = Self::keyspace(&db, "session_ops")?;
         let suggestion_ops = Self::keyspace(&db, "suggestion_ops")?;
+        let tool_results = Self::keyspace(&db, "tool_results")?;
 
         Ok(Self {
             db,
@@ -413,6 +444,7 @@ impl CanonicalRepository {
             sessions,
             session_ops,
             suggestion_ops,
+            tool_results,
             commit_hook: std::sync::Mutex::new(None),
             fault_injector,
             clock,
@@ -750,6 +782,7 @@ impl CanonicalRepository {
             &self.session_ops,
             &self.guide_ops,
             &self.suggestion_ops,
+            &self.tool_results,
         ];
         // Same synchronization boundary as admission: check-and-collect
         // holds this mutex across the whole collect+commit, so an
@@ -4006,6 +4039,118 @@ impl CanonicalRepository {
         .transpose()
     }
 
+    /// Replay a frozen compatibility-tool result (P1 replay depth): the
+    /// primary sub-command receipt must exist with matching channel and
+    /// digest (else miss / key-reuse, exactly like the gateway), and the
+    /// frozen record must carry the same digest. The durability barrier
+    /// runs before acknowledging — receipt visibility is never proof of
+    /// durable completion. Returns None when the operation never ran
+    /// (fresh execution proceeds) or froze nothing yet (crash window:
+    /// the caller rebuilds from the receipt and freezes).
+    pub fn replay_tool_result(
+        &self,
+        scope: &OperationScope,
+    ) -> DomainResult<Option<ltmrs_domain::session::FrozenToolResponse>> {
+        match self.check_tool_replay(scope)? {
+            ToolReplayStatus::Frozen(response) => Ok(Some(response)),
+            ToolReplayStatus::Miss | ToolReplayStatus::Unfrozen(_) => Ok(None),
+        }
+    }
+
+    /// One read of a tool operation's replay state: never ran, ran and
+    /// froze, or ran without freezing yet (crash window). Digest
+    /// mismatches reject as key reuse; channel mismatches read as a
+    /// miss (the gateway's own replay check refuses them authoritatively
+    /// on the fresh path). Frozen hits run the durability barrier
+    /// before acknowledging.
+    pub fn check_tool_replay(&self, scope: &OperationScope) -> DomainResult<ToolReplayStatus> {
+        let snapshot = self.db.read_tx();
+        let raw = snapshot
+            .get(&self.receipts, scope.op_key())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let Some(raw) = raw else {
+            return Ok(ToolReplayStatus::Miss);
+        };
+        let receipt: CommandReceipt = decode(raw.as_ref())?;
+        if receipt.channel_id != scope.channel_id {
+            return Ok(ToolReplayStatus::Miss);
+        }
+        if receipt.request_digest != scope.request_digest {
+            return Err(DomainError::new(
+                DomainErrorCode::KeyReuseDifferentInput,
+                "operation key reused with different input",
+            ));
+        }
+        let frozen = snapshot
+            .get(&self.tool_results, scope.op_key())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let Some(frozen) = frozen else {
+            return Ok(ToolReplayStatus::Unfrozen(receipt));
+        };
+        let record: FrozenToolRecord = serde_json::from_slice(frozen.as_ref())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        Self::check_scope_owner(record.scope.as_ref(), scope)?;
+        if record.digest != scope.request_digest {
+            return Err(DomainError::new(
+                DomainErrorCode::KeyReuseDifferentInput,
+                "operation key reused with different input",
+            ));
+        }
+        self.persist_barrier()?;
+        Ok(ToolReplayStatus::Frozen(record.response))
+    }
+
+    /// Freeze a compatibility-tool result after first execution (P2
+    /// replay fidelity): stored under the primary sub-command's scoped
+    /// key with its digest, so retries return the exact bytes —
+    /// no re-planning, no recomputation. Takes the admitted token (no
+    /// revalidation past the primary commit); the scope carries the key.
+    /// The barrier runs before acknowledging.
+    pub fn freeze_tool_result(
+        &self,
+        admitted: &AdmittedScope,
+        scope: &OperationScope,
+        response: &ltmrs_domain::session::FrozenToolResponse,
+    ) -> DomainResult<()> {
+        let admitted_scope = admitted.scope();
+        if admitted_scope.store_generation != scope.store_generation
+            || admitted_scope.frontend_id != scope.frontend_id
+            || admitted_scope.channel_id != scope.channel_id
+            || admitted_scope.retry_epoch != scope.retry_epoch
+        {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "frozen scope does not belong to the admitted operation",
+            ));
+        }
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let record = FrozenToolRecord {
+            digest: scope.request_digest.clone(),
+            response: response.clone(),
+            scope: Some(scope.clone()),
+        };
+        let raw = serde_json::to_vec(&record)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            tx.insert(&self.tool_results, scope.op_key(), raw.as_slice());
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("tool result freeze conflicted"))
+    }
+
     /// Freeze the tool response into a session operation receipt (P2-1):
     /// stored after first execution so a lost-response retry returns the
     /// original verbatim. The digest must still match (else key reuse); a
@@ -4692,6 +4837,7 @@ impl CanonicalRepository {
             &self.session_ops,
             &self.guide_ops,
             &self.suggestion_ops,
+            &self.tool_results,
         ] {
             for key in drain(&tx, ks)? {
                 tx.remove(ks, key);
@@ -5078,6 +5224,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m,
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5107,6 +5254,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5117,6 +5265,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m,
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5133,6 +5282,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5144,6 +5294,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(1), "x"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap_err();
@@ -5159,6 +5310,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5189,6 +5341,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), &format!("m{n}")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5233,6 +5386,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), &format!("m{n}")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5298,6 +5452,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), &format!("m{n}")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5348,6 +5503,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5358,6 +5514,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(2), "m2"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5382,6 +5539,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5416,6 +5574,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5427,6 +5586,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(2), "m2"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5454,6 +5614,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), &format!("m{n}")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5480,6 +5641,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5500,6 +5662,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), &format!("m{n}")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5540,6 +5703,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), &format!("m{n}")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -5599,6 +5763,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5637,6 +5802,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5692,6 +5858,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5724,6 +5891,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5757,6 +5925,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5810,6 +5979,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5854,6 +6024,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5865,6 +6036,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(2), "m2"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5886,6 +6058,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5913,6 +6086,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5937,6 +6111,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5957,6 +6132,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m1"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -5991,6 +6167,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "x"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6014,6 +6191,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "a"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6022,6 +6200,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(2), "b"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6063,6 +6242,7 @@ mod tests {
                     &DomainCommand::AddMemory {
                         memory: memory(eid(1), "T"),
                         session: None,
+                        auto_link: None,
                     },
                 )
             }));
@@ -6105,6 +6285,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(1), "x"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap_err();
@@ -6130,6 +6311,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "x"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6170,6 +6352,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(i), "x"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -6200,6 +6383,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6219,6 +6403,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: a,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6227,6 +6412,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: b,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6279,6 +6465,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: a,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6287,6 +6474,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: b,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6331,6 +6519,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m,
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -6366,6 +6555,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6400,6 +6590,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6442,6 +6633,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "hello"),
                 session: None,
+                auto_link: None,
             },
         );
         // The unknown outcome is resolved: no receipt exists, so it's an error.
@@ -6470,6 +6662,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "hello"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6501,6 +6694,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "a"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6512,6 +6706,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(2), "b"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6607,6 +6802,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "hello"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6625,6 +6821,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "hello"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6650,6 +6847,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "hello"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6691,6 +6889,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "hello"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6730,6 +6929,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), &format!("m{n}")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -6764,6 +6964,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(1), "hello"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -6787,6 +6988,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), "m"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -6807,6 +7009,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6832,6 +7035,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), "m"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -6857,6 +7061,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: first,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6904,6 +7109,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -6975,6 +7181,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), title),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -7018,6 +7225,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), title),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -7138,6 +7346,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(n), "x"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -7199,6 +7408,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "x"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7212,6 +7422,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(2), "x"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7280,6 +7491,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7289,6 +7501,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(2), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7299,6 +7512,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7344,6 +7558,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7406,6 +7621,7 @@ mod tests {
                             &DomainCommand::AddMemory {
                                 memory: memory(eid(n), "x"),
                                 session: None,
+                                auto_link: None,
                             },
                         );
                         if r.is_ok() {
@@ -7481,6 +7697,7 @@ mod tests {
                             &DomainCommand::AddMemory {
                                 memory: memory(eid(n), "x"),
                                 session: None,
+                                auto_link: None,
                             },
                         ) {
                             Ok(_) => {
@@ -7514,6 +7731,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7659,6 +7877,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(eid(1), "m"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap_err();
@@ -7672,6 +7891,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(1), "m"),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7783,6 +8003,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m.clone(),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -7795,6 +8016,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m,
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap_err();
@@ -8411,6 +8633,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -8422,6 +8645,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m2,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();

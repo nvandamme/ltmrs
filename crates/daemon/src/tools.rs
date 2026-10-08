@@ -67,11 +67,11 @@ pub fn execute_tool(
     match tool {
         ToolArgs::MemoryRead(args) => exec_memory_read(disp, envelope, args),
         ToolArgs::MemoryAdd(args) => exec_memory_add(disp, envelope, adm(), args),
-        ToolArgs::MemoryUpdate(args) => exec_memory_update(disp, envelope, args),
-        ToolArgs::MemoryFeedback(args) => exec_memory_feedback(disp, envelope, args),
-        ToolArgs::MemoryForget(args) => exec_memory_forget(disp, envelope, args),
-        ToolArgs::MemoryMerge(args) => exec_memory_merge(disp, envelope, args),
-        ToolArgs::MemoryRelate(args) => exec_memory_relate(disp, envelope, args),
+        ToolArgs::MemoryUpdate(args) => exec_memory_update(disp, envelope, adm(), args),
+        ToolArgs::MemoryFeedback(args) => exec_memory_feedback(disp, envelope, adm(), args),
+        ToolArgs::MemoryForget(args) => exec_memory_forget(disp, envelope, adm(), args),
+        ToolArgs::MemoryMerge(args) => exec_memory_merge(disp, envelope, adm(), args),
+        ToolArgs::MemoryRelate(args) => exec_memory_relate(disp, envelope, adm(), args),
         ToolArgs::MemoryStats(args) => exec_memory_stats(disp, args),
         ToolArgs::MemoryAudit(args) => exec_memory_audit(disp, args),
         ToolArgs::MemoryLibrary(args) => exec_memory_library(disp, args),
@@ -269,31 +269,82 @@ fn sub_command_ctx(envelope: &IpcEnvelope, index: u32) -> DomainResult<CommandCo
     Ok(ctx)
 }
 
-/// Replay-before-validation for mutating memory tools (P1): if this
-/// envelope's primary sub-command already committed, rebuild and return
-/// its recorded response INSTEAD of re-running state-dependent planning
-/// (dedup/existence checks) whose outcome the first execution changed.
-/// A stored receipt with a divergent digest rejects as key reuse (same
-/// as the gateway would); absence means fresh execution proceeds.
-fn replay_primary_subcommand(
+/// Sub-command scope for one tool-call step: the envelope identity with
+/// the derived sub-operation id and digest (shared by the replay check,
+/// the gateway context, and the freeze below).
+fn sub_scope(envelope: &IpcEnvelope, index: u32) -> DomainResult<OperationScope> {
+    let (op, digest) = sub_command_parts(envelope, index)?;
+    Ok(OperationScope {
+        store_generation: envelope.store_generation,
+        frontend_id: envelope.frontend_id,
+        channel_id: envelope.channel_id,
+        retry_epoch: envelope.retry_epoch,
+        operation_id: op,
+        request_digest: digest,
+    })
+}
+
+/// Convert a frozen tool response back into its tool payload.
+fn frozen_to_payload(frozen: &ltmrs_domain::session::FrozenToolResponse) -> DomainPayload {
+    DomainPayload::ToolResult {
+        text: frozen.text.clone(),
+        structured: frozen.structured.clone(),
+        is_error: frozen.is_error,
+    }
+}
+
+/// Freeze a freshly rendered tool response under the primary
+/// sub-command's scoped key (admitted: no revalidation past the
+/// primary commit). Only tool results freeze; anything else skips
+/// silently (no new failure mode on an already-rendered response).
+fn freeze_tool_payload(
+    disp: &Dispatcher,
+    admitted: &AdmittedScope,
+    scope: &OperationScope,
+    payload: &DomainPayload,
+) -> DomainResult<()> {
+    if let DomainPayload::ToolResult {
+        text,
+        structured,
+        is_error,
+    } = payload
+    {
+        disp.repo().freeze_tool_result(
+            admitted,
+            scope,
+            &ltmrs_domain::session::FrozenToolResponse {
+                text: text.clone(),
+                structured: structured.clone(),
+                is_error: *is_error,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Replay-before-validation for mutating memory tools (P1 replay
+/// depth): a frozen result returns verbatim (barriered); a receipt
+/// without a frozen result (crash window) rebuilds from the recorded
+/// receipt — never re-plans — then freezes; absence means fresh
+/// execution proceeds. A stored receipt with a divergent digest
+/// rejects as key reuse, exactly like the gateway.
+fn replay_tool_call(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     index: u32,
     rebuild: impl FnOnce(&CommandReceipt) -> DomainResult<DomainPayload>,
 ) -> DomainResult<Option<DomainPayload>> {
-    let (op, digest) = sub_command_parts(envelope, index)?;
-    match disp.repo().lookup_receipt(
-        envelope.store_generation,
-        envelope.frontend_id,
-        envelope.retry_epoch,
-        op,
-    )? {
-        Some(receipt) if receipt.request_digest == digest => Ok(Some(rebuild(&receipt)?)),
-        Some(_) => Err(DomainError::new(
-            DomainErrorCode::KeyReuseDifferentInput,
-            "operation key reused with different input",
-        )),
-        None => Ok(None),
+    use ltmrs_service::repository::ToolReplayStatus;
+    let scope = sub_scope(envelope, index)?;
+    match disp.repo().check_tool_replay(&scope)? {
+        ToolReplayStatus::Miss => Ok(None),
+        ToolReplayStatus::Frozen(frozen) => Ok(Some(frozen_to_payload(&frozen))),
+        ToolReplayStatus::Unfrozen(receipt) => {
+            let payload = rebuild(&receipt)?;
+            freeze_tool_payload(disp, admitted, &scope, &payload)?;
+            Ok(Some(payload))
+        }
     }
 }
 
@@ -1128,19 +1179,18 @@ fn render_detail(legacy_id: &str, m: &Memory, resolve: &dyn Fn(&EntityId) -> Str
 
 // ---- memory_add ----
 
-/// Shared add-response tail for fresh and replayed executions: topic
-/// overlaps, auto-link (its own sub-command receipt replays on retry),
-/// privacy/distill notes and the structured payload — all derived from
-/// the recorded memory plus a fresh snapshot. The fresh path calls this
-/// after its apply; the replay path calls it with the memory read back
-/// by receipt, so both render the same text.
+/// Shared add-response tail for the fresh path: topic overlaps, the
+/// recorded auto-link, privacy/distill notes and the structured payload.
+/// The link section renders the transactionally recorded link only —
+/// never plans or applies one (replay renders the frozen response
+/// instead; see below).
 fn finish_add_response(
     disp: &Dispatcher,
-    envelope: &IpcEnvelope,
     args: &MemoryAddArgs,
     memory: &Memory,
     final_fragment: &str,
     has_secrets: bool,
+    recorded_link: Option<Relation>,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let export = repo.export_snapshot()?;
@@ -1149,7 +1199,7 @@ fn finish_add_response(
     let project = memory.project.clone();
     let title = memory.title.clone();
     let description = memory.description.clone();
-    // Find topic overlaps for auto-linking.
+    // Other overlaps, for the informational list (read-only: no effects).
     let overlaps: Vec<&Memory> = export
         .memories
         .iter()
@@ -1181,36 +1231,25 @@ fn finish_add_response(
         );
     }
 
-    // Auto-link to topic overlaps.
-    if !overlaps.is_empty() {
-        let strongest = &overlaps[0];
-        let strongest_id = legacy_id_of(repo, strongest);
-        let rel = new_relation(
-            envelope,
-            eid,
-            strongest.id,
-            RelationType::RelatedTo,
-            Some(format!(
-                "Auto-linked: topic overlap ({:.2})",
-                word_overlap(final_fragment, &strongest.fragment)
-            )),
-        );
-        let rel_cmd = DomainCommand::Relate { relation: rel };
-        let rel_ctx = sub_command_ctx(envelope, 1)?;
-        if disp.repo().apply(&rel_ctx, &rel_cmd).is_ok() {
-            response.push_str("\n\nRelated memories (auto-linked to strongest match):");
+    // Recorded auto-link section (informational tail lists the other
+    // overlaps without linking them).
+    if let Some(link) = recorded_link {
+        let target = export.memories.iter().find(|m| m.id == link.target);
+        let (target_title, target_confidence, strongest_id) = match target {
+            Some(t) => (t.title.clone(), t.confidence, legacy_id_of(repo, t)),
+            None => (String::new(), 0.0, String::new()),
+        };
+        response.push_str("\n\nRelated memories (auto-linked to strongest match):");
+        response.push_str(&format!(
+            "\n  [{strongest_id}] \"{target_title}\" ({target_confidence:.2}) — AUTO-LINKED"
+        ));
+        for o in overlaps.iter().filter(|o| o.id != link.target).take(4) {
             response.push_str(&format!(
-                "\n  [{strongest_id}] \"{}\" ({:.2}) — AUTO-LINKED",
-                strongest.title, strongest.confidence
+                "\n  [{}] \"{}\" ({:.2})",
+                legacy_id_of(repo, o),
+                o.title,
+                o.confidence
             ));
-            for o in &overlaps[1..] {
-                response.push_str(&format!(
-                    "\n  [{}] \"{}\" ({:.2})",
-                    legacy_id_of(repo, o),
-                    o.title,
-                    o.confidence
-                ));
-            }
         }
     }
 
@@ -1264,34 +1303,60 @@ fn exec_memory_add(
 
     // Replay before validation: a retried envelope finds the memory the
     // first delivery created and would reject itself as a duplicate —
-    // the recorded receipt rebuilds the response instead.
-    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |receipt| {
-        let created = match &receipt.outcome {
+    // the recorded receipt rebuilds the response instead. The link
+    // section renders the transactionally recorded link (read, never
+    // re-planned or re-applied).
+    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |receipt| {
+        let (created, linked) = match &receipt.outcome {
             ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
-                affected.first().copied().ok_or_else(|| {
-                    DomainError::new(
-                        DomainErrorCode::Validation,
-                        "recorded add outcome carries no memory",
-                    )
-                })
+                (affected.first().copied(), affected.get(1).copied())
             }
-            _ => Err(DomainError::new(
+            _ => (None, None),
+        };
+        let created = created.ok_or_else(|| {
+            DomainError::new(
                 DomainErrorCode::Validation,
-                "recorded add outcome is not a success",
-            )),
-        }?;
-        let stored = disp
-            .repo()
-            .get_memories(&[created])?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                DomainError::new(
-                    DomainErrorCode::NotFound,
-                    "recorded memory no longer present",
-                )
-            })?;
-        finish_add_response(disp, envelope, args, &stored, &final_fragment, has_secrets)
+                "recorded add outcome carries no memory",
+            )
+        })?;
+        let stored = disp.repo().get_memories(&[created])?.into_iter().next();
+        let recorded_link = linked.and_then(|id| {
+            disp.repo()
+                .all_relations()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|r| r.id == id)
+        });
+        match stored {
+            Some(memory) => finish_add_response(
+                disp,
+                args,
+                &memory,
+                &final_fragment,
+                has_secrets,
+                recorded_link,
+            ),
+            // Recorded memory gone post-commit (deleted afterwards):
+            // report the recorded success from args-derived values
+            // rather than failing a legitimate retry.
+            None => {
+                let title = args
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| generate_title(&final_fragment));
+                let legacy_id = new_legacy_id(envelope);
+                Ok(ok_result(
+                    format!(
+                        "Added fragment [{legacy_id}]: \"{title}\" (recorded memory since removed)"
+                    ),
+                    json!({
+                        "success": true,
+                        "id": legacy_id,
+                        "conflicts": [],
+                    }),
+                ))
+            }
+        }
     })? {
         return Ok(replayed);
     }
@@ -1432,13 +1497,53 @@ fn exec_memory_add(
         unknown_fields: std::collections::BTreeMap::new(),
     };
 
-    // Apply the command.
+    // Apply the command, with the planned auto-link inside the same
+    // transaction (both endpoints live here: the memory below, the
+    // target from the pre-apply snapshot). Planning output rides the
+    // receipt, so replay never re-plans it.
+    let planned_link = export
+        .memories
+        .iter()
+        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| m.id != eid)
+        .filter(|m| {
+            let score = word_overlap(&final_fragment, &m.fragment);
+            (0.25..0.95).contains(&score)
+        })
+        .take(5)
+        .next()
+        .map(|strongest| {
+            new_relation(
+                envelope,
+                eid,
+                strongest.id,
+                RelationType::RelatedTo,
+                Some(format!(
+                    "Auto-linked: topic overlap ({:.2})",
+                    word_overlap(&final_fragment, &strongest.fragment)
+                )),
+            )
+        });
     let cmd = DomainCommand::AddMemory {
         memory: memory.clone(),
         session: None,
+        auto_link: planned_link.clone(),
     };
     let ctx = sub_command_ctx(envelope, 0)?;
-    disp.repo().apply(&ctx, &cmd)?;
+    let receipt = disp.repo().apply(&ctx, &cmd)?;
+    // The recorded link (if the transaction created it — a duplicate
+    // edge skips) is what the response renders, never a recomputation.
+    let recorded_link = match &receipt.outcome {
+        ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
+            affected.get(1).copied().and_then(|id| {
+                repo.all_relations()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|r| r.id == id)
+            })
+        }
+        _ => None,
+    };
 
     // Attribute the created memory to the session in the canonical store
     // (deduped), or to the virtual record when session-less (best-effort
@@ -1456,13 +1561,23 @@ fn exec_memory_add(
         );
     }
 
-    finish_add_response(disp, envelope, args, &memory, &final_fragment, has_secrets)
+    let payload = finish_add_response(
+        disp,
+        args,
+        &memory,
+        &final_fragment,
+        has_secrets,
+        recorded_link,
+    )?;
+    freeze_tool_payload(disp, admitted, &sub_scope(envelope, 0)?, &payload)?;
+    Ok(payload)
 }
 // ---- memory_update ----
 
 fn exec_memory_update(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &MemoryUpdateArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -1491,7 +1606,7 @@ fn exec_memory_update(
     // Replay before validation (uniform tool rule): a retried envelope
     // replays its recorded response instead of re-planning against
     // mutated state.
-    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |receipt| {
+    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |receipt| {
         let updated_id = match &receipt.outcome {
             ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
                 affected.first().copied().ok_or_else(|| {
@@ -1578,7 +1693,9 @@ fn exec_memory_update(
         "success": true,
         "id": args.id,
     });
-    Ok(ok_result(response, structured))
+    let payload = ok_result(response, structured);
+    freeze_tool_payload(disp, admitted, &sub_scope(envelope, 0)?, &payload)?;
+    Ok(payload)
 }
 
 // ---- memory_feedback ----
@@ -1586,12 +1703,13 @@ fn exec_memory_update(
 fn exec_memory_feedback(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &MemoryFeedbackArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
     // Replay before validation (uniform tool rule).
-    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |receipt| {
+    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |receipt| {
         let fb_id = match &receipt.outcome {
             ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
                 affected.first().copied().ok_or_else(|| {
@@ -1678,7 +1796,9 @@ fn exec_memory_feedback(
         "id": args.id,
         "confidence": new_confidence,
     });
-    Ok(ok_result(response, structured))
+    let payload = ok_result(response, structured);
+    freeze_tool_payload(disp, admitted, &sub_scope(envelope, 0)?, &payload)?;
+    Ok(payload)
 }
 
 // ---- memory_forget ----
@@ -1686,13 +1806,14 @@ fn exec_memory_feedback(
 fn exec_memory_forget(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &MemoryForgetArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
     // Replay before validation (uniform tool rule): after a hard
     // delete the target is gone, so only the receipt can answer.
-    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |_| {
+    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |_| {
         let response = if args.invalidate {
             format!(
                 "Invalidated fragment [{}] — hidden from recall but preserved (content + history kept). Reversible.",
@@ -1775,7 +1896,9 @@ fn exec_memory_forget(
         "success": true,
         "id": args.id,
     });
-    Ok(ok_result(response, structured))
+    let payload = ok_result(response, structured);
+    freeze_tool_payload(disp, admitted, &sub_scope(envelope, 0)?, &payload)?;
+    Ok(payload)
 }
 
 // ---- memory_merge ----
@@ -1783,6 +1906,7 @@ fn exec_memory_forget(
 fn exec_memory_merge(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &MemoryMergeArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -1796,7 +1920,7 @@ fn exec_memory_merge(
     // Replay before validation (uniform tool rule): after the first
     // execution the sources are archived, so resolution would fail —
     // the recorded receipt rebuilds the response instead.
-    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |_| {
+    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |_| {
         let legacy_id = new_legacy_id(envelope);
         let project = args.project.as_deref().and_then(normalize_project);
         let scope_info = project
@@ -1934,7 +2058,9 @@ fn exec_memory_merge(
         "id": legacy_id,
         "merged_ids": args.ids,
     });
-    Ok(ok_result(response, structured))
+    let payload = ok_result(response, structured);
+    freeze_tool_payload(disp, admitted, &sub_scope(envelope, 0)?, &payload)?;
+    Ok(payload)
 }
 
 // ---- memory_relate ----
@@ -1942,6 +2068,7 @@ fn exec_memory_merge(
 fn exec_memory_relate(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &MemoryRelateArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -1973,7 +2100,7 @@ fn exec_memory_relate(
     // Replay before validation: a retried envelope finds the edge the
     // first delivery created and would reject itself as a duplicate —
     // the recorded receipt replays instead.
-    if let Some(replayed) = replay_primary_subcommand(disp, envelope, 0, |_| {
+    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |_| {
         Ok(ok_result(
             format!(
                 "Created relation: [{}] --{}--> [{}]{}",
@@ -2035,7 +2162,9 @@ fn exec_memory_relate(
         "success": true,
         "relation": args.relation_type,
     });
-    Ok(ok_result(response, structured))
+    let payload = ok_result(response, structured);
+    freeze_tool_payload(disp, admitted, &sub_scope(envelope, 0)?, &payload)?;
+    Ok(payload)
 }
 
 // ---- memory_stats ----
@@ -6385,6 +6514,245 @@ mod tests {
             .filter(|m| m.fragment.contains("Namespace-expiry fixture"))
             .count();
         assert_eq!(count, 1, "exactly one effect allowed");
+    }
+
+    /// P1 (replay durability): a primary commit whose barrier fails must
+    /// not report success on retry while the barrier keeps failing —
+    /// receipt visibility is never proof of durable completion. Barrier
+    /// faults stay armed across both attempts; healing the barrier lets
+    /// the same envelope converge to success via rebuild+freeze.
+    #[test]
+    fn tool_replay_needs_durable_barrier() {
+        let (disp, _dir) = test_dispatcher();
+        disp.repo().fault_injector().set_persist_failures(1000);
+        let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Barrier Replay\n\n### Context\nDurability fixture.".to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(70, args.clone());
+        assert!(
+            execute_tool(&disp, &env, &args).is_err(),
+            "unflushed primary must error"
+        );
+        // Retry with the barrier still failing: receipt exists, nothing
+        // is frozen — must NOT report success.
+        assert!(
+            execute_tool(&disp, &env, &args).is_err(),
+            "replay without durability must error"
+        );
+        // Heal: the same envelope rebuilds from the receipt, freezes,
+        // and succeeds exactly once.
+        disp.repo().fault_injector().set_persist_failures(0);
+        let result = run(&disp, &env, &args);
+        assert!(!result_is_error(&result));
+        let count = disp
+            .repo()
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .iter()
+            .filter(|m| m.fragment.contains("Durability fixture"))
+            .count();
+        assert_eq!(count, 1, "exactly one effect allowed");
+        // Frozen replay still barriers: re-arm faults and retry the
+        // now-frozen operation — must NOT report success either.
+        disp.repo().fault_injector().set_persist_failures(1000);
+        assert!(
+            execute_tool(&disp, &env, &args).is_err(),
+            "frozen replay without durability must error"
+        );
+        disp.repo().fault_injector().set_persist_failures(0);
+    }
+
+    /// P1 (replay purity): replaying an add must create no new effects
+    /// and return the original response verbatim — even when the store
+    /// changed since (B now overlaps A). Second variant below: A
+    /// originally linked X, then a stronger Y arrives; replay must
+    /// still describe X and create no A→Y edge.
+    #[test]
+    fn add_replay_creates_no_new_effects() {
+        let (disp, _dir) = test_dispatcher();
+        let find = |frag: &str| {
+            disp.repo()
+                .export_snapshot()
+                .unwrap()
+                .memories
+                .into_iter()
+                .find(|m| m.fragment.contains(frag))
+                .expect("fixture memory must exist")
+                .id
+        };
+        // Outgoing edges only: B legitimately links TO A on its own
+        // first execution; replay must add none FROM A.
+        let edges_of = |id: ltmrs_domain::id::EntityId| {
+            disp.repo()
+                .neighbors(id)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.source == id)
+                .count()
+        };
+        // A lands with no overlap: no auto-link anywhere.
+        let args_a = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Quiescent Solo\n\n### Context\nZirconium lattice meridians.".to_string(),
+            ..Default::default()
+        });
+        let env_a = tool_call(71, args_a.clone());
+        let first = run(&disp, &env_a, &args_a);
+        assert!(!result_is_error(&first));
+        let first_text = result_text(&first);
+        let eid_a = find("Quiescent Solo");
+        assert_eq!(edges_of(eid_a), 0, "A must land link-free");
+        // B arrives overlapping A.
+        let args_b = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Overlapping Other\n\n### Context\nZirconium lattice parallels."
+                .to_string(),
+            ..Default::default()
+        });
+        let env_b = tool_call(72, args_b.clone());
+        assert!(!result_is_error(&run(&disp, &env_b, &args_b)));
+        // Replay the ORIGINAL A envelope: same bytes, no new relation.
+        let replayed = run(&disp, &env_a, &args_a);
+        assert!(!result_is_error(&replayed));
+        assert_eq!(
+            result_text(&replayed),
+            first_text,
+            "replay must return the original bytes verbatim"
+        );
+        assert_eq!(edges_of(eid_a), 0, "replay must create no relations");
+    }
+
+    /// P1 (replay purity, stronger-overlap variant): A originally linked
+    /// X; a stronger Y arrives later. Replaying A must describe X (the
+    /// recorded link), create no A→Y edge, and return the original text.
+    #[test]
+    fn add_replay_keeps_original_autolink() {
+        let (disp, _dir) = test_dispatcher();
+        let find = |frag: &str| {
+            disp.repo()
+                .export_snapshot()
+                .unwrap()
+                .memories
+                .into_iter()
+                .find(|m| m.fragment.contains(frag))
+                .expect("fixture memory must exist")
+                .id
+        };
+        // X first (nothing to link to).
+        let args_x = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Anchor Xray\n\n### Context\ntungsten carbide tooling delta echo"
+                .to_string(),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(73, args_x.clone()), &args_x);
+        assert!(!result_is_error(&result));
+        let eid_x = find("Anchor Xray");
+        // A overlaps X: links X on first execution.
+        let args_a = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Linked Apex\n\n### Context\ntungsten carbide latency alpha bravo"
+                .to_string(),
+            ..Default::default()
+        });
+        let env_a = tool_call(74, args_a.clone());
+        let first = run(&disp, &env_a, &args_a);
+        assert!(!result_is_error(&first));
+        let first_text = result_text(&first);
+        assert!(
+            first_text.contains("AUTO-LINKED"),
+            "A must link on first execution, got: {first_text}"
+        );
+        let eid_a = find("Linked Apex");
+        let outgoing = |id: ltmrs_domain::id::EntityId| {
+            disp.repo()
+                .neighbors(id)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.source == id)
+                .map(|r| r.target)
+                .collect::<Vec<_>>()
+        };
+        let linked_to = outgoing(eid_a);
+        assert_eq!(
+            linked_to,
+            vec![eid_x],
+            "A must link exactly X, got {linked_to:?}"
+        );
+        // Y arrives overlapping A at least as strongly.
+        let args_y = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Rival Yonder\n\n### Context\ntungsten carbide latency alpha bravo foxtrot golf hotel".to_string(),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(75, args_y.clone()), &args_y);
+        assert!(!result_is_error(&result));
+        // Sanity: Y really does overlap A more strongly than X does (the
+        // test only bites if a re-plan would prefer Y).
+        assert!(
+            word_overlap(
+                "tungsten carbide latency alpha bravo foxtrot golf hotel",
+                "tungsten carbide latency alpha bravo"
+            ) > word_overlap(
+                "tungsten carbide latency alpha bravo",
+                "tungsten carbide tooling delta echo"
+            ),
+            "Y must out-overlap X for the regression to bite"
+        );
+        // Replay the ORIGINAL A envelope.
+        let replayed = run(&disp, &env_a, &args_a);
+        assert!(!result_is_error(&replayed));
+        assert_eq!(
+            result_text(&replayed),
+            first_text,
+            "replay must return the original bytes verbatim"
+        );
+        let linked_to = outgoing(eid_a);
+        assert_eq!(
+            linked_to,
+            vec![eid_x],
+            "replay must create no new edges, got {linked_to:?}"
+        );
+    }
+
+    /// P2 (replay fidelity): a feedback replay must report the confidence
+    /// recorded by its own execution, not the current value — a later
+    /// op moved it to 0.53, but the first op's replay still says 0.515.
+    /// Only frozen bytes can do this; any recomputation drifts.
+    #[test]
+    fn feedback_replay_reports_original_confidence() {
+        let (disp, _dir) = test_dispatcher();
+        let mem = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Drift Anchor\n\n### Context\nConfidence fixture.".to_string(),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(80, mem.clone()), &mem);
+        assert!(!result_is_error(&result));
+        let legacy = result_structured(&result).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Negative feedback from the 1.0 creation baseline: 1.00
+        // first, 0.98 second — the replay must still say 0.98.
+        let fb = ToolArgs::MemoryFeedback(MemoryFeedbackArgs {
+            id: legacy.clone(),
+            useful: false,
+        });
+        let first = run(&disp, &tool_call(81, fb.clone()), &fb);
+        assert!(!result_is_error(&first));
+        let first_text = result_text(&first);
+        assert!(
+            first_text.contains("0.98"),
+            "first feedback must report 0.98, got: {first_text}"
+        );
+        // A second, independent feedback moves confidence again.
+        let again = run(&disp, &tool_call(82, fb.clone()), &fb);
+        assert!(!result_is_error(&again));
+        // Replay the FIRST feedback envelope: byte-identical text.
+        let replayed = run(&disp, &tool_call(81, fb.clone()), &fb);
+        assert!(!result_is_error(&replayed));
+        assert_eq!(
+            result_text(&replayed),
+            first_text,
+            "replay must return the frozen original, not recomputed state"
+        );
     }
 
     /// P1 (tool replay): the same MemoryAdd envelope twice must replay

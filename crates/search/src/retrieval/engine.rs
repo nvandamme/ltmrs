@@ -1012,6 +1012,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(n), title, frag, project),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1732,6 +1733,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: low,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1740,6 +1742,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: high,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1784,6 +1787,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: old,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1792,6 +1796,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: new,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();

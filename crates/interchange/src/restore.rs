@@ -1219,6 +1219,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: stale,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1286,6 +1287,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: test_memory(3, "Nope"),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap_err();
@@ -1309,6 +1311,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: changed,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();

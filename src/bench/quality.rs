@@ -747,6 +747,7 @@ mod tests {
                         doc.created_at_millis,
                     ),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1044,6 +1045,7 @@ mod tests {
                         unknown_fields: std::collections::BTreeMap::new(),
                     },
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1187,6 +1189,7 @@ mod tests {
                     unknown_fields: std::collections::BTreeMap::new(),
                 },
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();

@@ -261,7 +261,9 @@ pub(crate) fn apply_command(
     cmd: &DomainCommand,
 ) -> DomainResult<ReceiptOutcome> {
     match cmd {
-        DomainCommand::AddMemory { memory, .. } => apply_add_memory(state, memory),
+        DomainCommand::AddMemory {
+            memory, auto_link, ..
+        } => apply_add_memory(state, memory, auto_link.as_ref()),
         DomainCommand::UpdateMemory {
             id,
             expected_revision,
@@ -296,7 +298,11 @@ pub(crate) fn apply_command(
     }
 }
 
-fn apply_add_memory(state: &mut CommandState<'_>, memory: &Memory) -> DomainResult<ReceiptOutcome> {
+fn apply_add_memory(
+    state: &mut CommandState<'_>,
+    memory: &Memory,
+    auto_link: Option<&ltmrs_domain::relation::Relation>,
+) -> DomainResult<ReceiptOutcome> {
     if state.get_memory(memory.id)?.is_some() {
         return Err(DomainError::new(
             DomainErrorCode::Validation,
@@ -322,9 +328,32 @@ fn apply_add_memory(state: &mut CommandState<'_>, memory: &Memory) -> DomainResu
     state.record_pending_projection(memory.id, now)?;
     // The projected set changed: any open build must be refreshed.
     state.mark_build_dirty()?;
-    Ok(ReceiptOutcome::Success {
-        affected: vec![memory.id],
-    })
+    let mut affected = vec![memory.id];
+    // Planned auto-link, executed in the same transaction (both endpoints
+    // live: the memory was just written, the target was live at planning).
+    // A duplicate edge (concurrent identical link) skips silently — the
+    // link exists, which is all any response claims. Other rejections
+    // fail closed: a dead target must re-plan, not silently drop.
+    if let Some(rel) = auto_link {
+        let live_memory_ids = |id: EntityId| -> bool {
+            state
+                .get_memory(id)
+                .map(|m| m.map(|m| m.lifecycle.is_recallable()).unwrap_or(false))
+                .unwrap_or(false)
+        };
+        let relations = state.get_all_relations()?;
+        match validate_new_edge(rel, relations.iter(), live_memory_ids) {
+            GraphValidation::Ok => {
+                state.put_relation(rel)?;
+                affected.push(rel.id);
+            }
+            GraphValidation::Reject(DomainErrorCode::DuplicateEdge) => {}
+            GraphValidation::Reject(code) => {
+                return Err(DomainError::new(code, "graph validation failed"));
+            }
+        }
+    }
+    Ok(ReceiptOutcome::Success { affected })
 }
 
 fn apply_update_memory(

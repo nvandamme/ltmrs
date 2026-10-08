@@ -1934,6 +1934,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: test_memory(n),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();

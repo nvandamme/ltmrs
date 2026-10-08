@@ -641,6 +641,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(eid(n), title, frag),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();

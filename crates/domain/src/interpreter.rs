@@ -93,7 +93,9 @@ impl ReferenceInterpreter {
         cmd: &DomainCommand,
     ) -> DomainResult<CommandReceipt> {
         let outcome = match cmd {
-            DomainCommand::AddMemory { memory, .. } => self.apply_add_memory(memory)?,
+            DomainCommand::AddMemory {
+                memory, auto_link, ..
+            } => self.apply_add_memory(memory, auto_link.as_ref())?,
             DomainCommand::UpdateMemory {
                 id,
                 expected_revision,
@@ -152,7 +154,11 @@ impl ReferenceInterpreter {
         })
     }
 
-    fn apply_add_memory(&mut self, memory: &Memory) -> DomainResult<ReceiptOutcome> {
+    fn apply_add_memory(
+        &mut self,
+        memory: &Memory,
+        auto_link: Option<&Relation>,
+    ) -> DomainResult<ReceiptOutcome> {
         if self.memories.contains_key(&memory.id) {
             return Err(DomainError::new(
                 DomainErrorCode::Validation,
@@ -174,9 +180,28 @@ impl ReferenceInterpreter {
         if let Some(alias) = &memory.external_alias {
             self.aliases.insert(alias.clone(), memory.id);
         }
-        Ok(ReceiptOutcome::Success {
-            affected: vec![memory.id],
-        })
+        let mut affected = vec![memory.id];
+        // Parity with the canonical gateway: the planned auto-link
+        // records atomically; duplicates skip, other rejections fail.
+        if let Some(rel) = auto_link {
+            let live_memory_ids = |id: EntityId| -> bool {
+                self.memories
+                    .get(&id)
+                    .map(|m| m.lifecycle.is_recallable())
+                    .unwrap_or(false)
+            };
+            match validate_new_edge(rel, self.relations.iter(), live_memory_ids) {
+                GraphValidation::Ok => {
+                    self.relations.push(rel.clone());
+                    affected.push(rel.id);
+                }
+                GraphValidation::Reject(DomainErrorCode::DuplicateEdge) => {}
+                GraphValidation::Reject(code) => {
+                    return Err(DomainError::new(code, "graph validation failed"));
+                }
+            }
+        }
+        Ok(ReceiptOutcome::Success { affected })
     }
 
     fn apply_update_memory(
@@ -788,6 +813,7 @@ mod tests {
         let cmd = DomainCommand::AddMemory {
             memory: memory.clone(),
             session: None,
+            auto_link: None,
         };
         let receipt = interp.apply(&ctx, &cmd).unwrap();
         assert!(matches!(receipt.outcome, ReceiptOutcome::Success { .. }));
@@ -801,6 +827,7 @@ mod tests {
         let cmd = DomainCommand::AddMemory {
             memory,
             session: None,
+            auto_link: None,
         };
         let receipt1 = interp.apply(&ctx, &cmd.clone()).unwrap();
         let receipt2 = interp.apply(&ctx, &cmd).unwrap();
@@ -818,6 +845,7 @@ mod tests {
         let cmd = DomainCommand::AddMemory {
             memory,
             session: None,
+            auto_link: None,
         };
         let receipt = interp.apply(&ctx1, &cmd).unwrap();
         let affected = match receipt.outcome {
@@ -847,6 +875,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -856,6 +885,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m2.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -896,6 +926,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -905,6 +936,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m2.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -932,6 +964,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -968,6 +1001,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -997,6 +1031,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1.clone(),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1006,6 +1041,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m1,
                 session: None,
+                auto_link: None,
             },
         );
         assert!(result.is_err());
@@ -1022,6 +1058,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1,
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1034,6 +1071,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: m2,
                 session: None,
+                auto_link: None,
             },
         );
         assert!(result.is_err());
@@ -1049,6 +1087,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1,
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1108,6 +1147,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: m1,
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1127,6 +1167,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: mem(1, None),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1189,6 +1230,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: mem(1, Some("contested")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1200,6 +1242,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: mem(2, Some("contested")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap_err();
@@ -1285,6 +1328,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: mem(100, None),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1330,6 +1374,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: mem(100, None),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1370,6 +1415,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: mem(*i, None),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -1433,6 +1479,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: mem(100, Some("taken")),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -1467,6 +1514,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: mem(202, Some("fresh")),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap_err();

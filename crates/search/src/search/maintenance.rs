@@ -286,6 +286,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(1),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -374,6 +375,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(1),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -428,6 +430,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(n),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();
@@ -473,6 +476,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: memory(1),
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -516,6 +520,7 @@ mod tests {
                 &DomainCommand::AddMemory {
                     memory: memory(n),
                     session: None,
+                    auto_link: None,
                 },
             )
             .unwrap();

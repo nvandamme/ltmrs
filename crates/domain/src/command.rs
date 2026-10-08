@@ -40,6 +40,10 @@ pub enum DomainCommand {
     AddMemory {
         memory: Memory,
         session: Option<SessionHandle>,
+        /// Optional auto-link planned pre-apply (topic overlap): created
+        /// atomically with the memory so replay never re-plans it.
+        /// `None` means no link was planned (recorded explicitly).
+        auto_link: Option<Relation>,
     },
     UpdateMemory {
         id: EntityId,

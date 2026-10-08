@@ -5,7 +5,26 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-08 — P1/P2 symmetric relations keep one canonical edge
+## 2026-10-08 — P1/P2 frozen tool results + side-effect-free replay
+
+### P1/P2 frozen tool results + side-effect-free replay
+- New `tool_results` keyspace + `freeze_tool_result` /
+  `check_tool_replay` (`Miss`/`Frozen`/`Unfrozen`): frozen hits return
+  verbatim behind the durability barrier; crash-window retries rebuild
+  from the receipt and freeze. Subsumes the shallow receipt shortcut
+  (which skipped the barrier).
+- `AddMemory` carries its planned auto-link into the same transaction
+  (duplicate-edge skips, other rejections fail closed); replay renders
+  the recorded link, never re-plans. Parent-bound sub-command digests
+  stay: planning outputs ride receipts, so replay never re-executes.
+- All six memory tools freeze fresh responses and thread admission;
+  symmetric + merge behavior from the companion commit.
+- RED-first: barrier persistence across retry (both frozen-hit and
+  rebuild paths probe-verified), no-new-effects replay (both overlap
+  variants, byte-identical text), feedback drift (0.96 vs 0.98),
+  IPC ToolCall resend.
+
+## 3cd3aa1 (2026-10-08) — P1/P2 symmetric relations keep one canonical edge
 
 ### P1/P2 symmetric relations keep one canonical edge
 - `validate_new_edge` rejects reverse endpoint order for symmetric

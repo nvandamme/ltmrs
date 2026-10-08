@@ -445,6 +445,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: alpha,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
@@ -453,6 +454,7 @@ mod tests {
             &DomainCommand::AddMemory {
                 memory: beta,
                 session: None,
+                auto_link: None,
             },
         )
         .unwrap();
