@@ -827,7 +827,10 @@ impl Daemon {
             .await;
             let idle_tick = match wait {
                 Ok(Ok(stream)) => {
-                    tracker.lock().unwrap().note_connect(wall_now_millis());
+                    tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .note_connect(wall_now_millis());
                     let dispatcher = Arc::clone(&self.dispatcher);
                     let quotas = Arc::clone(&self.quotas);
                     let tracker = std::sync::Arc::clone(&tracker);
@@ -863,7 +866,7 @@ impl Daemon {
                 Err(_) => true,
             };
             if idle_tick {
-                let t = tracker.lock().unwrap();
+                let t = tracker.lock().unwrap_or_else(|e| e.into_inner());
                 if t.should_exit(wall_now_millis(), self.idle_timeout_millis) {
                     // Persist session history before the idle exit: the
                     // alternative silently discards everything since start.

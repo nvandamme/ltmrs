@@ -79,7 +79,7 @@ impl Dispatcher {
     /// Set the sessions snapshot path for eager durability (P1). Called by
     /// `Daemon::start` when sessions are enabled.
     pub fn set_sessions_path(&self, path: Option<std::path::PathBuf>) {
-        *self.sessions_path.lock().unwrap() = path;
+        *self.sessions_path.lock().unwrap_or_else(|e| e.into_inner()) = path;
     }
 
     /// Persist registry sessions now, before an acknowledgement returns (P1
@@ -88,9 +88,17 @@ impl Dispatcher {
     /// (re-review R1). Loud either way (previous file intact via
     /// tmp+rename); the loss on error is bounded to a failed disk write.
     pub fn persist_sessions(&self) -> Result<(), String> {
-        let path = self.sessions_path.lock().unwrap().clone();
+        let path = self
+            .sessions_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(p) = path
-            && let Err(e) = self.registry.lock().unwrap().persist(&p)
+            && let Err(e) = self
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .persist(&p)
         {
             let msg = format!("failed to persist session history: {e:?}");
             eprintln!("ltmrs: {msg}");
@@ -425,7 +433,7 @@ impl Dispatcher {
 
     /// Lock the registry (for lease management, health, session ops).
     pub fn registry(&self) -> std::sync::MutexGuard<'_, FrontendRegistry> {
-        self.registry.lock().unwrap()
+        self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Resolve the channel's ACTIVE traced session: the registry binding

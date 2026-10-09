@@ -242,8 +242,20 @@ impl SimilarityService {
     }
 
     /// Whether the table can answer lexical queries (built FTS index).
+    /// Degradation to the canonical snapshot is policy, but a failed
+    /// readiness probe is an anomaly (not a merely absent index) and stays
+    /// loud so health keeps the distinction.
     async fn fts_usable(&self, table: &SearchTable) -> DomainResult<bool> {
-        Ok(table.fts_index_ready().await.unwrap_or(false))
+        match table.fts_index_ready().await {
+            Ok(ready) => Ok(ready),
+            Err(e) => {
+                eprintln!(
+                    "ltmrs: similarity FTS readiness probe failed, degrading to canonical scan: {}",
+                    e.message
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Lance FTS candidate IDs in BM25 rank order (recall only; the decision

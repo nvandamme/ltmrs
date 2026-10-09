@@ -78,7 +78,7 @@ impl QuotaTracker {
         frontend_id: FrontendId,
         channel_id: ChannelId,
     ) -> Result<(), QuotaError> {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let key = (frontend_id, channel_id);
         if let Some(holders) = clients.get_mut(&key) {
             *holders += 1;
@@ -95,7 +95,7 @@ impl QuotaTracker {
     /// the key disconnects. Absent IDs are a no-op so a disconnect guard
     /// can run unconditionally at connection end.
     pub fn unregister_client(&self, frontend_id: FrontendId, channel_id: ChannelId) {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let key = (frontend_id, channel_id);
         if let Some(holders) = clients.get_mut(&key) {
             *holders = holders.saturating_sub(1);
@@ -107,7 +107,7 @@ impl QuotaTracker {
 
     /// Try to enqueue a job for a client. Fails if the per-client queue is full.
     pub fn try_enqueue(&self, frontend_id: FrontendId) -> Result<(), QuotaError> {
-        let mut queued = self.queued.lock().unwrap();
+        let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
         let count = queued.entry(frontend_id).or_insert(0);
         if *count >= self.limits.max_queued_per_client {
             return Err(QuotaError::ClientQueueFull);
@@ -118,7 +118,7 @@ impl QuotaTracker {
 
     /// Mark a job as completed (dequeue).
     pub fn dequeue(&self, frontend_id: FrontendId) {
-        let mut queued = self.queued.lock().unwrap();
+        let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = queued.get_mut(&frontend_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -129,7 +129,7 @@ impl QuotaTracker {
 
     /// Try to start an in-flight storage operation. Fails if at capacity.
     pub fn try_start_storage(&self) -> Result<(), QuotaError> {
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         if *in_flight >= self.limits.max_in_flight_storage {
             return Err(QuotaError::StorageBusy);
         }
@@ -139,7 +139,7 @@ impl QuotaTracker {
 
     /// Mark a storage operation as finished.
     pub fn finish_storage(&self) {
-        let mut in_flight = self.in_flight.lock().unwrap();
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         *in_flight = in_flight.saturating_sub(1);
     }
 
@@ -151,17 +151,25 @@ impl QuotaTracker {
     /// Number of registered clients (for health): total live connections
     /// across keys, so duplicate-key holders are counted, not hidden.
     pub fn client_count(&self) -> usize {
-        self.clients.lock().unwrap().values().sum()
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .sum()
     }
 
     /// Total queued jobs across clients (for health).
     pub fn total_queued(&self) -> usize {
-        self.queued.lock().unwrap().values().sum()
+        self.queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .sum()
     }
 
     /// In-flight storage operations (for health).
     pub fn in_flight_storage(&self) -> usize {
-        *self.in_flight.lock().unwrap()
+        *self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

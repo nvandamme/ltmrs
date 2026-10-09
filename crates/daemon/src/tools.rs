@@ -1335,6 +1335,47 @@ fn finish_add_response(
     Ok(ok_result(response, structured))
 }
 
+/// Resolve the session an add attributes to: the channel's live canonical
+/// session, else its virtual session (the link then becomes a registry
+/// record instead of a canonical row write). Deterministic per channel,
+/// so fresh execution and completing replay resolve identically.
+fn resolve_add_session(disp: &Dispatcher, envelope: &IpcEnvelope) -> DomainResult<SessionHandle> {
+    match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
+        Some(handle) => Ok(handle),
+        None => {
+            let now = disp.clock().now_millis();
+            Ok(disp.registry().ensure_virtual_session(
+                envelope.frontend_id,
+                envelope.channel_id,
+                now,
+            ))
+        }
+    }
+}
+
+/// Complete the memory-created session attribution (staged tool
+/// completion): the canonical link is a dedup merge, so replay safely
+/// re-runs it; virtual sessions track in the registry instead. Fails
+/// loudly — callers freeze success only after this returns.
+fn ensure_memory_created_link(
+    disp: &Dispatcher,
+    admitted: &AdmittedScope,
+    session_handle: SessionHandle,
+    legacy_id: &str,
+) -> DomainResult<()> {
+    if disp.registry().virtual_record(session_handle).is_some() {
+        disp.registry()
+            .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id.to_string()));
+        return Ok(());
+    }
+    disp.repo().track_session_link(
+        admitted,
+        session_handle,
+        ltmrs_service::repository::SessionLinkField::MemoryCreated,
+        std::slice::from_ref(&legacy_id.to_string()),
+    )
+}
+
 fn exec_memory_add(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
@@ -1353,9 +1394,10 @@ fn exec_memory_add(
 
     // Replay before validation: a retried envelope finds the memory the
     // first delivery created and would reject itself as a duplicate —
-    // the recorded receipt rebuilds the response instead. Crash-window
-    // rebuild is a pure function of the request + receipt (never a
-    // live re-read): content, title and description are the requested
+    // the recorded receipt rebuilds the response instead. The rebuild
+    // first completes the session-attribution stage (dedup merge: safe
+    // to re-run), then renders purely from the request + receipt (never
+    // a live re-read): content, title and description are the requested
     // ones, so a concurrent edit after the commit cannot rewrite what
     // this operation reported. Live-derived sections (overlaps, link
     // details, suggestions) are omitted; the structured id and the core
@@ -1371,6 +1413,13 @@ fn exec_memory_add(
                 ));
             }
         }
+        let legacy_id = new_legacy_id(envelope);
+        ensure_memory_created_link(
+            disp,
+            admitted,
+            resolve_add_session(disp, envelope)?,
+            &legacy_id,
+        )?;
         let title = args
             .title
             .clone()
@@ -1379,7 +1428,6 @@ fn exec_memory_add(
             .description
             .clone()
             .unwrap_or_else(|| generate_description(&final_fragment));
-        let legacy_id = new_legacy_id(envelope);
         let scope_info = args
             .project
             .as_deref()
@@ -1411,7 +1459,10 @@ fn exec_memory_add(
     // frozen rule. Held under the similarity gate with the commit below so
     // racing near-duplicates cannot both miss. The query project is
     // normalized like the stored form (a raw-case mismatch used to miss).
-    let _similarity_guard = disp.similarity_gate().lock().unwrap();
+    let _similarity_guard = disp
+        .similarity_gate()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let similar = similarity_service(disp)
         .find_similar_sync(&SimilarityQuery {
             text: final_fragment.clone(),
@@ -1486,28 +1537,14 @@ fn exec_memory_add(
     // dropped (DEV-003: no daemon-global session). A two-step link would
     // blind-overwrite a concurrent change with no revision check and no
     // receipt.
-    let (session_handle, session_task_type) = {
-        let now = disp.clock().now_millis();
-        match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
-            Some(handle) => {
-                let task_type = disp
-                    .repo()
-                    .get_session(handle)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.task_type.clone())
-                    .unwrap_or_default();
-                (handle, task_type)
-            }
-            None => {
-                let handle = disp.registry().ensure_virtual_session(
-                    envelope.frontend_id,
-                    envelope.channel_id,
-                    now,
-                );
-                (handle, String::new())
-            }
-        }
+    let session_handle = resolve_add_session(disp, envelope)?;
+    let session_task_type = if disp.registry().virtual_record(session_handle).is_some() {
+        String::new()
+    } else {
+        disp.repo()
+            .get_session(session_handle)?
+            .and_then(|s| s.task_type.clone())
+            .unwrap_or_default()
     };
 
     // Build the memory.
@@ -1605,20 +1642,10 @@ fn exec_memory_add(
     };
 
     // Attribute the created memory to the session in the canonical store
-    // (deduped), or to the virtual record when session-less (best-effort
-    // routing attribution). The canonical record already carries the link
-    // (set before AddMemory).
-    if disp.registry().virtual_record(session_handle).is_some() {
-        disp.registry()
-            .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id));
-    } else {
-        let _ = disp.repo().track_session_link(
-            admitted,
-            session_handle,
-            ltmrs_service::repository::SessionLinkField::MemoryCreated,
-            std::slice::from_ref(&legacy_id),
-        );
-    }
+    // (deduped), or to the virtual record when session-less. A failed
+    // link fails the tool: no success is frozen over a dropped canonical
+    // effect, and the retry's completing replay re-runs this stage.
+    ensure_memory_created_link(disp, admitted, session_handle, &legacy_id)?;
 
     let payload = finish_add_response(
         disp,
@@ -1699,7 +1726,10 @@ fn exec_memory_update(
     // exactly as before). Held under the similarity gate with the commit
     // below so a racing add cannot slip a duplicate between check and
     // commit.
-    let _similarity_guard = disp.similarity_gate().lock().unwrap();
+    let _similarity_guard = disp
+        .similarity_gate()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(fragment) = &args.fragment {
         let similar = similarity_service(disp)
             .find_similar_sync(&SimilarityQuery {
@@ -2079,7 +2109,10 @@ fn exec_memory_merge(
     // Merge changes recallability: commit under the similarity gate so a
     // concurrent mutation preflight cannot interleave its check here.
     {
-        let _similarity_guard = disp.similarity_gate().lock().unwrap();
+        let _similarity_guard = disp
+            .similarity_gate()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         disp.repo().apply(&ctx, &cmd)?;
     }
 
@@ -3673,23 +3706,24 @@ fn exec_guide_practice(
         return Ok(err_result("'outcome' must be one of: success, failure."));
     }
     let now = disp.clock().now_millis();
-    // Track into the active session (canonical store, best-effort) before
-    // the guide mutation so validated_by links the session's pre-loaded
-    // reads. Virtual sessions have no canonical record: their link is a
-    // no-op and validated_by stays empty. Runs under the entry admission.
+    // Attribute the practice to the active session (canonical store)
+    // before the guide mutation so validated_by links the session's
+    // pre-loaded reads. Virtual sessions have no canonical record: their
+    // link is a no-op and validated_by stays empty. A failed link fails
+    // the tool (staged completion): no success is frozen over a dropped
+    // canonical effect, and the retry re-runs this idempotent stage.
+    // Runs under the entry admission.
     let validated: Vec<String> =
         match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
             Some(handle) => {
-                let _ = disp.repo().track_session_link(
+                disp.repo().track_session_link(
                     admitted,
                     handle,
                     ltmrs_service::repository::SessionLinkField::GuideUsed,
                     std::slice::from_ref(&args.guide.to_lowercase().trim().to_string()),
-                );
+                )?;
                 disp.repo()
-                    .get_session(handle)
-                    .ok()
-                    .flatten()
+                    .get_session(handle)?
                     .map(|s| s.memories_read.clone())
                     .unwrap_or_default()
             }
@@ -4454,14 +4488,17 @@ fn exec_session_start(
     let mut relevant: Vec<Memory> = recall_browse(disp, &browse_args)?.0;
     relevant.truncate(3);
 
-    // Boost pre-loaded memories (upstream boostConfidence 0.02).
+    // Boost pre-loaded memories (upstream boostConfidence 0.02). A
+    // failed boost fails the tool: the boost is a receipted sub-command,
+    // so a retry replays-or-applies it instead of double-boosting, and
+    // no success is ever frozen over a dropped canonical effect.
     let boosted: Vec<EntityId> = relevant.iter().map(|m| m.id).collect();
     if !boosted.is_empty() {
         let ctx = sub_command_ctx(envelope, 0)?;
         let cmd = DomainCommand::BoostConfidence {
             memory_ids: boosted,
         };
-        let _ = disp.repo().apply(&ctx, &cmd);
+        disp.repo().apply(&ctx, &cmd)?;
     }
 
     // Track read memories into the session (canonical store, deduped).
@@ -4504,7 +4541,7 @@ fn exec_session_start(
     // claimed through the session receipt flag, so a crash between the
     // boost and the response freeze cannot double-apply on continuation.
     let (continuity, boost_targets) =
-        build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
+        build_continuity_recall(disp, &args.task_type, project.as_deref(), now)?;
     if !boost_targets.is_empty() {
         match repo.claim_continuity_boost(admitted, &boost_targets, 0.015, now) {
             Ok(_) => {}
@@ -4553,14 +4590,16 @@ fn exec_session_start(
 }
 
 /// Continuity recall: dead-ends, lessons and warnings from prior sessions
-/// (upstream buildContinuityRecall).
+/// (upstream buildContinuityRecall). Storage failures propagate — a dead
+/// store must read as "continuity unavailable" (loud, retryable), never as
+/// "no relevant previous context" (silent missing knowledge).
 fn build_continuity_recall(
     disp: &Dispatcher,
     task_type: &str,
     project: Option<&str>,
     _now: u64,
-) -> (String, Vec<(SessionHandle, u32)>) {
-    let sessions = disp.repo().all_sessions().unwrap_or_default();
+) -> DomainResult<(String, Vec<(SessionHandle, u32)>)> {
+    let sessions = disp.repo().all_sessions()?;
 
     // Layer 1 — dead ends from similar prior sessions.
     let mut dead_ends: Vec<(SessionHandle, u32, String, Option<String>)> = Vec::new();
@@ -4614,7 +4653,7 @@ fn build_continuity_recall(
 
     // Layer 3 — warning fragments for this project (or global).
     let repo = disp.repo();
-    let export = repo.export_snapshot().unwrap_or_default();
+    let export = repo.export_snapshot()?;
     let warnings: Vec<&Memory> = export
         .memories
         .iter()
@@ -4628,7 +4667,7 @@ fn build_continuity_recall(
         .collect();
 
     if dead_ends.is_empty() && lessons.is_empty() && warnings.is_empty() {
-        return (String::new(), Vec::new());
+        return Ok((String::new(), Vec::new()));
     }
 
     let mut block = format!("\n\n## Prior reasoning on similar {task_type} tasks");
@@ -4663,7 +4702,7 @@ fn build_continuity_recall(
             block.push_str(&format!("\n- {text}"));
         }
     }
-    (block, boosted)
+    Ok((block, boosted))
 }
 
 // ---- session_attempt ----
@@ -7254,6 +7293,101 @@ mod tests {
             !text.contains("Edited"),
             "unfrozen rebuild must not report later state, got: {text}"
         );
+    }
+
+    /// P1 (staged completion): an UNFROZEN add receipt (committed, link +
+    /// freeze lost) completes the canonical session link on retry instead
+    /// of freezing success over a missing attribution.
+    #[test]
+    fn add_unfrozen_receipt_completes_session_link_and_freezes() {
+        let (disp, _dir) = test_dispatcher();
+        // Canonical session on the channel.
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "linking".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let started = run(&disp, &tool_call(230, start.clone()), &start);
+        assert!(!result_is_error(&started));
+        // Crash window: op-231 add commits its receipt directly (no link,
+        // no freeze).
+        let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Link Me\n\n### Context\nLink fixture.".to_string(),
+            title: Some("Link Me".to_string()),
+            ..Default::default()
+        });
+        let env = tool_call(231, args.clone());
+        let legacy_id = new_legacy_id(&env);
+        let eid = EntityId::new(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("ltmrs:entity:{}", env.operation_id.as_uuid()).as_bytes(),
+        ));
+        let memory = Memory {
+            id: eid,
+            external_alias: Some(ltmrs_domain::id::ExternalAlias::new(legacy_id.clone())),
+            title: "Link Me".to_string(),
+            fragment: "## Link Me\n\n### Context\nLink fixture.".to_string(),
+            description: "Link fixture.".to_string(),
+            fragment_type: FragmentType::Fact,
+            project: None,
+            source: MemorySource::Ai,
+            confidence: 1.0,
+            quality_score: None,
+            lifecycle: ltmrs_domain::memory::MemoryLifecycle::Live,
+            tags: Vec::new(),
+            associated_with: Vec::new(),
+            relations: Vec::new(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            session_id: None,
+            task_type: None,
+            related_guides: Vec::new(),
+            evidence: Vec::new(),
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: ltmrs_domain::id::EntityRevision::new(0),
+            document_revision: ltmrs_domain::id::DocumentRevision::new(0),
+            eligibility_revision: ltmrs_domain::id::EligibilityRevision::new(0),
+            created_at: Instant::new(1000),
+            updated_at: Instant::new(1000),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        };
+        let ctx = sub_command_ctx(&env, 0).unwrap();
+        disp.repo()
+            .apply(
+                &ctx,
+                &DomainCommand::AddMemory {
+                    memory,
+                    session: None,
+                    auto_link: None,
+                },
+            )
+            .unwrap();
+        // Retry completes the canonical link, then freezes.
+        let first = run(&disp, &env, &args);
+        assert!(
+            !result_is_error(&first),
+            "retry must succeed, got: {}",
+            result_text(&first)
+        );
+        let linked = disp
+            .repo()
+            .all_sessions()
+            .unwrap()
+            .iter()
+            .any(|s| s.memories_created.contains(&legacy_id));
+        assert!(
+            linked,
+            "unfrozen retry must complete the session link for [{legacy_id}]"
+        );
+        let second = run(&disp, &env, &args);
+        assert_eq!(result_text(&second), result_text(&first));
     }
 
     /// P1 (tool replay): the same MemoryAdd envelope twice must replay
@@ -10223,6 +10357,144 @@ mod tests {
         assert_eq!(guide.success_count, 1, "replay must not recount success");
     }
 
+    /// P1 (staged completion): a practice receipt without session
+    /// attribution (link stage lost) completes the GuideUsed link on
+    /// retry instead of freezing success over a missing attribution —
+    /// without re-practicing (usage stays 1).
+    #[test]
+    fn guide_practice_unfrozen_receipt_completes_session_link() {
+        let (disp, _dir) = test_dispatcher();
+        // Canonical session on the channel.
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "linking".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let started = run(&disp, &tool_call(240, start.clone()), &start);
+        assert!(!result_is_error(&started));
+        // Crash window: op-241 practice commits directly (no link).
+        let args = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "git".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec![],
+            learnings: vec!["stage selectively".to_string()],
+            outcome: Some("success".to_string()),
+        });
+        let env = tool_call(241, args.clone());
+        let digest = env.request_digest().unwrap();
+        let admitted = disp
+            .repo()
+            .admit_scope(&env.operation_scope(digest))
+            .unwrap();
+        disp.repo()
+            .practice_guide_idempotent(
+                &admitted,
+                "git",
+                "dev-tool",
+                None,
+                &[],
+                &["stage selectively".to_string()],
+                &[],
+                Some(true),
+                1000,
+            )
+            .unwrap();
+        // Practice has no tool-level recorded replay: every call flows
+        // through link + practice, and the primitive replays internally
+        // (usage stays 1 below proves the direct receipt is hit).
+        // Retry completes the link; the recorded snapshot stands.
+        let replayed = run(&disp, &env, &args);
+        assert!(
+            !result_is_error(&replayed),
+            "retry must succeed, got: {}",
+            result_text(&replayed)
+        );
+        let sessions = disp.repo().all_sessions().unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.guides_used.contains(&"git".to_string())),
+            "unfrozen retry must complete the GuideUsed link"
+        );
+        let guide = disp.repo().get_guide("git").unwrap().expect("guide exists");
+        assert_eq!(
+            guide.usage_count, 1,
+            "completing replay must not re-practice"
+        );
+        assert_eq!(guide.learnings.len(), 1);
+    }
+
+    /// P1 (tool atomicity): a failed GuideUsed-link stage must fail the
+    /// tool, never be swallowed into a success. Deterministic seed: one
+    /// armed barrier fault, consumed by the link (the practice replay
+    /// runs after it, so the fault isolates the link stage).
+    #[test]
+    fn guide_practice_link_failure_fails_loudly() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "linking".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let started = run(&disp, &tool_call(250, start.clone()), &start);
+        assert!(!result_is_error(&started));
+        // Crash window: op-251 practice commits directly (no link).
+        let args = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "git".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec![],
+            learnings: vec!["stage selectively".to_string()],
+            outcome: Some("success".to_string()),
+        });
+        let env = tool_call(251, args.clone());
+        let digest = env.request_digest().unwrap();
+        let admitted = disp
+            .repo()
+            .admit_scope(&env.operation_scope(digest))
+            .unwrap();
+        disp.repo()
+            .practice_guide_idempotent(
+                &admitted,
+                "git",
+                "dev-tool",
+                None,
+                &[],
+                &["stage selectively".to_string()],
+                &[],
+                Some(true),
+                1000,
+            )
+            .unwrap();
+        // The link runs before the practice replay, so the single armed
+        // fault fails exactly the link stage.
+        disp.repo().fault_injector().set_persist_failures(1);
+        let err = execute_tool(&disp, &env, &args).unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::Validation,
+            "link stage failure must fail the tool, got: {}",
+            err.message
+        );
+        // The practice itself never re-ran; a clean retry completes.
+        let guide = disp.repo().get_guide("git").unwrap().expect("guide exists");
+        assert_eq!(guide.usage_count, 1);
+        let replayed = run(&disp, &env, &args);
+        assert!(
+            !result_is_error(&replayed),
+            "clean retry must complete, got: {}",
+            result_text(&replayed)
+        );
+        let sessions = disp.repo().all_sessions().unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.guides_used.contains(&"git".to_string())),
+            "clean retry must complete the GuideUsed link"
+        );
+    }
+
     /// P1 race: a guide-reference rename preserves a concurrent content
     /// update (fresh-read patch, no stale-clone overwrite).
     #[test]
@@ -11069,6 +11341,107 @@ mod tests {
             mems[0].confidence
         );
         assert_eq!(mems[0].access_count, 1);
+    }
+
+    /// P1 (tool atomicity): a failed confidence-boost stage must fail the
+    /// tool — never freeze success over a dropped canonical effect.
+    /// Deterministic seed: a conflicting receipt under the boost sub-key
+    /// (index 0) makes the boost apply reject as key reuse.
+    #[test]
+    fn session_start_boost_conflict_fails_loudly() {
+        let (disp, _dir) = test_dispatcher();
+        // Seed one memory matching the task description (non-empty boost).
+        add_fragment(
+            &disp,
+            210,
+            "## Rust debugging fragment\n\n### Context\nRust debugging notes.",
+        );
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string()],
+            initial_approach: None,
+        });
+        let env = tool_call(211, start.clone());
+        // Conflicting receipt under the boost sub-key: same op key,
+        // different digest.
+        let mut conflict_ctx = sub_command_ctx(&env, 0).unwrap();
+        conflict_ctx.request_digest = "conflicting-digest".to_string();
+        disp.repo()
+            .apply(
+                &conflict_ctx,
+                &DomainCommand::Access {
+                    memory_ids: vec![],
+                    context: None,
+                },
+            )
+            .unwrap();
+        let err = execute_tool(&disp, &env, &start).unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::KeyReuseDifferentInput,
+            "boost stage failure must fail the tool, got: {}",
+            err.message
+        );
+    }
+
+    /// P1 (staged completion): a session receipt without a frozen response
+    /// (crash between commit and freeze) completes every stage on retry —
+    /// boost applied, links tracked, response frozen.
+    #[test]
+    fn session_start_unfrozen_receipt_completes_stages_and_freezes() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(
+            &disp,
+            220,
+            "## Rust debugging fragment\n\n### Context\nRust debugging notes.",
+        );
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        // Lower confidence so the +0.02 completion boost is observable
+        // (boosts cap at 1.0).
+        let upd = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: id.clone(),
+            confidence: Some(0.5),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(222, upd.clone()), &upd);
+        // Crash window: start op commits its receipt directly (no freeze).
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string()],
+            initial_approach: None,
+        });
+        let env = tool_call(221, start.clone());
+        let digest = env.request_digest().unwrap();
+        let scope = env.operation_scope(digest);
+        let handle = ltmrs_domain::id::SessionHandle::new(uuid::Uuid::from_u128(221));
+        disp.repo()
+            .session_start_tx(
+                &scope,
+                handle,
+                None,
+                Some("debugging".to_string()),
+                vec!["rust".to_string()],
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+        // Retry completes the boost stage instead of skipping it.
+        let first = run(&disp, &env, &start);
+        assert!(
+            !result_is_error(&first),
+            "retry must succeed, got: {}",
+            result_text(&first)
+        );
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            (mems[0].confidence - 0.52).abs() < 1e-9,
+            "unfrozen retry must complete the boost, got {}",
+            mems[0].confidence
+        );
+        // And the completed response is frozen for the next retry.
+        let second = run(&disp, &env, &start);
+        assert_eq!(result_text(&second), result_text(&first));
     }
 
     /// RQ-06 dispatch gate: a mutating tool under an unknown/expired

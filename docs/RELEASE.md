@@ -2,7 +2,7 @@
 
 Living tracker for the release checklist (WP-12 qualification,
 WP-13 closure). Statuses: `done` (executed, pointer), `open`
-(explicit reason + owner). Updated 2026-09-28. Normative spec stays
+(explicit reason + owner). Updated 2026-10-09. Normative spec stays
 in `plans/`; history in `CHANGELOG.md`; evidence bundle in
 `reports/release-01/` (gitignored).
 
@@ -10,7 +10,7 @@ in `plans/`; history in `CHANGELOG.md`; evidence bundle in
 
 | Ticker | Status | Evidence / owner |
 |---|---|---|
-| Full suites (fmt/lint/unit/integration/recovery/conformance) | done | 664 lib + 2 smoke green (7 ignored); compat fixtures in-suite |
+| Full suites (fmt/lint/unit/integration/recovery/conformance) | done | 803 passed / 0 failed (15 ignored with reason) at 3c78557; compat fixtures in-suite |
 | Native-code policy | done | no dep changes; 594-comp SBOM, no GPL/AGPL/proprietary |
 | Offline install (fresh HOME, pre-provisioned, no network) | done | enforced `unshare -Unr` proof (control fails, serving exit 0) |
 | Migration + rollback instructions | done | unit suites + live rollback cycle transcript |

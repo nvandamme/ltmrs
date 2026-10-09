@@ -5,7 +5,47 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-09 — Audit review wave 2: admission-once, replay purity, migration, embedding
+## 2026-10-09 — Tool-atomicity wave: staged completion, FTS honesty, evidence
+
+### Tool-atomicity wave (staged completion)
+- Staged tool completion (`crates/daemon/src/tools.rs`,
+  `crates/service/src/repository.rs`): multi-effect tools freeze success
+  only after every stage completes; retries re-run idempotent stages
+  (sub-command receipts for boosts, dedup merges for session links) before
+  freezing. `session_start` boost `let _` → `?` (replay already flows
+  through all stages); `memory_add` gains `resolve_add_session` +
+  `ensure_memory_created_link` with `?` on fresh and ensure on Unfrozen
+  rebuild; `guide_practice` link + validated-read `?` (practice has no
+  tool-level recorded replay — every call flows through link + primitive).
+  New tests: `session_start_boost_conflict_fails_loudly`,
+  `session_start_unfrozen_receipt_completes_stages_and_freezes`,
+  `add_unfrozen_receipt_completes_session_link_and_freezes`,
+  `guide_practice_unfrozen_receipt_completes_session_link`,
+  `guide_practice_link_failure_fails_loudly`,
+  `session_link_barrier_failure_errors` (all RED→GREEN or guard-verified).
+- Sweep: add `task_type` read + continuity recall propagate storage errors
+  (`build_continuity_recall` → `DomainResult`); rest triaged
+  presentation/best-effort/read-only.
+
+### FTS honesty, poison policy, evidence reconciliation
+- `fts_ready` propagates Lance errors (destroyed-index table reports
+  `Unavailable`, was `Partial`; RED→GREEN
+  `search_state_unavailable_when_table_unreadable`); `fts_usable` keeps
+  canonical-scan degrade with a loud anomaly line.
+- Poison policy: plain locks recover via `into_inner` (dispatcher, limits,
+  scheduler, server, similarity gate, queue, hooks); restore fence keeps
+  fail-daemon unwrap + policy comment.
+- Formal: RQ-17 → `executed_partial` with staged-completion evidence;
+  RELEASE.md date/numbers refreshed; README toolchain 1.99.0 + baseline
+  scoping; TODO delivery boxes flipped with WP-12/13 honestly open.
+- Evidence: `cargo test --workspace` 811 passed / 0 failed (15 ignored with
+  reason), `cargo fmt --all -- --check` + `cargo clippy --workspace
+  --all-targets -- -D warnings` clean. Rulings: boost-list recompute on
+  replay may drift targets (never loses/doubles effects); link-first order
+  kept (1-fault test isolates the link barrier); failure-only `?` changes
+  without corruption seams use existing success-path coverage.
+
+## 3c78557 (2026-10-09) — Audit review wave 2: admission-once, replay purity, migration, embedding
 
 ### Audit review wave 2: session replay, TTL renewal, housekeeping
 - Session-operation replay before mutable routing (`crates/daemon/src/tools.rs`,

@@ -468,8 +468,8 @@
       "tests": [
         "T-MCP-04"
       ],
-      "status": "executed_passed",
-      "evidence": "RQ-17 read side effects persisted via canonical gateway before success: memory_read applies Access (confidence +0.015, access_count+1, last_accessed_at, context tag) in repository_internal.rs apply_access / interpreter.rs; semantic_search does not boost (upstream). Feedback: positive +0.015 + access_count + positive_feedback++, negative -0.02 + negative_hits++ + negative_feedback++. Tests: tools.rs memory_read_records_access_side_effect, memory_feedback_positive_boosts_confidence, memory_feedback_negative_reduces_confidence."
+      "status": "executed_partial",
+      "evidence": "RQ-17 read side effects persisted via canonical gateway before success: memory_read applies Access (confidence +0.015, access_count+1, last_accessed_at, context tag) in repository_internal.rs apply_access / interpreter.rs; semantic_search does not boost (upstream). Feedback: positive +0.015 + access_count + positive_feedback++, negative -0.02 + negative_hits++ + negative_feedback++. Tests: tools.rs memory_read_records_access_side_effect, memory_feedback_positive_boosts_confidence, memory_feedback_negative_reduces_confidence. Staged completion (this wave): session_start boost, memory_add/guide_practice session links and continuity recall now fail loudly instead of swallowing (no frozen success over dropped effects; retries complete idempotent stages). New tests: session_start_boost_conflict_fails_loudly, session_start_unfrozen_receipt_completes_stages_and_freezes, add_unfrozen_receipt_completes_session_link_and_freezes, guide_practice_unfrozen_receipt_completes_session_link, guide_practice_link_failure_fails_loudly, session_link_barrier_failure_errors. Re-graded to partial pending full evidence reconciliation."
     },
     {
       "id": "RQ-18",

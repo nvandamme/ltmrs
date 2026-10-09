@@ -96,7 +96,7 @@ impl<T> BoundedQueue<T> {
     /// Push without blocking. Returns the item back (and `Err`) when full —
     /// this is the visible backpressure point for RQ-22.
     pub fn try_send(&self, item: T) -> Result<(), T> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.items.len() >= inner.capacity {
             return Err(item);
         }
@@ -108,7 +108,7 @@ impl<T> BoundedQueue<T> {
     /// Pop, waiting up to `timeout` for an item. Used by the worker loop so it
     /// can also observe shutdown flags between messages.
     pub fn pop_timeout(&self, timeout: Duration) -> Option<T> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(item) = inner.items.pop_front() {
@@ -129,7 +129,11 @@ impl<T> BoundedQueue<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().items.len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .items
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -630,7 +634,11 @@ mod tests {
         impl GatedEmbedder {
             fn locked_gate(&self) -> std::sync::mpsc::Receiver<()> {
                 // Take the receiver out exactly once (first batch only).
-                self.gate.lock().unwrap().take().unwrap()
+                self.gate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .unwrap()
             }
         }
 

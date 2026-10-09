@@ -154,7 +154,9 @@ impl SearchBackend {
         handle.block_on(self.embedder.embed_passages(texts))
     }
 
-    /// Whether the FTS index is ready (for readiness reporting).
+    /// Whether the FTS index is ready (for readiness reporting). Lance
+    /// failures propagate (a corrupt table is `Unavailable`, never a
+    /// healthy-absent `Partial`).
     pub fn fts_ready(&self) -> DomainResult<bool> {
         let handle = tokio::runtime::Handle::try_current().map_err(|e| {
             ltmrs_domain::command::DomainError::new(
@@ -163,7 +165,7 @@ impl SearchBackend {
             )
         })?;
         let table = self.table.clone();
-        Ok(handle.block_on(async move { table.fts_index_ready().await.unwrap_or(false) }))
+        handle.block_on(async move { table.fts_index_ready().await })
     }
 }
 
@@ -748,6 +750,36 @@ mod tests {
         assert!(
             matches!(&state, SearchState::Partial { reason } if reason.contains("fts")),
             "unindexed table must report Partial, got: {state:?}"
+        );
+    }
+
+    /// search_state reports Unavailable (not Partial) when the Lance table
+    /// itself is unreadable: a corrupt table is not "index not built".
+    /// The index is created first so the readiness probe must describe
+    /// on-storage index state (which the destruction breaks), rather
+    /// than answering from the empty in-memory listing.
+    #[tokio::test]
+    async fn search_state_unavailable_when_table_unreadable() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = std::sync::Arc::new(
+            ltmrs_service::repository::CanonicalRepository::open(repo_dir.path().to_str().unwrap())
+                .unwrap(),
+        );
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = crate::search::table::SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        table.ensure_fts_index().await.unwrap();
+        let backend = SearchBackend::new(repo, table, std::sync::Arc::new(NoDenseEmbedder));
+        // Destroy the dataset files under the open handle: readiness
+        // probes must fail, not report healthy-absent.
+        std::fs::remove_dir_all(lance_dir.path()).unwrap();
+        let state = tokio::task::spawn_blocking(move || backend.search_state())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&state, SearchState::Unavailable { reason } if reason.contains("unreadable")),
+            "corrupt table must report Unavailable, got: {state:?}"
         );
     }
 

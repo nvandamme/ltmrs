@@ -175,7 +175,12 @@ pub struct CanonicalRepository {
     /// see brand-new keys, so mutual exclusion (not conflict detection)
     /// closes the drain-then-write race. RULE: fence outermost public
     /// entries only; internals and the restore path itself never re-fence
-    /// (a write guard is not re-entrant with a waiting writer).
+    /// (a write guard is not re-entrant with a waiting writer). Poison
+    /// policy: readers keep plain `unwrap` (fail-daemon) — this fence
+    /// guards a genuine exclusion invariant, and durability itself comes
+    /// from fjall transactions, so a poisoned fence must never be silently
+    /// recovered into a possibly concurrent restore. Plain data locks
+    /// (counters, registries, queues, hooks) recover via `into_inner`.
     restore_lock: std::sync::RwLock<()>,
     /// Live-operation pins per retry namespace (`frontend:epoch` →
     /// admitted-operation count). Admission pins its namespace so
@@ -479,13 +484,17 @@ impl CanonicalRepository {
     /// mutation, never on replay. The projection worker uses it to drive new
     /// jobs immediately; the interval remains as the maintenance fallback.
     pub fn set_commit_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        *self.commit_hook.lock().unwrap() = Some(hook);
+        *self.commit_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
     /// Fire the commit hook after a durable commit (best-effort: a panicking
     /// hook must never fail the already-committed write).
     fn fire_commit_hook(&self) {
-        let hook = self.commit_hook.lock().unwrap().clone();
+        let hook = self
+            .commit_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(hook) = hook {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
         }
@@ -8724,6 +8733,38 @@ mod tests {
             other => panic!("decay failure must not fail the start, got {other:?}"),
         }
         assert!(repo.get_session(handle).unwrap().is_some());
+    }
+
+    /// P1 (tool atomicity): the session-link continuation stage fails
+    /// loudly on a durability-barrier failure — multi-effect tools must
+    /// propagate this, never freeze success over it.
+    #[test]
+    fn session_link_barrier_failure_errors() {
+        use ltmrs_domain::id::SessionHandle;
+        let (repo, _dir) = repo_with_ns();
+        let handle = SessionHandle::new(Uuid::from_u128(700));
+        repo.session_start_tx(
+            &scope(700, "d-link"),
+            handle,
+            None,
+            None,
+            vec![],
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let admitted = admit(&repo, 701, "d-link-use");
+        repo.fault_injector().set_persist_failures(1);
+        let err = repo
+            .track_session_link(
+                &admitted,
+                handle,
+                SessionLinkField::MemoryCreated,
+                &["m1".to_string()],
+            )
+            .unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation);
     }
 
     #[test]
