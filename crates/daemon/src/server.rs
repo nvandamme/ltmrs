@@ -740,6 +740,10 @@ impl Daemon {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                    // Windows: a byte-mode pipe with no client data reports
+                    // `WouldBlock` once the connect-data gate times out; keep
+                    // serving (the idle-exit loop below treats it as a tick).
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e.into()),
                 }
             }

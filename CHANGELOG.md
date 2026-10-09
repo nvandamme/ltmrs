@@ -5,7 +5,22 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-09 — Whole-tree audit fix wave + Windows compat certification
+## 2026-10-09 — Serve-forever accept-loop WouldBlock fix
+
+### Serve-forever accept-loop WouldBlock fix
+- Serve-forever accept loop `WouldBlock` fix (`crates/daemon/src/server.rs`,
+  `tests/daemon_lifecycle.rs`): the idle-budget-0 branch returned
+  `WouldBlock` as a fatal error, so a serve-forever daemon on Windows
+  exited ~1s after its first quiet window (all other loops already
+  continued/ticked on it; no test exercised idle 0). Added the `continue`
+  arm + `foreground_daemon_without_idle_budget_serves_across_quiet_windows`
+  (RED→GREEN: failed in 2.5s pre-fix; boots, survives a 1500ms quiet
+  window, serves a frontend attach, explicit kill with a KillGuard against
+  strays on failure paths). Evidence: `daemon_lifecycle` 6 passed +
+  1 ignored, fmt + clippy `-D warnings` clean. Design §2.1 wording
+  extended to the serve-forever loop.
+
+## 3fbf00d (2026-10-09) — Whole-tree audit fix wave + Windows compat certification
 
 ### Whole-tree audit fix wave (Lance similarity authority, fencing, durability)
 - Whole-tree audit fix wave (22 findings, P1→P3): single Lance-backed

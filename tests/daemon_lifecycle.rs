@@ -315,6 +315,64 @@ fn foreground_daemon_idle_exits_cleanly() {
     assert!(status.success(), "idle daemon must exit 0, got: {status}");
 }
 
+/// Serve-forever daemon survives quiet windows: with `--daemon-idle-ms 0`
+/// a full connect-data gate with zero clients must not error the accept
+/// loop out (Windows `WouldBlock` regression test) — and the daemon must
+/// still be serving afterwards.
+#[test]
+fn foreground_daemon_without_idle_budget_serves_across_quiet_windows() {
+    /// A serve-forever daemon never exits alone: guarantee no stray on
+    /// any failure path below (disarmed before the explicit stop).
+    struct KillGuard<'a> {
+        child: Option<&'a mut std::process::Child>,
+    }
+    impl Drop for KillGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut daemon = std::process::Command::new(bin())
+        .env(HOME_ENV, home.path())
+        .env("HOME", home.path())
+        .arg("daemon")
+        .arg("--foreground")
+        .arg("--daemon-idle-ms")
+        .arg("0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn foreground daemon");
+    let mut guard = KillGuard {
+        child: Some(&mut daemon),
+    };
+    wait_for_path(&managed_socket(home.path()), "daemon endpoint");
+    // A full 1000ms data-gate window with zero clients attached.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        guard
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .expect("try_wait")
+            .is_none(),
+        "serve-forever daemon must survive quiet windows"
+    );
+    // Still serving: a frontend attaches and initializes through it.
+    let mut front = Frontend::spawn(home.path(), &[]);
+    front.initialize();
+    front.shutdown();
+    // Serve-forever never exits on its own: stop it explicitly (disarmed
+    // first so the guard does not double-kill).
+    let child = guard.child.take().unwrap();
+    child.kill().expect("stop daemon");
+    let _ = child.wait();
+}
+
 /// SIGTERM shuts the daemon down gracefully: exit 0 and bindings persisted
 /// (a kill -9 would leave no file behind to check).
 #[cfg(unix)]

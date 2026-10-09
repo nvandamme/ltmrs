@@ -52,7 +52,8 @@ macOS stays uncertified. CUDA remains optional and out of scope.
   (handshake), so waiting bytes prove a genuine peer. `PeekNamedPipe` success alone does
   NOT discriminate (verified: it succeeds on unconnected instances). Bounded at 1000ms
   → `WouldBlock`, which the serve idle loop treats exactly like a timeout tick (exit
-  when quiet past the budget) and `spawn_socket_server` skips with `continue`. The
+  when quiet past the budget), the serve-forever loop (`--daemon-idle-ms 0`) skips
+  with `continue`, and `spawn_socket_server` skips with `continue`. The
   connect stays inside tokio/mio: their `OVERLAPPED` lives in boxed, never-moved memory
   — a future-stack `OVERLAPPED` handed to the kernel dangles across awaits and
   access-violates (verified exit `0xc0000005`). `HasOverlappedIoCompleted` is a WinBase
