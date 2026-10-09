@@ -5,6 +5,52 @@
     "commit": "d30a816632d0bc5d92907cbc51c1dc1010111986"
   },
   "status": "planned_inventory_not_wire_capture",
+  "visualizer_conformance_lemma_0_21_0": {
+    "upstream": "xenitV1/lemma 0.21.0 @ d30a8166 (src/server/visualize.ts, src/index.ts, assets/visualizer.html, CHANGELOG 0.11.0/0.19.0, README)",
+    "executed": "2026-10-08 on Windows 11 Pro x86_64 (release binary live smoke: URL+pid printed, /api/library?token 200; vis_smoke + visualizer unit tests green)",
+    "rows": [
+      {
+        "upstream_fact": "-vis, -vis -p PORT, foreground",
+        "ltmrs": "implemented, aliases matched",
+        "status": "conform"
+      },
+      {
+        "upstream_fact": "loopback-only bind, token gate",
+        "ltmrs": "127.0.0.1-only, token on every route",
+        "status": "conform (hardened)"
+      },
+      {
+        "upstream_fact": "default port 3456",
+        "ltmrs": "native 18721, pinned by test",
+        "status": "deviation"
+      },
+      {
+        "upstream_fact": "token header x-lemma-token",
+        "ltmrs": "?token= query only",
+        "status": "deviation"
+      },
+      {
+        "upstream_fact": "browser auto-open",
+        "ltmrs": "URL printed, user opens",
+        "status": "deviation"
+      },
+      {
+        "upstream_fact": "D3 graph + write routes (PATCH/DELETE/POST)",
+        "ltmrs": "read-only native routes /, /api/library, /api/export",
+        "status": "deviation"
+      },
+      {
+        "upstream_fact": "CORS allow-list",
+        "ltmrs": "no CORS (single static page, no browser fetch)",
+        "status": "deviation"
+      },
+      {
+        "upstream_fact": "background prints URL+PID",
+        "ltmrs": "prints URL+pid",
+        "status": "conform"
+      }
+    ]
+  },
   "expected_tool_count": 29,
   "tools": [
     {

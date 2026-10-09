@@ -204,7 +204,26 @@ impl Daemon {
         };
         let (dispatcher, embedding, models_dir) = match &config.embedding {
             EmbeddingMode::Disabled => {
-                (Arc::new(Dispatcher::new(repo, registry, clock)), None, None)
+                // Lexical projection stays available without a model: FTS
+                // rows publish, dense simply has no vectors. No search path
+                // means no table (tests and minimal setups keep the
+                // degraded snapshot path).
+                if config.search_path.is_empty() {
+                    (Arc::new(Dispatcher::new(repo, registry, clock)), None, None)
+                } else {
+                    let table = SearchTable::open(&config.search_path)
+                        .await
+                        .map_err(DaemonError::from)?;
+                    let embedder: std::sync::Arc<
+                        dyn ltmrs_search::retrieval::engine::QueryEmbedder,
+                    > = std::sync::Arc::new(ltmrs_search::search::backend::NoDenseEmbedder);
+                    let backend = Arc::new(SearchBackend::new(Arc::clone(&repo), table, embedder));
+                    (
+                        Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend)),
+                        None,
+                        None,
+                    )
+                }
             }
             EmbeddingMode::E5SmallCached { cache_dir } => {
                 if config.search_path.is_empty() {
@@ -226,7 +245,10 @@ impl Daemon {
                     std::sync::Arc::new(ltmrs_search::search::backend::ServiceQueryEmbedder::new(
                         service.clone(),
                     ));
-                let backend = Arc::new(SearchBackend::new(Arc::clone(&repo), table, embedder));
+                let backend = Arc::new(
+                    SearchBackend::new(Arc::clone(&repo), table, embedder)
+                        .with_model_fingerprint(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
+                );
                 (
                     Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend)),
                     Some(service),
@@ -280,9 +302,10 @@ impl Daemon {
         &self.search_path
     }
 
-    /// The resolver for the socket path (for frontends to connect).
-    pub fn socket_path(&self) -> &std::path::Path {
-        &self.paths.socket_path
+    /// The IPC endpoint for frontends to connect to (Unix socket path,
+    /// Windows named-pipe name).
+    pub fn endpoint(&self) -> &std::path::Path {
+        &self.paths.endpoint
     }
 
     /// The sessions snapshot path for eager persistence (P1 owned-daemon
@@ -331,7 +354,7 @@ impl Daemon {
         *guard = Some(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         let dispatcher = Arc::clone(&dispatcher);
                         let quotas = Arc::clone(&quotas);
                         tokio::spawn(async move {
@@ -339,6 +362,12 @@ impl Daemon {
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // Unix: a rejected peer uid is skipped, the loop keeps
+                    // serving (the listener stays alive).
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                    // Windows: byte-mode pipe with no client yet; accept()
+                    // already paces the retry, so just keep serving.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(_) => break,
                 }
             }
@@ -379,7 +408,8 @@ impl Daemon {
         if let Some(mworker) = aborted {
             mworker.abort();
         }
-        // Same best-effort abort for the projection worker (E5 mode only).
+        // Same best-effort abort for the projection worker (dense and
+        // lexical modes alike).
         let paborted = self
             .projection_worker
             .try_lock()
@@ -402,18 +432,27 @@ impl Daemon {
         // cannot delete a successor's socket. Graceful exits then leave no
         // stale file behind, and "socket gone" observably means "daemon
         // gone". Best-effort: crashes keep the old stale-recovery path.
-        let _ = std::fs::remove_file(&self.paths.socket_path);
+        // Windows pipes have no filesystem residue: the name is gone with
+        // the last handle.
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&self.paths.endpoint);
     }
 
-    /// Build a health/doctor report (no memory contents).
+    /// Build a health/doctor report (no memory contents). The served
+    /// generation is read live; when it is unreadable the report degrades
+    /// explicitly (`ready: false`) instead of inventing generation 1.
     pub fn health_report(
         &self,
         ready: bool,
         projection_current: bool,
     ) -> crate::health::HealthReport {
+        let (generation, ready) = match self.dispatcher.repo_arc().store_generation() {
+            Ok(generation) => (generation, ready),
+            Err(_) => (ltmrs_domain::id::StoreGeneration::FIRST, false),
+        };
         crate::health::build_health_report(
             ready,
-            ltmrs_domain::id::StoreGeneration::FIRST,
+            generation,
             crate::dispatcher::Dispatcher::protocol_version(),
             projection_current,
             &self.scheduler,
@@ -447,66 +486,91 @@ impl Daemon {
         self.maintenance_worker.lock().await.is_some()
     }
 
-    /// Spawn the dense-projection worker when E5 embedding is configured.
-    /// Idempotent. Each tick rebuilds the projector at the repo's current
-    /// generation (a cutover can never strand it refusing publishes) and
-    /// drives pending jobs off the Tokio I/O workers via `spawn_blocking`
-    /// (candle inference is synchronous CPU; the single outer bridge
-    /// contains no nested blocking). Embed failures stay pending and retry
-    /// next tick; lexical rows publish regardless. A commit wake drives the
-    /// new job immediately (P2-1); the interval is the maintenance fallback.
-    /// Without embedding this parks silently:
-    /// lexical-only daemons have nothing to index densely.
+    /// Spawn the projection worker: dense when E5 embedding is configured,
+    /// lexical-only otherwise (text rows with NULL vectors; the dense leg
+    /// excludes them explicitly). Idempotent. Each tick rebuilds the
+    /// projector at the repo's current generation (a cutover can never
+    /// strand it refusing publishes) and drives pending jobs off the Tokio
+    /// I/O workers via `spawn_blocking` (candle inference is synchronous
+    /// CPU; the single outer bridge contains no nested blocking). Embed
+    /// failures stay pending and retry next tick; lexical rows publish
+    /// regardless. A commit wake drives the new job immediately (P2-1); the
+    /// interval is the maintenance fallback. Without a search path the
+    /// worker parks (tests and minimal setups keep the degraded path).
     pub async fn start_projection(&self) {
         let mut pw = self.projection_worker.lock().await;
         if pw.is_some() {
             return;
         }
-        let Some(models_dir) = self.models_dir.clone() else {
-            return;
-        };
         let repo = self.dispatcher.repo_arc();
         let table = match SearchTable::open(&self.search_path).await {
             Ok(table) => table,
             Err(e) => {
                 eprintln!(
-                    "ltmrs: projection table unavailable ({}); dense indexing parked",
+                    "ltmrs: projection table unavailable ({}); indexing parked",
                     e.message
                 );
                 return;
             }
         };
-        let cache = ArtifactCache::new(&models_dir);
-        // Digest-hash + weight load (~1GB with the query service) runs on
-        // the blocking pool: holding the worker guard across it is fine
-        // (async yield only), but Tokio I/O workers must never hash.
-        let adapter = match tokio::task::spawn_blocking(move || {
-            ltmrs_embeddings::e5_small::E5SmallAdapter::load_from_cache(&cache)
-        })
-        .await
-        {
-            Ok(Ok(adapter)) => std::sync::Arc::new(std::sync::Mutex::new(adapter)),
-            Ok(Err(e)) => {
-                eprintln!(
-                    "ltmrs: projection adapter failed ({e}); dense indexing parked; \
-                     run `ltmrs --provision-models` to repair"
-                );
-                return;
+        /// What each worker tick embeds with: loaded E5 weights, or nothing
+        /// (lexical rows only, jobs resolve instead of retrying vectors).
+        enum EmbedderSource {
+            E5(std::sync::Arc<std::sync::Mutex<ltmrs_embeddings::e5_small::E5SmallAdapter>>),
+            Lexical,
+        }
+        let source = match self.models_dir.clone() {
+            Some(models_dir) => {
+                let cache = ArtifactCache::new(&models_dir);
+                // Digest-hash + weight load (~1GB with the query service) runs on
+                // the blocking pool: holding the worker guard across it is fine
+                // (async yield only), but Tokio I/O workers must never hash.
+                let adapter = match tokio::task::spawn_blocking(move || {
+                    ltmrs_embeddings::e5_small::E5SmallAdapter::load_from_cache(&cache)
+                })
+                .await
+                {
+                    Ok(Ok(adapter)) => std::sync::Arc::new(std::sync::Mutex::new(adapter)),
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "ltmrs: projection adapter failed ({e}); dense indexing parked; \
+                             run `ltmrs --provision-models` to repair"
+                        );
+                        return;
+                    }
+                    Err(join_err) => {
+                        eprintln!("ltmrs: projection adapter load panicked ({join_err}); parked");
+                        return;
+                    }
+                };
+                // Upgrade backfill: rows projected while lexical-only carry
+                // NULL vectors; requeue them for dense embedding now.
+                Self::backfill_null_vectors(&repo, &table).await;
+                EmbedderSource::E5(adapter)
             }
-            Err(join_err) => {
-                eprintln!("ltmrs: projection adapter load panicked ({join_err}); parked");
-                return;
+            None => {
+                eprintln!("ltmrs: no embedding models; lexical-only projection");
+                EmbedderSource::Lexical
             }
         };
+        let lexical = matches!(source, EmbedderSource::Lexical);
         let interval = self.maintenance_config.interval;
         let trigger = self.projection_trigger.clone();
         *pw = Some(tokio::spawn(async move {
             loop {
+                let embedder: Box<dyn ltmrs_search::search::projector::Embedder + Send> =
+                    match &source {
+                        EmbedderSource::E5(adapter) => Box::new(std::sync::Arc::clone(adapter)),
+                        EmbedderSource::Lexical => {
+                            Box::new(ltmrs_search::search::projector::StalledEmbedder)
+                        }
+                    };
                 let (driven, fts) = Self::drive_projection_batch(
                     &repo,
                     &table,
-                    Box::new(std::sync::Arc::clone(&adapter)),
+                    embedder,
                     Self::MAX_PROJECTION_JOBS_PER_TICK,
+                    lexical,
                 )
                 .await;
                 let resolved = match driven {
@@ -551,26 +615,76 @@ impl Daemon {
         }));
     }
 
+    /// Requeue memories whose projected rows lack vectors (lexical-era rows)
+    /// for dense embedding now that E5 is available. Skips memories with
+    /// pending jobs (already covered) and non-recallable ones. Best-effort:
+    /// failures log loudly and the next start retries. Upgrade path for
+    /// daemons that ran lexical-only.
+    async fn backfill_null_vectors(repo: &Arc<CanonicalRepository>, table: &SearchTable) {
+        let rows = match table.rows_where("embedding IS NULL").await {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!(
+                    "ltmrs: dense backfill scan failed ({}); retry on next start",
+                    e.message
+                );
+                return;
+            }
+        };
+        let mut ids: Vec<ltmrs_domain::id::EntityId> = rows.iter().map(|r| r.memory_id).collect();
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return;
+        }
+        let mut queued = 0usize;
+        for memory in repo.get_memories(&ids).unwrap_or_default() {
+            if !memory.lifecycle.is_recallable() {
+                continue;
+            }
+            match repo.enqueue_projection_job_if_absent(memory.id, memory.document_revision, 1) {
+                Ok(true) => queued += 1,
+                Ok(false) => {}
+                Err(e) => eprintln!(
+                    "ltmrs: dense backfill enqueue failed ({}); retry on next start",
+                    e.message
+                ),
+            }
+        }
+        if queued > 0 {
+            eprintln!("ltmrs: dense backfill requeued {queued} lexical-era memories");
+        }
+    }
+
     /// One bounded projection pass: drive pending jobs off the Tokio I/O
     /// workers (inference is synchronous CPU; the spawn_blocking bridge
     /// keeps it there), then rebuild the FTS index after a successful
     /// drive. Returns jobs resolved plus the FTS outcome. Extracted so
-    /// drain behavior is unit-testable without the E5 adapter.
+    /// drain behavior is unit-testable without the E5 adapter. `lexical`
+    /// drives text-only rows to resolution instead of retrying vectors.
     async fn drive_projection_batch(
         repo: &Arc<CanonicalRepository>,
         table: &SearchTable,
         embedder: Box<dyn ltmrs_search::search::projector::Embedder + Send>,
         max_jobs: usize,
+        lexical: bool,
     ) -> (DomainResult<usize>, Option<DomainResult<bool>>) {
         let repo = Arc::clone(repo);
         let table = table.clone();
         let table_fts = table.clone();
         let driven = tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async {
-                ltmrs_search::search::projector::Projector::project_pending(
-                    &repo, &table, embedder, max_jobs,
-                )
-                .await
+                if lexical {
+                    ltmrs_search::search::projector::Projector::project_pending_lexical(
+                        &repo, &table, max_jobs,
+                    )
+                    .await
+                } else {
+                    ltmrs_search::search::projector::Projector::project_pending(
+                        &repo, &table, embedder, max_jobs,
+                    )
+                    .await
+                }
             })
         })
         .await;
@@ -617,7 +731,7 @@ impl Daemon {
         if self.idle_timeout_millis == 0 {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         let dispatcher = Arc::clone(&self.dispatcher);
                         let quotas = Arc::clone(&self.quotas);
                         tokio::spawn(async move {
@@ -625,6 +739,7 @@ impl Daemon {
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -642,8 +757,8 @@ impl Daemon {
                 listener.accept(),
             )
             .await;
-            match wait {
-                Ok(Ok((stream, _))) => {
+            let idle_tick = match wait {
+                Ok(Ok(stream)) => {
                     tracker.lock().unwrap().note_connect(wall_now_millis());
                     let dispatcher = Arc::clone(&self.dispatcher);
                     let quotas = Arc::clone(&self.quotas);
@@ -667,25 +782,31 @@ impl Daemon {
                         let _note = DropNote { tracker };
                         let _ = handle_connection(stream, dispatcher, quotas).await;
                     });
+                    false
                 }
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                // Windows: a byte-mode pipe with no client data reports
+                // `WouldBlock` once the connect-data gate times out; treat it
+                // exactly like a timeout tick so idle-exit still fires
+                // instead of erroring out.
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => true,
                 Ok(Err(e)) => return Err(e.into()),
-                Err(_) => {
-                    let t = tracker.lock().unwrap();
-                    if t.should_exit(wall_now_millis(), self.idle_timeout_millis) {
-                        // Persist session history before the idle exit: the
-                        // alternative silently discards everything since start.
-                        // A failure is loud (previous file intact via
-                        // tmp+rename: loss bounded to this run's sessions).
-                        if let Some(p) = &self.sessions_path
-                            && let Err(e) = self.dispatcher.registry().persist(p)
-                        {
-                            eprintln!(
-                                "ltmrs: failed to persist session history at idle exit: {e:?}"
-                            );
-                        }
-                        return Ok(());
+                Err(_) => true,
+            };
+            if idle_tick {
+                let t = tracker.lock().unwrap();
+                if t.should_exit(wall_now_millis(), self.idle_timeout_millis) {
+                    // Persist session history before the idle exit: the
+                    // alternative silently discards everything since start.
+                    // A failure is loud (previous file intact via
+                    // tmp+rename: loss bounded to this run's sessions).
+                    if let Some(p) = &self.sessions_path
+                        && let Err(e) = self.dispatcher.registry().persist(p)
+                    {
+                        eprintln!("ltmrs: failed to persist session history at idle exit: {e:?}");
                     }
+                    return Ok(());
                 }
             }
         }
@@ -701,41 +822,16 @@ fn wall_now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Same-user IPC boundary (design §7.1): the peer's UID must equal ours.
-/// The 0600 socket already restricts access; this closes the remainder
-/// (permissive umask at bind, fd passing). Raw UIDs, no exceptions — not
-/// even root connecting elsewhere.
-fn peer_authorized(peer_uid: u32, own_uid: u32) -> bool {
-    peer_uid == own_uid
-}
-
-/// Reject connections from other UIDs before reading any frame.
-fn check_peer_cred(stream: &tokio::net::UnixStream) -> Result<(), DaemonError> {
-    let peer = stream.peer_cred().map_err(DaemonError::from)?.uid();
-    // SAFETY: geteuid takes no arguments and only reads process state.
-    if !peer_authorized(peer, unsafe { libc::geteuid() }) {
-        return Err(DaemonError::Ipc(IpcError::Unauthorized));
-    }
-    Ok(())
-}
-
 /// Handle a single client connection: read frames, dispatch, write responses.
 /// The first frame MUST be a handshake; it authenticates the frontend and
 /// issues its retry namespace. Subsequent frames are typed domain requests.
+/// The same-user boundary runs in the platform accept path (Unix peer-cred,
+/// Windows per-user DACL), so no frame is ever read from a foreign user.
 pub async fn handle_connection(
-    mut stream: tokio::net::UnixStream,
+    mut stream: crate::runtime::IpcStream,
     dispatcher: Arc<Dispatcher>,
     quotas: Arc<QuotaTracker>,
 ) -> Result<(), DaemonError> {
-    // Same-user boundary first: never read a frame from another UID.
-    if let Err(e) = check_peer_cred(&stream) {
-        let err = WireError {
-            kind: "unauthorized".into(),
-            message: e.to_string(),
-        };
-        write_reply(&mut stream, &WireReply::Error(err), &quotas).await?;
-        return Ok(());
-    }
     let mut buf = Vec::with_capacity(4096);
 
     // Live-connection tracking for restore readiness: counted while this
@@ -983,7 +1079,7 @@ impl Drop for ClientGuard {
 
 /// Read one tagged wire frame (a `WireMessage`) from the stream.
 async fn read_wire_frame(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut crate::runtime::IpcStream,
     buf: &mut Vec<u8>,
 ) -> Result<WireMessage, DaemonError> {
     buf.clear();
@@ -1007,7 +1103,7 @@ async fn read_wire_frame(
 /// `MAX_FRAME_BYTES`. Uniform for small and large replies — large payloads
 /// stream across multiple frames instead of being rejected or truncated.
 async fn write_reply(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut crate::runtime::IpcStream,
     reply: &WireReply,
     quotas: &QuotaTracker,
 ) -> Result<(), DaemonError> {
@@ -1055,21 +1151,6 @@ mod tests {
         assert_eq!(config.idle_timeout_millis, 0, "serve forever by default");
     }
 
-    /// Same-user IPC boundary: a connected peer with our UID passes.
-    #[test]
-    fn peer_authorized_matches_uids() {
-        assert!(peer_authorized(1000, 1000));
-        assert!(!peer_authorized(0, 1000));
-        assert!(!peer_authorized(1000, 0));
-    }
-
-    /// A live socket pair shares our UID, so the peer check passes.
-    #[tokio::test]
-    async fn peer_cred_same_uid_passes() {
-        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
-        assert!(check_peer_cred(&a).is_ok());
-    }
-
     /// Channel binding (RQ-05): frames must carry the handshake channel as
     /// well as the frontend. A same-frontend frame naming another channel
     /// is rejected, never routed into that channel's session.
@@ -1079,9 +1160,9 @@ mod tests {
             HandshakeRequest, PROTOCOL_VERSION, WireMessage, WireReply, read_response_payload,
         };
         use ltmrs_service::repository::CanonicalRepository;
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        async fn write_frame(stream: &mut tokio::net::UnixStream, msg: &WireMessage) {
+        async fn write_frame<S: AsyncWriteExt + Unpin>(stream: &mut S, msg: &WireMessage) {
             let payload = serde_json::to_vec(msg).unwrap();
             stream
                 .write_all(&(payload.len() as u32).to_be_bytes())
@@ -1090,7 +1171,7 @@ mod tests {
             stream.write_all(&payload).await.unwrap();
             stream.flush().await.unwrap();
         }
-        async fn read_reply(stream: &mut tokio::net::UnixStream) -> WireReply {
+        async fn read_reply<S: AsyncReadExt + Unpin>(stream: &mut S) -> WireReply {
             let bytes = read_response_payload(stream).await.unwrap();
             serde_json::from_slice(&bytes).unwrap()
         }
@@ -1104,9 +1185,9 @@ mod tests {
         );
         let dispatcher = std::sync::Arc::new(Dispatcher::new(repo, FrontendRegistry::new(), clock));
         let quotas = std::sync::Arc::new(QuotaTracker::default());
-        let (server_end, mut client_end) = tokio::net::UnixStream::pair().unwrap();
+        let (server_end, mut client_end) = tokio::io::duplex(65536);
         let server_handle = tokio::spawn(async move {
-            let _ = handle_connection(server_end, dispatcher, quotas).await;
+            let _ = handle_connection(Box::new(server_end), dispatcher, quotas).await;
         });
 
         let fe = FrontendId::new(Uuid::from_u128(1));
@@ -1204,10 +1285,10 @@ mod tests {
         );
     }
 
-    /// No embedding configured: projection stays parked (no worker, no
-    /// crash) and shutdown is a clean no-op for it.
+    /// No embedding configured: a lexical-only projection worker still runs
+    /// (text rows converge without vectors) and shutdown aborts it cleanly.
     #[tokio::test]
-    async fn projection_worker_parked_without_embedding() {
+    async fn projection_worker_runs_lexical_without_embedding() {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::resolve(dir.path(), "proj-store");
         let config = DaemonConfig {
@@ -1220,8 +1301,8 @@ mod tests {
         assert!(!daemon.projection_worker_running().await);
         daemon.start_projection().await;
         assert!(
-            !daemon.projection_worker_running().await,
-            "lexical-only daemons must not spawn a projection worker"
+            daemon.projection_worker_running().await,
+            "lexical-only daemons still project text rows"
         );
 
         daemon.shutdown();
@@ -1267,7 +1348,15 @@ mod tests {
             ..Default::default()
         };
         let daemon = Daemon::start(&paths, config.clone()).await.unwrap();
-        assert!(daemon.socket_path().ends_with("daemon.sock"));
+        #[cfg(unix)]
+        assert!(daemon.endpoint().ends_with("daemon.sock"));
+        #[cfg(windows)]
+        assert!(
+            daemon
+                .endpoint()
+                .to_string_lossy()
+                .starts_with("\\\\.\\pipe\\ltmrs-")
+        );
         // The lock is held; a second start must fail.
         let result = Daemon::start(&paths, config).await;
         assert!(result.is_err());
@@ -1383,10 +1472,14 @@ mod tests {
             .unwrap();
         let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
 
-        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
-        let server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
+        let server = tokio::spawn(handle_connection(
+            Box::new(server_stream),
+            dispatcher,
+            quotas,
+        ));
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
         let err = client.handshake(&handshake_as(1)).await.unwrap_err();
         assert!(
             err.to_string().contains("limit")
@@ -1413,26 +1506,26 @@ mod tests {
         let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
 
         // First client connects: slot held.
-        let (a_stream, a_server) = tokio::net::UnixStream::pair().unwrap();
+        let (a_stream, a_server) = tokio::io::duplex(65536);
         let a_task = tokio::spawn(handle_connection(
-            a_server,
+            Box::new(a_server),
             Arc::clone(&dispatcher),
             Arc::clone(&quotas),
         ));
         let mut client_a = IpcClient::new(std::path::PathBuf::from("unused"));
-        client_a.set_stream(a_stream);
+        client_a.set_stream(Box::new(a_stream));
         client_a.handshake(&handshake_as(1)).await.unwrap();
         assert_eq!(quotas.client_count(), 1);
 
         // Second client rejected while the first is live.
-        let (b_stream, b_server) = tokio::net::UnixStream::pair().unwrap();
+        let (b_stream, b_server) = tokio::io::duplex(65536);
         let b_task = tokio::spawn(handle_connection(
-            b_server,
+            Box::new(b_server),
             Arc::clone(&dispatcher),
             Arc::clone(&quotas),
         ));
         let mut client_b = IpcClient::new(std::path::PathBuf::from("unused"));
-        client_b.set_stream(b_stream);
+        client_b.set_stream(Box::new(b_stream));
         assert!(client_b.handshake(&handshake_as(2)).await.is_err());
         let _ = b_task.await;
 
@@ -1440,14 +1533,14 @@ mod tests {
         client_a.close();
         let _ = a_task.await;
         assert_eq!(quotas.client_count(), 0);
-        let (c_stream, c_server) = tokio::net::UnixStream::pair().unwrap();
+        let (c_stream, c_server) = tokio::io::duplex(65536);
         let c_task = tokio::spawn(handle_connection(
-            c_server,
+            Box::new(c_server),
             Arc::clone(&dispatcher),
             Arc::clone(&quotas),
         ));
         let mut client_c = IpcClient::new(std::path::PathBuf::from("unused"));
-        client_c.set_stream(c_stream);
+        client_c.set_stream(Box::new(c_stream));
         client_c.handshake(&handshake_as(3)).await.unwrap();
         client_c.close();
         let _ = c_task.await;
@@ -1465,10 +1558,14 @@ mod tests {
         ));
         let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
 
-        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
-        let _server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
+        let _server = tokio::spawn(handle_connection(
+            Box::new(server_stream),
+            dispatcher,
+            quotas,
+        ));
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
         client.handshake(&handshake_as(1)).await.unwrap();
         // Same channel, forged frontend: must not route.
         let mut env = IpcEnvelope {
@@ -1505,10 +1602,14 @@ mod tests {
         }));
         let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
 
-        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
-        let _server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
+        let _server = tokio::spawn(handle_connection(
+            Box::new(server_stream),
+            dispatcher,
+            quotas,
+        ));
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
         client.handshake(&handshake_as(1)).await.unwrap();
         let env = DomainRequest::ListMemories;
         let envelope = IpcEnvelope {
@@ -1550,10 +1651,14 @@ mod tests {
         }));
         let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
 
-        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
-        let server = tokio::spawn(handle_connection(server_stream, dispatcher, quotas));
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
+        let server = tokio::spawn(handle_connection(
+            Box::new(server_stream),
+            dispatcher,
+            quotas,
+        ));
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
         let hs = client
             .handshake(&HandshakeRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1802,14 +1907,14 @@ mod tests {
         ));
         let quotas = Arc::new(QuotaTracker::new(ResourceLimits::default()));
 
-        let (client_stream, server) = tokio::net::UnixStream::pair().unwrap();
-        let handle = tokio::spawn(handle_connection(server, dispatcher, quotas));
+        let (client_stream, server) = tokio::io::duplex(65536);
+        let handle = tokio::spawn(handle_connection(Box::new(server), dispatcher, quotas));
 
         // Client connects, handshakes (which issues the retry namespace),
         // then sends an AddMemory request and drops before reading the
         // response — simulating a crash after the request is in flight.
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
         let hs = client
             .handshake(&HandshakeRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1948,6 +2053,7 @@ mod tests {
             &table,
             Box::new(FixedEmbedder { dim: 384 }),
             100,
+            false,
         )
         .await;
         assert_eq!(first.unwrap(), 100);
@@ -1956,6 +2062,7 @@ mod tests {
             &table,
             Box::new(FixedEmbedder { dim: 384 }),
             100,
+            false,
         )
         .await;
         assert_eq!(second.unwrap(), 100);
@@ -1964,9 +2071,143 @@ mod tests {
             &table,
             Box::new(FixedEmbedder { dim: 384 }),
             100,
+            false,
         )
         .await;
         assert_eq!(third.unwrap(), 50);
         assert_eq!(repo.projection_lag().unwrap(), 0);
+    }
+
+    /// Lexical drive resolves text rows without vectors: the job ackes and
+    /// the row stays NULL-vectored (dense excludes NULLs explicitly).
+    #[tokio::test]
+    async fn lexical_drive_resolves_text_rows_without_vectors() {
+        use ltmrs_domain::command::DomainCommand;
+        use ltmrs_search::search::projector::Projector;
+        use ltmrs_search::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let table_dir = dir.path().join("table");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let table = SearchTable::open(table_dir.to_str().unwrap())
+            .await
+            .unwrap();
+        let ctx = ltmrs_domain::command::CommandContext {
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(1),
+            channel_id: ch(1),
+            session: None,
+            operation_id: OperationId::new(Uuid::from_u128(1)),
+            request_digest: "lexical-drive".to_string(),
+            deadline_millis: None,
+            scope: Scope::default(),
+            retry_epoch: 1,
+        };
+        repo.apply(
+            &ctx,
+            &DomainCommand::AddMemory {
+                memory: test_memory(1),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+        let resolved = Projector::project_pending_lexical(&repo, &table, 10)
+            .await
+            .unwrap();
+        assert_eq!(resolved, 1);
+        assert!(!repo.has_pending_projection(test_memory(1).id).unwrap());
+        assert_eq!(
+            table.count_rows(Some("embedding IS NULL")).await.unwrap(),
+            1,
+            "lexical rows stay NULL-vectored"
+        );
+    }
+
+    /// E5-upgrade backfill: memories projected while lexical-only (NULL
+    /// rows, jobs acked) are requeued for dense embedding.
+    #[tokio::test]
+    async fn backfill_requeues_lexical_null_vector_rows() {
+        use ltmrs_domain::command::DomainCommand;
+        use ltmrs_search::search::projector::Projector;
+        use ltmrs_search::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(
+                dir.path().join("store").to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let table_dir = dir.path().join("table");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let table = SearchTable::open(table_dir.to_str().unwrap())
+            .await
+            .unwrap();
+        let ctx = ltmrs_domain::command::CommandContext {
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(1),
+            channel_id: ch(1),
+            session: None,
+            operation_id: OperationId::new(Uuid::from_u128(1)),
+            request_digest: "lexical-backfill".to_string(),
+            deadline_millis: None,
+            scope: Scope::default(),
+            retry_epoch: 1,
+        };
+        repo.apply(
+            &ctx,
+            &DomainCommand::AddMemory {
+                memory: test_memory(1),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+        Projector::project_pending_lexical(&repo, &table, 10)
+            .await
+            .unwrap();
+        assert!(!repo.has_pending_projection(test_memory(1).id).unwrap());
+        Daemon::backfill_null_vectors(&repo, &table).await;
+        assert!(
+            repo.has_pending_projection(test_memory(1).id).unwrap(),
+            "NULL-vector rows must be requeued for dense embedding"
+        );
+    }
+
+    /// Health serves the live generation (not a hardcoded FIRST): after a
+    /// generation switch the report follows the store.
+    #[tokio::test]
+    async fn health_reports_live_generation_not_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "health-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        let report = daemon.health_report(true, true);
+        assert_eq!(report.store_generation, StoreGeneration::FIRST);
+        assert!(report.ready);
+        daemon
+            .dispatcher_arc()
+            .repo_arc()
+            .set_store_generation(StoreGeneration::new(2))
+            .unwrap();
+        let report = daemon.health_report(true, true);
+        assert_eq!(report.store_generation.as_u64(), 2);
+        assert!(report.ready);
     }
 }

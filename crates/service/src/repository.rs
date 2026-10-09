@@ -1078,6 +1078,23 @@ impl CanonicalRepository {
             ));
         }
 
+        // Transaction-level generation fence: the command's generation must
+        // equal the generation visible inside this transaction. The
+        // dispatcher checks before dispatch, but only this comparison closes
+        // the race where a restore cut over between dispatch and commit —
+        // a fencing token must never fail open.
+        let live = self.resolve_generation(tx)?;
+        if live != ctx.store_generation {
+            return Err(DomainError::new(
+                DomainErrorCode::StaleGeneration,
+                format!(
+                    "stale store generation {} (live {}): re-handshake and retry",
+                    ctx.store_generation.as_u64(),
+                    live.as_u64(),
+                ),
+            ));
+        }
+
         // Validate preconditions and apply the command inside the transaction.
         let mut state = CommandState::new(
             tx,
@@ -1202,16 +1219,22 @@ impl CanonicalRepository {
         let raw = snapshot
             .get(&meta, "store_generation")
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        Self::decode_meta_generation(raw.as_ref().map(|v| v.as_ref()))
+    }
+
+    /// Decode the raw meta generation pointer: missing means a fresh store
+    /// (FIRST); present-but-truncated is corruption and fails closed —
+    /// generation identity is a fencing token, never a default.
+    fn decode_meta_generation(raw: Option<&[u8]>) -> DomainResult<StoreGeneration> {
         match raw {
-            Some(v) => {
-                let bytes = v.as_ref();
-                if bytes.len() >= 8 {
-                    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    Ok(StoreGeneration::new(value))
-                } else {
-                    Ok(StoreGeneration::FIRST)
-                }
+            Some(bytes) if bytes.len() >= 8 => {
+                let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                Ok(StoreGeneration::new(value))
             }
+            Some(_) => Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "corrupt store_generation metadata: present but truncated",
+            )),
             None => Ok(StoreGeneration::FIRST),
         }
     }
@@ -1642,18 +1665,7 @@ impl CanonicalRepository {
         let raw = tx
             .get(&meta, "store_generation")
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        match raw {
-            Some(v) => {
-                let bytes = v.as_ref();
-                if bytes.len() >= 8 {
-                    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    Ok(StoreGeneration::new(value))
-                } else {
-                    Ok(StoreGeneration::FIRST)
-                }
-            }
-            None => Ok(StoreGeneration::FIRST),
-        }
+        Self::decode_meta_generation(raw.as_ref().map(|v| v.as_ref()))
     }
 
     /// Count recallable canonical memories inside a write transaction (the
@@ -1859,6 +1871,59 @@ impl CanonicalRepository {
             .iter()
             .map(|j| now_millis.saturating_sub(j.enqueued_at_millis))
             .max())
+    }
+
+    /// Enqueue a projection job only when none is pending (upgrade backfill):
+    /// check-and-set in one transaction, so a concurrent mutation's own job
+    /// can never be clobbered by a stale backfill write. Returns whether a
+    /// job was enqueued.
+    pub fn enqueue_projection_job_if_absent(
+        &self,
+        memory_id: EntityId,
+        desired_document_revision: ltmrs_domain::id::DocumentRevision,
+        seq: u64,
+    ) -> DomainResult<bool> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let key = memory_id.as_uuid().to_string();
+            let present = tx
+                .get(&self.projections, &key)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                .is_some();
+            if present {
+                tx.rollback();
+                return Ok(false);
+            }
+            let job = ltmrs_domain::projection::ProjectionJob {
+                memory_id,
+                desired_document_revision,
+                seq,
+                enqueued_at_millis: self.clock.now_millis(),
+                is_tombstone: false,
+            };
+            tx.insert(
+                &self.projections,
+                memory_id.as_uuid().to_string(),
+                serde_json::to_vec(&job)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                    .as_slice(),
+            );
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(true);
+                }
+                Ok(Err(_conflict)) => continue,
+                Err(e) => return Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
+            }
+        }
+        Err(Self::exhausted_contention(
+            "max transaction retries exceeded",
+        ))
     }
 
     /// Enqueue (or advance) a projection job using the repository's clock for
@@ -3260,6 +3325,49 @@ impl CanonicalRepository {
         ))
     }
 
+    /// Read a recorded distill outcome (`PracticeLog` receipt): the recorded
+    /// guide on digest match, key reuse on digest mismatch, None on miss.
+    /// A `GuideOpLog`-shaped entry proves another operation kind owns this
+    /// key and rejects the same way; corrupt entries fail loudly. Lets the
+    /// distill tool check its receipt before resolving the memory, so a
+    /// retry after the source vanished still replays instead of failing
+    /// resolution.
+    pub fn read_recorded_distill_op(
+        &self,
+        scope: &OperationScope,
+    ) -> DomainResult<Option<ltmrs_domain::guide::Guide>> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        self.validate_scope(scope)?;
+        let snapshot = self.db.read_tx();
+        let raw = snapshot
+            .get(&self.guide_ops, scope.op_key())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        if let Ok(log) = serde_json::from_slice::<PracticeLog>(raw.as_ref()) {
+            Self::check_scope_owner(log.scope.as_ref(), scope)?;
+            if log.digest != scope.request_digest {
+                return Err(DomainError::new(
+                    DomainErrorCode::KeyReuseDifferentInput,
+                    "operation key reused with different input",
+                ));
+            }
+            self.persist_barrier()?;
+            return Ok(Some(log.recorded));
+        }
+        if serde_json::from_slice::<GuideOpLog>(raw.as_ref()).is_ok() {
+            return Err(DomainError::new(
+                DomainErrorCode::KeyReuseDifferentInput,
+                "operation key reused with different input",
+            ));
+        }
+        Err(DomainError::new(
+            DomainErrorCode::Validation,
+            "corrupt guide operation log entry",
+        ))
+    }
+
     /// Look up one guide tool operation in the `guide_ops` log inside the
     /// caller's transaction: a digest match returns the recorded outcome, a
     /// digest mismatch rejects as key reuse. Entries written by practice
@@ -4136,6 +4244,17 @@ impl CanonicalRepository {
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            // First freeze wins transactionally: a duplicate in-flight
+            // execution must never overwrite the already-frozen verbatim
+            // response. A same-key re-freeze (replay path) is a no-op.
+            if tx
+                .get(&self.tool_results, scope.op_key())
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                .is_some()
+            {
+                tx.rollback();
+                return Ok(());
+            }
             tx.insert(&self.tool_results, scope.op_key(), raw.as_slice());
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -4699,18 +4818,7 @@ impl CanonicalRepository {
         let raw = snapshot
             .get(&meta, "store_generation")
             .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-        match raw {
-            Some(v) => {
-                let bytes = v.as_ref();
-                if bytes.len() >= 8 {
-                    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                    Ok(StoreGeneration::new(value))
-                } else {
-                    Ok(StoreGeneration::FIRST)
-                }
-            }
-            None => Ok(StoreGeneration::FIRST),
-        }
+        Self::decode_meta_generation(raw.as_ref().map(|v| v.as_ref()))
     }
 
     /// Acquire the exclusive restore fence (P1 restore quiescence): while
@@ -5726,14 +5834,17 @@ mod tests {
             "result must stay live"
         );
         for s in [eid(1), eid(2)] {
+            // Frozen contract (consolidate=true): sources are KEPT, marked
+            // superseded via the edges below, and down-weighted — never
+            // archived.
+            let kept = repo.get_memories(&[s]).unwrap().remove(0);
             assert!(
-                !repo
-                    .get_memories(&[s])
-                    .unwrap()
-                    .remove(0)
-                    .lifecycle
-                    .is_recallable(),
-                "sources must archive"
+                kept.lifecycle.is_recallable(),
+                "consolidated sources stay recallable"
+            );
+            assert_eq!(
+                kept.confidence, 0.05,
+                "consolidated sources down-weight to 0.05"
             );
         }
         let edges: Vec<_> = repo
@@ -5751,6 +5862,68 @@ mod tests {
             assert_eq!(e.source, eid(3));
             assert!(e.target == eid(1) || e.target == eid(2));
         }
+    }
+
+    #[test]
+    fn merge_delete_removes_sources_and_severs_edges() {
+        let (repo, _dir) = repo_with_ns();
+        for n in [1u64, 2] {
+            repo.apply(
+                &ctx(n, &format!("m{n}")),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(n), &format!("m{n}")),
+                    session: None,
+                    auto_link: None,
+                },
+            )
+            .unwrap();
+        }
+        // A relation touching a source: hard delete must sever it.
+        repo.apply(
+            &ctx(10, "rel"),
+            &DomainCommand::Relate {
+                relation: ltmrs_domain::relation::Relation::new(
+                    ltmrs_domain::id::EntityId::new(Uuid::from_u128(90)),
+                    eid(1),
+                    eid(2),
+                    ltmrs_domain::relation::RelationType::RelatedTo,
+                    None,
+                    ltmrs_domain::memory::Instant::new(1000),
+                ),
+            },
+        )
+        .unwrap();
+        repo.apply(
+            &ctx(3, "merge"),
+            &DomainCommand::Merge {
+                source_ids: vec![eid(1), eid(2)],
+                result: memory(eid(3), "m3"),
+                consolidate: false,
+            },
+        )
+        .unwrap();
+        // Frozen contract (consolidate=false): sources are deleted —
+        // ltmrs hard-delete tombstones (row preserved for audit, like
+        // Forget{Delete}): not recallable, edges severed.
+        for s in [eid(1), eid(2)] {
+            let tomb = repo.get_memories(&[s]).unwrap().pop().unwrap();
+            assert!(
+                !tomb.lifecycle.is_recallable(),
+                "deleted sources must not be recallable"
+            );
+        }
+        assert!(
+            repo.all_relations().unwrap().is_empty(),
+            "hard delete severs edges involving deleted sources"
+        );
+        assert!(
+            repo.get_memories(&[eid(3)])
+                .unwrap()
+                .remove(0)
+                .lifecycle
+                .is_recallable(),
+            "result must stay live"
+        );
     }
 
     /// Project-only updates change indexed rows (project column), so they
@@ -6290,6 +6463,145 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, DomainErrorCode::StaleReplay);
+    }
+
+    #[test]
+    fn corrupt_generation_meta_fails_closed_not_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = CanonicalRepository::open(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(repo.store_generation().unwrap(), StoreGeneration::FIRST);
+        // Torn metadata (present but short) must error, never degrade to
+        // generation 1: generation identity is a fencing token.
+        let meta = CanonicalRepository::keyspace(&repo.db, "meta").unwrap();
+        let mut tx = repo.db.write_tx().unwrap();
+        tx.insert(&meta, "store_generation", [1u8, 2, 3].as_slice());
+        tx.commit().unwrap().unwrap();
+        let err = repo.store_generation().unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation);
+        assert!(err.message.contains("corrupt"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn apply_with_retired_generation_fails_closed() {
+        let (repo, _dir) = repo_with_ns();
+        let mut c = ctx(1, "d1");
+        c.store_generation = StoreGeneration::new(2);
+        let err = repo
+            .apply(
+                &c,
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(1), "x"),
+                    session: None,
+                    auto_link: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::StaleGeneration);
+    }
+
+    #[test]
+    fn first_tool_freeze_wins_over_later_duplicates() {
+        let (repo, _dir) = repo_with_ns();
+        let admitted = admit(&repo, 1, "d1");
+        let scope = scope(1, "d1");
+        // A receipt must exist first (freeze answers replays of executions).
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "x"),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+        let first = ltmrs_domain::session::FrozenToolResponse {
+            text: "first".to_string(),
+            structured: Some(serde_json::json!({"n": 1})),
+            is_error: false,
+        };
+        let second = ltmrs_domain::session::FrozenToolResponse {
+            text: "second".to_string(),
+            structured: Some(serde_json::json!({"n": 2})),
+            is_error: false,
+        };
+        repo.freeze_tool_result(&admitted, &scope, &first).unwrap();
+        // A duplicate in-flight execution must not overwrite the frozen
+        // verbatim response.
+        repo.freeze_tool_result(&admitted, &scope, &second).unwrap();
+        match repo.check_tool_replay(&scope).unwrap() {
+            ToolReplayStatus::Frozen(back) => {
+                assert_eq!(back.text, "first");
+                assert_eq!(back.structured, Some(serde_json::json!({"n": 1})));
+            }
+            other => panic!("expected frozen first response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_absent_enqueue_never_clobbers_a_fresh_job() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "x"),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+        let rev = repo
+            .get_memories(&[eid(1)])
+            .unwrap()
+            .remove(0)
+            .document_revision;
+        // No job pending (fresh add records one — acknowledge it first).
+        let job = repo
+            .projection_job(eid(1))
+            .unwrap()
+            .expect("add records a job");
+        assert!(repo.acknowledge_projection(eid(1), job.seq).unwrap());
+        // Backfill path: enqueues exactly once, then holds.
+        assert!(
+            repo.enqueue_projection_job_if_absent(eid(1), rev, 1)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .enqueue_projection_job_if_absent(eid(1), rev, 1)
+                .unwrap()
+        );
+        let kept = repo.projection_job(eid(1)).unwrap().expect("job kept");
+        assert_eq!(kept.seq, 1, "second call must not advance the seq");
+        assert_eq!(kept.desired_document_revision, rev);
+    }
+
+    #[test]
+    fn content_update_advances_updated_at() {
+        let (repo, _dir) = repo_with_ns();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "x"),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+        repo.apply(
+            &ctx(2, "d2"),
+            &DomainCommand::UpdateMemory {
+                id: eid(1),
+                expected_revision: None,
+                patch: ltmrs_domain::command::MemoryPatch {
+                    fragment: Some("new body".to_string()),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        let updated = repo.get_memories(&[eid(1)]).unwrap().remove(0);
+        // FrozenClock(1000) in repo_with_ns: the mutation stamps real time.
+        assert_eq!(updated.updated_at.as_millis(), 1000);
     }
 
     #[test]

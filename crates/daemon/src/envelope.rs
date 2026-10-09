@@ -654,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_response_roundtrips_over_a_stream() {
-        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let (mut client, mut server) = tokio::io::duplex(65536);
         let payload = "y".repeat(MAX_FRAME_BYTES + 1024).into_bytes();
         let expected = payload.clone();
         tokio::spawn(async move {
@@ -666,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn small_response_roundtrips_as_single_frame() {
-        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        let (mut client, mut server) = tokio::io::duplex(65536);
         let payload = b"{\"hello\":\"world\"}".to_vec();
         let expected = payload.clone();
         tokio::spawn(async move {

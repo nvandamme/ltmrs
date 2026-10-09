@@ -463,9 +463,19 @@ mod tests {
     }
 
     fn gateway_ctx(op_num: u64) -> ltmrs_domain::command::CommandContext {
+        gateway_ctx_gen(op_num, ltmrs_domain::id::StoreGeneration::FIRST)
+    }
+
+    /// Context under an explicit generation: post-restore writes name the
+    /// live generation (like a re-handshaked client); the transaction
+    /// fence rejects retired generations.
+    fn gateway_ctx_gen(
+        op_num: u64,
+        generation: ltmrs_domain::id::StoreGeneration,
+    ) -> ltmrs_domain::command::CommandContext {
         use ltmrs_domain::id::{ChannelId, FrontendId, OperationId};
         ltmrs_domain::command::CommandContext {
-            store_generation: ltmrs_domain::id::StoreGeneration::FIRST,
+            store_generation: generation,
             frontend_id: FrontendId::new(uuid::Uuid::from_u128(1)),
             channel_id: ChannelId::new(uuid::Uuid::from_u128(2)),
             session: None,
@@ -1297,7 +1307,9 @@ mod tests {
         );
         // Receipts drained: replaying op 5 with new content executes fresh
         // instead of returning the stale receipt. A fresh namespace is
-        // issued first (the pre-restore epoch was drained with the rest).
+        // issued first (the pre-restore epoch was drained with the rest),
+        // and the write names the live generation like a re-handshaked
+        // client (the fence rejects the retired one).
         repo.issue_namespace(
             ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
             ltmrs_domain::id::ChannelId::new(uuid::Uuid::from_u128(2)),
@@ -1307,7 +1319,7 @@ mod tests {
         let mut changed = test_memory(1, "Changed Content");
         changed.external_alias = Some(ExternalAlias::new("old-alias"));
         repo.apply(
-            &gateway_ctx(5),
+            &gateway_ctx_gen(5, ltmrs_domain::id::StoreGeneration::new(2)),
             &DomainCommand::AddMemory {
                 memory: changed,
                 session: None,

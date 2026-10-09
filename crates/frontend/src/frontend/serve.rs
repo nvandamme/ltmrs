@@ -4,8 +4,9 @@
 //! frontend to an already-running daemon (fail fast when unreachable);
 //! without `--socket` the frontend attaches to the managed-home daemon if
 //! one is reachable (connect-or-spawn), otherwise it starts the daemon
-//! in-process under the managed home (`$HOME/.ltmrs`) and serves its socket
-//! alongside the bridged `UnixStream` pair. Either way the MCP boundary is
+//! in-process under the managed home (`$HOME/.ltmrs` on unix,
+//! `%USERPROFILE%/.ltmrs` on Windows) and serves its IPC endpoint
+//! alongside the bridged duplex pair. Either way the MCP boundary is
 //! `LtmrsFrontend` served over rmcp stdio. Losing the startup lock race
 //! retries the connection instead of failing; the owning frontend stays
 //! alive serving socket clients after its own stdio closes.
@@ -22,8 +23,9 @@ use ltmrs_daemon::runtime::RuntimePaths;
 use ltmrs_daemon::server::{Daemon, DaemonConfig, EmbeddingMode, handle_connection};
 use ltmrs_domain::id::{ChannelId, FrontendId, StoreGeneration};
 
-/// Managed home directory name under `$HOME` (native default; upstream
-/// Lemma uses `~/.lemma`, so this path is ltmrs-native by design).
+/// Managed home directory name under the home dir (`$HOME` on unix,
+/// `%USERPROFILE%` on Windows; upstream Lemma uses `~/.lemma`, so this
+/// path is ltmrs-native by design).
 pub const MANAGED_HOME_DIR: &str = ".ltmrs";
 /// Fjall canonical store directory name under the managed home.
 pub const STORE_DIR_NAME: &str = "store";
@@ -43,7 +45,8 @@ pub const RUNTIME_IDENTITY: &str = "daemon";
 /// Resolved on-disk layout for in-process stdio serving.
 #[derive(Debug, Clone)]
 pub struct StdioLayout {
-    /// The managed home (`$HOME/.ltmrs`).
+    /// The managed home (`$HOME/.ltmrs` on unix, `%USERPROFILE%/.ltmrs`
+    /// on Windows).
     pub base: PathBuf,
     /// Canonical store path (string form for `DaemonConfig`).
     pub store_path: String,
@@ -64,9 +67,48 @@ pub struct StdioLayout {
 pub fn resolve_home(home: Option<String>) -> Result<PathBuf, CliError> {
     match home {
         Some(h) if !h.is_empty() => Ok(Path::new(&h).join(MANAGED_HOME_DIR)),
-        _ => Err(CliError::Runtime(
-            "stdio serving needs a home directory: set $HOME (no store location invented)".into(),
-        )),
+        _ => Err(CliError::Runtime(format!(
+            "stdio serving needs a home directory: set {} (no store location invented)",
+            home_env_name()
+        ))),
+    }
+}
+
+/// The home-directory environment variable per platform: `$HOME` on unix,
+/// `%USERPROFILE%` on Windows.
+pub fn home_dir() -> Option<String> {
+    home_dir_from(
+        std::env::var("HOME").ok(),
+        std::env::var(home_env_var()).ok(),
+    )
+}
+
+/// Precedence core (pure for deterministic tests): an explicit, non-empty
+/// HOME wins; otherwise the platform fallback (`USERPROFILE` on Windows).
+fn home_dir_from(home: Option<String>, fallback: Option<String>) -> Option<String> {
+    home.filter(|h| !h.is_empty())
+        .or_else(|| fallback.filter(|h| !h.is_empty()))
+}
+
+pub const fn home_env_var() -> &'static str {
+    #[cfg(unix)]
+    {
+        "HOME"
+    }
+    #[cfg(windows)]
+    {
+        "USERPROFILE"
+    }
+}
+
+pub fn home_env_name() -> &'static str {
+    #[cfg(unix)]
+    {
+        "$HOME"
+    }
+    #[cfg(windows)]
+    {
+        "%USERPROFILE%"
     }
 }
 
@@ -109,14 +151,14 @@ fn resolve_daemon_embedding(layout: &StdioLayout) -> EmbeddingMode {
     }
 }
 
-/// The managed daemon socket for a stdio layout (single definition so
+/// The managed daemon IPC endpoint for a stdio layout (single definition so
 /// spawners, frontends and status output never disagree on the path).
 pub fn daemon_socket_path(layout: &StdioLayout) -> PathBuf {
-    RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).socket_path
+    RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).endpoint
 }
 
 /// Start an in-process daemon and return it together with a frontend
-/// client bridged over a `UnixStream` pair. Single-process mode for
+/// client bridged over a `tokio::io::duplex` pair. Single-process mode for
 /// tests and embeddings: production frontends attach to a spawned daemon
 /// process instead (see `ensure_daemon_process`). The daemon must be kept
 /// alive (and `shutdown` at the end) to hold the singleton lock.
@@ -150,17 +192,16 @@ pub async fn start_local_daemon(layout: &StdioLayout) -> Result<(Daemon, IpcClie
     // Serve the bound socket too: without this a second frontend dials a
     // bound-but-unaccepted listener and parks forever (P1 shared lifecycle).
     daemon.spawn_socket_server().await;
-    let (client_stream, server_stream) = tokio::net::UnixStream::pair()
-        .map_err(|e| CliError::Runtime(format!("cannot bridge stdio daemon: {e}")))?;
+    let (client_stream, server_stream) = tokio::io::duplex(65536);
     // Detached on purpose: the task lives until the client stream closes
     // (dropping the JoinHandle detaches; only `abort` would cancel it).
     let _connection = tokio::spawn(handle_connection(
-        server_stream,
+        Box::new(server_stream),
         daemon.dispatcher_arc(),
         daemon.quotas(),
     ));
-    let mut client = IpcClient::new(paths.socket_path.clone());
-    client.set_stream(client_stream);
+    let mut client = IpcClient::new(paths.endpoint.clone());
+    client.set_stream(Box::new(client_stream));
     Ok((daemon, client))
 }
 
@@ -198,30 +239,24 @@ pub fn daemon_idle_ms(flag: Option<u64>, env_raw: Option<String>) -> u64 {
 }
 
 /// Spawn a detached daemon child (`exe daemon --foreground ...`) that
-/// outlives this process: stdin to null, stdout/stderr appended to a
-/// mode-0600 log file in the runtime dir (a silent daemon is
-/// undebuggable; rotation is future work), new session so terminal
-/// signals to our group never reach it, never waited on (reparented on
+/// outlives this process: stdin to null, stdout/stderr appended to a log
+/// file in the runtime dir (mode-0600 on unix, default ACL on Windows; a
+/// silent daemon is undebuggable; rotation is future work), detached from
+/// our terminal signal group (new session on unix,
+/// `CREATE_NEW_PROCESS_GROUP` on Windows), never waited on (reparented on
 /// our exit; it idle-exits on its own).
 pub fn spawn_daemon_child(
     exe: &Path,
     idle_ms: u64,
     log_path: &Path,
 ) -> Result<std::process::Child, CliError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CliError::Runtime(format!("cannot create daemon runtime dir: {e}")))?;
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(log_path)
-        .map_err(|e| CliError::Runtime(format!("cannot open daemon log: {e}")))?;
+    let log = open_daemon_log(log_path)?;
     let log_err = log
         .try_clone()
         .map_err(|e| CliError::Runtime(format!("cannot duplicate daemon log: {e}")))?;
@@ -234,12 +269,41 @@ pub fn spawn_daemon_child(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
-    // Detach into a new session so terminal signals to our process group
-    // (Ctrl-C) never reach the daemon. The child stays a child of this
-    // process until we exit (reparented by init afterwards, reaped if it
-    // exits first while we still hold the handle); it idle-exits on its
-    // own. SAFETY: pre_exec runs post-fork/pre-exec; the closure calls
-    // only async-signal-safe libc::setsid with no allocation.
+    detach_child(&mut cmd);
+    cmd.spawn()
+        .map_err(|e| CliError::Runtime(format!("cannot spawn daemon process: {e}")))
+}
+
+/// Open the daemon log: mode-0600 on unix (owner-only diagnostics); the
+/// default ACL on Windows (per-user profile dir inherits protection).
+#[cfg(unix)]
+fn open_daemon_log(log_path: &Path) -> Result<std::fs::File, CliError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log_path)
+        .map_err(|e| CliError::Runtime(format!("cannot open daemon log: {e}")))
+}
+
+#[cfg(windows)]
+fn open_daemon_log(log_path: &Path) -> Result<std::fs::File, CliError> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| CliError::Runtime(format!("cannot open daemon log: {e}")))
+}
+
+/// Detach a child from our terminal's signal group: a new session on unix
+/// (setsid), `CREATE_NEW_PROCESS_GROUP` on Windows. Ctrl-C to our console
+/// never reaches the child; Ctrl-Break still does (Task 6 pins it).
+#[cfg(unix)]
+pub fn detach_child(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: pre_exec runs post-fork/pre-exec; the closure calls only
+    // async-signal-safe libc::setsid with no allocation.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -248,8 +312,13 @@ pub fn spawn_daemon_child(
             Ok(())
         });
     }
-    cmd.spawn()
-        .map_err(|e| CliError::Runtime(format!("cannot spawn daemon process: {e}")))
+}
+
+#[cfg(windows)]
+pub fn detach_child(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0020;
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
 /// Daemon child log file: diagnostics a detached daemon would otherwise
@@ -480,15 +549,17 @@ pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result
     let mut daemon = Daemon::start(&paths, config)
         .await
         .map_err(|e| CliError::Runtime(format!("cannot start daemon: {e}")))?;
-    // SIGTERM (supervisors, hosts) shuts down gracefully: persist routing
-    // state, stop workers, exit 0. SIGKILL needs no handling (store writes
-    // are barrier-flushed per commit, so acknowledged work survives it).
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| CliError::Runtime(format!("cannot watch for SIGTERM: {e}")))?;
+    // SIGTERM (unix supervisors/hosts) and Ctrl-C shut down gracefully:
+    // persist routing state, stop workers, exit 0. SIGKILL needs no
+    // handling (store writes are barrier-flushed per commit, so
+    // acknowledged work survives it). Windows: Ctrl-C on the console; a
+    // detached daemon is Ctrl-C-protected by its new process group and
+    // shuts down via Ctrl-Break (Task 6 pins the break path).
+
     let result = tokio::select! {
         r = daemon.serve() => r,
-        _ = term.recv() => {
-            eprintln!("ltmrs: daemon received SIGTERM, shutting down");
+        _ = shutdown_signal() => {
+            eprintln!("ltmrs: daemon received shutdown signal, shutting down");
             Ok(())
         }
     };
@@ -497,6 +568,28 @@ pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result
     daemon.shutdown();
     result.map_err(|e| CliError::Runtime(format!("daemon serve failed: {e}")))?;
     Ok(())
+}
+
+/// The shutdown signal set per platform: SIGTERM + Ctrl-C on unix; Ctrl-C
+/// and Ctrl-Break on Windows (a detached daemon is Ctrl-C-protected by its
+/// new process group; Ctrl-Break reaches it via GenerateConsoleCtrlEvent).
+#[cfg(unix)]
+pub async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("cannot watch for SIGTERM");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(windows)]
+pub async fn shutdown_signal() {
+    let mut brk = tokio::signal::windows::ctrl_break().expect("cannot watch for Ctrl-Break");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = brk.recv() => {}
+    }
 }
 
 /// Serve MCP over stdio: `socket=None` ensures the managed-home daemon
@@ -564,7 +657,11 @@ mod tests {
     fn resolve_home_requires_home() {
         let err = resolve_home(None).unwrap_err();
         assert!(matches!(err, CliError::Runtime(_)));
-        assert!(err.to_string().contains("HOME"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains(crate::frontend::serve::home_env_var()),
+            "got: {err}"
+        );
         assert!(matches!(
             resolve_home(Some(String::new())),
             Err(CliError::Runtime(_))
@@ -580,7 +677,30 @@ mod tests {
         );
     }
 
+    /// HOME wins over USERPROFILE (tests and msys-style shells set HOME on
+    /// Windows); empty HOME falls back; both missing resolves to nothing.
+    #[test]
+    fn home_dir_prefers_home_over_userprofile() {
+        assert_eq!(
+            home_dir_from(Some("C:/t".to_string()), Some("C:/u".to_string())),
+            Some("C:/t".to_string())
+        );
+        assert_eq!(
+            home_dir_from(None, Some("C:/u".to_string())),
+            Some("C:/u".to_string())
+        );
+        assert_eq!(
+            home_dir_from(Some(String::new()), Some("C:/u".to_string())),
+            Some("C:/u".to_string()),
+            "empty HOME falls back"
+        );
+        assert_eq!(home_dir_from(None, None), None);
+    }
+
     /// Layout sub-paths are pinned (store/sessions/search/runtime wiring).
+    /// Unix path literals; Windows layout is pinned by `resolve_home` +
+    /// the runtime endpoint tests.
+    #[cfg(unix)]
     #[test]
     fn stdio_layout_pins_subpaths() {
         let base = Path::new("/tmp/x/.ltmrs");
@@ -592,7 +712,7 @@ mod tests {
         assert_eq!(layout.runtime_base, base);
         // The runtime (lock + socket) resolves under the managed home.
         let runtime = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
-        assert!(runtime.socket_path.starts_with(&layout.base));
+        assert!(runtime.endpoint.starts_with(&layout.base));
     }
 
     fn test_memory() -> ltmrs_domain::memory::Memory {
@@ -768,12 +888,24 @@ mod tests {
         daemon.shutdown();
     }
 
-    /// Layout pins the models directory (provision target + daemon enablement source).
+    /// Layout pins the models directory (provision target + daemon
+    /// enablement source). Unix path-literal pin; the Windows layout is
+    /// pinned by the native-separator assertion below.
+    #[cfg(unix)]
     #[test]
     fn stdio_layout_pins_models_path() {
         let base = Path::new("/tmp/x/.ltmrs");
         let layout = stdio_layout(base);
         assert_eq!(layout.models_path, "/tmp/x/.ltmrs/models");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stdio_layout_pins_models_path() {
+        let base = Path::new("C:\\Users\\x\\.ltmrs");
+        let layout = stdio_layout(base);
+        assert_eq!(layout.models_path, "C:\\Users\\x\\.ltmrs\\models");
+        assert_eq!(layout.store_path, "C:\\Users\\x\\.ltmrs\\store");
     }
 
     /// Unprovisioned models dir resolves dense-disabled (offline-safe).
@@ -805,16 +937,39 @@ mod tests {
         );
     }
 
-    /// No provisioned models: the local daemon serves lexical-only and says so
+    /// No provisioned models: the local daemon serves lexical-only through
+    /// the attached lexical backend (not the snapshot fallback) and says so
     /// on the wire (mode + dense_ready), never a silent dense claim.
     #[tokio::test]
-    async fn local_daemon_without_models_serves_lexical_fallback() {
+    async fn local_daemon_without_models_serves_lexical_engine() {
         use ltmrs_compat::lemma::tool_args::{SemanticSearchArgs, ToolArgs};
         use ltmrs_daemon::envelope::{DomainPayload, IpcResult};
 
         let dir = tempfile::tempdir().unwrap();
         let layout = stdio_layout(&dir.path().join(".ltmrs"));
         let (mut daemon, mut client) = start_local_daemon(&layout).await.unwrap();
+        // Deterministic convergence: the lexical worker builds the FTS
+        // index asynchronously; ensure it here (retrying the worker's own
+        // concurrent build) so the search below meets a converged
+        // (Complete) table instead of racing the worker.
+        let mut table = ltmrs_search::search::table::SearchTable::open(daemon.search_path())
+            .await
+            .unwrap();
+        let mut converged = false;
+        for _ in 0..40 {
+            // Refresh first: this handle snapshots at open and would
+            // otherwise never observe the worker's concurrent index build.
+            let _ = table.refresh().await;
+            match table.ensure_fts_index().await {
+                Ok(_) => {
+                    converged = true;
+                    break;
+                }
+                // The worker's own concurrent index build preempted ours.
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        assert!(converged, "FTS index must converge");
         let id = test_identity();
         let hs = client
             .handshake(&HandshakeRequest {
@@ -859,7 +1014,7 @@ mod tests {
                     },
                 ..
             } => {
-                assert_eq!(v["explanation"]["mode"], "lexical-fallback");
+                assert_eq!(v["explanation"]["mode"], "lexical");
                 assert_eq!(v["explanation"]["dense_ready"], false);
             }
             other => panic!("expected tool result, got: {other:?}"),
@@ -879,7 +1034,7 @@ mod tests {
             daemon.socket_server_running().await,
             "stdio daemon must serve its socket"
         );
-        let socket = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).socket_path;
+        let socket = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY).endpoint;
         let mut second = IpcClient::new(socket);
         tokio::time::timeout(std::time::Duration::from_secs(2), second.connect())
             .await
@@ -929,5 +1084,29 @@ mod tests {
         );
         assert_eq!(daemon_idle_ms(None, None), DEFAULT_DAEMON_IDLE_MS);
         assert_eq!(daemon_idle_ms(Some(0), None), 0, "0 serves forever");
+    }
+
+    /// Windows shutdown handlers register successfully: Ctrl-C and
+    /// Ctrl-Break via tokio's console control handler. Programmatic
+    /// delivery is not testable under `cargo test` on this conhost:
+    /// group-0 events kill cargo (cargo registers no handler), and
+    /// targeted delivery to the daemon's own process group is delayed
+    /// tens of seconds and hangs `try_wait` after the daemon exits —
+    /// both verified by probe (2026-10-08, deviation ledger). The
+    /// foreground Ctrl-C path is proven clean in the same console group
+    /// (daemon fires, exits 0).
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_handlers_register() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let c = tokio::signal::windows::ctrl_c();
+            let b = tokio::signal::windows::ctrl_break();
+            assert!(c.is_ok(), "ctrl_c handler must register, got {c:?}");
+            assert!(b.is_ok(), "ctrl_break handler must register, got {b:?}");
+        });
     }
 }

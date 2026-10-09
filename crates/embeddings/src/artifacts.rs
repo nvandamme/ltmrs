@@ -136,6 +136,11 @@ impl ArtifactCache {
             .join(model.revision.as_str())
     }
 
+    /// Upper bound for one downloaded artifact file (E5-small totals
+    /// ~130MB; 1 GiB leaves generous headroom while a misbehaving endpoint
+    /// can no longer force an unbounded response into memory or disk).
+    const MAX_ARTIFACT_BYTES: u64 = 1 << 30;
+
     async fn download_one(
         &self,
         model: &ModelArtifact,
@@ -145,7 +150,7 @@ impl ArtifactCache {
         let url = model.url_for(file);
         tracing::info!(file, "downloading model artifact");
 
-        let resp = client
+        let mut resp = client
             .get(&url)
             .send()
             .await
@@ -158,15 +163,56 @@ impl ArtifactCache {
             ));
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ArtifactError::Download(model.id.clone(), e.to_string()))?;
+        // Bound first: a declared length beyond the cap fails before
+        // reading a single body byte.
+        if let Some(len) = resp.content_length()
+            && len > Self::MAX_ARTIFACT_BYTES
+        {
+            return Err(ArtifactError::Download(
+                model.id.clone(),
+                format!("artifact {file} declares {len} bytes, over the bound"),
+            ));
+        }
 
-        // Write atomically: temp file, then rename into place.
+        // Stream chunk by chunk (never buffer the whole response): RAM
+        // stays flat no matter what the endpoint sends. The digest is
+        // verified by the caller over the published file, as before.
         let final_path = self.model_dir(model).join(file);
         let tmp_path = final_path.with_extension("part");
-        std::fs::write(&tmp_path, &bytes)?;
+        let streamed = async {
+            let mut staged = std::fs::File::create(&tmp_path)?;
+            let mut total: u64 = 0;
+            loop {
+                match resp
+                    .chunk()
+                    .await
+                    .map_err(|e| ArtifactError::Download(model.id.clone(), e.to_string()))?
+                {
+                    None => break,
+                    Some(chunk) => {
+                        total += chunk.len() as u64;
+                        if total > Self::MAX_ARTIFACT_BYTES {
+                            return Err(ArtifactError::Download(
+                                model.id.clone(),
+                                format!("artifact {file} exceeds the bound mid-download"),
+                            ));
+                        }
+                        std::io::Write::write_all(&mut staged, &chunk)?;
+                    }
+                }
+            }
+            staged.sync_all()?;
+            Ok::<(), ArtifactError>(())
+        }
+        .await;
+        // A failed download never leaves a staged partial behind (a later
+        // run recreates it from scratch).
+        if streamed.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        streamed?;
+
+        // Write atomically: temp file, then rename into place.
         std::fs::rename(&tmp_path, &final_path)?;
 
         Ok(())

@@ -6,12 +6,12 @@
 //! reconnection for resilience.
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 
 use crate::envelope::{
     HandshakeRequest, HandshakeResponse, IpcError, IpcResponse, WireMessage, WireReply,
     read_response_payload,
 };
+use crate::runtime::IpcStream;
 
 /// Parse a generation-mismatch wire error back into its typed form.
 /// Message shape (from `IpcError::GenerationMismatch`'s Display):
@@ -46,10 +46,11 @@ fn parse_generation_mismatch(kind: &str, message: &str) -> Option<IpcError> {
 
 /// A typed IPC client used by a frontend to talk to the daemon.
 pub struct IpcClient {
-    /// The daemon socket path to connect to.
-    socket_path: std::path::PathBuf,
+    /// The daemon IPC endpoint to connect to (Unix socket path, Windows
+    /// named-pipe name).
+    endpoint: std::path::PathBuf,
     /// The current connection (None when disconnected).
-    stream: Option<UnixStream>,
+    stream: Option<IpcStream>,
     /// The retry epoch issued by the daemon handshake (None until handshaked).
     retry_epoch: Option<u64>,
     /// In-process bridge (stdio mode): the stream was handed over directly
@@ -59,9 +60,9 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    pub fn new(socket_path: std::path::PathBuf) -> Self {
+    pub fn new(endpoint: std::path::PathBuf) -> Self {
         Self {
-            socket_path,
+            endpoint,
             stream: None,
             retry_epoch: None,
             bridged: false,
@@ -79,8 +80,37 @@ impl IpcClient {
             }
             return Err(IpcError::NotConnected);
         }
-        let stream = UnixStream::connect(&self.socket_path).await?;
-        self.stream = Some(stream);
+        #[cfg(unix)]
+        let stream = tokio::net::UnixStream::connect(&self.endpoint).await?;
+        #[cfg(windows)]
+        let stream = {
+            use tokio::net::windows::named_pipe::ClientOptions;
+            // The daemon creates one pipe instance per accept: opening a
+            // name with no live instance fails with NotFound (2) / pipe-not-
+            // available (231), so retry briefly until the accept side
+            // publishes one. Bounded: a daemon that never serves must fail
+            // the connect, not hang it.
+            let start = std::time::Instant::now();
+            loop {
+                match ClientOptions::new().open(&self.endpoint) {
+                    Ok(client) => {
+                        // `open` succeeded against a live server instance,
+                        // so the connection is established; `readable()`
+                        // would gate on incoming data and deadlock the
+                        // request-first protocol.
+                        break client;
+                    }
+                    Err(e)
+                        if matches!(e.raw_os_error(), Some(2) | Some(231))
+                            && start.elapsed() < std::time::Duration::from_secs(10) =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+        self.stream = Some(Box::new(stream));
         self.retry_epoch = None;
         Ok(())
     }
@@ -129,8 +159,8 @@ impl IpcClient {
         self.retry_epoch
     }
 
-    /// Set an existing stream (for tests using a stream pair).
-    pub fn set_stream(&mut self, stream: UnixStream) {
+    /// Set an existing stream (for tests and the in-process bridge).
+    pub fn set_stream(&mut self, stream: IpcStream) {
         self.stream = Some(stream);
         self.bridged = true;
     }
@@ -140,9 +170,9 @@ impl IpcClient {
         self.stream.is_some()
     }
 
-    /// The socket path this client targets.
-    pub fn socket_path(&self) -> &std::path::Path {
-        &self.socket_path
+    /// The IPC endpoint this client targets.
+    pub fn endpoint(&self) -> &std::path::Path {
+        &self.endpoint
     }
 
     /// Send a tagged request frame over the current connection.
@@ -341,15 +371,15 @@ mod tests {
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
 
-        // Simulate a connected frontend/daemon pair with a stream pair.
-        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        // Simulate a connected frontend/daemon pair with a duplex stream.
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
         let server_handle = tokio::spawn(async move {
-            let _ = handle_connection(server_stream, dispatcher, quotas).await;
+            let _ = handle_connection(Box::new(server_stream), dispatcher, quotas).await;
         });
 
         // Client uses the paired stream: handshake, then round-trip.
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
         assert!(client.is_connected());
 
         // The handshake validates protocol/generation and issues the epoch.
@@ -372,10 +402,10 @@ mod tests {
     /// next call reconnects instead of failing forever.
     #[tokio::test]
     async fn roundtrip_or_forget_resets_on_dead_stream() {
-        let (dead, peer) = tokio::net::UnixStream::pair().unwrap();
+        let (dead, peer) = tokio::io::duplex(64);
         drop(peer);
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(dead);
+        client.set_stream(Box::new(dead));
         client.retry_epoch = Some(7);
         assert!(client.roundtrip_or_forget(&envelope(1)).await.is_err());
         assert_eq!(
@@ -395,10 +425,10 @@ mod tests {
     /// forever with nobody to answer.
     #[tokio::test]
     async fn bridged_connect_never_dials_socket() {
-        let (a, _peer) = tokio::net::UnixStream::pair().unwrap();
+        let (a, _peer) = tokio::io::duplex(64);
         let mut client =
             IpcClient::new(std::path::PathBuf::from("/nonexistent-dir-xyz/daemon.sock"));
-        client.set_stream(a);
+        client.set_stream(Box::new(a));
         client.retry_epoch = Some(7);
         assert!(client.connect().await.is_ok());
         assert!(client.is_connected(), "live bridge must survive connect");
@@ -422,13 +452,13 @@ mod tests {
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
 
-        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
         let server_handle = tokio::spawn(async move {
-            let _ = handle_connection(server_stream, dispatcher, quotas).await;
+            let _ = handle_connection(Box::new(server_stream), dispatcher, quotas).await;
         });
 
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
 
         // A wrong store generation must be rejected.
         let mut bad = handshake_req();
@@ -458,13 +488,13 @@ mod tests {
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
 
-        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
         let server_handle = tokio::spawn(async move {
-            let _ = handle_connection(server_stream, dispatcher, quotas).await;
+            let _ = handle_connection(Box::new(server_stream), dispatcher, quotas).await;
         });
 
         let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
-        client.set_stream(client_stream);
+        client.set_stream(Box::new(client_stream));
 
         let mut bad = handshake_req();
         bad.store_generation = StoreGeneration::new(99);

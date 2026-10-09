@@ -326,9 +326,12 @@ pub fn run_library(store: Option<String>) -> Result<String, CliError> {
 pub fn install_skill_command(home: Option<String>) -> Result<String, CliError> {
     use crate::skills::installer::{InstallOutcome, install_native_skill};
 
-    let home = home
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| CliError::Runtime("HOME is not set".to_string()))?;
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        CliError::Runtime(format!(
+            "{} is not set",
+            crate::frontend::serve::home_env_name()
+        ))
+    })?;
     let path = crate::skills::installer::skill_path(std::path::Path::new(&home), "ltmrs");
     match install_native_skill(std::path::Path::new(&home))
         .map_err(|e| CliError::Runtime(format!("skill install failed: {e}")))?
@@ -362,9 +365,12 @@ pub fn install_skill_command(home: Option<String>) -> Result<String, CliError> {
 pub fn install_shim_command(home: Option<String>) -> Result<String, CliError> {
     use crate::skills::shim::{ShimOutcome, install_shim, shim_path};
 
-    let home = home
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| CliError::Runtime("HOME is not set".to_string()))?;
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        CliError::Runtime(format!(
+            "{} is not set",
+            crate::frontend::serve::home_env_name()
+        ))
+    })?;
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Runtime(format!("cannot locate ltmrs binary: {e}")))?;
     let path = shim_path(std::path::Path::new(&home));
@@ -407,9 +413,12 @@ pub async fn provision_models_command(home: Option<String>) -> Result<String, Cl
     use ltmrs_embeddings::e5_small::E5SmallAdapter;
     use ltmrs_embeddings::manifest::{E5_SMALL_ID, E5_SMALL_REVISION, e5_small_artifact};
 
-    let home = home
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| CliError::Runtime("HOME is not set".to_string()))?;
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        CliError::Runtime(format!(
+            "{} is not set",
+            crate::frontend::serve::home_env_name()
+        ))
+    })?;
     let models = std::path::Path::new(&home)
         .join(crate::frontend::serve::MANAGED_HOME_DIR)
         .join(crate::frontend::serve::MODELS_DIR_NAME);
@@ -572,7 +581,11 @@ mod tests {
     async fn provision_models_requires_home() {
         let err = provision_models_command(None).await.unwrap_err();
         assert!(matches!(err, CliError::Runtime(_)), "got: {err}");
-        assert!(err.to_string().contains("HOME"), "got: {err}");
+        assert!(
+            err.to_string()
+                .contains(crate::frontend::serve::home_env_var()),
+            "got: {err}"
+        );
     }
 
     /// Flag-like option values are rejected, never swallowed as paths.
@@ -774,11 +787,18 @@ mod tests {
             second.contains("current"),
             "reinstall is a no-op, got: {second}"
         );
-        // The shim is a symlink to this very binary.
+        // The shim routes to this very binary: a symlink on unix, the
+        // byte-identical `.cmd` content on Windows.
         let link = crate::skills::shim::shim_path(dir.path());
+        #[cfg(unix)]
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
             std::env::current_exe().unwrap()
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::read(&link).unwrap(),
+            crate::skills::shim::shim_content(&std::env::current_exe().unwrap()).as_bytes()
         );
     }
 

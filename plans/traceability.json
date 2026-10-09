@@ -2,6 +2,42 @@
   "plan_version": "2.0-review",
   "date": "2026-09-27",
   "status": "implementation_in_progress",
+  "windows_certification_2026_10_08": {
+    "host": "Windows 11 Pro x86_64, NTFS, MSVC toolchain 1.99.0, protoc 36.0, no mold/wild",
+    "gate": "cargo fmt --all -- --check clean; cargo clippy --workspace --all-targets -- -D warnings clean; cargo test --workspace 768 passed / 0 failed (15 ignored with reason); cargo build --release clean; live-binary smokes: daemon foreground idle exit 0, two stdio frontends share one daemon, -vis URL+pid with /api/library 200, --install-shim writes byte-exact lemma.cmd",
+    "deviations": [
+      {
+        "area": "runtime dir protection (spec 2.4)",
+        "upstream_or_plan": "0700/0600 permission bits",
+        "ltmrs": "NTFS ACL inheritance from the per-user profile dir",
+        "status": "executed_passed"
+      },
+      {
+        "area": "shutdown testability (spec 2.5)",
+        "upstream_or_plan": "programmatic Ctrl-Break delivery under cargo test",
+        "ltmrs": "test kept as #[ignore] with reason; handler registration pinned by serve::tests::shutdown_handlers_register; foreground Ctrl-C path proven by probe; visualizer child stopped via TerminateProcess",
+        "status": "executed_passed"
+      },
+      {
+        "area": "shim location (spec 2.7)",
+        "upstream_or_plan": "upstream shim dir convention",
+        "ltmrs": "<home>/.local/bin/lemma.cmd, PATH hint only (Windows PATH is not user-owned)",
+        "status": "executed_passed"
+      },
+      {
+        "area": "accept data gate (spec 2.1)",
+        "upstream_or_plan": "plain connect() accept loop",
+        "ltmrs": "accept gated on PeekNamedPipe bytes-available > 0 on the same instance, bounded 1000ms to WouldBlock (byte-mode ERROR_NO_DATA is indistinguishable from success); connect stays inside tokio/mio",
+        "status": "executed_passed"
+      },
+      {
+        "area": "peer auth + home (spec 2.3, 2.6)",
+        "upstream_or_plan": "as designed",
+        "ltmrs": "per-user DACL (user SID + SYSTEM) in place of peer credentials; literal HOME wins over USERPROFILE when set",
+        "status": "executed_passed"
+      }
+    ]
+  },
   "review_findings": [
     {
       "id": "RV-01",
@@ -472,7 +508,7 @@
         "T-SEC-03"
       ],
       "status": "executed_partial",
-      "evidence": "Same-UID peer-credential check before any frame (pair-tested), past-deadline refusal, handshake validation, bounded frames, per-frame frontend binding (frontend_mismatch rejection), WireReply shape fix (rejections parseable). Full adversarial suites (fuzzing, 32-startup arbitration, malicious-archive/visualizer vectors) deferred."
+      "evidence": "Same-UID peer-credential check before any frame (pair-tested), past-deadline refusal, handshake validation, bounded frames, per-frame frontend binding (frontend_mismatch rejection), WireReply shape fix (rejections parseable). Windows execution 2026-10-08 (all green): per-user DACL with exactly user SID + SYSTEM ACEs (dacl_grants_only_user_and_system); LockFileEx one-owner exclusivity plus shared held/free/missing probe (second_acquire_rejects_while_first_holds_lock, lock_probe_distinguishes_held_free_and_missing); simultaneous-start race loser exits AlreadyRunning with both frontends served (simultaneous_cold_start_serves_both_frontends); junction refusal via symlink_metadata (junction_runtime_dir_refused); typed generation-mismatch refusal with same-connection retry (handshake_generation_mismatch_is_typed, mismatched_handshake_retry_on_same_connection). Full adversarial suites (fuzzing, 32-startup arbitration, malicious-archive/visualizer vectors) deferred."
     },
     {
       "id": "RQ-21",

@@ -85,12 +85,12 @@
       "class": "compatibility",
       "tool": "memory_add",
       "upstream_behavior": "Fuzzy duplicate refusal on near-identical adds (plus auto-link on add).",
-      "ltmrs_behavior": "Duplicate detection via 0.80 word-overlap threshold; auto-link behavior differs (see workflow notes).",
-      "reason": "Deterministic, testable duplicate policy independent of upstream heuristics.",
+      "ltmrs_behavior": "Duplicate detection via one Lance-backed similarity contract: indexed candidates plus pending-projection overlay, decided by Jaccard 0.80 over fragments (degraded snapshot scan without a table); auto-link plans the globally strongest match (see workflow notes).",
+      "reason": "Deterministic, testable duplicate policy independent of upstream heuristics; single similarity authority (no parallel word-overlap engine).",
       "user_visible_impact": "Near-duplicate adds may be refused or linked differently than upstream.",
       "test": "T-MCP-02",
       "release_wording": "Duplicate handling follows documented ltmrs thresholds, not upstream heuristics.",
-      "approval": "approved by owner 2026-09-28"
+      "approval": "re-review 2026-10-09: word-overlap engine replaced by the single similarity contract; owner re-approval pending"
     },
     {
       "id": "DEV-008",

@@ -13,6 +13,12 @@ use std::net::TcpStream;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+/// The home-directory env var per platform (same source of truth as the
+/// frontend: `HOME` unix, `USERPROFILE` Windows). Spawn sites set literal
+/// `HOME` alongside it: Windows honors HOME-first, so an ambient HOME must
+/// never leak in and break test isolation.
+const HOME_ENV: &str = ltmrs_frontend::frontend::serve::home_env_var();
+
 /// Find a free loopback port (bind 0, read back, release; TOCTOU-acceptable
 /// for a local smoke test — the child fails loudly if it loses the race).
 fn free_port() -> u16 {
@@ -64,6 +70,7 @@ fn vis_background_detaches_and_serves() {
     let bin = env!("CARGO_BIN_EXE_ltmrs");
     let port = free_port();
     let mut child = std::process::Command::new(bin)
+        .env(HOME_ENV, home.path())
         .env("HOME", home.path())
         .arg("-vis")
         .arg("-p")
@@ -107,8 +114,34 @@ fn vis_background_detaches_and_serves() {
     assert!(index.starts_with("HTTP/1.1 200"), "got: {index}");
     assert!(index.contains("ltmrs library"), "got: {index}");
 
-    // Stop the detached child via the reported pid; the port must go quiet.
+    // Stop the detached child; the port must go quiet. unix: SIGTERM
+    // (graceful). Windows: TerminateProcess by pid — programmatic console
+    // control events are not deliverable under `cargo test` on this
+    // conhost (group-0 kills cargo, targeted delivery hangs `try_wait`;
+    // probe-verified 2026-10-08, deviation ledger). The visualizer's
+    // graceful Ctrl-C/Ctrl-Break handlers are pinned executably in
+    // `serve::tests::shutdown_handlers_register`.
+    #[cfg(unix)]
     let killed = unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0;
+    #[cfg(windows)]
+    let killed = {
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        const SYNCHRONIZE: u32 = 0x100000;
+        let h = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(
+                PROCESS_TERMINATE | SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if h.is_null() {
+            false
+        } else {
+            let ok = unsafe { windows_sys::Win32::System::Threading::TerminateProcess(h, 1) };
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            ok == 1
+        }
+    };
     assert!(killed, "child pid {pid} must be killable");
     let deadline = Instant::now() + Duration::from_secs(10);
     while TcpStream::connect(("127.0.0.1", port)).is_ok() && Instant::now() < deadline {

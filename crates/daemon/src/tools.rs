@@ -29,10 +29,16 @@ use ltmrs_domain::command::{
 };
 use ltmrs_domain::guide::Guide;
 use ltmrs_domain::id::{EntityId, EntityRevision, OperationId, SessionHandle};
-use ltmrs_domain::memory::{Evidence, FragmentType, Instant, Memory, MemorySource};
+use ltmrs_domain::memory::{
+    CONSOLIDATED_CONFIDENCE, Evidence, FragmentType, Instant, Memory, MemorySource,
+};
 use ltmrs_domain::relation::{Relation, RelationType};
 use ltmrs_domain::session::SessionOp;
 use ltmrs_domain::session::{AttemptOutcome, Session, SuggestionStatus, TaskOutcome};
+use ltmrs_search::similarity::{
+    AUTOLINK_JACCARD_BAND, DEDUP_JACCARD_THRESHOLD, SimilarityPurpose, SimilarityQuery,
+    SimilarityService,
+};
 use ltmrs_service::repository::AdmittedScope;
 use ltmrs_service::repository::{GuideMutation, RecordedGuideOp};
 use serde_json::{Value, json};
@@ -224,24 +230,11 @@ fn generate_description(fragment: &str) -> String {
     format!("{}...", truncated.trim())
 }
 
-/// Word-overlap similarity (Jaccard on whitespace tokens).
-fn word_overlap(a: &str, b: &str) -> f64 {
-    let ta: BTreeSet<String> = a
-        .to_lowercase()
-        .split_whitespace()
-        .map(|w| w.to_string())
-        .collect();
-    let tb: BTreeSet<String> = b
-        .to_lowercase()
-        .split_whitespace()
-        .map(|w| w.to_string())
-        .collect();
-    if ta.is_empty() || tb.is_empty() {
-        return 0.0;
-    }
-    let inter = ta.intersection(&tb).count();
-    let union = ta.union(&tb).count();
-    inter as f64 / union as f64
+/// One similarity service over this dispatcher's repo and table (when
+/// attached): every compatibility similarity decision — dedup, auto-link,
+/// conflict candidates — routes through it instead of ad-hoc scans.
+fn similarity_service(disp: &Dispatcher) -> SimilarityService {
+    SimilarityService::new(disp.repo_arc(), disp.search().map(|sb| sb.table()))
 }
 
 /// Derived sub-command identity for one tool-call step, shared by the
@@ -387,6 +380,7 @@ fn relation_exists(
 /// Create a relation with a deterministic ID derived from the operation.
 fn new_relation(
     envelope: &IpcEnvelope,
+    now_millis: u64,
     source: EntityId,
     target: EntityId,
     rtype: RelationType,
@@ -403,7 +397,7 @@ fn new_relation(
         )
         .as_bytes(),
     ));
-    Relation::new(rid, source, target, rtype, note, Instant::new(0))
+    Relation::new(rid, source, target, rtype, note, Instant::new(now_millis))
 }
 
 // ---- memory_read ----
@@ -560,9 +554,11 @@ fn exec_memory_read(
     let limit = args.limit.unwrap_or(30).clamp(1, 100);
     let offset = args.offset.unwrap_or(0);
 
-    let mut memories = recall_browse(disp, args)?;
+    let (mut memories, method) = recall_browse(disp, args)?;
 
     // Post-filters (dates, min_confidence) applied on top of the search result.
+    // The engine request already carries these predicates; this re-check is a
+    // cheap idempotent net for the degraded snapshot path.
     memories.retain(|m| {
         if let Some(min) = args.min_confidence
             && m.confidence < min
@@ -589,11 +585,8 @@ fn exec_memory_read(
 
     // Build the recall explanation from the pre-boost page (upstream captures
     // provenance before boostOnAccess mutates confidence/access counters).
-    let method = if args.query.is_some() && !args.query.as_deref().unwrap().is_empty() {
-        "fts5_bm25"
-    } else {
-        "confidence_browse"
-    };
+    // `method` is whatever produced the memories (engine legs or the
+    // labelled degraded scan), never a hardcoded guess.
     let selections: Vec<RecallSelection> = page
         .iter()
         .enumerate()
@@ -736,11 +729,22 @@ fn expand_graph(
     Ok(out)
 }
 
-/// Recall memories for browse/query mode: search backend when available,
-/// else a canonical snapshot scan (lexical fallback). An attached but empty
-/// backend (e.g. a fresh E5 start before projection runs) also falls back —
-/// an empty dense/lexical index must never hide canonical knowledge.
-fn recall_browse(disp: &Dispatcher, args: &MemoryReadArgs) -> DomainResult<Vec<Memory>> {
+/// Recall memories for browse/query mode, with the provenance method of
+/// whatever produced them. An attached backend serves authoritatively: a
+/// Complete result stands even when empty (a converged no-match is a
+/// legitimate answer, never papered over). Anything else — no backend, a
+/// failed call, or a Partial result — falls back to the explicitly
+/// labelled canonical snapshot scan, which never hides knowledge behind
+/// an unconverged index.
+fn recall_browse(
+    disp: &Dispatcher,
+    args: &MemoryReadArgs,
+) -> DomainResult<(Vec<Memory>, &'static str)> {
+    // Page through the engine, not around it: postfilters below mirror
+    // these predicates, so the request carries them (plus headroom-free
+    // exact paging) instead of truncating at a fixed 100 first.
+    let limit = args.limit.unwrap_or(30).clamp(1, 100);
+    let offset = args.offset.unwrap_or(0);
     if let Some(sb) = disp.search() {
         let req = ltmrs_search::retrieval::engine::RetrievalRequest {
             query: args.query.clone().unwrap_or_default(),
@@ -748,23 +752,61 @@ fn recall_browse(disp: &Dispatcher, args: &MemoryReadArgs) -> DomainResult<Vec<M
                 project: args.project.clone(),
                 all_projects: args.all,
                 min_confidence: args.min_confidence,
+                after: args.after_date.as_deref().and_then(parse_iso_date),
+                before: args.before_date.as_deref().and_then(parse_iso_date),
                 ..Default::default()
             },
-            // An attached backend means dense retrieval is available: run
-            // the dense leg in the pinned E5 space (empty tables yield no
-            // dense hits and fall back gracefully below).
-            model_fingerprint: Some(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
-            result_limit: 100,
+            // Dense only when this backend serves vectors (lexical-only
+            // tables run the lexical leg and report Complete when converged).
+            model_fingerprint: sb.model_fingerprint(),
+            result_limit: offset + limit,
             ..Default::default()
         };
-        if let Ok(result) = sb.retrieve_sync(&req)
-            && !result.results.is_empty()
-        {
-            return Ok(result.results.into_iter().map(|r| r.memory).collect());
+        match sb.retrieve_sync(&req) {
+            Ok(result) => {
+                let method = recall_method(&result.explanation);
+                let memories: Vec<Memory> = result.results.into_iter().map(|r| r.memory).collect();
+                // Engine results stand, Complete or Partial alike: only a
+                // Complete empty is a legitimate no-answer. A Partial empty
+                // falls through to the labelled snapshot scan below.
+                if !memories.is_empty() || !result.explanation.partial {
+                    return Ok((memories, method));
+                }
+            }
+            // Failed call: the labelled substring fallback below.
+            Err(_) => return Ok((snapshot_recall(disp, args)?, "substring_fallback")),
         }
+    } else {
+        // No backend: the snapshot scan below is the only source.
+        return Ok((snapshot_recall(disp, args)?, "degraded_snapshot"));
     }
 
-    // Canonical snapshot fallback.
+    // Canonical snapshot fallback (Partial result).
+    Ok((snapshot_recall(disp, args)?, "degraded_snapshot"))
+}
+
+/// Provenance method for an engine result, from its own explanation.
+fn recall_method(
+    explanation: &ltmrs_search::retrieval::explain::RetrievalExplanation,
+) -> &'static str {
+    if explanation.empty_query {
+        return "confidence_browse";
+    }
+    if explanation
+        .candidates
+        .values()
+        .any(|c| c.leg_ranks.iter().any(|l| l.leg == "dense"))
+    {
+        return "hybrid_rrf_mmr";
+    }
+    "lance_fts"
+}
+
+/// Canonical snapshot scan: the explicitly labelled degraded path, used
+/// only when no backend is attached, the call failed, or the engine
+/// reported Partial. Same ordering recipe as before (term overlap for
+/// queries, stored confidence for browse).
+fn snapshot_recall(disp: &Dispatcher, args: &MemoryReadArgs) -> DomainResult<Vec<Memory>> {
     let repo = disp.repo();
     let export = repo.export_snapshot()?;
     let mut memories: Vec<Memory> = export
@@ -872,9 +914,14 @@ const RECALL_METHODS: &[(&str, &str, Option<&str>)] = &[
         Some("graph_score_with_depth_penalty"),
     ),
     (
-        "fts5_bm25",
-        "Matched the keyword query; ordered by FTS5 BM25 (lower scores rank first).",
-        Some("bm25_lower_is_better"),
+        "lance_fts",
+        "Matched the keyword query; ordered by Lance full-text search rank.",
+        Some("lance_fts_rank"),
+    ),
+    (
+        "degraded_snapshot",
+        "No search backend (or an unconverged index); matched over a canonical snapshot ordered by term overlap or stored confidence.",
+        Some("stored_confidence"),
     ),
     (
         "confidence_browse",
@@ -887,13 +934,8 @@ const RECALL_METHODS: &[(&str, &str, Option<&str>)] = &[
         Some("stored_confidence"),
     ),
     (
-        "tfidf_cosine",
-        "Selected by TF-IDF cosine similarity to the query.",
-        Some("tfidf_cosine_similarity"),
-    ),
-    (
         "hybrid_rrf_mmr",
-        "Selected from fused lexical and TF-IDF ranks, adjusted by recall priority and diversity. Display order includes MMR diversity reranking.",
+        "Selected from fused lexical and dense ranks, adjusted by recall priority and diversity. Display order includes MMR diversity reranking.",
         Some("hybrid_relevance_before_diversity"),
     ),
 ];
@@ -1200,16 +1242,24 @@ fn finish_add_response(
     let title = memory.title.clone();
     let description = memory.description.clone();
     // Other overlaps, for the informational list (read-only: no effects).
-    let overlaps: Vec<&Memory> = export
-        .memories
-        .iter()
-        .filter(|m| m.lifecycle.is_recallable())
-        .filter(|m| m.id != eid)
-        .filter(|m| {
-            let score = word_overlap(final_fragment, &m.fragment);
-            (0.25..0.95).contains(&score)
+    // Same contract as auto-link planning, globally score-ordered.
+    let overlaps: Vec<Memory> = similarity_service(disp)
+        .find_similar_sync(&SimilarityQuery {
+            text: final_fragment.to_string(),
+            project: None,
+            exclude: Some(eid),
+            limit: 5,
+            purpose: SimilarityPurpose::AutoLink,
+        })?
+        .into_iter()
+        .filter(|h| AUTOLINK_JACCARD_BAND.contains(&h.score))
+        .filter_map(|h| {
+            disp.repo()
+                .get_memories(&[h.memory_id])
+                .ok()?
+                .into_iter()
+                .next()
         })
-        .take(5)
         .collect();
 
     // Build response text.
@@ -1361,24 +1411,36 @@ fn exec_memory_add(
         return Ok(replayed);
     }
 
-    // Deduplication: reject if a similar fragment already exists.
-    let export = repo.export_snapshot()?;
-    let similar = export
-        .memories
-        .iter()
-        .filter(|m| m.lifecycle.is_recallable())
-        .filter(|m| match (&args.project, m.project.as_deref()) {
-            (None, _) => true,
-            (Some(p), Some(mp)) => p == mp,
-            (Some(_), None) => true,
-        })
-        .find(|m| word_overlap(&final_fragment, &m.fragment) >= 0.80);
+    // Deduplication through the one similarity contract: reject when the
+    // ranked union of indexed candidates and pending writes scores at the
+    // frozen rule. Held under the similarity gate with the commit below so
+    // racing near-duplicates cannot both miss. The query project is
+    // normalized like the stored form (a raw-case mismatch used to miss).
+    let _similarity_guard = disp.similarity_gate().lock().unwrap();
+    let similar = similarity_service(disp)
+        .find_similar_sync(&SimilarityQuery {
+            text: final_fragment.clone(),
+            project: args.project.as_deref().and_then(normalize_project),
+            exclude: None,
+            limit: 5,
+            purpose: SimilarityPurpose::Dedup,
+        })?
+        .into_iter()
+        .find(|h| h.score >= DEDUP_JACCARD_THRESHOLD);
     if let Some(similar) = similar {
-        let sid = legacy_id_of(repo, similar);
-        return Ok(err_result(&format!(
-            "A similar memory already exists [{sid}]: \"{}\"\nUse memory_update on [{sid}] if you want to modify it.",
-            similar.title
-        )));
+        // A raced deletion between check and read means no duplicate.
+        if let Some(target) = disp
+            .repo()
+            .get_memories(&[similar.memory_id])?
+            .into_iter()
+            .next()
+        {
+            let sid = legacy_id_of(repo, &target);
+            return Ok(err_result(&format!(
+                "A similar memory already exists [{sid}]: \"{}\"\nUse memory_update on [{sid}] if you want to modify it.",
+                target.title
+            )));
+        }
     }
 
     // Resolve fragment type.
@@ -1499,28 +1561,30 @@ fn exec_memory_add(
 
     // Apply the command, with the planned auto-link inside the same
     // transaction (both endpoints live here: the memory below, the
-    // target from the pre-apply snapshot). Planning output rides the
-    // receipt, so replay never re-plans it.
-    let planned_link = export
-        .memories
-        .iter()
-        .filter(|m| m.lifecycle.is_recallable())
-        .filter(|m| m.id != eid)
-        .filter(|m| {
-            let score = word_overlap(&final_fragment, &m.fragment);
-            (0.25..0.95).contains(&score)
-        })
-        .take(5)
-        .next()
+    // target from the similarity union). Planning output rides the
+    // receipt, so replay never re-plans it. The strongest global match
+    // wins (the old scan took the first qualifying memory in export
+    // order, not the best).
+    let planned_link = similarity_service(disp)
+        .find_similar_sync(&SimilarityQuery {
+            text: final_fragment.clone(),
+            project: None,
+            exclude: Some(eid),
+            limit: 5,
+            purpose: SimilarityPurpose::AutoLink,
+        })?
+        .into_iter()
+        .find(|h| AUTOLINK_JACCARD_BAND.contains(&h.score))
         .map(|strongest| {
             new_relation(
                 envelope,
+                disp.clock().now_millis(),
                 eid,
-                strongest.id,
+                strongest.memory_id,
                 RelationType::RelatedTo,
                 Some(format!(
                     "Auto-linked: topic overlap ({:.2})",
-                    word_overlap(&final_fragment, &strongest.fragment)
+                    strongest.score
                 )),
             )
         });
@@ -1582,30 +1646,9 @@ fn exec_memory_update(
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
-    let Ok(eid) = resolve_id(repo, &args.id) else {
-        return Ok(err_result(&format!(
-            "Fragment with ID '{}' not found",
-            args.id
-        )));
-    };
-    let mems = repo.get_memories(&[eid])?;
-    let Some(m) = mems.first() else {
-        return Ok(err_result(&format!(
-            "Fragment with ID '{}' not found",
-            args.id
-        )));
-    };
-
-    // Validate confidence range.
-    if let Some(c) = args.confidence
-        && !(0.0..=1.0).contains(&c)
-    {
-        return Ok(err_result("'confidence' must be a number between 0 and 1"));
-    }
-
-    // Replay before validation (uniform tool rule): a retried envelope
-    // replays its recorded response instead of re-planning against
-    // mutated state.
+    // Replay before any mutable-state lookup (uniform tool rule): a retried
+    // envelope whose target has since vanished still replays its recorded
+    // response instead of failing resolution.
     if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |receipt| {
         let updated_id = match &receipt.outcome {
             ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
@@ -1631,10 +1674,7 @@ fn exec_memory_update(
                 .map(|m| m.title)
                 .unwrap_or_default(),
         };
-        let mut response = format!("Updated fragment [{}]: \"{}\"", args.id, title);
-        if args.fragment.is_some() {
-            response.push_str("\nOrphan relations cleaned up after content change.");
-        }
+        let response = format!("Updated fragment [{}]: \"{}\"", args.id, title);
         Ok(ok_result(
             response,
             json!({
@@ -1646,20 +1686,58 @@ fn exec_memory_update(
         return Ok(replayed);
     }
 
-    // Duplicate detection on fragment change.
+    let Ok(eid) = resolve_id(repo, &args.id) else {
+        return Ok(err_result(&format!(
+            "Fragment with ID '{}' not found",
+            args.id
+        )));
+    };
+    let mems = repo.get_memories(&[eid])?;
+    let Some(m) = mems.first() else {
+        return Ok(err_result(&format!(
+            "Fragment with ID '{}' not found",
+            args.id
+        )));
+    };
+
+    // Validate confidence range.
+    if let Some(c) = args.confidence
+        && !(0.0..=1.0).contains(&c)
+    {
+        return Ok(err_result("'confidence' must be a number between 0 and 1"));
+    }
+
+    // Duplicate detection on fragment change, through the one similarity
+    // contract (update scans every recallable memory except the target,
+    // exactly as before). Held under the similarity gate with the commit
+    // below so a racing add cannot slip a duplicate between check and
+    // commit.
+    let _similarity_guard = disp.similarity_gate().lock().unwrap();
     if let Some(fragment) = &args.fragment {
-        let export = repo.export_snapshot()?;
-        let similar = export
-            .memories
-            .iter()
-            .filter(|m2| m2.id != eid && m2.lifecycle.is_recallable())
-            .find(|m2| word_overlap(fragment, &m2.fragment) >= 0.80);
+        let similar = similarity_service(disp)
+            .find_similar_sync(&SimilarityQuery {
+                text: fragment.clone(),
+                project: None,
+                exclude: Some(eid),
+                limit: 5,
+                purpose: SimilarityPurpose::Dedup,
+            })?
+            .into_iter()
+            .find(|h| h.score >= DEDUP_JACCARD_THRESHOLD);
         if let Some(similar) = similar {
-            let sid = legacy_id_of(repo, similar);
-            return Ok(err_result(&format!(
-                "Similar fragment already exists: [{sid}] \"{}\". Use a different content or update the existing one.",
-                similar.title
-            )));
+            // A raced deletion between check and read means no duplicate.
+            if let Some(target) = disp
+                .repo()
+                .get_memories(&[similar.memory_id])?
+                .into_iter()
+                .next()
+            {
+                let sid = legacy_id_of(repo, &target);
+                return Ok(err_result(&format!(
+                    "Similar fragment already exists: [{sid}] \"{}\". Use a different content or update the existing one.",
+                    target.title
+                )));
+            }
         }
     }
 
@@ -1684,10 +1762,7 @@ fn exec_memory_update(
     disp.repo().apply(&ctx, &cmd)?;
 
     let display_title = args.title.clone().unwrap_or_else(|| m.title.clone());
-    let mut response = format!("Updated fragment [{}]: \"{}\"", args.id, display_title);
-    if args.fragment.is_some() {
-        response.push_str("\nOrphan relations cleaned up after content change.");
-    }
+    let response = format!("Updated fragment [{}]: \"{}\"", args.id, display_title);
 
     let structured = json!({
         "success": true,
@@ -1865,9 +1940,9 @@ fn exec_memory_forget(
             args.id
         )
     } else if args.consolidate {
-        // Non-destructive archive: down-weight to 0.05, keep the row.
+        // Non-destructive archive: down-weight, keep the row.
         let patch = MemoryPatch {
-            confidence: Some(0.05),
+            confidence: Some(CONSOLIDATED_CONFIDENCE),
             ..Default::default()
         };
         let cmd = DomainCommand::UpdateMemory {
@@ -2027,11 +2102,16 @@ fn exec_memory_merge(
         consolidate: args.consolidate,
     };
     let ctx = sub_command_ctx(envelope, 0)?;
-    disp.repo().apply(&ctx, &cmd)?;
+    // Merge changes recallability: commit under the similarity gate so a
+    // concurrent mutation preflight cannot interleave its check here.
+    {
+        let _similarity_guard = disp.similarity_gate().lock().unwrap();
+        disp.repo().apply(&ctx, &cmd)?;
+    }
 
-    // Consolidation edges record inside the merge transaction above
-    // (sources archive there): no post-commit relation tail, which would
-    // reject on the archived endpoints and silently drop the edges.
+    // Consolidation edges record inside the merge transaction above: no
+    // post-commit relation tail, which would reject on removed endpoints
+    // and silently drop the edges.
 
     let scope_info = project
         .as_ref()
@@ -2073,6 +2153,30 @@ fn exec_memory_relate(
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
+    // Replay before any mutable-state lookup (uniform tool rule): a retried
+    // envelope whose endpoints have since vanished still replays its
+    // recorded response instead of failing resolution.
+    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |_| {
+        Ok(ok_result(
+            format!(
+                "Created relation: [{}] --{}--> [{}]{}",
+                args.source_id,
+                args.relation_type,
+                args.target_id,
+                args.note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default()
+            ),
+            json!({
+                "success": true,
+                "relation": args.relation_type,
+            }),
+        ))
+    })? {
+        return Ok(replayed);
+    }
+
     let rtype = RelationType::parse(&args.relation_type).ok_or_else(|| {
         DomainError::new(
             DomainErrorCode::Validation,
@@ -2097,30 +2201,6 @@ fn exec_memory_relate(
         return Ok(err_result("sourceId and targetId cannot be the same"));
     }
 
-    // Replay before validation: a retried envelope finds the edge the
-    // first delivery created and would reject itself as a duplicate —
-    // the recorded receipt replays instead.
-    if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |_| {
-        Ok(ok_result(
-            format!(
-                "Created relation: [{}] --{}--> [{}]{}",
-                args.source_id,
-                args.relation_type,
-                args.target_id,
-                args.note
-                    .as_deref()
-                    .map(|n| format!(" ({n})"))
-                    .unwrap_or_default()
-            ),
-            json!({
-                "success": true,
-                "relation": args.relation_type,
-            }),
-        ))
-    })? {
-        return Ok(replayed);
-    }
-
     if repo.get_memories(&[source_eid])?.is_empty() {
         return Ok(err_result(&format!(
             "Source fragment [{}] not found",
@@ -2142,7 +2222,14 @@ fn exec_memory_relate(
         )));
     }
 
-    let relation = new_relation(envelope, source_eid, target_eid, rtype, args.note.clone());
+    let relation = new_relation(
+        envelope,
+        disp.clock().now_millis(),
+        source_eid,
+        target_eid,
+        rtype,
+        args.note.clone(),
+    );
     let cmd = DomainCommand::Relate { relation };
     let ctx = sub_command_ctx(envelope, 0)?;
     disp.repo().apply(&ctx, &cmd)?;
@@ -2670,13 +2757,16 @@ fn exec_semantic_search(
     let top_k = args.top_k.unwrap_or(10).clamp(1, 30);
     let offset = args.offset.unwrap_or(0);
 
-    // Use the search backend when available.
+    // Use the search backend when available. A Complete engine answer
+    // stands even when empty (a converged no-match is legitimate); anything
+    // else routes to the labelled fallback below.
     let mut scored: Vec<(Memory, f64)> = Vec::new();
+    let mut engine_complete = false;
     let mut engine_explanation: Option<ltmrs_search::retrieval::explain::RetrievalExplanation> =
         None;
     if let Some(sb) = disp.search() {
         // hybrid:false forces lexical-only (upstream parity on demand);
-        // absent/true runs the hybrid engine when a backend is attached.
+        // absent/true runs dense only when this backend serves vectors.
         let use_dense = args.hybrid != Some(false);
         let req = ltmrs_search::retrieval::engine::RetrievalRequest {
             query: args.query.clone(),
@@ -2685,10 +2775,8 @@ fn exec_semantic_search(
                 all_projects: false,
                 ..Default::default()
             },
-            // Dense leg in the pinned E5 space when a backend is attached;
-            // no backend (or no dense hits) falls back to lexical below.
             model_fingerprint: if use_dense {
-                Some(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT)
+                sb.model_fingerprint()
             } else {
                 None
             },
@@ -2699,6 +2787,7 @@ fn exec_semantic_search(
             // Map each result to its engine score (native calibrated score,
             // falling back to the legacy reference score). Not a claim of
             // identical TF-IDF — the legacy `score` field is a display value.
+            engine_complete = !result.explanation.partial;
             let scores = &result.explanation.candidates;
             for r in result.results {
                 let s = scores
@@ -2743,8 +2832,9 @@ fn exec_semantic_search(
         }
     }
 
-    // Lexical fallback when the backend is unavailable or returned nothing.
-    if scored.is_empty() {
+    // Lexical fallback when there is no Complete engine answer: no backend,
+    // a failed call, or a Partial result. A Complete empty answer stays empty.
+    if !engine_complete && scored.is_empty() {
         let export = repo.export_snapshot()?;
         let q = args.query.to_lowercase();
         let mut candidates: Vec<(Memory, f64)> = export
@@ -3872,6 +3962,34 @@ fn exec_guide_distill(
             "'memory_id' and 'guide' parameters are required",
         ));
     }
+    // Replay before any mutable-state lookup (uniform tool rule): a retried
+    // envelope whose memory has since vanished still replays its recorded
+    // guide instead of failing resolution.
+    let digest = envelope.request_digest()?;
+    let scope = envelope.operation_scope(digest.clone());
+    match disp.repo().read_recorded_distill_op(&scope) {
+        Ok(None) => {}
+        Ok(Some(recorded)) => {
+            return Ok(ok_result(
+                format!(
+                    "Successfully distilled memory [{}] into guide \"{}\" ({}).\n\n{}",
+                    args.memory_id,
+                    recorded.name,
+                    recorded.category,
+                    format_guide_detail(&recorded)
+                ),
+                json!({
+                    "success": true,
+                    "guide": recorded.name,
+                    "memory_id": args.memory_id,
+                }),
+            ));
+        }
+        Err(e) if e.code == ltmrs_domain::command::DomainErrorCode::KeyReuseDifferentInput => {
+            return Ok(err_result(&e.message));
+        }
+        Err(e) => return Err(e),
+    }
     let now = disp.clock().now_millis();
     let eid = match resolve_id(repo, &args.memory_id) {
         Ok(id) => id,
@@ -3888,10 +4006,7 @@ fn exec_guide_distill(
         .unwrap_or_else(|| "dev-tool".to_string());
     // ONE canonical operation (re-review R2): memory + guide are read fresh
     // inside the transaction and commit together — no stale clone can
-    // overwrite a concurrent content update. Replay returns the recorded
-    // guide; digest mismatch rejects.
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
+    // overwrite a concurrent content update.
     let updated = match repo.distill_memory_link(&scope, eid, &args.guide, &category, now) {
         Ok(g) => g,
         Err(e) if e.code == ltmrs_domain::command::DomainErrorCode::NotFound => {
@@ -4363,7 +4478,7 @@ fn exec_session_start(
         all: true,
         ..Default::default()
     };
-    let mut relevant: Vec<Memory> = recall_browse(disp, &browse_args)?;
+    let mut relevant: Vec<Memory> = recall_browse(disp, &browse_args)?.0;
     relevant.truncate(3);
 
     // Boost pre-loaded memories (upstream boostConfidence 0.02).
@@ -4963,6 +5078,71 @@ fn exec_suggestion_respond(
 
 // ---- conflict_scan ----
 
+/// Conflict pairs over Lance-nearest-neighbor candidates: each recallable
+/// memory proposes its top neighbors through the one similarity contract
+/// and the frozen contradiction rules score each unordered pair once.
+/// Without an indexed table the degraded snapshot proposes every other
+/// memory, so small knowledge bases keep exact all-pairs behavior.
+fn find_conflicts(
+    disp: &Dispatcher,
+    memories: &[Memory],
+    project: Option<&str>,
+) -> DomainResult<Vec<ltmrs_compat::lemma::intelligence::ConflictPair>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let repo = disp.repo();
+    let svc = similarity_service(disp);
+    let in_scope = |m: &Memory| match (project, m.project.as_deref()) {
+        (None, _) => true,
+        (Some(p), Some(mp)) => p == mp,
+        (Some(_), None) => true,
+    };
+    let by_id: BTreeMap<EntityId, &Memory> = memories.iter().map(|m| (m.id, m)).collect();
+    let mut seen: BTreeSet<(EntityId, EntityId)> = BTreeSet::new();
+    let mut conflicts = Vec::new();
+    for m in memories {
+        let neighbors = svc.find_similar_sync(&SimilarityQuery {
+            text: m.fragment.clone(),
+            project: None,
+            exclude: Some(m.id),
+            limit: 20,
+            purpose: SimilarityPurpose::ConflictCandidates,
+        })?;
+        for hit in neighbors {
+            let other = match by_id.get(&hit.memory_id) {
+                Some(other) => *other,
+                None => continue,
+            };
+            // The neighbor index may lag canonical state, or admit
+            // out-of-scope peers: re-validate both endpoints here.
+            if !other.lifecycle.is_recallable() || !in_scope(other) {
+                continue;
+            }
+            let (first, second): (&Memory, &Memory) = if m.id < other.id {
+                (m, other)
+            } else {
+                (other, m)
+            };
+            if !seen.insert((first.id, second.id)) {
+                continue;
+            }
+            if let Some(pair) = ltmrs_compat::lemma::intelligence::score_conflict_pair(
+                first,
+                second,
+                repo.legacy_id(first),
+                repo.legacy_id(second),
+            ) {
+                conflicts.push(pair);
+            }
+        }
+    }
+    conflicts.sort_by(|a, b| {
+        b.overlap_score
+            .partial_cmp(&a.overlap_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(conflicts)
+}
+
 fn exec_conflict_scan(disp: &Dispatcher, args: &ConflictScanArgs) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let format = args.response_format;
@@ -4980,8 +5160,7 @@ fn exec_conflict_scan(disp: &Dispatcher, args: &ConflictScanArgs) -> DomainResul
         .cloned()
         .collect();
 
-    let legacy_id_of = |m: &Memory| repo.legacy_id(m);
-    let conflicts = ltmrs_compat::lemma::intelligence::scan_for_conflicts(&memories, legacy_id_of);
+    let conflicts = find_conflicts(disp, &memories, args.project.as_deref())?;
     let text = ltmrs_compat::lemma::intelligence::format_conflict_results(&conflicts);
     let data = json!({ "count": conflicts.len(), "conflicts": conflicts });
     Ok(format_result(text, data, format))
@@ -5016,7 +5195,7 @@ fn exec_proactive_analysis(
         ltmrs_compat::lemma::intelligence::run_full_analysis(&memories, &guides, now, legacy_id_of);
 
     // Conflict count suggestion.
-    let conflicts = ltmrs_compat::lemma::intelligence::scan_for_conflicts(&memories, legacy_id_of);
+    let conflicts = find_conflicts(disp, &memories, args.project.as_deref())?;
     if !conflicts.is_empty() {
         suggestions.push(ltmrs_compat::lemma::intelligence::ProactiveSuggestion {
             r#type: "conflict".into(),
@@ -5067,11 +5246,12 @@ fn exec_backup_create(disp: &Dispatcher, args: &BackupCreateArgs) -> DomainResul
         }
     };
     let now = disp.clock().now_millis();
-    let report = ltmrs_interchange::backup::export_backup(
+    let report = ltmrs_interchange::backup::export_backup_with_limit(
         disp.repo(),
         std::path::Path::new(&dir),
         "ltmrs",
         now,
+        ltmrs_interchange::backup::backup_byte_limit(),
     )
     .map_err(|e| {
         ltmrs_domain::command::DomainError::new(
@@ -5126,7 +5306,7 @@ fn exec_backup_preview(
     envelope: &IpcEnvelope,
     args: &BackupPreviewArgs,
 ) -> DomainResult<DomainPayload> {
-    use ltmrs_interchange::backup::{MAX_BACKUP_BYTES, verify_backup_file};
+    use ltmrs_interchange::backup::{backup_byte_limit, verify_backup_file};
     let path = match args.path.as_deref().map(str::trim) {
         Some(p) if !p.is_empty() => p.to_string(),
         _ => {
@@ -5136,7 +5316,7 @@ fn exec_backup_preview(
         }
     };
     let verified =
-        verify_backup_file(std::path::Path::new(&path), MAX_BACKUP_BYTES).map_err(|e| {
+        verify_backup_file(std::path::Path::new(&path), backup_byte_limit()).map_err(|e| {
             ltmrs_domain::command::DomainError::new(
                 ltmrs_domain::command::DomainErrorCode::Validation,
                 format!("backup preview failed: {e}"),
@@ -5211,7 +5391,8 @@ fn exec_backup_restore(
 ) -> DomainResult<DomainPayload> {
     use ltmrs_domain::command::{DomainError, DomainErrorCode};
     use ltmrs_interchange::backup::{
-        MAX_BACKUP_BYTES, encode_backup, export_backup_to, verify_backup_file,
+        backup_byte_limit, encode_backup_with_limit, export_backup_to_with_limit,
+        verify_backup_file,
     };
     use ltmrs_interchange::restore::{RestoreError, restore_verified_guarded, safety_backup_path};
     let fail = |message: String| DomainError::new(DomainErrorCode::Validation, message);
@@ -5238,7 +5419,7 @@ fn exec_backup_restore(
             ));
         }
     };
-    let verified = verify_backup_file(&source, MAX_BACKUP_BYTES)
+    let verified = verify_backup_file(&source, backup_byte_limit())
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
     // Exclusive restore fence (P1 restore quiescence): held from here
     // through the context reset, every mutating entry point blocks at
@@ -5293,9 +5474,10 @@ fn exec_backup_restore(
         .repo()
         .export_full()
         .map_err(|e| fail(format!("safety backup failed: {}", e.message)))?;
-    let (safety_bytes, _, _) = encode_backup(&live_export, live_generation, now)
+    let limit = backup_byte_limit();
+    let (safety_bytes, _, _) = encode_backup_with_limit(&live_export, live_generation, now, limit)
         .map_err(|e| fail(format!("safety backup failed: {e}")))?;
-    export_backup_to(&safety_path, &safety_bytes)
+    export_backup_to_with_limit(&safety_path, &safety_bytes, limit)
         .map_err(|e| fail(format!("safety backup failed: {e}")))?;
     // Replace + bump in one durable transaction (P1-1): domain records,
     // canonical sessions from the backup, all op-receipt logs drained so
@@ -5685,6 +5867,98 @@ mod tests {
         assert!(result_text(&result).contains("similar memory already exists"));
     }
 
+    /// Mutation-time dedup admission: two barrier-synchronized near-duplicate
+    /// adds admit exactly one. Without the similarity gate serializing
+    /// check+commit, both preflights would miss each other and commit.
+    #[test]
+    fn concurrent_near_duplicate_adds_admit_exactly_one() {
+        let (disp, _dir) = test_dispatcher();
+        let fragment =
+            "## Raced Write\n\n### Context\nBarrier synchronized duplicate content here."
+                .to_string();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let fragment2 = fragment.clone();
+            let (b, d) = (&barrier, &disp);
+            let t1 = s.spawn(move || {
+                b.wait();
+                let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+                    fragment: fragment.clone(),
+                    ..Default::default()
+                });
+                run(d, &tool_call(1, args.clone()), &args)
+            });
+            let t2 = s.spawn(move || {
+                b.wait();
+                let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+                    fragment: fragment2,
+                    ..Default::default()
+                });
+                run(d, &tool_call(2, args.clone()), &args)
+            });
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+            let e1 = result_is_error(&r1);
+            let e2 = result_is_error(&r2);
+            assert_ne!(e1, e2, "exactly one racer must be rejected as duplicate");
+            let (ok_text, err_text) = if e1 {
+                (result_text(&r2), result_text(&r1))
+            } else {
+                (result_text(&r1), result_text(&r2))
+            };
+            assert!(ok_text.contains("Added fragment"));
+            assert!(err_text.contains("similar memory already exists"));
+        });
+    }
+
+    /// Unprojected duplicate rejected via the pending overlay: with a usable
+    /// table but no projection run, a near-duplicate of a pending write is
+    /// still rejected — no blind spot between commit and indexing.
+    #[tokio::test]
+    async fn unprojected_duplicate_rejected_via_overlay() {
+        use ltmrs_search::search::backend::{NoDenseEmbedder, SearchBackend};
+        use ltmrs_search::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        table.ensure_fts_index().await.unwrap();
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(NoDenseEmbedder),
+        ));
+        let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
+            .with_search(backend);
+        // Sync bridge contract: blocking context for table-backed tools.
+        let out = tokio::task::spawn_blocking(move || {
+            let args_a = ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: "the quick brown fox jumps over the lazy dog".to_string(),
+                ..Default::default()
+            });
+            let r_a = run(&disp, &tool_call(1, args_a.clone()), &args_a);
+            assert!(!result_is_error(&r_a));
+            let args_b = ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: "the quick brown fox jumps over the lazy dog today".to_string(),
+                ..Default::default()
+            });
+            run(&disp, &tool_call(2, args_b.clone()), &args_b)
+        })
+        .await
+        .unwrap();
+        assert!(result_is_error(&out));
+        assert!(result_text(&out).contains("similar memory already exists"));
+    }
+
     #[test]
     fn memory_add_flags_distill_candidate() {
         let (disp, _dir) = test_dispatcher();
@@ -5787,7 +6061,7 @@ mod tests {
 
         // retrieve_sync bridges onto the runtime and must run from a
         // synchronous context, exactly like the dispatcher's spawn_blocking.
-        let out = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
+        let (out, method) = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
             .await
             .unwrap()
             .unwrap();
@@ -5796,11 +6070,12 @@ mod tests {
             1,
             "empty backend must fall back to the snapshot scan"
         );
+        assert_eq!(method, "degraded_snapshot");
     }
 
-    /// Fingerprint plumbing: with a backend attached, browse requests run
-    /// the dense leg (embedder invoked once) instead of skipping it for a
-    /// missing fingerprint. Empty table → fallback results, dense attempted.
+    /// Fingerprint plumbing: a dense-capable backend (fingerprint declared)
+    /// runs the dense leg (embedder invoked once); a backend without one
+    /// stays lexical-only. Empty table → fallback results either way.
     #[tokio::test]
     async fn recall_browse_passes_fingerprint_to_dense_leg() {
         use ltmrs_search::search::backend::{ClosureEmbedder, SearchBackend};
@@ -5839,13 +6114,18 @@ mod tests {
                 Ok(vec![0.0; 384])
             }
         }));
-        let backend = Arc::new(SearchBackend::new(
-            Arc::clone(&repo),
-            table,
-            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
-                embedder,
-            )),
-        ));
+        // Dense-capable test double: declare the fingerprint so the dense
+        // leg runs (backends without one are lexical-only by design).
+        let backend = Arc::new(
+            SearchBackend::new(
+                Arc::clone(&repo),
+                table,
+                Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                    embedder,
+                )),
+            )
+            .with_model_fingerprint(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
+        );
         let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
             .with_search(backend);
         let args = MemoryReadArgs {
@@ -5854,7 +6134,7 @@ mod tests {
             ..Default::default()
         };
 
-        let out = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
+        let (out, method) = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
             .await
             .unwrap()
             .unwrap();
@@ -5862,8 +6142,9 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
-            "attached backend must run the dense leg"
+            "dense-capable backend must run the dense leg"
         );
+        assert_eq!(method, "degraded_snapshot");
     }
 
     /// Without a traced session, memory_add links the fragment to the
@@ -6004,13 +6285,16 @@ mod tests {
             .embed(&render_text("Tail Memory", "Quantum bananas orbit pluto."))
             .unwrap();
         let embedder = Arc::new(ClosureEmbedder::new(move |_| Ok(tail_vec.clone())));
-        let backend = Arc::new(SearchBackend::new(
-            Arc::clone(&repo),
-            table,
-            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
-                embedder,
-            )),
-        ));
+        let backend = Arc::new(
+            SearchBackend::new(
+                Arc::clone(&repo),
+                table,
+                Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                    embedder,
+                )),
+            )
+            .with_model_fingerprint(E5_SMALL_FINGERPRINT),
+        );
         let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
             .with_search(backend);
 
@@ -6164,7 +6448,7 @@ mod tests {
         assert_eq!(exp["scope"]["mode"], json!("project_and_global"));
         let items = exp["items"].as_array().unwrap();
         assert!(!items.is_empty());
-        assert_eq!(items[0]["selection"]["method"], json!("fts5_bm25"));
+        assert_eq!(items[0]["selection"]["method"], json!("degraded_snapshot"));
         assert_eq!(items[0]["selection"]["rank"], json!(1));
     }
 
@@ -6687,10 +6971,10 @@ mod tests {
         // Sanity: Y really does overlap A more strongly than X does (the
         // test only bites if a re-plan would prefer Y).
         assert!(
-            word_overlap(
+            ltmrs_search::similarity::jaccard(
                 "tungsten carbide latency alpha bravo foxtrot golf hotel",
                 "tungsten carbide latency alpha bravo"
-            ) > word_overlap(
+            ) > ltmrs_search::similarity::jaccard(
                 "tungsten carbide latency alpha bravo",
                 "tungsten carbide tooling delta echo"
             ),
@@ -6953,6 +7237,53 @@ mod tests {
         let structured = result_structured(&result).unwrap();
         assert_eq!(structured["success"], json!(true));
         assert_eq!(structured["merged_ids"].as_array().unwrap().len(), 2);
+        // Frozen contract (consolidate=false): sources are deleted, not
+        // recallable.
+        for id in [&id1, &id2] {
+            let eid = resolve_id(disp.repo(), id).unwrap();
+            let mem = disp.repo().get_memories(&[eid]).unwrap().pop().unwrap();
+            assert!(
+                !mem.lifecycle.is_recallable(),
+                "merged-away source must not be recallable"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_merge_consolidate_keeps_and_down_weights_sources() {
+        let (disp, _dir) = test_dispatcher();
+        let id1 = add_fragment(
+            &disp,
+            1,
+            "## Merge Keep One\n\n### Context\nFirst kept source.",
+        );
+        let id2 = add_fragment(
+            &disp,
+            2,
+            "## Merge Keep Two\n\n### Context\nSecond kept source.",
+        );
+        let args = MemoryMergeArgs {
+            ids: vec![id1.clone(), id2.clone()],
+            title: "Merged Result".to_string(),
+            fragment: "## Merged Result\n\n### Context\nCombined content.".to_string(),
+            project: None,
+            consolidate: true,
+        };
+        let env = tool_call(3, ToolArgs::MemoryMerge(args.clone()));
+        let result = run(&disp, &env, &ToolArgs::MemoryMerge(args));
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Superseded"));
+        // Frozen contract (consolidate=true): sources are kept live and
+        // down-weighted, never archived.
+        for id in [&id1, &id2] {
+            let eid = resolve_id(disp.repo(), id).unwrap();
+            let mem = disp.repo().get_memories(&[eid]).unwrap().pop().unwrap();
+            assert!(
+                mem.lifecycle.is_recallable(),
+                "consolidated source stays recallable"
+            );
+            assert_eq!(mem.confidence, 0.05);
+        }
     }
 
     #[test]
@@ -7245,13 +7576,18 @@ mod tests {
                 Ok(vec![0.0; 384])
             }
         }));
-        let backend = Arc::new(SearchBackend::new(
-            Arc::clone(&repo),
-            table,
-            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
-                embedder,
-            )),
-        ));
+        // Dense-capable test double: declare the fingerprint so the dense
+        // leg runs before the fallback answers.
+        let backend = Arc::new(
+            SearchBackend::new(
+                Arc::clone(&repo),
+                table,
+                Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                    embedder,
+                )),
+            )
+            .with_model_fingerprint(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
+        );
         let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
             .with_search(backend);
         let args = SemanticSearchArgs {
@@ -7430,13 +7766,18 @@ mod tests {
         .await;
         table.create_fts_index().await.unwrap();
         let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
-        let backend = Arc::new(SearchBackend::new(
-            Arc::clone(&repo),
-            table,
-            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
-                embedder,
-            )),
-        ));
+        // Dense-capable test double: declare the fingerprint so the hybrid
+        // engine path (not lexical-only) answers.
+        let backend = Arc::new(
+            SearchBackend::new(
+                Arc::clone(&repo),
+                table,
+                Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                    embedder,
+                )),
+            )
+            .with_model_fingerprint(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
+        );
         let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
             .with_search(backend);
         let args = SemanticSearchArgs {

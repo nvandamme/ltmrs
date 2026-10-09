@@ -44,6 +44,11 @@ tempfile = "3"
 # deterministic, fast interval/scheduling tests (no real-time sleeps).
 tokio = { version = "1", features = ["test-util"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# Test-only: TerminateProcess by pid (visualizer smoke stop) and the
+# daemon's graceful Ctrl-Break test shape (T-DAEMON lifecycle, Windows).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+
 # Release-grade optimization on both profiles (v0.1-alpha decision):
 # Dev profile is tuned for iteration speed, not runtime: no LTO
 # (thin-LTO costs minutes per test link on the candle/lance tree),

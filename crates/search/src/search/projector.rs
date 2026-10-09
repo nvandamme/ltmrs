@@ -154,6 +154,10 @@ pub struct Projector {
     fingerprint: ModelFingerprint,
     generation: StoreGeneration,
     guards: PublicationGuards,
+    /// Lexical-only mode (no embedding model): text rows publish with NULL
+    /// vectors and jobs resolve instead of retrying vector work forever.
+    /// Dense rows stay absent until an E5 backfill requeues them.
+    lexical_only: bool,
 }
 
 impl Projector {
@@ -171,6 +175,7 @@ impl Projector {
             fingerprint,
             generation,
             guards: PublicationGuards::default(),
+            lexical_only: false,
         }
     }
 
@@ -197,6 +202,29 @@ impl Projector {
             E5_SMALL_FINGERPRINT,
             generation,
         );
+        projector.run_capped(max_jobs).await
+    }
+
+    /// One-shot lexical drive (no embedding model): publish text rows with
+    /// NULL vectors and resolve the jobs. Rows carry the E5 fingerprint so
+    /// a later E5 backfill recognizes and re-embeds exactly these rows; the
+    /// dense leg excludes NULL vectors explicitly meanwhile.
+    pub async fn project_pending_lexical(
+        repo: &Arc<ltmrs_service::repository::CanonicalRepository>,
+        table: &SearchTable,
+        max_jobs: usize,
+    ) -> DomainResult<usize> {
+        use ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT;
+
+        let generation = repo.store_generation()?;
+        let mut projector = Projector::new(
+            Arc::clone(repo),
+            table.clone(),
+            Box::new(StalledEmbedder),
+            E5_SMALL_FINGERPRINT,
+            generation,
+        );
+        projector.lexical_only = true;
         projector.run_capped(max_jobs).await
     }
 
@@ -248,7 +276,12 @@ impl Projector {
 
         // Step 6: compare-and-clear exactly the job we published — but only when
         // every chunk has its vector; a missing vector leaves semantic work
-        // pending while all chunks stay lexically indexed.
+        // pending while all chunks stay lexically indexed. Lexical-only mode
+        // resolves instead: NULL-vector rows are the converged state there.
+        if self.lexical_only {
+            self.repo.acknowledge_projection(job.memory_id, job.seq)?;
+            return Ok(ProjectorOutcome::Published);
+        }
         if rows.iter().all(|r| r.embedding.is_some()) {
             self.repo.acknowledge_projection(job.memory_id, job.seq)?;
             Ok(ProjectorOutcome::Published)

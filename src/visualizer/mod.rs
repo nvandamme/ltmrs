@@ -301,7 +301,7 @@ pub async fn run_foreground(port: Option<u16>, store: &str) -> Result<String, Cl
     println!("serving at http://127.0.0.1:{port}/?token={token}");
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        ltmrs_frontend::frontend::serve::shutdown_signal().await;
         let _ = tx.send(());
     });
     serve_with_token(listener, store.to_string(), rx, token.clone()).await?;
@@ -346,16 +346,9 @@ pub async fn run_background(port: Option<u16>) -> Result<String, CliError> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
-    // Detach: `pre_exec` runs between fork and exec, where only
-    // async-signal-safe calls are allowed — `setsid` qualifies. The child
-    // then execs a fresh single-purpose process, so no thread state survives.
-    use std::os::unix::process::CommandExt as _;
-    unsafe {
-        child.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    // Detach from our terminal signal group (shared with the daemon spawn):
+    // new session on unix, CREATE_NEW_PROCESS_GROUP on Windows.
+    ltmrs_frontend::frontend::serve::detach_child(&mut child);
     let mut child = child
         .spawn()
         .map_err(|e| CliError::Runtime(format!("cannot spawn visualizer child: {e}")))?;

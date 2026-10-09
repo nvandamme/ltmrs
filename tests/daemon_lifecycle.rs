@@ -7,17 +7,25 @@
 //!   daemon, not just the frontend, survived).
 //! - foreground idle: `--daemon --daemon-idle-ms N` exits cleanly with no
 //!   clients, bounding stray processes.
-//! - SIGTERM: the daemon shuts down gracefully (exit 0, bindings persisted).
+//! - SIGTERM (unix) / Ctrl-Break (Windows): the daemon shuts down
+//!   gracefully (exit 0, bindings persisted).
 //!
 //! Every test uses an isolated HOME; no two tests share a store.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ltmrs")
 }
+
+/// The home-directory env var per platform (`HOME` unix, `USERPROFILE`
+/// Windows) — same source of truth as the frontend. Spawn sites set literal
+/// `HOME` alongside it: Windows honors HOME-first, so an ambient HOME must
+/// never leak in and break test isolation.
+const HOME_ENV: &str = ltmrs_frontend::frontend::serve::home_env_var();
 
 /// A spawned stdio frontend with piped streams under an isolated HOME.
 struct Frontend {
@@ -30,7 +38,8 @@ struct Frontend {
 impl Frontend {
     fn spawn(home: &std::path::Path, extra_env: &[(&str, &str)]) -> Self {
         let mut cmd = std::process::Command::new(bin());
-        cmd.env("HOME", home)
+        cmd.env(HOME_ENV, home)
+            .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -146,12 +155,12 @@ fn read_line(reader: &mut BufReader<std::process::ChildStdout>, what: &str) -> S
     }
 }
 
-/// Managed socket path for an isolated HOME (mirrors the daemon layout).
-fn managed_socket(home: &std::path::Path) -> std::path::PathBuf {
-    home.join(".ltmrs")
-        .join("ltmrs")
-        .join("daemon")
-        .join("daemon.sock")
+/// The managed daemon IPC endpoint for an isolated HOME (mirrors the
+/// daemon layout: `RuntimePaths::resolve(home/.ltmrs, "daemon")`). On unix
+/// a socket file; on Windows a named-pipe name (the pipe namespace answers
+/// `exists()` while instances are live).
+fn managed_socket(home: &std::path::Path) -> PathBuf {
+    ltmrs_daemon::runtime::RuntimePaths::resolve(&home.join(".ltmrs"), "daemon").endpoint
 }
 
 /// Wait until a path exists (bounded), then wait until it is gone.
@@ -189,6 +198,7 @@ fn cold_start_frontend_spawns_daemon_and_serves() {
     // Clean shutdown: closing our stdio ends the frontend; the idle daemon
     // (1.5s budget) must then exit on its own — no strays.
     front.shutdown();
+    // Idle daemon (1.5s budget) exits on its own — no strays.
     wait_for_gone(&managed_socket(home.path()), "daemon socket after idle");
 }
 
@@ -199,6 +209,7 @@ fn peer_survives_owner_sigkill() {
     let home = tempfile::tempdir().unwrap();
     // Explicit short-idle daemon: deterministic teardown, zero strays.
     let mut daemon = std::process::Command::new(bin())
+        .env(HOME_ENV, home.path())
         .env("HOME", home.path())
         .arg("daemon")
         .arg("--daemon-idle-ms")
@@ -259,6 +270,7 @@ fn bare_daemon_command_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
     for _ in 0..2 {
         let out = std::process::Command::new(bin())
+            .env(HOME_ENV, home.path())
             .env("HOME", home.path())
             .env("LTMRS_DAEMON_IDLE_MS", "1500")
             .arg("daemon")
@@ -288,6 +300,7 @@ fn bare_daemon_command_is_idempotent() {
 fn foreground_daemon_idle_exits_cleanly() {
     let home = tempfile::tempdir().unwrap();
     let mut daemon = std::process::Command::new(bin())
+        .env(HOME_ENV, home.path())
         .env("HOME", home.path())
         .arg("daemon")
         .arg("--foreground")
@@ -304,10 +317,12 @@ fn foreground_daemon_idle_exits_cleanly() {
 
 /// SIGTERM shuts the daemon down gracefully: exit 0 and bindings persisted
 /// (a kill -9 would leave no file behind to check).
+#[cfg(unix)]
 #[test]
 fn foreground_daemon_sigterm_shuts_down_gracefully() {
     let home = tempfile::tempdir().unwrap();
     let mut daemon = std::process::Command::new(bin())
+        .env(HOME_ENV, home.path())
         .env("HOME", home.path())
         .arg("daemon")
         .arg("--foreground")
@@ -332,6 +347,58 @@ fn foreground_daemon_sigterm_shuts_down_gracefully() {
     wait_for_gone(
         &managed_socket(home.path()),
         "daemon socket after graceful shutdown",
+    );
+    let _ = daemon.wait();
+}
+
+/// Ctrl-Break shuts the daemon down gracefully on Windows: exit 0 and
+/// bindings persisted. NOT RUN under `cargo test` on this conhost:
+/// group-0 events kill cargo (cargo registers no handler), and targeted
+/// delivery to the daemon's own process group is delayed tens of seconds
+/// and hangs `try_wait` after the daemon exits — both verified by probe
+/// (2026-10-08, deviation ledger). Handler registration is pinned
+/// executably in `serve::tests::shutdown_handlers_register`; the
+/// foreground Ctrl-C path is proven clean by probe in one console group.
+#[cfg(windows)]
+#[ignore = "conhost blocks programmatic delivery under cargo test (see doc comment)"]
+#[test]
+fn foreground_daemon_ctrlbreak_shuts_down_gracefully() {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0020;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    unsafe extern "system" fn pass_through(_ty: u32) -> i32 {
+        0
+    }
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(pass_through), 1);
+    }
+    let home = tempfile::tempdir().unwrap();
+    let mut daemon = std::process::Command::new(bin())
+        .env(HOME_ENV, home.path())
+        .env("HOME", home.path())
+        .arg("daemon")
+        .arg("--foreground")
+        .arg("--daemon-idle-ms")
+        .arg("60000")
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn foreground daemon");
+    wait_for_path(&managed_socket(home.path()), "daemon endpoint");
+    unsafe {
+        windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
+    }
+    let status = wait_timeout_or_kill(&mut daemon, Duration::from_secs(30));
+    assert!(status.success(), "Ctrl-Break must exit 0, got: {status}");
+    assert!(
+        home.path().join(".ltmrs").join("sessions.json").exists(),
+        "graceful shutdown must persist bindings"
+    );
+    wait_for_gone(
+        &managed_socket(home.path()),
+        "daemon endpoint after graceful shutdown",
     );
     let _ = daemon.wait();
 }

@@ -413,25 +413,27 @@ impl ReferenceInterpreter {
         self.memories.insert(result.id, result.clone());
         affected.push(result.id);
 
-        // Parity with the canonical gateway: consolidated supersession
-        // edges record while both endpoints are live (before archival).
+        // Parity with the canonical gateway: consolidate=true keeps live
+        // sources (down-weighted, supersession edges); consolidate=false
+        // hard-deletes them (rows gone, edges severed).
+        let now = Instant::new(self.clock.now_millis());
         if consolidate {
+            // Edges record while both endpoints are live.
             for source_id in source_ids {
-                let edge = Relation::consolidation_edge(
-                    result.id,
-                    *source_id,
-                    Instant::new(self.clock.now_millis()),
-                );
+                let edge = Relation::consolidation_edge(result.id, *source_id, now);
                 self.apply_relate(&edge)?;
             }
-        }
-
-        for source_id in source_ids {
-            if let Some(source) = self.memories.get_mut(source_id) {
-                source.lifecycle = MemoryLifecycle::Archived {
-                    at: Instant::new(self.clock.now_millis()),
-                };
-                source.advance_eligibility();
+            for source_id in source_ids {
+                if let Some(source) = self.memories.get_mut(source_id) {
+                    source.confidence = crate::memory::CONSOLIDATED_CONFIDENCE;
+                    affected.push(*source_id);
+                }
+            }
+        } else {
+            for source_id in source_ids {
+                self.relations
+                    .retain(|r| r.source != *source_id && r.target != *source_id);
+                self.memories.remove(source_id);
                 affected.push(*source_id);
             }
         }
@@ -915,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_archives_sources() {
+    fn test_merge_deletes_sources() {
         let mut interp = ReferenceInterpreter::new(42, 0);
         let m1 = test_memory(1);
         let m2 = test_memory(2);
@@ -952,6 +954,53 @@ mod tests {
             _ => vec![],
         };
         assert_eq!(affected.len(), 3);
+    }
+
+    #[test]
+    fn test_merge_consolidate_keeps_and_down_weights_sources() {
+        let mut interp = ReferenceInterpreter::new(42, 0);
+        let m1 = test_memory(1);
+        let m2 = test_memory(2);
+        let m3 = test_memory(3);
+        for (n, m) in [(1, m1.clone()), (2, m2.clone())] {
+            interp
+                .apply(
+                    &test_ctx(n),
+                    &DomainCommand::AddMemory {
+                        memory: m,
+                        session: None,
+                        auto_link: None,
+                    },
+                )
+                .unwrap();
+        }
+        let cmd = DomainCommand::Merge {
+            source_ids: vec![m1.id, m2.id],
+            result: m3.clone(),
+            consolidate: true,
+        };
+        interp.apply(&test_ctx(3), &cmd).unwrap();
+        for id in [m1.id, m2.id] {
+            let source = interp.memories.get(&id).expect("source kept");
+            assert!(
+                source.lifecycle.is_recallable(),
+                "consolidated sources stay live"
+            );
+            assert_eq!(
+                source.confidence,
+                crate::memory::CONSOLIDATED_CONFIDENCE,
+                "consolidated sources down-weight"
+            );
+        }
+        assert_eq!(
+            interp
+                .relations
+                .iter()
+                .filter(|r| r.relation_type.is_supersession())
+                .count(),
+            2,
+            "consolidation records supersession edges"
+        );
     }
 
     #[test]

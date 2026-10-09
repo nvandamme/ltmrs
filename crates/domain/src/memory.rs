@@ -106,6 +106,11 @@ impl MemoryLifecycle {
     }
 }
 
+/// Compatibility down-weight for consolidated (superseded but kept) sources:
+/// `memory_forget(consolidate=true)` and `memory_merge(consolidate=true)`
+/// keep the row live at this confidence, mirroring upstream Lemma.
+pub const CONSOLIDATED_CONFIDENCE: f64 = 0.05;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Evidence {
     pub file: String,

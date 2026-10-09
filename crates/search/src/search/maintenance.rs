@@ -202,8 +202,15 @@ mod tests {
     }
 
     fn ctx(op_num: u64) -> ltmrs_domain::command::CommandContext {
+        ctx_gen(op_num, StoreGeneration::FIRST)
+    }
+
+    /// Context under an explicit generation (post-cutover writes name the
+    /// live generation, exactly like a re-handshaked client; the
+    /// transaction fence rejects retired generations).
+    fn ctx_gen(op_num: u64, generation: StoreGeneration) -> ltmrs_domain::command::CommandContext {
         ltmrs_domain::command::CommandContext {
-            store_generation: StoreGeneration::FIRST,
+            store_generation: generation,
             frontend_id: ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1)),
             channel_id: ltmrs_domain::id::ChannelId::new(Uuid::from_u128(2)),
             session: None,
@@ -554,7 +561,7 @@ mod tests {
         // projected yet) untouched, and the active pointer is unaffected.
         // Project one memory at gen 2 first so the active space is non-empty.
         repo.apply(
-            &ctx(3),
+            &ctx_gen(3, gen2),
             &DomainCommand::UpdateMemory {
                 id: eid(1),
                 expected_revision: None,

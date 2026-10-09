@@ -146,6 +146,8 @@ mod tests {
         }
     }
 
+    /// Windows: needs a unix shell (`sh -c`) absent on a bare Windows host.
+    #[cfg_attr(windows, ignore = "needs sh; run on unix CI")]
     #[test]
     fn failing_child_propagates_exit_code() {
         let out = execute(
@@ -156,6 +158,8 @@ mod tests {
         assert_eq!(out.exit_code, 3);
     }
 
+    /// Windows: needs a unix shell (`sh -c`) absent on a bare Windows host.
+    #[cfg_attr(windows, ignore = "needs sh; run on unix CI")]
     #[test]
     fn child_observes_sandboxed_home() {
         let out = execute_with_env(
@@ -168,6 +172,8 @@ mod tests {
         assert_eq!(out.stdout_tail.trim(), "/tmp/sandbox-XYZ");
     }
 
+    /// Windows: needs a unix shell (`sh -c`) absent on a bare Windows host.
+    #[cfg_attr(windows, ignore = "needs sh; run on unix CI")]
     #[test]
     fn parent_home_unchanged_after_sandboxed_child() {
         let before = std::env::var_os("HOME");

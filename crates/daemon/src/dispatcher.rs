@@ -45,6 +45,12 @@ pub struct Dispatcher {
     /// session mutation persists before success returns, so kill-after-ack
     /// loses nothing. None disables persistence (tests without a path).
     sessions_path: Mutex<Option<std::path::PathBuf>>,
+    /// Mutation-time similarity gate: serializes duplicate-check + commit
+    /// across concurrent memory_add/update/merge so two racing neardup
+    /// writes cannot both miss each other. Held for milliseconds (one
+    /// Lance query + one commit); different scopes still share it because
+    /// unprojected writes are globally visible to every scope's scan.
+    similarity_gate: std::sync::Mutex<()>,
 }
 
 impl Dispatcher {
@@ -60,6 +66,7 @@ impl Dispatcher {
             search: None,
             restore: Mutex::new(ltmrs_interchange::restore::RestoreCoordinator::default()),
             sessions_path: Mutex::new(None),
+            similarity_gate: std::sync::Mutex::new(()),
         }
     }
 
@@ -166,10 +173,10 @@ impl Dispatcher {
     }
 
     /// The store generation this daemon serves (for health/handshake).
-    pub fn store_generation(&self) -> ltmrs_domain::id::StoreGeneration {
-        self.repo
-            .store_generation()
-            .unwrap_or(ltmrs_domain::id::StoreGeneration::FIRST)
+    /// Fail-closed: an unreadable generation is a server fault, never a
+    /// default — callers refuse rather than admit under generation 1.
+    pub fn store_generation(&self) -> DomainResult<ltmrs_domain::id::StoreGeneration> {
+        self.repo.store_generation()
     }
 
     /// Handle one IPC envelope, returning the typed response.
@@ -193,8 +200,14 @@ impl Dispatcher {
         // Generation gate: a restore replaces the store under a new
         // generation. Envelopes naming a retired generation are refused so
         // stale writers re-handshake instead of polluting the new store
-        // (or minting receipts under a dead generation).
-        let live = self.store_generation();
+        // (or minting receipts under a dead generation). An unreadable live
+        // generation fails closed as a server fault, not a default.
+        let live = self.store_generation().map_err(|e| {
+            DomainError::new(
+                DomainErrorCode::Validation,
+                format!("cannot read live store generation: {}", e.message),
+            )
+        })?;
         if envelope.store_generation != live {
             return Err(DomainError::new(
                 DomainErrorCode::StaleGeneration,
@@ -389,6 +402,13 @@ impl Dispatcher {
     /// Access the search backend (WP-08 semantic retrieval), if attached.
     pub fn search(&self) -> Option<&SearchBackend> {
         self.search.as_deref()
+    }
+
+    /// Hold across a mutation preflight (similarity check) plus its commit:
+    /// concurrent memory_add/update/merge serialize here so racing
+    /// near-duplicates cannot both miss. Leaf lock, milliseconds held.
+    pub fn similarity_gate(&self) -> &std::sync::Mutex<()> {
+        &self.similarity_gate
     }
 
     /// Access the restore preview registry (lock briefly; never hold across IO).

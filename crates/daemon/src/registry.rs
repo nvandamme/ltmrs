@@ -395,10 +395,18 @@ impl FrontendRegistry {
         // Durability barrier (re-review R1): flush file data before the
         // rename makes it visible, then flush the directory entry. Every
         // step participates in the result — a discarded sync error would
-        // let callers acknowledge unflushed state as durable.
-        let f = std::fs::File::open(&tmp)?;
+        // let callers acknowledge unflushed state as durable. Windows
+        // `FlushFileBuffers` requires write access, and refuses to rename
+        // a file opened without FILE_SHARE_DELETE, so the handle is opened
+        // write-only and closed before the rename.
+        let f = std::fs::OpenOptions::new().write(true).open(&tmp)?;
         f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, path)?;
+        // Unix only: the parent-dir flush pins the rename in the directory
+        // entry. Windows has no openable directory handle; the rename is
+        // atomic and NTFS flushes metadata with the handle close.
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             let dir = std::fs::File::open(parent).map_err(|e| {
                 std::io::Error::other(format!("cannot open parent dir for sync: {e}"))

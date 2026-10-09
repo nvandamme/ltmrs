@@ -104,6 +104,30 @@ fi
 
 TOOLCHAIN="$(rustc --version)"
 LOCK_SHA="$(sha256sum Cargo.lock | cut -d' ' -f1)"
+# Effective linker provenance (mirrors tools/detect_linker.rs selection so
+# two bundles built with different linkers cannot look identical): explicit
+# LTMRS_LINKER wins, else the first of mold/wild the system driver accepts,
+# else the system default (non-Linux included — no probing happens there).
+LINKER_REQUESTED="${LTMRS_LINKER:-auto}"
+LINKER_EFFECTIVE="system"
+LINKER_VERSION="null"
+if [ -n "${LTMRS_LINKER:-}" ] && [ "$LTMRS_LINKER" != "system" ]; then
+    LINKER_EFFECTIVE="$LTMRS_LINKER"
+elif [ -z "${LTMRS_LINKER:-}" ] && [ "$(uname -s)" = "Linux" ]; then
+    CC_BIN="${CC:-cc}"
+    for CAND in mold wild; do
+        PROBE="$(mktemp)"
+        if printf 'int main(){return 0;}' | "$CC_BIN" -fuse-ld="$CAND" -x c - -o "$PROBE" >/dev/null 2>&1 && [ -e "$PROBE" ]; then
+            LINKER_EFFECTIVE="$CAND"
+            rm -f "$PROBE"
+            break
+        fi
+        rm -f "$PROBE"
+    done
+fi
+if command -v "$LINKER_EFFECTIVE" >/dev/null 2>&1; then
+    LINKER_VERSION="$("$LINKER_EFFECTIVE" --version 2>/dev/null | head -n 1)"
+fi
 # Workspace-wide direct-dependency inventory: the union of every member's
 # direct deps (names + versions, no paths: local rows carry `(...)` and are
 # excluded). `cargo tree --workspace` renders member roots as already-shown
@@ -182,16 +206,20 @@ if [ -n "$LOCKED" ]; then
     fi
 fi
 
-python3 - "$DIR/manifest.json" "$HEAD" "$MODE" "$PROFILE" "$LOCKED_FLAG" "$TOOLCHAIN" "$LOCK_SHA" "$FMT_CLEAN" "$CLIPPY_STATUS" "$SUITE_SUMMARY" "$DIR/deps.txt" <<'EOF'
+python3 - "$DIR/manifest.json" "$HEAD" "$MODE" "$PROFILE" "$LOCKED_FLAG" "$TOOLCHAIN" "$LOCK_SHA" "$FMT_CLEAN" "$CLIPPY_STATUS" "$SUITE_SUMMARY" "$DIR/deps.txt" "$LINKER_REQUESTED" "$LINKER_EFFECTIVE" "$LINKER_VERSION" <<'EOF'
 import json, sys
 (_, out, head, mode, profile, locked, toolchain, lock_sha, fmt_clean,
- clippy_raw, suite_raw, deps) = sys.argv
+ clippy_raw, suite_raw, deps, linker_requested, linker_effective,
+ linker_version_raw) = sys.argv
 manifest = {
     "commit": head,
     "mode": mode,
     "profile": profile,
     "locked": (locked == "true"),
     "toolchain": toolchain,
+    "requested_linker": linker_requested,
+    "effective_linker": linker_effective,
+    "effective_linker_version": None if linker_version_raw == "null" else linker_version_raw,
     "cargo_lock_sha256": lock_sha,
     "fmt_clean": (fmt_clean == "true"),
     "clippy": None if clippy_raw == "null" else json.loads(clippy_raw),

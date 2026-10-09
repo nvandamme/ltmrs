@@ -5,6 +5,73 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2026-10-09 — Whole-tree audit fix wave + Windows compat certification
+
+### Whole-tree audit fix wave (Lance similarity authority, fencing, durability)
+- Whole-tree audit fix wave (22 findings, P1→P3): single Lance-backed
+  `SimilarityService` in `ltmrs-search` (Jaccard recipe, indexed candidates +
+  pending overlay + degraded snapshot; `word_overlap` removed from compat);
+  SearchBackend always attached (lexical without E5) + always-on lexical
+  projection worker + NULL-row backfill on E5 start; `SearchState`
+  Complete/Partial/Unavailable with empty-complete answers standing;
+  mutation-time admission gate with barrier + overlay regression tests;
+  `memory_merge` DeleteSources vs Consolidate per frozen contract (both
+  levels + interpreter parity, 0.05 const); generation fencing fail-closed
+  (dispatcher + txn check + corrupt-meta rejection + degraded health);
+  backup durable publication + 0600 + configurable bound (`_with_limit`
+  + `LTMRS_MAX_BACKUP_BYTES`); replay-first in update/relate/distill (new
+  distill receipt reader); first-freeze-wins; real timestamps +
+  `updated_at`; update claim removed; truthful provenance + engine-side
+  dates/pagination; Lance-neighbor conflict candidates; bounded streaming
+  artifact download; linker provenance in release evidence (executed);
+  deviations.json + CI-section + stale-comment drift fixed. Evidence:
+  `cargo test --workspace` 790 passed / 0 failed (15 ignored with reason),
+  fmt + clippy `-D warnings` clean. Deferred with path: streaming backup
+  encode (bound is now a parameter), partial-nonempty recall surfacing.
+  Rulings: shell-dependent tests get `cfg_attr(windows, ignore)`; dense
+  stays out of dup rejection (unfrozen thresholds must not block writes);
+  ltmrs hard-delete is tombstoned (merge-delete matches Forget{Delete}).
+
+### Windows daemon accept data gate + compat plan Tasks 1-7
+- Windows daemon accept data gate (`crates/daemon/src/runtime/windows.rs`,
+  `crates/daemon/src/server.rs`): byte-mode `ConnectNamedPipe` `ERROR_NO_DATA`
+  is mistaken for success by tokio/mio, spinning fake EOF accepts and starving
+  idle-exit. `accept()` now gates on `PeekNamedPipe` bytes-available `> 0` on the
+  same instance (bounded 1000ms → `WouldBlock`); serve idle loop treats
+  `WouldBlock` as a timeout tick, `spawn_socket_server` continues. Evidence:
+  `cargo test --test daemon_lifecycle` 5 passed + 1 ignored (simultaneous ×3
+  stable), `cargo test -p ltmrs-daemon --lib` 215 passed,
+  `cargo test -p ltmrs-frontend --lib` 94 passed, `cargo test -p ltmrs --bin ltmrs`
+  34 passed, `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets
+  -- -D warnings` clean (also fixed two pre-existing clippy hits: redundant cast
+  in `create_pipe`, no-op `.into()` in `resolve_home`). Design recorded in
+  `plans/2026-10-08-windows-compat-design.md` §2.1. Rejected: future-stack
+  `OVERLAPPED` with direct `ConnectNamedPipe` (kernel pointer dangles across
+  awaits → `0xc0000005`); `PeekNamedPipe` success as connectedness proof (succeeds
+  on unconnected instances); `HasOverlappedIoCompleted` import (WinBase macro).
+- Windows compat plan Tasks 1–7 complete (2026-10-09 session). T3: `home_dir()`
+  now prefers non-empty `HOME`, falls back to `USERPROFILE` on Windows
+  (`home_dir_prefers_home_over_userprofile` RED→GREEN; frontend lib 95/95).
+  Rulings: shipped `detach_child(&mut Command)` stands in for the plan's
+  `spawn_detached` constructor (shared by daemon spawn + visualizer); the
+  spawn smoke test lives in `tests/daemon_lifecycle.rs` (`CARGO_BIN_EXE_ltmrs`
+  unavailable in frontend unit tests). T5: `vis_smoke` 1/1 (shared helper
+  already wired). T6 gate: `cargo fmt --all -- --check` clean,
+  `cargo clippy --workspace --all-targets -- -D warnings` clean,
+  `cargo test --workspace` 768 passed / 0 failed (15 ignored with reason),
+  `cargo build --release` clean; release-binary smokes: daemon foreground
+  idle exit 0, two stdio frontends share one daemon, `-vis` URL+pid with
+  `/api/library?token` 200, `--install-shim` writes byte-exact `lemma.cmd`;
+  no strays. Rulings: `tests/release_evidence.rs` 4 bash-executing tests +
+  `xtask/src/run.rs` 3 `sh`-dependent tests get `#[cfg_attr(windows, ignore)]`
+  with reason (no bash/sh on bare Windows host; static guards still run;
+  full runs on unix CI). T7: §7.1 Windows paragraph + AD-07
+  (Windows 11 Pro x86_64, NTFS, MSVC 1.99.0, protoc 36.0 — all verified),
+  T-SEC-01 Windows execution row, RQ-20 evidence, `windows_certification`
+  ledger entries in `traceability.json` / `conformance_matrix.json` (visualizer
+  table verbatim); design cross-check fixes (`detach_child` shape, shim
+  `exit /b` line).
+
 ## 2026-10-08 — Build speed: profiles, auto-detected fast linker, hygiene rules
 
 ### Build speed: profiles, auto-detected fast linker, hygiene rules

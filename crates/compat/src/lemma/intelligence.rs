@@ -115,58 +115,40 @@ fn detect_contradiction_signals(text_a: &str, text_b: &str) -> f64 {
     max_score
 }
 
-pub fn scan_for_conflicts(
-    memories: &[Memory],
-    legacy_id_of: impl Fn(&Memory) -> String,
-) -> Vec<ConflictPair> {
-    let mut conflicts = Vec::new();
-    let n = memories.len();
-    if n < 2 {
-        return conflicts;
+/// Score one candidate pair with the contradiction rules (None below the
+/// emit threshold). Candidate generation lives with the caller — Lance
+/// nearest neighbors through the similarity service — so only sufficiently
+/// similar pairs reach these rules; the rules themselves are unchanged.
+pub fn score_conflict_pair(
+    a: &Memory,
+    b: &Memory,
+    legacy_a_id: String,
+    legacy_b_id: String,
+) -> Option<ConflictPair> {
+    let overlap = topic_overlap(
+        &extract_topic_signature(&a.fragment),
+        &extract_topic_signature(&b.fragment),
+    );
+    if overlap < CONFLICT_MIN_OVERLAP {
+        return None;
     }
-
-    let signatures: Vec<HashSet<String>> = memories
-        .iter()
-        .map(|m| extract_topic_signature(&m.fragment))
-        .collect();
-    let negations: Vec<bool> = memories.iter().map(|m| has_negation(&m.fragment)).collect();
-
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let overlap = topic_overlap(&signatures[i], &signatures[j]);
-            if overlap < CONFLICT_MIN_OVERLAP {
-                continue;
-            }
-            let neg_differs = negations[i] != negations[j];
-            let conflict_score = score_conflict(
-                &memories[i].fragment,
-                &memories[j].fragment,
-                overlap,
-                neg_differs,
-            );
-            if conflict_score >= CONFLICT_EMIT_THRESHOLD {
-                conflicts.push(ConflictPair {
-                    memory_a_id: legacy_id_of(&memories[i]),
-                    memory_a_title: memories[i].title.clone(),
-                    memory_b_id: legacy_id_of(&memories[j]),
-                    memory_b_title: memories[j].title.clone(),
-                    reason: if neg_differs {
-                        "Opposing sentiment on same topic".to_string()
-                    } else {
-                        "Contradiction signals detected".to_string()
-                    },
-                    overlap_score: (conflict_score * 100.0).round() / 100.0,
-                });
-            }
-        }
+    let neg_differs = has_negation(&a.fragment) != has_negation(&b.fragment);
+    let conflict_score = score_conflict(&a.fragment, &b.fragment, overlap, neg_differs);
+    if conflict_score < CONFLICT_EMIT_THRESHOLD {
+        return None;
     }
-
-    conflicts.sort_by(|a, b| {
-        b.overlap_score
-            .partial_cmp(&a.overlap_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    conflicts
+    Some(ConflictPair {
+        memory_a_id: legacy_a_id,
+        memory_a_title: a.title.clone(),
+        memory_b_id: legacy_b_id,
+        memory_b_title: b.title.clone(),
+        reason: if neg_differs {
+            "Opposing sentiment on same topic".to_string()
+        } else {
+            "Contradiction signals detected".to_string()
+        },
+        overlap_score: (conflict_score * 100.0).round() / 100.0,
+    })
 }
 
 pub fn format_conflict_results(conflicts: &[ConflictPair]) -> String {

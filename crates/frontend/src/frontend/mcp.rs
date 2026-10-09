@@ -1559,11 +1559,12 @@ mod tests {
             .unwrap();
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
-        let socket = dir.path().join("test.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let paths = ltmrs_daemon::runtime::RuntimePaths::resolve(dir.path(), "test-store");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
         let server_handle = tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok(stream) = listener.accept().await else {
                     break;
                 };
                 let dispatcher = dispatcher.clone();
@@ -1617,11 +1618,12 @@ mod tests {
             .unwrap();
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
-        let socket = dir.path().join("test.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let paths = ltmrs_daemon::runtime::RuntimePaths::resolve(dir.path(), "test-store");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
         let server_handle = tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok(stream) = listener.accept().await else {
                     break;
                 };
                 let dispatcher = dispatcher.clone();
@@ -1690,7 +1692,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         async fn read_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
         ) -> ltmrs_daemon::envelope::WireMessage {
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await.unwrap();
@@ -1700,7 +1702,7 @@ mod tests {
             serde_json::from_slice(&buf).unwrap()
         }
         async fn write_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
             reply: &ltmrs_daemon::envelope::WireReply,
         ) {
             // Same streaming reply format as the production server
@@ -1727,8 +1729,9 @@ mod tests {
             FrontendRegistry::new(),
             Arc::clone(&clock),
         ));
-        let socket = dir.path().join("resend.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let paths = ltmrs_daemon::runtime::RuntimePaths::resolve(dir.path(), "resend");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
 
         // Connection 1: handshake normally, then commit the request and
         // drop WITHOUT responding — a deterministic unknown outcome.
@@ -1738,7 +1741,7 @@ mod tests {
             let dispatcher = Arc::clone(&dispatcher);
             async move {
                 use ltmrs_daemon::envelope::WireMessage;
-                let (mut conn1, _) = listener.accept().await.unwrap();
+                let mut conn1 = listener.accept().await.unwrap();
                 let m1 = read_msg(&mut conn1).await;
                 let WireMessage::Handshake(hs_req) = m1 else {
                     panic!("expected handshake first");
@@ -1772,7 +1775,7 @@ mod tests {
                 let first_op = env.operation_id;
                 dispatcher.handle(&env).unwrap();
                 drop(conn1);
-                let (mut conn2, _) = listener.accept().await.unwrap();
+                let mut conn2 = listener.accept().await.unwrap();
                 let m2 = read_msg(&mut conn2).await;
                 let WireMessage::Handshake(resume_req) = m2 else {
                     panic!("expected resume handshake on conn2");
@@ -1861,7 +1864,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         async fn read_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
         ) -> ltmrs_daemon::envelope::WireMessage {
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await.unwrap();
@@ -1871,7 +1874,7 @@ mod tests {
             serde_json::from_slice(&buf).unwrap()
         }
         async fn write_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
             reply: &ltmrs_daemon::envelope::WireReply,
         ) {
             let payload = serde_json::to_vec(reply).unwrap();
@@ -1902,15 +1905,16 @@ mod tests {
             FrontendRegistry::new(),
             Arc::clone(&clock),
         ));
-        let socket = dir.path().join("cut.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let paths = ltmrs_daemon::runtime::RuntimePaths::resolve(dir.path(), "cut");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
 
         let server_task = tokio::spawn({
             let dispatcher = Arc::clone(&dispatcher);
             let repo = Arc::clone(&repo);
             async move {
                 use ltmrs_daemon::envelope::WireMessage;
-                let (mut conn1, _) = listener.accept().await.unwrap();
+                let mut conn1 = listener.accept().await.unwrap();
                 let WireMessage::Handshake(hs_req) = read_msg(&mut conn1).await else {
                     panic!("expected handshake first");
                 };
@@ -1946,7 +1950,7 @@ mod tests {
                 // Reconnect with a resume for the pre-cut epoch, served
                 // through the real handshake path (must refuse: the
                 // generation moved under the uncertain mutation).
-                let (mut conn2, _) = listener.accept().await.unwrap();
+                let mut conn2 = listener.accept().await.unwrap();
                 let WireMessage::Handshake(resume_req) = read_msg(&mut conn2).await else {
                     panic!("expected resume handshake on conn2");
                 };
@@ -2019,7 +2023,7 @@ mod tests {
                                 ),
                             )
                             .await;
-                            let (mut conn3, _) = tokio::time::timeout(
+                            let mut conn3 = tokio::time::timeout(
                                 std::time::Duration::from_secs(5),
                                 listener.accept(),
                             )
@@ -2119,7 +2123,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         async fn read_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
         ) -> ltmrs_daemon::envelope::WireMessage {
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await.unwrap();
@@ -2129,7 +2133,7 @@ mod tests {
             serde_json::from_slice(&buf).unwrap()
         }
         async fn write_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
             reply: &ltmrs_daemon::envelope::WireReply,
         ) {
             let payload = serde_json::to_vec(reply).unwrap();
@@ -2152,8 +2156,9 @@ mod tests {
             FrontendRegistry::new(),
             Arc::clone(&clock),
         ));
-        let socket = dir.path().join("tool-resend.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let paths = ltmrs_daemon::runtime::RuntimePaths::resolve(dir.path(), "tool-resend");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
 
         let server_task = tokio::spawn({
             let dispatcher = Arc::clone(&dispatcher);
@@ -2161,7 +2166,7 @@ mod tests {
                 use ltmrs_daemon::envelope::WireMessage;
                 // conn1: handshake, prefetch, ToolCall add → commit, then
                 // drop WITHOUT responding (deterministic unknown outcome).
-                let (mut conn1, _) = listener.accept().await.unwrap();
+                let mut conn1 = listener.accept().await.unwrap();
                 let WireMessage::Handshake(hs_req) = read_msg(&mut conn1).await else {
                     panic!("expected handshake first");
                 };
@@ -2190,7 +2195,7 @@ mod tests {
                 drop(conn1);
                 // conn2: resume the same epoch; the resent envelope must
                 // replay through the recorded receipt.
-                let (mut conn2, _) = listener.accept().await.unwrap();
+                let mut conn2 = listener.accept().await.unwrap();
                 let WireMessage::Handshake(resume_req) = read_msg(&mut conn2).await else {
                     panic!("expected resume handshake on conn2");
                 };
@@ -2280,7 +2285,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         async fn read_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
         ) -> ltmrs_daemon::envelope::WireMessage {
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await.unwrap();
@@ -2290,7 +2295,7 @@ mod tests {
             serde_json::from_slice(&buf).unwrap()
         }
         async fn write_msg(
-            stream: &mut tokio::net::UnixStream,
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
             reply: &ltmrs_daemon::envelope::WireReply,
         ) {
             let payload = serde_json::to_vec(reply).unwrap();
@@ -2313,8 +2318,9 @@ mod tests {
             FrontendRegistry::new(),
             Arc::clone(&clock),
         ));
-        let socket = dir.path().join("stale-resend.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let paths = ltmrs_daemon::runtime::RuntimePaths::resolve(dir.path(), "stale-resend");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
 
         let server_task = tokio::spawn({
             let dispatcher = Arc::clone(&dispatcher);
@@ -2323,7 +2329,7 @@ mod tests {
                 use ltmrs_daemon::envelope::{IpcResponse, WireMessage, WireReply};
                 // conn1: handshake, prefetch, main X (answered stale after
                 // a real generation bump), then the fresh re-handshake.
-                let (mut conn1, _) = listener.accept().await.unwrap();
+                let mut conn1 = listener.accept().await.unwrap();
                 let WireMessage::Handshake(hs_req) = read_msg(&mut conn1).await else {
                     panic!("expected handshake first");
                 };
@@ -2373,7 +2379,7 @@ mod tests {
                 // conn1b: the frontend reconnects after the mismatch (see
                 // ensure_handshaked) — handshake, prefetch, then the fresh
                 // mutation, which commits and is dropped without responding.
-                let (mut conn1b, _) = listener.accept().await.unwrap();
+                let mut conn1b = listener.accept().await.unwrap();
                 let WireMessage::Handshake(hs_req) = read_msg(&mut conn1b).await else {
                     panic!("expected handshake on conn1b");
                 };
@@ -2393,7 +2399,7 @@ mod tests {
                 drop(conn1);
                 drop(conn1b);
                 // conn2: resume the fresh epoch and resend the fresh op.
-                let (mut conn2, _) = listener.accept().await.unwrap();
+                let mut conn2 = listener.accept().await.unwrap();
                 let m2 = read_msg(&mut conn2).await;
                 let WireMessage::Handshake(resume_req) = m2 else {
                     panic!("expected resume handshake on conn2");
@@ -2473,7 +2479,8 @@ mod tests {
         let daemon = Daemon::start(&paths, config).await.unwrap();
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
-        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        let (server_end, client_end) = tokio::io::duplex(65536);
+        let (server_end, client_end) = (Box::new(server_end), Box::new(client_end));
         tokio::spawn(async move {
             let _ = handle_connection(server_end, dispatcher, quotas).await;
         });
@@ -2538,7 +2545,8 @@ mod tests {
         use ltmrs_daemon::envelope::{WireError, WireReply};
         use tokio::io::AsyncReadExt;
 
-        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        let (server_end, client_end) = tokio::io::duplex(65536);
+        let (server_end, client_end) = (Box::new(server_end), Box::new(client_end));
         tokio::spawn(async move {
             let mut server_end = server_end;
             let mut len_buf = [0u8; 4];
@@ -2592,11 +2600,12 @@ mod tests {
         let daemon = Daemon::start(&paths, config).await.unwrap();
         let dispatcher = daemon.dispatcher_arc();
         let quotas = daemon.quotas();
-        let socket = dir.path().join("test.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let paths = ltmrs_daemon::runtime::RuntimePaths::resolve(dir.path(), "test-store");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
         let server_handle = tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok(stream) = listener.accept().await else {
                     break;
                 };
                 let dispatcher = dispatcher.clone();
@@ -2619,9 +2628,10 @@ mod tests {
         fe.ensure_handshaked().await.unwrap();
         assert!(fe.client.lock().await.retry_epoch().is_some());
         // Simulate a dead stream: swap in a pair end whose peer is gone.
-        let (dead, peer) = tokio::net::UnixStream::pair().unwrap();
+        let (dead, peer) = tokio::io::duplex(65536);
+        let peer = Box::new(peer);
         drop(peer);
-        fe.client.lock().await.set_stream(dead);
+        fe.client.lock().await.set_stream(Box::new(dead));
         assert!(
             fe.roundtrip_with_rehandshake(DomainRequest::ListMemories)
                 .await

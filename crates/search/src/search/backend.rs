@@ -27,11 +27,14 @@ pub trait QueryEmbedderProvider: Send + Sync {
 /// The dense leg's model fingerprint travels per-request in
 /// `RetrievalRequest::model_fingerprint`, so the backend caches no
 /// fingerprint/generation state (it may hold model weights behind the
-/// embedder trait object).
+/// embedder trait object). The backend-level fingerprint records whether
+/// THIS backend can serve dense vectors at all (None: lexical-only table):
+/// callers gate the dense leg on it instead of assuming density.
 pub struct SearchBackend {
     repo: Arc<CanonicalRepository>,
     table: SearchTable,
     embedder: Arc<dyn QueryEmbedder>,
+    model_fingerprint: Option<ltmrs_domain::id::ModelFingerprint>,
 }
 
 impl SearchBackend {
@@ -44,6 +47,55 @@ impl SearchBackend {
             repo,
             table,
             embedder,
+            model_fingerprint: None,
+        }
+    }
+
+    /// Declare the dense model this backend serves (E5 wiring); default None.
+    pub fn with_model_fingerprint(
+        mut self,
+        fingerprint: ltmrs_domain::id::ModelFingerprint,
+    ) -> Self {
+        self.model_fingerprint = Some(fingerprint);
+        self
+    }
+
+    /// The dense fingerprint, if this backend serves vectors.
+    pub fn model_fingerprint(&self) -> Option<ltmrs_domain::id::ModelFingerprint> {
+        self.model_fingerprint
+    }
+
+    /// The Lance table (for similarity candidate generation).
+    pub fn table(&self) -> SearchTable {
+        self.table.clone()
+    }
+
+    /// Lexical readiness state: Complete (converged), Partial (index
+    /// missing or projection lagging — results are best-effort), or
+    /// Unavailable (table unreadable). A usable backend returning zero
+    /// hits is Complete-empty, never a reason to substitute other results.
+    pub fn search_state(&self) -> SearchState {
+        let fts = match self.fts_ready() {
+            Err(e) => {
+                return SearchState::Unavailable {
+                    reason: format!("table unreadable: {}", e.message),
+                };
+            }
+            Ok(ready) => ready,
+        };
+        if !fts {
+            return SearchState::Partial {
+                reason: "fts index not built".to_string(),
+            };
+        }
+        match self.repo.projection_lag() {
+            Err(e) => SearchState::Partial {
+                reason: format!("pending queue unreadable: {}", e.message),
+            },
+            Ok(0) => SearchState::Complete,
+            Ok(lag) => SearchState::Partial {
+                reason: format!("{lag} projection jobs pending"),
+            },
         }
     }
 
@@ -112,6 +164,39 @@ impl SearchBackend {
         })?;
         let table = self.table.clone();
         Ok(handle.block_on(async move { table.fts_index_ready().await.unwrap_or(false) }))
+    }
+}
+
+/// Lexical readiness state of the attached table.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchState {
+    /// Converged: results are authoritative, including empty ones.
+    Complete,
+    /// Best-effort: the FTS index is missing or projection lags. Results
+    /// may be incomplete; the pending-projection overlay covers the lag for
+    /// mutation preflights.
+    Partial { reason: String },
+    /// The table itself is unreadable: route to the degraded path.
+    Unavailable { reason: String },
+}
+
+/// A query embedder for lexical-only backends: dense is unavailable, so
+/// every embedding call fails and callers take their documented
+/// no-dense path (the engine skips the dense leg without a fingerprint).
+pub struct NoDenseEmbedder;
+
+impl QueryEmbedder for NoDenseEmbedder {
+    fn embed_query<'a>(
+        &'a self,
+        _query: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DomainResult<Vec<f32>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Err(DomainError::new(
+                DomainErrorCode::Validation,
+                "dense unavailable: lexical-only backend",
+            ))
+        })
     }
 }
 
@@ -640,6 +725,52 @@ mod tests {
             1,
             "dense leg must invoke the worker exactly once"
         );
+    }
+
+    /// search_state tracks table readiness through the same bridge contract
+    /// as retrieve_sync (blocking context): fresh table without an index
+    /// reports Partial, never Complete.
+    #[tokio::test]
+    async fn search_state_partial_without_fts_index() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = std::sync::Arc::new(
+            ltmrs_service::repository::CanonicalRepository::open(repo_dir.path().to_str().unwrap())
+                .unwrap(),
+        );
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = crate::search::table::SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let backend = SearchBackend::new(repo, table, std::sync::Arc::new(NoDenseEmbedder));
+        let state = tokio::task::spawn_blocking(move || backend.search_state())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&state, SearchState::Partial { reason } if reason.contains("fts")),
+            "unindexed table must report Partial, got: {state:?}"
+        );
+    }
+
+    /// search_state reports Complete once the index is built and no
+    /// projection work pends: a converged empty table is authoritative,
+    /// including for empty answers.
+    #[tokio::test]
+    async fn search_state_complete_when_converged() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = std::sync::Arc::new(
+            ltmrs_service::repository::CanonicalRepository::open(repo_dir.path().to_str().unwrap())
+                .unwrap(),
+        );
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = crate::search::table::SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        table.ensure_fts_index().await.unwrap();
+        let backend = SearchBackend::new(repo, table, std::sync::Arc::new(NoDenseEmbedder));
+        let state = tokio::task::spawn_blocking(move || backend.search_state())
+            .await
+            .unwrap();
+        assert_eq!(state, SearchState::Complete);
     }
 
     /// Live E5 embedding against a provisioned cache (ignored: needs the

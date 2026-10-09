@@ -22,6 +22,25 @@ pub const BACKUP_EXTENSION: &str = "ltmrs-backup";
 /// enforced on read so a hostile file cannot exhaust memory).
 pub const MAX_BACKUP_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Effective backup byte bound: `LTMRS_MAX_BACKUP_BYTES` overrides the
+/// default when it parses as a positive u64 (100k-memory tiers need headroom
+/// the hostile-input default denies); unset or garbage falls back silently
+/// to `MAX_BACKUP_BYTES` — the safe direction, since a smaller bound only
+/// refuses oversized backups.
+pub fn backup_byte_limit() -> u64 {
+    backup_byte_limit_from(std::env::var("LTMRS_MAX_BACKUP_BYTES").ok())
+}
+
+/// Pure precedence core (see `backup_byte_limit`).
+pub fn backup_byte_limit_from(env: Option<String>) -> u64 {
+    env.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MAX_BACKUP_BYTES)
+}
+
 /// Backup failure (IO, format, integrity — never silent).
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
@@ -92,23 +111,35 @@ pub fn export_backup(
     prefix: &str,
     created_at_millis: u64,
 ) -> Result<BackupReport, BackupError> {
+    // One coherent cut (see below): the full domain export plus the live
+    // generation come from a single read transaction.
+    export_backup_with_limit(repo, dir, prefix, created_at_millis, MAX_BACKUP_BYTES)
+}
+
+/// `export_backup` with an explicit byte bound (see `backup_byte_limit`).
+pub fn export_backup_with_limit(
+    repo: &CanonicalRepository,
+    dir: &Path,
+    prefix: &str,
+    created_at_millis: u64,
+    limit: u64,
+) -> Result<BackupReport, BackupError> {
     let io_err = |path: &Path, e: std::io::Error| BackupError::Io {
         path: path.to_string_lossy().into_owned(),
         message: e.to_string(),
     };
-    // One coherent cut: the full domain export (sessions included) plus
-    // the live generation come from a single read transaction.
     let (export, generation) = repo
         .export_full_with_generation()
         .map_err(|e| BackupError::Store(e.message))?;
-    let (bytes, _digest, _counts) = encode_backup(&export, generation.as_u64(), created_at_millis)?;
+    let (bytes, _digest, _counts) =
+        encode_backup_with_limit(&export, generation.as_u64(), created_at_millis, limit)?;
     std::fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
     let name = format!(
         "{prefix}-{created_at_millis}-{}.{}",
         uuid::Uuid::now_v7().as_simple(),
         BACKUP_EXTENSION
     );
-    export_backup_to(&dir.join(&name), &bytes)
+    export_backup_to_with_limit(&dir.join(&name), &bytes, limit)
 }
 
 /// Publish already-encoded backup `bytes` at an exact path (safety backups
@@ -120,6 +151,16 @@ pub fn encode_backup(
     export: &CanonicalExport,
     generation: u64,
     created_at_millis: u64,
+) -> Result<EncodedBackup, BackupError> {
+    encode_backup_with_limit(export, generation, created_at_millis, MAX_BACKUP_BYTES)
+}
+
+/// `encode_backup` with an explicit byte bound (see `backup_byte_limit`).
+pub fn encode_backup_with_limit(
+    export: &CanonicalExport,
+    generation: u64,
+    created_at_millis: u64,
+    limit: u64,
 ) -> Result<EncodedBackup, BackupError> {
     let digest = export.digest();
     let count = |n: usize| n as u64;
@@ -159,16 +200,31 @@ pub fn encode_backup(
     });
     let bytes = serde_json::to_vec(&envelope)
         .map_err(|e| BackupError::Corrupt(format!("cannot encode snapshot: {e}")))?;
-    if bytes.len() as u64 > MAX_BACKUP_BYTES {
+    if bytes.len() as u64 > limit {
         return Err(BackupError::TooLarge {
             size: bytes.len() as u64,
-            bound: MAX_BACKUP_BYTES,
+            bound: limit,
         });
     }
     Ok((bytes, digest, counts))
 }
 
 pub fn export_backup_to(final_path: &Path, bytes: &[u8]) -> Result<BackupReport, BackupError> {
+    export_backup_to_with_limit(final_path, bytes, MAX_BACKUP_BYTES)
+}
+
+/// `export_backup_to` with an explicit byte bound (see `backup_byte_limit`).
+/// Durability barrier: the staged file is created owner-private, flushed,
+/// and closed before the rename makes it visible; the rename is then pinned
+/// with a parent-dir flush (unix). Every step participates in the result —
+/// a discarded sync error would acknowledge unflushed state as durable.
+/// Windows opens directories un-openable, so the parent flush is unix-only
+/// (NTFS flushes metadata at handle close; the rename itself is atomic).
+pub fn export_backup_to_with_limit(
+    final_path: &Path,
+    bytes: &[u8],
+    limit: u64,
+) -> Result<BackupReport, BackupError> {
     let io_err = |path: &Path, e: std::io::Error| BackupError::Io {
         path: path.to_string_lossy().into_owned(),
         message: e.to_string(),
@@ -179,14 +235,41 @@ pub fn export_backup_to(final_path: &Path, bytes: &[u8]) -> Result<BackupReport,
         std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
     }
     let staged = final_path.with_extension(BACKUP_EXTENSION.to_string() + ".tmp");
-    std::fs::write(&staged, bytes).map_err(|e| io_err(&staged, e))?;
-    // Best-effort durability before publication (the verify below re-reads).
-    if let Ok(f) = std::fs::File::open(&staged) {
-        let _ = f.sync_all();
-    }
+    // Owner-private from creation (0600 on unix; the per-user profile ACL
+    // on Windows): a backup holds the whole corpus and must never depend
+    // on the process umask.
+    #[cfg(unix)]
+    let mut staged_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staged)
+            .map_err(|e| io_err(&staged, e))?
+    };
+    #[cfg(not(unix))]
+    let mut staged_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staged)
+        .map_err(|e| io_err(&staged, e))?;
+    std::io::Write::write_all(&mut staged_file, bytes).map_err(|e| io_err(&staged, e))?;
+    staged_file.sync_all().map_err(|e| io_err(&staged, e))?;
+    drop(staged_file);
     std::fs::rename(&staged, final_path).map_err(|e| io_err(final_path, e))?;
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| io_err(parent, e))?;
+    }
     // Verify by re-reading (a torn write fails here, never silently).
-    let verified = verify_backup_file(final_path, MAX_BACKUP_BYTES)?;
+    let verified = verify_backup_file(final_path, limit)?;
     Ok(BackupReport {
         path: final_path.to_path_buf(),
         digest: verified.digest.clone(),
@@ -628,5 +711,65 @@ mod tests {
         .unwrap();
         let err = verify_backup_file(&future, MAX_BACKUP_BYTES).unwrap_err();
         assert!(matches!(err, BackupError::Version(99)), "got: {err}");
+    }
+
+    /// Published backups are owner-private from creation (never umask-dependent).
+    #[cfg(unix)]
+    #[test]
+    fn export_sets_owner_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, repo) = setup();
+        seed_alpha_beta(&repo);
+        let report = export_backup(&repo, dir.path(), "test", 1700000000000).unwrap();
+        let mode = std::fs::metadata(&report.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "backup must be owner-private, got {mode:o}"
+        );
+    }
+
+    /// The byte bound is configurable: explicit positive values win, unset /
+    /// empty / garbage / zero fall back to the hostile-input default.
+    #[test]
+    fn byte_limit_override_is_honored() {
+        assert_eq!(backup_byte_limit_from(Some("1048576".to_string())), 1048576);
+        assert_eq!(backup_byte_limit_from(None), MAX_BACKUP_BYTES);
+        assert_eq!(
+            backup_byte_limit_from(Some(String::new())),
+            MAX_BACKUP_BYTES
+        );
+        assert_eq!(
+            backup_byte_limit_from(Some("  ".to_string())),
+            MAX_BACKUP_BYTES
+        );
+        assert_eq!(
+            backup_byte_limit_from(Some("forever".to_string())),
+            MAX_BACKUP_BYTES
+        );
+        assert_eq!(
+            backup_byte_limit_from(Some("0".to_string())),
+            MAX_BACKUP_BYTES
+        );
+    }
+
+    /// Encode honors a custom bound end to end (encode + publish + verify).
+    #[test]
+    fn custom_limit_roundtrips_and_rejects() {
+        let (dir, repo) = setup();
+        seed_alpha_beta(&repo);
+        let export = repo.export_full().unwrap();
+        let err = encode_backup_with_limit(&export, 1, 1700000000000, 10).unwrap_err();
+        assert!(
+            matches!(err, BackupError::TooLarge { bound: 10, .. }),
+            "got: {err}"
+        );
+        let report =
+            export_backup_with_limit(&repo, dir.path(), "test", 1700000000000, MAX_BACKUP_BYTES)
+                .unwrap();
+        verify_backup_file(&report.path, MAX_BACKUP_BYTES).unwrap();
     }
 }
