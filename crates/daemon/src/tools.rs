@@ -83,17 +83,17 @@ pub fn execute_tool(
         ToolArgs::MemoryLibrary(args) => exec_memory_library(disp, args),
         ToolArgs::SemanticSearch(args) => exec_semantic_search(disp, envelope, args),
         ToolArgs::GuideGet(args) => exec_guide_get(disp, args),
-        ToolArgs::GuidePractice(args) => exec_guide_practice(disp, envelope, args),
-        ToolArgs::GuideCreate(args) => exec_guide_create(disp, envelope, args),
-        ToolArgs::GuideDistill(args) => exec_guide_distill(disp, envelope, args),
-        ToolArgs::GuideUpdate(args) => exec_guide_update(disp, envelope, args),
-        ToolArgs::GuideForget(args) => exec_guide_forget(disp, envelope, args),
-        ToolArgs::GuideMerge(args) => exec_guide_merge(disp, envelope, args),
+        ToolArgs::GuidePractice(args) => exec_guide_practice(disp, envelope, adm(), args),
+        ToolArgs::GuideCreate(args) => exec_guide_create(disp, envelope, adm(), args),
+        ToolArgs::GuideDistill(args) => exec_guide_distill(disp, envelope, adm(), args),
+        ToolArgs::GuideUpdate(args) => exec_guide_update(disp, envelope, adm(), args),
+        ToolArgs::GuideForget(args) => exec_guide_forget(disp, envelope, adm(), args),
+        ToolArgs::GuideMerge(args) => exec_guide_merge(disp, envelope, adm(), args),
         ToolArgs::SessionStart(args) => exec_session_start(disp, envelope, adm(), args),
         ToolArgs::SessionAttempt(args) => exec_session_attempt(disp, envelope, adm(), args),
         ToolArgs::SessionEnd(args) => exec_session_end(disp, envelope, adm(), args),
         ToolArgs::SessionStats(args) => exec_session_stats(disp, envelope, args),
-        ToolArgs::SuggestionRespond(args) => exec_suggestion_respond(disp, envelope, args),
+        ToolArgs::SuggestionRespond(args) => exec_suggestion_respond(disp, envelope, adm(), args),
         ToolArgs::ConflictScan(args) => exec_conflict_scan(disp, args),
         ToolArgs::ProactiveAnalysis(args) => exec_proactive_analysis(disp, args),
         ToolArgs::ProjectAnalytics(args) => exec_project_analytics(disp, args),
@@ -1353,60 +1353,55 @@ fn exec_memory_add(
 
     // Replay before validation: a retried envelope finds the memory the
     // first delivery created and would reject itself as a duplicate —
-    // the recorded receipt rebuilds the response instead. The link
-    // section renders the transactionally recorded link (read, never
-    // re-planned or re-applied).
+    // the recorded receipt rebuilds the response instead. Crash-window
+    // rebuild is a pure function of the request + receipt (never a
+    // live re-read): content, title and description are the requested
+    // ones, so a concurrent edit after the commit cannot rewrite what
+    // this operation reported. Live-derived sections (overlaps, link
+    // details, suggestions) are omitted; the structured id and the core
+    // line match the fresh render.
     if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |receipt| {
-        let (created, linked) = match &receipt.outcome {
-            ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
-                (affected.first().copied(), affected.get(1).copied())
+        match &receipt.outcome {
+            ltmrs_domain::command::ReceiptOutcome::Success { affected } if !affected.is_empty() => {
             }
-            _ => (None, None),
-        };
-        let created = created.ok_or_else(|| {
-            DomainError::new(
-                DomainErrorCode::Validation,
-                "recorded add outcome carries no memory",
-            )
-        })?;
-        let stored = disp.repo().get_memories(&[created])?.into_iter().next();
-        let recorded_link = linked.and_then(|id| {
-            disp.repo()
-                .all_relations()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|r| r.id == id)
-        });
-        match stored {
-            Some(memory) => finish_add_response(
-                disp,
-                args,
-                &memory,
-                &final_fragment,
-                has_secrets,
-                recorded_link,
-            ),
-            // Recorded memory gone post-commit (deleted afterwards):
-            // report the recorded success from args-derived values
-            // rather than failing a legitimate retry.
-            None => {
-                let title = args
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| generate_title(&final_fragment));
-                let legacy_id = new_legacy_id(envelope);
-                Ok(ok_result(
-                    format!(
-                        "Added fragment [{legacy_id}]: \"{title}\" (recorded memory since removed)"
-                    ),
-                    json!({
-                        "success": true,
-                        "id": legacy_id,
-                        "conflicts": [],
-                    }),
-                ))
+            _ => {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "recorded add outcome carries no memory",
+                ));
             }
         }
+        let title = args
+            .title
+            .clone()
+            .unwrap_or_else(|| generate_title(&final_fragment));
+        let description = args
+            .description
+            .clone()
+            .unwrap_or_else(|| generate_description(&final_fragment));
+        let legacy_id = new_legacy_id(envelope);
+        let scope_info = args
+            .project
+            .as_deref()
+            .and_then(normalize_project)
+            .map(|p| format!(" (project: {p})"))
+            .unwrap_or_else(|| " (global)".to_string());
+        let mut response = format!(
+            "Added fragment [{legacy_id}]{scope_info}: \"{title}\"\nSummary: {description}"
+        );
+        if has_secrets && !args.confirm {
+            response.push_str(
+                "\n\n⚠️ Privacy: potential secret(s) detected and auto-redacted. Use confirm: true to store as-is.",
+            );
+        }
+        Ok(ok_result(
+            response,
+            json!({
+                "success": true,
+                "id": legacy_id,
+                "conflicts": [],
+            }),
+        ))
     })? {
         return Ok(replayed);
     }
@@ -1648,33 +1643,25 @@ fn exec_memory_update(
 
     // Replay before any mutable-state lookup (uniform tool rule): a retried
     // envelope whose target has since vanished still replays its recorded
-    // response instead of failing resolution.
+    // response instead of failing resolution. Crash-window rebuild is a
+    // pure function of the request + receipt: the pre-update title is not
+    // in the receipt, so without an explicit title none is quoted — a
+    // later rename must never rewrite what this operation reported.
     if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |receipt| {
-        let updated_id = match &receipt.outcome {
-            ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
-                affected.first().copied().ok_or_else(|| {
-                    DomainError::new(
-                        DomainErrorCode::Validation,
-                        "recorded update outcome carries no memory",
-                    )
-                })
+        match &receipt.outcome {
+            ltmrs_domain::command::ReceiptOutcome::Success { affected } if !affected.is_empty() => {
             }
-            _ => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "recorded update outcome is not a success",
-            )),
-        }?;
-        let title = match &args.title {
-            Some(t) => t.clone(),
-            None => disp
-                .repo()
-                .get_memories(&[updated_id])?
-                .into_iter()
-                .next()
-                .map(|m| m.title)
-                .unwrap_or_default(),
+            _ => {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "recorded update outcome carries no memory",
+                ));
+            }
+        }
+        let response = match &args.title {
+            Some(t) => format!("Updated fragment [{}]: \"{t}\"", args.id),
+            None => format!("Updated fragment [{}].", args.id),
         };
-        let response = format!("Updated fragment [{}]: \"{}\"", args.id, title);
         Ok(ok_result(
             response,
             json!({
@@ -1783,45 +1770,32 @@ fn exec_memory_feedback(
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
-    // Replay before validation (uniform tool rule).
+    // Replay before validation (uniform tool rule). Crash-window
+    // rebuild is a pure function of the request + receipt: the recorded
+    // absolute is not in the receipt, so the rebuild reports the
+    // direction only — a later confidence move must never rewrite what
+    // this operation reported.
     if let Some(replayed) = replay_tool_call(disp, envelope, admitted, 0, |receipt| {
-        let fb_id = match &receipt.outcome {
-            ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
-                affected.first().copied().ok_or_else(|| {
-                    DomainError::new(
-                        DomainErrorCode::Validation,
-                        "recorded feedback outcome carries no memory",
-                    )
-                })
+        match &receipt.outcome {
+            ltmrs_domain::command::ReceiptOutcome::Success { affected } if !affected.is_empty() => {
             }
-            _ => Err(DomainError::new(
-                DomainErrorCode::Validation,
-                "recorded feedback outcome is not a success",
-            )),
-        }?;
-        let confidence = repo
-            .get_memories(&[fb_id])?
-            .into_iter()
-            .next()
-            .map(|m| m.confidence)
-            .unwrap_or(0.5);
+            _ => {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "recorded feedback outcome carries no memory",
+                ));
+            }
+        }
         let response = if args.useful {
-            format!(
-                "Positive feedback recorded for [{}]. Confidence boosted to {:.2}.",
-                args.id, confidence
-            )
+            format!("Positive feedback recorded for [{}].", args.id)
         } else {
-            format!(
-                "Negative feedback recorded for [{}]. Confidence reduced to {:.2}.",
-                args.id, confidence
-            )
+            format!("Negative feedback recorded for [{}].", args.id)
         };
         Ok(ok_result(
             response,
             json!({
                 "success": true,
                 "id": args.id,
-                "confidence": confidence,
             }),
         ))
     })? {
@@ -3683,6 +3657,7 @@ fn exec_guide_get(disp: &Dispatcher, args: &GuideGetArgs) -> DomainResult<Domain
 fn exec_guide_practice(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &GuidePracticeArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -3698,18 +3673,15 @@ fn exec_guide_practice(
         return Ok(err_result("'outcome' must be one of: success, failure."));
     }
     let now = disp.clock().now_millis();
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
     // Track into the active session (canonical store, best-effort) before
     // the guide mutation so validated_by links the session's pre-loaded
     // reads. Virtual sessions have no canonical record: their link is a
-    // no-op and validated_by stays empty.
+    // no-op and validated_by stays empty. Runs under the entry admission.
     let validated: Vec<String> =
         match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
             Some(handle) => {
-                let track_admitted = disp.repo().admit_scope(&scope)?;
                 let _ = disp.repo().track_session_link(
-                    &track_admitted,
+                    admitted,
                     handle,
                     ltmrs_service::repository::SessionLinkField::GuideUsed,
                     std::slice::from_ref(&args.guide.to_lowercase().trim().to_string()),
@@ -3729,9 +3701,10 @@ fn exec_guide_practice(
         _ => None,
     };
     // Idempotent guide mutation: same operation ID + digest replays the
-    // recorded snapshot; a digest mismatch rejects (re-review R5).
+    // recorded snapshot; a digest mismatch rejects (re-review R5). Runs
+    // under the entry admission (no TTL revalidation mid-call).
     let updated = match repo.practice_guide_idempotent(
-        &scope,
+        admitted,
         &args.guide,
         &args.category,
         args.description.as_deref(),
@@ -3849,9 +3822,9 @@ fn map_guide_tool_error(e: DomainError) -> DomainResult<DomainPayload> {
 /// into a spurious "not found").
 fn replay_recorded_guide_op(
     repo: &ltmrs_service::repository::CanonicalRepository,
-    scope: &OperationScope,
+    admitted: &AdmittedScope,
 ) -> DomainResult<Option<DomainPayload>> {
-    match repo.read_recorded_guide_op(scope) {
+    match repo.read_recorded_guide_op(admitted) {
         Ok(None) => Ok(None),
         Ok(Some(recorded)) => Ok(Some(guide_op_response(&recorded)?)),
         Err(e)
@@ -3866,7 +3839,8 @@ fn replay_recorded_guide_op(
 
 fn exec_guide_create(
     disp: &Dispatcher,
-    envelope: &IpcEnvelope,
+    _envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &GuideCreateArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -3879,10 +3853,9 @@ fn exec_guide_create(
         ));
     }
     // Receipted operation (P1-2): same operation ID + digest replays the
-    // recorded response instead of re-executing.
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
-    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
+    // recorded response instead of re-executing. Runs under the entry
+    // admission (no TTL revalidation mid-call).
+    if let Some(replayed) = replay_recorded_guide_op(repo, admitted)? {
         return Ok(replayed);
     }
     let now = disp.clock().now_millis();
@@ -3895,7 +3868,7 @@ fn exec_guide_create(
         // Revision-checked: a concurrent mutation since the read rejects
         // instead of being overwritten (re-review P1-2).
         let recorded = match repo.guide_mutation_idempotent(
-            &scope,
+            admitted,
             GuideMutation::CreateUpdate {
                 expected: Some(expected),
                 guide: updated,
@@ -3919,7 +3892,7 @@ fn exec_guide_create(
         updated.description = args.description.clone();
         updated.updated_at = Instant::new(now);
         let recorded = match repo.guide_mutation_idempotent(
-            &scope,
+            admitted,
             GuideMutation::CreateUpdate {
                 expected: Some(expected),
                 guide: updated,
@@ -3941,11 +3914,12 @@ fn exec_guide_create(
     );
     // Create-if-absent: a concurrent creation wins instead of being
     // overwritten (re-review P1-2).
-    let recorded =
-        match repo.guide_mutation_idempotent(&scope, GuideMutation::Create { guide: new_guide }) {
-            Ok(recorded) => recorded,
-            Err(e) => return map_guide_tool_error(e),
-        };
+    let recorded = match repo
+        .guide_mutation_idempotent(admitted, GuideMutation::Create { guide: new_guide })
+    {
+        Ok(recorded) => recorded,
+        Err(e) => return map_guide_tool_error(e),
+    };
     guide_op_response(&recorded)
 }
 
@@ -3953,7 +3927,8 @@ fn exec_guide_create(
 
 fn exec_guide_distill(
     disp: &Dispatcher,
-    envelope: &IpcEnvelope,
+    _envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &GuideDistillArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -3964,10 +3939,8 @@ fn exec_guide_distill(
     }
     // Replay before any mutable-state lookup (uniform tool rule): a retried
     // envelope whose memory has since vanished still replays its recorded
-    // guide instead of failing resolution.
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
-    match disp.repo().read_recorded_distill_op(&scope) {
+    // guide instead of failing resolution. Runs under the entry admission.
+    match disp.repo().read_recorded_distill_op(admitted) {
         Ok(None) => {}
         Ok(Some(recorded)) => {
             return Ok(ok_result(
@@ -4007,7 +3980,7 @@ fn exec_guide_distill(
     // ONE canonical operation (re-review R2): memory + guide are read fresh
     // inside the transaction and commit together — no stale clone can
     // overwrite a concurrent content update.
-    let updated = match repo.distill_memory_link(&scope, eid, &args.guide, &category, now) {
+    let updated = match repo.distill_memory_link(admitted, eid, &args.guide, &category, now) {
         Ok(g) => g,
         Err(e) if e.code == ltmrs_domain::command::DomainErrorCode::NotFound => {
             return Ok(err_result(&format!(
@@ -4042,7 +4015,8 @@ fn exec_guide_distill(
 
 fn exec_guide_update(
     disp: &Dispatcher,
-    envelope: &IpcEnvelope,
+    _envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &GuideUpdateArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -4050,10 +4024,9 @@ fn exec_guide_update(
         return Ok(err_result("'guide' parameter is required"));
     }
     // Receipted operation (P1-2): replay before planning, so a retry never
-    // mistakes a concurrently changed store for a failure.
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
-    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
+    // mistakes a concurrently changed store for a failure. Runs under the
+    // entry admission (no TTL revalidation mid-call).
+    if let Some(replayed) = replay_recorded_guide_op(repo, admitted)? {
         return Ok(replayed);
     }
     let now = disp.clock().now_millis();
@@ -4122,7 +4095,7 @@ fn exec_guide_update(
             old_name: None,
         }
     };
-    let recorded = match repo.guide_mutation_idempotent(&scope, mutation) {
+    let recorded = match repo.guide_mutation_idempotent(admitted, mutation) {
         Ok(recorded) => recorded,
         Err(e) => return map_guide_tool_error(e),
     };
@@ -4133,17 +4106,17 @@ fn exec_guide_update(
 
 fn exec_guide_forget(
     disp: &Dispatcher,
-    envelope: &IpcEnvelope,
+    _envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &GuideForgetArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     if args.guide.trim().is_empty() {
         return Ok(err_result("'guide' parameter is required"));
     }
-    // Receipted operation (P1-2): replay before planning.
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
-    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
+    // Receipted operation (P1-2): replay before planning. Runs under the
+    // entry admission (no TTL revalidation mid-call).
+    if let Some(replayed) = replay_recorded_guide_op(repo, admitted)? {
         return Ok(replayed);
     }
     let existing = repo.get_guide(&args.guide)?;
@@ -4155,7 +4128,7 @@ fn exec_guide_forget(
     // guide and no surviving guide with half-removed references. Recorded
     // atomically with the operation receipt (P1-2): retries replay.
     let recorded = match repo.guide_mutation_idempotent(
-        &scope,
+        admitted,
         GuideMutation::Forget {
             name: args.guide.clone(),
         },
@@ -4227,7 +4200,8 @@ fn format_guide_merge_response(result: &Guide, sources: &[String]) -> DomainPayl
 
 fn exec_guide_merge(
     disp: &Dispatcher,
-    envelope: &IpcEnvelope,
+    _envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &GuideMergeArgs,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
@@ -4240,10 +4214,9 @@ fn exec_guide_merge(
         return Ok(err_result("'guide' and 'category' parameters are required"));
     }
     // Receipted operation (P1-2): replay before planning, so a retry never
-    // mistakes consumed sources for a failure.
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
-    if let Some(replayed) = replay_recorded_guide_op(repo, &scope)? {
+    // mistakes consumed sources for a failure. Runs under the entry
+    // admission (no TTL revalidation mid-call).
+    if let Some(replayed) = replay_recorded_guide_op(repo, admitted)? {
         return Ok(replayed);
     }
     let now = disp.clock().now_millis();
@@ -4333,7 +4306,7 @@ fn exec_guide_merge(
         .map(|g| (g.name.clone(), g.entity_revision))
         .collect();
     let recorded = match repo.guide_mutation_idempotent(
-        &scope,
+        admitted,
         GuideMutation::Merge {
             sources: args.guides.clone(),
             expected,
@@ -4695,6 +4668,48 @@ fn build_continuity_recall(
 
 // ---- session_attempt ----
 
+/// Render + freeze a session-attempt response for an applied or replayed
+/// attempt (shared by the fresh path and the receipt pre-check path, which
+/// replays with the RECORDED handle when the session has since gone
+/// terminal).
+fn render_attempt_response(
+    disp: &Dispatcher,
+    admitted: &AdmittedScope,
+    outcome: &AttemptOutcome,
+    approach_redacted: &str,
+    handle: SessionHandle,
+    seq: u32,
+) -> DomainResult<DomainPayload> {
+    let value_tag = match outcome {
+        AttemptOutcome::Rejected => "(dead end — most valuable)",
+        AttemptOutcome::Partial => "(partial)",
+        AttemptOutcome::Promising => "(promising)",
+    };
+    let preview = if approach_redacted.len() > 80 {
+        let mut end = 80;
+        while !approach_redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &approach_redacted[..end])
+    } else {
+        approach_redacted.to_string()
+    };
+    let response = format!("Recorded attempt #{seq} — {preview} {value_tag}.");
+    let data = json!({
+        "recorded": true,
+        "attempt_id": format!("{}#{}", handle.as_uuid(), seq),
+    });
+    let payload = ok_result(response, data);
+    match freeze_session_response(disp.repo(), admitted, &payload) {
+        Ok(()) => {}
+        Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
+            return key_reuse_result();
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(payload)
+}
+
 fn exec_session_attempt(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
@@ -4722,6 +4737,30 @@ fn exec_session_attempt(
     // Operation identity for the canonical call below.
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
+
+    // Replay before session routing: a retried envelope replays from its
+    // durable receipt even when the session has since gone terminal (the
+    // recorded handle routes the response, never the live binding).
+    // Digest mismatch rejects as key reuse, like the tx path.
+    match disp.repo().session_attempt_receipt(&scope) {
+        Ok(Some((rec_handle, seq))) => {
+            if let Some(frozen) = replay_frozen_session_response(disp.repo(), admitted)? {
+                return Ok(frozen);
+            }
+            return render_attempt_response(
+                disp,
+                admitted,
+                &outcome,
+                &approach_redacted,
+                rec_handle,
+                seq,
+            );
+        }
+        Ok(None) => {}
+        Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => return key_reuse_result(),
+        Err(e) => return Err(e),
+    }
+
     // Resolve the channel's active session (canonical liveness).
     let session = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let Some(handle) = session else {
@@ -4744,7 +4783,7 @@ fn exec_session_attempt(
     // session); digest mismatch rejects; barrier failures fail loudly.
     // A frozen response (P2-1) returns verbatim; otherwise the response is
     // rebuilt and then frozen.
-    let seq = match disp.repo().session_attempt_tx(
+    let (handle, seq) = match disp.repo().session_attempt_tx(
         &scope,
         handle,
         approach_redacted.clone(),
@@ -4754,45 +4793,17 @@ fn exec_session_attempt(
         related_memory_id,
         now,
     ) {
-        Ok(SessionOp::Applied((_, seq))) => seq,
-        Ok(SessionOp::Replayed((_, seq))) => {
+        Ok(SessionOp::Applied((handle, seq))) => (handle, seq),
+        Ok(SessionOp::Replayed((rec_handle, seq))) => {
             if let Some(frozen) = replay_frozen_session_response(disp.repo(), admitted)? {
                 return Ok(frozen);
             }
-            seq
+            (rec_handle, seq)
         }
         Ok(SessionOp::Conflict) => return key_reuse_result(),
         Err(e) => return Err(e),
     };
-
-    let value_tag = match outcome {
-        AttemptOutcome::Rejected => "(dead end — most valuable)",
-        AttemptOutcome::Partial => "(partial)",
-        AttemptOutcome::Promising => "(promising)",
-    };
-    let preview = if approach_redacted.len() > 80 {
-        let mut end = 80;
-        while !approach_redacted.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &approach_redacted[..end])
-    } else {
-        approach_redacted.clone()
-    };
-    let response = format!("Recorded attempt #{seq} — {preview} {value_tag}.");
-    let data = json!({
-        "recorded": true,
-        "attempt_id": format!("{}#{}", handle.as_uuid(), seq),
-    });
-    let payload = ok_result(response, data);
-    match freeze_session_response(disp.repo(), admitted, &payload) {
-        Ok(()) => {}
-        Err(e) if e.code == DomainErrorCode::KeyReuseDifferentInput => {
-            return key_reuse_result();
-        }
-        Err(e) => return Err(e),
-    }
-    Ok(payload)
+    render_attempt_response(disp, admitted, &outcome, &approach_redacted, handle, seq)
 }
 
 // ---- session_end ----
@@ -5030,7 +5041,8 @@ fn exec_session_stats(
 
 fn exec_suggestion_respond(
     disp: &Dispatcher,
-    envelope: &IpcEnvelope,
+    _envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &SuggestionRespondArgs,
 ) -> DomainResult<DomainPayload> {
     let action = args.action.to_lowercase();
@@ -5046,11 +5058,9 @@ fn exec_suggestion_respond(
 
     // Receipted operation (P1-2): status transition + attempt adjustments
     // commit atomically with the receipt, so a retry replays instead of
-    // adjusting twice.
+    // adjusting twice. Runs under the entry admission.
     let now = disp.clock().now_millis();
-    let digest = envelope.request_digest()?;
-    let scope = envelope.operation_scope(digest.clone());
-    match repo.respond_suggestion_idempotent(&scope, args.id, status, now) {
+    match repo.respond_suggestion_idempotent(admitted, args.id, status, now) {
         Ok(_) => {}
         Err(e)
             if e.code == DomainErrorCode::NotFound
@@ -7036,6 +7046,213 @@ mod tests {
             result_text(&replayed),
             first_text,
             "replay must return the frozen original, not recomputed state"
+        );
+    }
+
+    /// P2-high (crash-window fidelity): an UNFROZEN feedback receipt
+    /// (committed, response lost before freezing) rebuilds from the
+    /// request alone — a confidence move landing after the commit must
+    /// not rewrite what the first operation reported.
+    #[test]
+    fn feedback_unfrozen_rebuild_reports_no_later_confidence() {
+        let (disp, _dir) = test_dispatcher();
+        let legacy = add_fragment(
+            &disp,
+            90,
+            "## Crash Window\n\n### Context\nUnfrozen rebuild fixture.",
+        );
+        let eid = resolve_id(disp.repo(), &legacy).unwrap();
+        // Crash window: op-91 feedback commits its receipt directly,
+        // freezing nothing.
+        let fb = ToolArgs::MemoryFeedback(MemoryFeedbackArgs {
+            id: legacy.clone(),
+            useful: true,
+        });
+        let env91 = tool_call(91, fb.clone());
+        let ctx = sub_command_ctx(&env91, 0).unwrap();
+        disp.repo()
+            .apply(
+                &ctx,
+                &DomainCommand::Feedback {
+                    memory_id: eid,
+                    useful: true,
+                },
+            )
+            .unwrap();
+        // A second, independent feedback moves confidence after the commit.
+        let again = run(&disp, &tool_call(92, fb.clone()), &fb);
+        assert!(!result_is_error(&again));
+        // Retry op 91: the Unfrozen receipt rebuilds — direction only,
+        // never the moved absolute.
+        let replayed = run(&disp, &env91, &fb);
+        let text = result_text(&replayed);
+        assert!(
+            !result_is_error(&replayed),
+            "replay must succeed, got: {text}"
+        );
+        assert_eq!(
+            text,
+            format!("Positive feedback recorded for [{legacy}]."),
+            "unfrozen rebuild must not claim live state, got: {text}"
+        );
+        assert!(
+            result_structured(&replayed)
+                .unwrap()
+                .get("confidence")
+                .is_none(),
+            "unfrozen rebuild must not fabricate a confidence value"
+        );
+    }
+
+    /// P2-high (crash-window fidelity): an UNFROZEN update receipt
+    /// rebuilds from the request alone — a title change landing after
+    /// the commit must not rewrite what the first operation reported.
+    #[test]
+    fn update_unfrozen_rebuild_uses_no_later_title() {
+        let (disp, _dir) = test_dispatcher();
+        let legacy = add_fragment(
+            &disp,
+            110,
+            "## Update Window\n\n### Context\nUnfrozen title fixture.",
+        );
+        let eid = resolve_id(disp.repo(), &legacy).unwrap();
+        // Crash window: op-111 update (fragment only, no title) commits
+        // its receipt, freezing nothing.
+        let args = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: legacy.clone(),
+            title: None,
+            fragment: Some("replacement fragment".to_string()),
+            confidence: None,
+        });
+        let env111 = tool_call(111, args.clone());
+        let ctx = sub_command_ctx(&env111, 0).unwrap();
+        disp.repo()
+            .apply(
+                &ctx,
+                &DomainCommand::UpdateMemory {
+                    id: eid,
+                    expected_revision: None,
+                    patch: MemoryPatch {
+                        fragment: Some("replacement fragment".to_string()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        // A concurrent rename lands after the commit.
+        let rename = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: legacy.clone(),
+            title: Some("Later Title".to_string()),
+            fragment: None,
+            confidence: None,
+        });
+        let renamed = run(&disp, &tool_call(112, rename.clone()), &rename);
+        assert!(!result_is_error(&renamed));
+        // Retry op 111: the Unfrozen receipt rebuilds from the request —
+        // no title was given, so none is quoted (never the later one).
+        let replayed = run(&disp, &env111, &args);
+        let text = result_text(&replayed);
+        assert!(
+            !result_is_error(&replayed),
+            "replay must succeed, got: {text}"
+        );
+        assert_eq!(
+            text,
+            format!("Updated fragment [{legacy}]."),
+            "unfrozen rebuild must not quote later state, got: {text}"
+        );
+    }
+
+    /// P2-high (crash-window fidelity): an UNFROZEN add receipt rebuilds
+    /// from the request alone — a fragment/title edit landing after the
+    /// commit must not rewrite what the first operation reported.
+    #[test]
+    fn add_unfrozen_rebuild_uses_request_content_only() {
+        let (disp, _dir) = test_dispatcher();
+        let args = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Crash Add\n\n### Context\nOriginal content.".to_string(),
+            title: Some("Original Title".to_string()),
+            ..Default::default()
+        });
+        let env131 = tool_call(131, args.clone());
+        // Crash window: op-131 add commits its receipt directly (same
+        // deterministic ids the fresh path would mint), freezing nothing.
+        let legacy_id = new_legacy_id(&env131);
+        let eid = EntityId::new(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("ltmrs:entity:{}", env131.operation_id.as_uuid()).as_bytes(),
+        ));
+        let memory = Memory {
+            id: eid,
+            external_alias: Some(ltmrs_domain::id::ExternalAlias::new(legacy_id.clone())),
+            title: "Original Title".to_string(),
+            fragment: "## Crash Add\n\n### Context\nOriginal content.".to_string(),
+            description: "Original content.".to_string(),
+            fragment_type: FragmentType::Fact,
+            project: None,
+            source: MemorySource::Ai,
+            confidence: 1.0,
+            quality_score: None,
+            lifecycle: ltmrs_domain::memory::MemoryLifecycle::Live,
+            tags: Vec::new(),
+            associated_with: Vec::new(),
+            relations: Vec::new(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            session_id: None,
+            task_type: None,
+            related_guides: Vec::new(),
+            evidence: Vec::new(),
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: ltmrs_domain::id::EntityRevision::new(0),
+            document_revision: ltmrs_domain::id::DocumentRevision::new(0),
+            eligibility_revision: ltmrs_domain::id::EligibilityRevision::new(0),
+            created_at: Instant::new(1000),
+            updated_at: Instant::new(1000),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        };
+        let ctx = sub_command_ctx(&env131, 0).unwrap();
+        disp.repo()
+            .apply(
+                &ctx,
+                &DomainCommand::AddMemory {
+                    memory,
+                    session: None,
+                    auto_link: None,
+                },
+            )
+            .unwrap();
+        // A concurrent edit lands after the commit.
+        let edit = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: legacy_id.clone(),
+            title: Some("Edited Title".to_string()),
+            fragment: Some("Edited content.".to_string()),
+            confidence: None,
+        });
+        let edited = run(&disp, &tool_call(132, edit.clone()), &edit);
+        assert!(!result_is_error(&edited));
+        // Retry op 131: the Unfrozen receipt rebuilds from the request —
+        // the later edit must not rewrite the reported content.
+        let replayed = run(&disp, &env131, &args);
+        let text = result_text(&replayed);
+        assert!(
+            !result_is_error(&replayed),
+            "replay must succeed, got: {text}"
+        );
+        assert!(
+            text.contains("\"Original Title\""),
+            "unfrozen rebuild must report the requested title, got: {text}"
+        );
+        assert!(
+            !text.contains("Edited"),
+            "unfrozen rebuild must not report later state, got: {text}"
         );
     }
 
@@ -10580,6 +10797,55 @@ mod tests {
         );
         assert!(!result_is_error(&result3));
         assert!(text_contains(&result3, "ended: success"));
+    }
+
+    /// A retried attempt replays from its durable receipt even after its
+    /// session ended: start S, attempt X, end S, replay X → X's original
+    /// result with no second attempt recorded.
+    #[test]
+    fn session_attempt_replays_after_session_end() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string()],
+            initial_approach: Some("read the code".to_string()),
+        });
+        let result = run(&disp, &tool_call(1, start.clone()), &start);
+        assert!(!result_is_error(&result));
+
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: "try X".to_string(),
+            outcome: "rejected".to_string(),
+            critique: Some("didn't work".to_string()),
+            rationale: None,
+            related_memory_id: None,
+        });
+        let env2 = tool_call(2, attempt.clone());
+        let first = run(&disp, &env2, &attempt);
+        assert!(!result_is_error(&first));
+        let first_text = result_text(&first);
+        assert!(first_text.contains("Recorded attempt #1"));
+
+        let end = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "success".to_string(),
+            final_approach: Some("fixed it".to_string()),
+            lessons: vec![],
+        });
+        let result3 = run(&disp, &tool_call(3, end.clone()), &end);
+        assert!(!result_is_error(&result3));
+
+        // Retry the exact attempt envelope after the terminal transition.
+        let replayed = run(&disp, &env2, &attempt);
+        assert!(
+            !result_is_error(&replayed),
+            "replay after end must succeed, got: {}",
+            result_text(&replayed)
+        );
+        assert_eq!(
+            result_text(&replayed),
+            first_text,
+            "replay must return the original attempt result"
+        );
     }
 
     /// Whole learning workflow (S6/WP-09 trace): recall, act, persist,

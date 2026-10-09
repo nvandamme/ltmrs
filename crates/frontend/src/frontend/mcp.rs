@@ -332,8 +332,12 @@ impl LtmrsFrontend {
     /// the live generation between the handshake and the call, so an
     /// established connection that draws StaleGeneration forgets its epoch,
     /// re-handshakes (adopting the live generation), and retries once with
-    /// a fresh operation id. A second stale answer is returned as-is —
-    /// unbounded retry would mask a daemon that never converges.
+    /// a fresh operation id. An explicit StaleReplay on a healthy stream
+    /// likewise renews: the dead epoch refused this fresh operation before
+    /// execution (certain no-commit), so forgetting it and executing once
+    /// under a fresh epoch cannot double-apply. A second stale answer is
+    /// returned as-is — unbounded retry would mask a daemon that never
+    /// converges.
     ///
     /// Transport failures are unknown outcomes (P1-B), NOT fresh attempts:
     /// the envelope is built ONCE per MCP call and, after reconnect plus a
@@ -341,6 +345,8 @@ impl LtmrsFrontend {
     /// daemon replays its receipt instead of executing twice. A refused
     /// resume (or an unreconnectable transport) surfaces an unknown-outcome
     /// error to the host instead of silently minting a fresh operation.
+    /// `resend_after_reconnect` stays conservative: only transport
+    /// ambiguity flows there, never an explicit healthy-stream refusal.
     async fn roundtrip_with_rehandshake(
         &self,
         body: DomainRequest,
@@ -368,14 +374,21 @@ impl LtmrsFrontend {
                     .await;
             }
         };
-        let stale = matches!(
+        let stale_generation = matches!(
             resp.result,
             IpcResult::Error {
                 code: DomainErrorCode::StaleGeneration,
                 ..
             }
         );
-        if !stale {
+        let stale_epoch = matches!(
+            resp.result,
+            IpcResult::Error {
+                code: DomainErrorCode::StaleReplay,
+                ..
+            }
+        );
+        if !stale_generation && !stale_epoch {
             return Ok(resp);
         }
         // Epoch-only reset: the stale reply arrived over a healthy stream,
@@ -2457,6 +2470,159 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(memories.len(), 1, "exactly one effect allowed");
 
+        drop(fe);
+    }
+
+    /// Explicit StaleReplay on a healthy stream renews the epoch: the dead
+    /// epoch refused this fresh operation before execution (certain
+    /// no-commit), so the frontend forgets it, re-handshakes, and executes
+    /// once with a fresh operation id — instead of failing every mutation
+    /// until restart. A second stale answer returns as-is (bounded).
+    #[tokio::test]
+    async fn stale_replay_renews_epoch_and_executes_once() {
+        use ltmrs_daemon::envelope::{
+            DomainPayload, IpcResponse, IpcResult, WireMessage, WireReply,
+        };
+        use ltmrs_daemon::runtime::RuntimePaths;
+        use ltmrs_domain::command::DomainErrorCode;
+        use tokio::io::AsyncReadExt;
+
+        async fn read_msg(
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
+        ) -> ltmrs_daemon::envelope::WireMessage {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        }
+        async fn write_msg(
+            stream: &mut ltmrs_daemon::runtime::IpcStream,
+            reply: &ltmrs_daemon::envelope::WireReply,
+        ) {
+            let payload = serde_json::to_vec(reply).unwrap();
+            ltmrs_daemon::envelope::write_response_payload(stream, &payload)
+                .await
+                .unwrap()
+        }
+
+        // Fully scripted server: no real dispatch, so the flow (refusal →
+        // fresh handshake → fresh op → success) is pinned exactly.
+        fn handshake_reply(epoch: u64) -> ltmrs_daemon::envelope::WireReply {
+            WireReply::Handshake(ltmrs_daemon::envelope::HandshakeResponse {
+                protocol_version: ltmrs_daemon::envelope::PROTOCOL_VERSION,
+                store_generation: ltmrs_domain::id::StoreGeneration::FIRST,
+                retry_epoch: epoch,
+            })
+        }
+        fn memories_reply(
+            operation_id: ltmrs_domain::id::OperationId,
+        ) -> ltmrs_daemon::envelope::WireReply {
+            WireReply::Response(IpcResponse {
+                protocol_version: ltmrs_daemon::envelope::PROTOCOL_VERSION,
+                operation_id,
+                result: IpcResult::Success {
+                    outcome: ltmrs_domain::command::ReceiptOutcome::Success { affected: vec![] },
+                    payload: DomainPayload::Memories(vec![]),
+                },
+            })
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "stale-epoch");
+        let listener = ltmrs_daemon::runtime::bind_listener(&paths).unwrap();
+        let socket = paths.endpoint.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            // First handshake issues epoch 5.
+            let WireMessage::Handshake(hs_req) = read_msg(&mut conn).await else {
+                panic!("expected handshake first");
+            };
+            assert_eq!(hs_req.resume_retry_epoch, None);
+            write_msg(&mut conn, &handshake_reply(5)).await;
+            // Prefetch after handshake (best-effort snapshot for instructions).
+            let WireMessage::Request(prefetch) = read_msg(&mut conn).await else {
+                panic!("expected prefetch second");
+            };
+            write_msg(&mut conn, &memories_reply(prefetch.operation_id)).await;
+            // First mutation under the dead epoch: explicit healthy-stream
+            // refusal before any execution.
+            let WireMessage::Request(env1) = read_msg(&mut conn).await else {
+                panic!("expected mutation third");
+            };
+            assert_eq!(env1.retry_epoch, 5);
+            write_msg(
+                &mut conn,
+                &WireReply::Response(IpcResponse {
+                    protocol_version: ltmrs_daemon::envelope::PROTOCOL_VERSION,
+                    operation_id: env1.operation_id,
+                    result: IpcResult::Error {
+                        code: DomainErrorCode::StaleReplay,
+                        message: "retry namespace expired".to_string(),
+                    },
+                }),
+            )
+            .await;
+            // Fresh handshake on the SAME stream (no redial for a healthy
+            // refusal), never a resume: the epoch is dead, not resumable.
+            let WireMessage::Handshake(fresh_req) = read_msg(&mut conn).await else {
+                panic!("expected fresh handshake fourth");
+            };
+            assert_eq!(fresh_req.resume_retry_epoch, None);
+            write_msg(&mut conn, &handshake_reply(9)).await;
+            // Prefetch after the fresh handshake.
+            let WireMessage::Request(prefetch2) = read_msg(&mut conn).await else {
+                panic!("expected prefetch fifth");
+            };
+            write_msg(&mut conn, &memories_reply(prefetch2.operation_id)).await;
+            // Fresh mutation: new operation id, fresh epoch, succeeds.
+            let WireMessage::Request(env2) = read_msg(&mut conn).await else {
+                panic!("expected fresh mutation sixth");
+            };
+            assert_ne!(
+                env2.operation_id, env1.operation_id,
+                "renewal must mint a fresh operation"
+            );
+            assert_eq!(env2.retry_epoch, 9);
+            write_msg(
+                &mut conn,
+                &WireReply::Response(IpcResponse {
+                    protocol_version: ltmrs_daemon::envelope::PROTOCOL_VERSION,
+                    operation_id: env2.operation_id,
+                    result: IpcResult::Success {
+                        outcome: ltmrs_domain::command::ReceiptOutcome::Success {
+                            affected: vec![],
+                        },
+                        payload: DomainPayload::Memories(vec![]),
+                    },
+                }),
+            )
+            .await;
+        });
+
+        let client = IpcClient::new(socket);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fe.roundtrip_with_rehandshake(DomainRequest::ListMemories),
+        )
+        .await
+        .expect("renewal must not hang")
+        .expect("stale-epoch call must resolve");
+        assert!(
+            matches!(resp.result, IpcResult::Success { .. }),
+            "renewed mutation must succeed, got {:?}",
+            resp.result
+        );
+        server_task.await.unwrap();
         drop(fe);
     }
 

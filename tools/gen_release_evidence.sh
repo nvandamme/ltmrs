@@ -211,6 +211,11 @@ import json, sys
 (_, out, head, mode, profile, locked, toolchain, lock_sha, fmt_clean,
  clippy_raw, suite_raw, deps, linker_requested, linker_effective,
  linker_version_raw) = sys.argv
+def _dep_record(line):
+    # deps.txt rows are `name version` (cargo tree --prefix none); a row
+    # without a version keeps its name instead of breaking the manifest.
+    parts = line.split(None, 1)
+    return {"name": parts[0], "version": parts[1] if len(parts) == 2 else ""}
 manifest = {
     "commit": head,
     "mode": mode,
@@ -224,7 +229,7 @@ manifest = {
     "fmt_clean": (fmt_clean == "true"),
     "clippy": None if clippy_raw == "null" else json.loads(clippy_raw),
     "suite": None if suite_raw == "null" else json.loads(suite_raw),
-    "direct_dependencies": open(deps).read().split(),
+    "direct_dependencies": [_dep_record(line) for line in open(deps).read().splitlines() if line.split()],
     "sanitized": True,
     "note": "Reproducible from HEAD via tools/gen_release_evidence.sh; no memory contents, secrets or local paths.",
 }

@@ -148,9 +148,15 @@ pub struct Daemon {
     embedding: Option<ltmrs_embeddings::service::EmbeddingService>,
     maintenance_worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     maintenance_config: MaintenanceConfig,
-    /// Dense-projection worker (E5 mode only): drives pending projection
-    /// jobs to the Lance table. Aborted on shutdown like maintenance.
+    /// Projection worker (dense with E5, lexical-only otherwise): drives
+    /// pending projection jobs to the Lance table. Aborted on shutdown
+    /// like maintenance.
     projection_worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Canonical housekeeping worker: periodically collects expired retry
+    /// namespaces and their receipts via `gc_expired`. Independent from
+    /// search maintenance so lexical-only deployments (no Lance path)
+    /// still collect. Aborted on shutdown.
+    housekeeping_worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     /// Verified model-cache directory (E5 mode only): the projection
     /// worker loads its passage adapter from here. `None` parks
     /// projection (lexical-only daemon).
@@ -285,6 +291,7 @@ impl Daemon {
             maintenance_worker: tokio::sync::Mutex::new(None),
             maintenance_config: config.maintenance,
             projection_worker: tokio::sync::Mutex::new(None),
+            housekeeping_worker: tokio::sync::Mutex::new(None),
             models_dir,
             quotas,
             runtime,
@@ -418,6 +425,15 @@ impl Daemon {
         if let Some(pworker) = paborted {
             pworker.abort();
         }
+        // Same best-effort abort for the housekeeping worker.
+        let haborted = self
+            .housekeeping_worker
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(hworker) = haborted {
+            hworker.abort();
+        }
         // Same best-effort abort for the background socket server (stdio path).
         let saborted = self
             .socket_server
@@ -484,6 +500,52 @@ impl Daemon {
     /// Whether the maintenance worker is currently running (diagnostics/tests).
     pub async fn maintenance_worker_running(&self) -> bool {
         self.maintenance_worker.lock().await.is_some()
+    }
+
+    /// Canonical housekeeping cadence: expired namespaces/retries are a
+    /// slow leak (24h TTL), so an hourly bounded pass is plenty; errors are
+    /// loud and retried next tick, never fatal to serving.
+    const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Spawn the canonical housekeeping worker if not already running.
+    /// Idempotent — safe to call from both serve() and tests. Independent
+    /// from search maintenance: runs with no search path, no models, and
+    /// no Lance table (lexical-only deployments collect too). The first
+    /// pass runs immediately so short-lived daemons still collect.
+    pub async fn start_housekeeping(&self) {
+        let mut hw = self.housekeeping_worker.lock().await;
+        if hw.is_some() {
+            return;
+        }
+        let repo = self.dispatcher.repo_arc();
+        let clock = Arc::clone(self.dispatcher.clock());
+        *hw = Some(tokio::spawn(async move {
+            loop {
+                let collected = tokio::task::spawn_blocking({
+                    let repo = Arc::clone(&repo);
+                    let clock = Arc::clone(&clock);
+                    move || repo.gc_expired(clock.now_millis())
+                })
+                .await;
+                match collected {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => eprintln!("ltmrs: housekeeping collected {n} expired receipts"),
+                    Ok(Err(e)) => eprintln!(
+                        "ltmrs: housekeeping pass failed ({}); retrying next tick",
+                        e.message
+                    ),
+                    Err(join_err) => eprintln!(
+                        "ltmrs: housekeeping pass panicked ({join_err}); retrying next tick"
+                    ),
+                }
+                tokio::time::sleep(Self::HOUSEKEEPING_INTERVAL).await;
+            }
+        }));
+    }
+
+    /// Whether the housekeeping worker is currently running (diagnostics/tests).
+    pub async fn housekeeping_worker_running(&self) -> bool {
+        self.housekeeping_worker.lock().await.is_some()
     }
 
     /// Spawn the projection worker: dense when E5 embedding is configured,
@@ -723,8 +785,10 @@ impl Daemon {
     pub async fn serve(&self) -> Result<(), DaemonError> {
         // Start background maintenance under its explicit budgets, if configured.
         self.start_maintenance().await;
-        // Start dense projection when E5 embedding is configured (no-op otherwise).
+        // Start projection (dense with E5, lexical-only otherwise).
         self.start_projection().await;
+        // Start canonical housekeeping (namespace/GC collection).
+        self.start_housekeeping().await;
 
         let listener = &self.runtime.listener;
 
@@ -1278,6 +1342,38 @@ mod tests {
         assert!(
             !daemon.maintenance_worker_running().await,
             "shutdown must clear the maintenance worker"
+        );
+    }
+
+    /// Canonical housekeeping spawns without any search path (it collects
+    /// expired namespaces/receipts, not Lance state), is idempotent, and is
+    /// aborted on shutdown.
+    #[tokio::test]
+    async fn housekeeping_spawns_without_search_path_and_aborts_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "house-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let mut daemon = Daemon::start(&paths, config).await.unwrap();
+
+        assert!(!daemon.housekeeping_worker_running().await);
+
+        daemon.start_housekeeping().await;
+        assert!(
+            daemon.housekeeping_worker_running().await,
+            "housekeeping must spawn with no search path configured"
+        );
+
+        // Idempotent: a second call does not stack another worker.
+        daemon.start_housekeeping().await;
+        assert!(daemon.housekeeping_worker_running().await);
+
+        daemon.shutdown();
+        assert!(
+            !daemon.housekeeping_worker_running().await,
+            "shutdown must clear the housekeeping worker"
         );
     }
 

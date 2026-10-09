@@ -572,7 +572,9 @@ mod tests {
         )
         .unwrap();
         repo.practice_guide_idempotent(
-            &fixture_scope("op-14", "digest-14"),
+            &repo
+                .admit_scope(&fixture_scope("op-14", "digest-14"))
+                .unwrap(),
             "backup-guide",
             "test",
             Some("Backup fixture guide."),
@@ -730,6 +732,26 @@ mod tests {
             0o600,
             "backup must be owner-private, got {mode:o}"
         );
+    }
+
+    /// Fail-closed publish (restore safety): when the destination cannot
+    /// even be created, NO artifact (final or staged) is left behind and
+    /// the error names the failing path — a failed safety backup must
+    /// never look like a usable rollback source.
+    #[test]
+    fn publish_through_file_parent_is_refused_without_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let final_path = blocker.join("safety.ltmrs-backup");
+        let staged = final_path.with_extension(BACKUP_EXTENSION.to_string() + ".tmp");
+        let err = export_backup_to_with_limit(&final_path, b"{}", MAX_BACKUP_BYTES).unwrap_err();
+        assert!(
+            err.to_string().contains("blocker"),
+            "error must name the failing path, got: {err}"
+        );
+        assert!(!final_path.exists(), "no final artifact on failure");
+        assert!(!staged.exists(), "no staged artifact on failure");
     }
 
     /// The byte bound is configurable: explicit positive values win, unset /

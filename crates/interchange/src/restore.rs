@@ -1474,7 +1474,9 @@ mod tests {
         // Guide op Y: creates + practices guide "git" (usage 1).
         let guide = repo
             .practice_guide_idempotent(
-                &gateway_scope("op-Y", "digest-Y"),
+                &repo
+                    .admit_scope(&gateway_scope("op-Y", "digest-Y"))
+                    .unwrap(),
                 "git",
                 "dev-tool",
                 None,
@@ -1565,7 +1567,9 @@ mod tests {
         // return a detached pre-restore recording.
         let guide = repo
             .practice_guide_idempotent(
-                &gateway_scope_post("op-Y", "digest-Y"),
+                &repo
+                    .admit_scope(&gateway_scope_post("op-Y", "digest-Y"))
+                    .unwrap(),
                 "git",
                 "dev-tool",
                 None,

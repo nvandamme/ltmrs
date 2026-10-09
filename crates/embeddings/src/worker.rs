@@ -151,6 +151,9 @@ enum WorkerMessage {
 
 /// Shared worker thread state. The dedicated thread owns the adapter and runs
 /// inference synchronously on its own OS thread (never on Tokio I/O workers).
+/// Cloneable (shared state): a bare clone only observes — worker lifetime
+/// is owned by the service's `Arc<ServiceInner>`, never by handle count.
+#[derive(Clone)]
 pub struct EmbeddingWorkerHandle {
     queue: Arc<BoundedQueue<WorkerMessage>>,
     generation: Arc<AtomicU64>,

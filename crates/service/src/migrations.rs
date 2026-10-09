@@ -12,6 +12,28 @@ use ltmrs_domain::command::{DomainError, DomainErrorCode, DomainResult};
 /// Target schema version for this build.
 pub const TARGET_SCHEMA_VERSION: u64 = 1;
 
+/// Every durable keyspace the runtime opens (single source of truth for
+/// both store open and post-migration validation): a keyspace missing
+/// here is a keyspace migration cannot see.
+pub const REQUIRED_KEYSPACES: [&str; 16] = [
+    "memories",
+    "relations",
+    "receipts",
+    "aliases",
+    "namespaces",
+    "projections",
+    "feedback_events",
+    "generations",
+    "guides",
+    "suggestions",
+    "guide_ops",
+    "sessions",
+    "session_ops",
+    "suggestion_ops",
+    "tool_results",
+    "meta",
+];
+
 /// A single schema migration step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Migration {
@@ -30,13 +52,14 @@ pub struct MigrationPlan {
 impl MigrationPlan {
     /// The default migration plan for ltmrs.
     ///
-    /// Version 0 → 1: initial schema (no migration needed, just stamp the version).
+    /// Version 0 → 1: initial schema (no data transform, just stamp the
+    /// version — keyspaces are created on open from REQUIRED_KEYSPACES).
     pub fn default_plan() -> Self {
         Self {
             migrations: vec![Migration {
                 to_version: 1,
                 description:
-                    "Initial schema: memories, relations, receipts, aliases, namespaces, meta"
+                    "Initial schema (REQUIRED_KEYSPACES): memories, relations, receipts, aliases, namespaces, projections, feedback_events, generations, guides, suggestions, guide_ops, sessions, session_ops, suggestion_ops, tool_results, meta"
                         .into(),
             }],
         }
@@ -69,7 +92,13 @@ impl MigrationPlan {
 
 /// Migration safety rules enforced before and after migration.
 pub struct MigrationSafetyRules {
-    /// Whether to create a backup before migrating.
+    /// Policy flag: a structural migration (one that rewrites user data,
+    /// unlike the stamp-only 0 → 1) must snapshot the store first — via an
+    /// interchange export before transforming — and the migration's
+    /// author wires that snapshot in. Crash-safety itself comes from
+    /// atomic per-step application: a step that fails leaves the version
+    /// unstamped, so the next open retries cleanly
+    /// (`injected_migration_fault_fails_atomically` locks this).
     pub backup_before: bool,
     /// Whether to validate the schema after migrating.
     pub validate_after: bool,
@@ -256,19 +285,14 @@ impl MigrationRunner {
         }
     }
 
-    /// Validate the schema after migration.
+    /// Validate the schema after migration: every keyspace in
+    /// [`REQUIRED_KEYSPACES`] must open. Note this opens (creating when
+    /// absent — fjall has no read-only open), so it proves openability,
+    /// not pre-existence; a half-migrated store is caught by the version
+    /// record refusing to advance, and each step applies atomically
+    /// (crash before commit retries cleanly on next open).
     fn validate_schema(&self, db: &OptimisticTxDatabase) -> DomainResult<()> {
-        // Check that all required keyspaces exist.
-        for name in [
-            "memories",
-            "relations",
-            "receipts",
-            "aliases",
-            "namespaces",
-            "projections",
-            "feedback_events",
-            "meta",
-        ] {
+        for name in REQUIRED_KEYSPACES {
             db.keyspace(name, KeyspaceCreateOptions::default)
                 .map_err(|e| {
                     DomainError::new(
@@ -292,6 +316,41 @@ mod tests {
             .open()
             .unwrap();
         (db, dir)
+    }
+
+    /// The persisted layout the runtime opens must be exactly the layout
+    /// migration validates: a keyspace the store needs but validation
+    /// ignores is a half-migrated store that still passes.
+    #[test]
+    fn migration_validation_covers_every_runtime_keyspace() {
+        for name in [
+            "memories",
+            "relations",
+            "receipts",
+            "aliases",
+            "namespaces",
+            "projections",
+            "generations",
+            "feedback_events",
+            "guides",
+            "suggestions",
+            "guide_ops",
+            "sessions",
+            "session_ops",
+            "suggestion_ops",
+            "tool_results",
+            "meta",
+        ] {
+            assert!(
+                REQUIRED_KEYSPACES.contains(&name),
+                "runtime keyspace '{name}' must be migration-validated"
+            );
+        }
+        assert_eq!(
+            REQUIRED_KEYSPACES.len(),
+            16,
+            "validation list must match the runtime layout exactly"
+        );
     }
 
     #[test]

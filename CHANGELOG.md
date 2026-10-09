@@ -5,7 +5,55 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-09 — Serve-forever accept-loop WouldBlock fix
+## 2026-10-09 — Audit review wave 2: admission-once, replay purity, migration, embedding
+
+### Audit review wave 2: session replay, TTL renewal, housekeeping
+- Session-operation replay before mutable routing (`crates/daemon/src/tools.rs`,
+  `crates/service/src/repository.rs`): `exec_session_attempt` consults
+  `session_attempt_receipt` before `resolve_session`, so a retried envelope
+  replays from its durable receipt even after its session went terminal;
+  shared `render_attempt_response` (recorded handle, frozen after render).
+  `apply()` looks up the durable receipt before namespace validation
+  (dead epoch never hides a committed outcome). Regression:
+  `session_attempt_replays_after_session_end` + expiry replay tests.
+- Frontend TTL renewal (`crates/frontend/src/frontend/mcp.rs`): healthy-stream
+  `StaleReplay` forgets the dead epoch, re-handshakes (no resume) and executes
+  once with a fresh operation id; `resend_after_reconnect` stays conservative.
+  Scripted wire test `stale_replay_renews_epoch_and_executes_once`.
+- GC scheduling (`crates/daemon/src/server.rs`): hourly `start_housekeeping`
+  worker runs `gc_expired` independent of search maintenance (lexical-only
+  collects too), first pass immediate, aborted on shutdown + test.
+
+### Audit review wave 2: admission-once, replay purity, migration, embedding
+- Admission-once throughout (`repository.rs`, `tools.rs`): guide/distill/
+  suggestion primitives and all mutating exec adapters take `&AdmittedScope`
+  (TTL checked once at tool entry); reads admit once at the gateway.
+  `check_tool_replay`/sub-scopes verified TTL-free. Expiry test asserts gate
+  rejection. Debug derives on `AdmittedScope`/`NamespacePin`.
+- Crash-window replay purity (`tools.rs`): add/update/feedback Unfrozen
+  rebuilds are pure functions of request + receipt (no live reads); three
+  RED→GREEN exec-level tests prove later mutations can't rewrite reported
+  results. Forget/merge/relate were already pure; MemoryRead intentionally
+  unfrozen (reads re-render; access side-effect receipted).
+- Migration repair (`migrations.rs`, `repository.rs`): `REQUIRED_KEYSPACES`
+  (16) shared by open + validation with coverage test; accurate v1
+  description; `backup_before` author contract; atomicity locked by existing
+  fault test. Fail-closed publish lock test (`backup.rs`).
+- Embedding ownership (`embeddings/service.rs`, `worker.rs`):
+  `Arc<ServiceInner>` owns handle + JoinHandle; race-free last-drop shutdown;
+  `mem::forget` gone; bare-handle Clone is observe-only. Barrier-synced 300x
+  stress test failed pre-fix, green post.
+- Evidence/API hygiene: manifest `direct_dependencies` are `{name, version}`
+  records; `put_guide`/`delete_guide`/`put_suggestion` doc-marked
+  seeding/repair-only.
+- Evidence: `cargo test --workspace` 803 passed / 0 failed (15 ignored with
+  reason), `cargo fmt --all -- --check` + `cargo clippy --workspace
+  --all-targets -- -D warnings` clean. Rulings: no receipt-schema surgery
+  (reduced-but-honest window text, frozen after); no version bump or dir-copy
+  backup (stamp-only path; migration #2 author snapshots); mutators stay pub
+  (cross-crate test + bench callers).
+
+## 8017237 (2026-10-09) — Serve-forever accept-loop WouldBlock fix
 
 ### Serve-forever accept-loop WouldBlock fix
 - Serve-forever accept loop `WouldBlock` fix (`crates/daemon/src/server.rs`,

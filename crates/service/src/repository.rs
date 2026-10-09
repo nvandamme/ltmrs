@@ -14,7 +14,9 @@ use fjall::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::migrations::{MigrationOutcome, MigrationPlan, MigrationRunner, MigrationSafetyRules};
+use crate::migrations::{
+    MigrationOutcome, MigrationPlan, MigrationRunner, MigrationSafetyRules, REQUIRED_KEYSPACES,
+};
 use crate::repository_internal::{CommandState, TxAction, apply_command};
 use ltmrs_domain::command::{
     CommandContext, CommandReceipt, DomainCommand, DomainError, DomainErrorCode, DomainResult,
@@ -192,6 +194,7 @@ pub struct CanonicalRepository {
 /// between primary commit and response finalization can never turn an
 /// executed operation into an error. Constructible only via
 /// [`CanonicalRepository::admit_scope`].
+#[derive(Debug)]
 pub struct AdmittedScope {
     scope: OperationScope,
     _pin: NamespacePin,
@@ -206,7 +209,7 @@ impl AdmittedScope {
 
 /// One live-operation pin on a retry namespace. Cloned per admission;
 /// dropping the last pin for a namespace makes it collectible again.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct NamespacePin {
     pins: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     key: String,
@@ -412,21 +415,30 @@ impl CanonicalRepository {
             }
         }
 
-        let memories = Self::keyspace(&db, "memories")?;
-        let relations = Self::keyspace(&db, "relations")?;
-        let receipts = Self::keyspace(&db, "receipts")?;
-        let aliases = Self::keyspace(&db, "aliases")?;
-        let namespaces = Self::keyspace(&db, "namespaces")?;
-        let projections = Self::keyspace(&db, "projections")?;
-        let generations = Self::keyspace(&db, "generations")?;
-        let feedback_events = Self::keyspace(&db, "feedback_events")?;
-        let guides = Self::keyspace(&db, "guides")?;
-        let suggestions = Self::keyspace(&db, "suggestions")?;
-        let guide_ops = Self::keyspace(&db, "guide_ops")?;
-        let sessions = Self::keyspace(&db, "sessions")?;
-        let session_ops = Self::keyspace(&db, "session_ops")?;
-        let suggestion_ops = Self::keyspace(&db, "suggestion_ops")?;
-        let tool_results = Self::keyspace(&db, "tool_results")?;
+        // Opened from REQUIRED_KEYSPACES (single source with migration
+        // validation): adding a runtime keyspace means extending the
+        // const, never a local literal. `meta` rides along (bound lazily
+        // by the paths that version the store).
+        let mut open = std::collections::HashMap::with_capacity(REQUIRED_KEYSPACES.len());
+        for name in REQUIRED_KEYSPACES {
+            open.insert(name, Self::keyspace(&db, name)?);
+        }
+        let mut take = |name: &str| open.remove(name).expect("required keyspace opened above");
+        let memories = take("memories");
+        let relations = take("relations");
+        let receipts = take("receipts");
+        let aliases = take("aliases");
+        let namespaces = take("namespaces");
+        let projections = take("projections");
+        let generations = take("generations");
+        let feedback_events = take("feedback_events");
+        let guides = take("guides");
+        let suggestions = take("suggestions");
+        let guide_ops = take("guide_ops");
+        let sessions = take("sessions");
+        let session_ops = take("session_ops");
+        let suggestion_ops = take("suggestion_ops");
+        let tool_results = take("tool_results");
 
         Ok(Self {
             db,
@@ -986,11 +998,11 @@ impl CanonicalRepository {
     /// Centralized command application: idempotent, atomic, precondition-checked.
     pub fn apply(&self, ctx: &CommandContext, cmd: &DomainCommand) -> DomainResult<CommandReceipt> {
         let _restore_guard = self.restore_lock.read().unwrap();
-        // Validate the retry namespace: expired or unknown namespaces are
-        // refused as stale, not silently converted into new work.
-        self.validate_namespace(ctx)?;
-
-        // Fast-path idempotency on a read-only snapshot.
+        // Idempotency before admission: a committed operation replays from
+        // its durable receipt even when its namespace has since expired —
+        // replay creates no new effects, so a dead epoch must not hide it.
+        // Owner + digest are enforced by replay_or_conflict, exactly as on
+        // the transaction path below. Fresh work still validates next.
         if let Some(r) = self.lookup_receipt(
             ctx.store_generation,
             ctx.frontend_id,
@@ -1001,6 +1013,10 @@ impl CanonicalRepository {
             self.persist_barrier()?;
             return Ok(receipt);
         }
+
+        // Validate the retry namespace: expired or unknown namespaces are
+        // refused as stale, not silently converted into new work.
+        self.validate_namespace(ctx)?;
 
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
@@ -2091,7 +2107,9 @@ impl CanonicalRepository {
         Ok(guide)
     }
 
-    /// Store a guide (keyed by lowercased name).
+    /// Store a guide (keyed by lowercased name). Blind write (no receipt,
+    /// revision check or reference upkeep): tests, bench seeding and offline
+    /// repair only — production tool writes go through `guide_mutation_idempotent`.
     pub fn put_guide(&self, guide: &ltmrs_domain::guide::Guide) -> DomainResult<()> {
         let _restore_guard = self.restore_lock.read().unwrap();
         let key = guide.name.to_lowercase();
@@ -2128,7 +2146,7 @@ impl CanonicalRepository {
     #[allow(clippy::too_many_arguments)]
     pub fn practice_guide_idempotent(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
         guide_name: &str,
         category: &str,
         description: Option<&str>,
@@ -2138,8 +2156,11 @@ impl CanonicalRepository {
         outcome: Option<bool>,
         now_millis: u64,
     ) -> DomainResult<ltmrs_domain::guide::Guide> {
+        // Admission-once: the caller admitted this scope at tool entry, so
+        // TTL is not revalidated here (only owner/digest checks remain on
+        // the replay paths below).
+        let scope = admitted.scope();
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
@@ -2407,14 +2428,15 @@ impl CanonicalRepository {
     #[allow(clippy::too_many_arguments)]
     pub fn distill_memory_link(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
         memory_id: ltmrs_domain::id::EntityId,
         guide_name: &str,
         category_default: &str,
         now_millis: u64,
     ) -> DomainResult<ltmrs_domain::guide::Guide> {
+        // Admission-once: TTL was checked at tool entry, not revalidated here.
+        let scope = admitted.scope();
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
@@ -2598,6 +2620,8 @@ impl CanonicalRepository {
     }
 
     /// Delete a guide by name (case-insensitive). Returns true if removed.
+    /// Blind delete (no reference cleanup or receipt): tests and offline
+    /// repair only — production forgets go through `guide_mutation_idempotent`.
     pub fn delete_guide(&self, name: &str) -> DomainResult<bool> {
         let _restore_guard = self.restore_lock.read().unwrap();
         let key = name.to_lowercase();
@@ -3176,11 +3200,12 @@ impl CanonicalRepository {
     /// unlogged, so a retry re-evaluates against current state.
     pub fn guide_mutation_idempotent(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
         mutation: GuideMutation,
     ) -> DomainResult<RecordedGuideOp> {
+        // Admission-once: TTL was checked at tool entry, not revalidated here.
+        let scope = admitted.scope();
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
@@ -3287,10 +3312,12 @@ impl CanonicalRepository {
     /// before acknowledging a replay, matching the in-transaction path.
     pub fn read_recorded_guide_op(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
     ) -> DomainResult<Option<RecordedGuideOp>> {
+        // Admission-once: replay reads ride the entry admission, so a dead
+        // epoch never hides a durable receipt.
+        let scope = admitted.scope();
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
         let snapshot = self.db.read_tx();
         let raw = snapshot
             .get(&self.guide_ops, scope.op_key())
@@ -3334,10 +3361,12 @@ impl CanonicalRepository {
     /// resolution.
     pub fn read_recorded_distill_op(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
     ) -> DomainResult<Option<ltmrs_domain::guide::Guide>> {
+        // Admission-once: replay reads ride the entry admission, so a dead
+        // epoch never hides a durable receipt.
+        let scope = admitted.scope();
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
         let snapshot = self.db.read_tx();
         let raw = snapshot
             .get(&self.guide_ops, scope.op_key())
@@ -3587,6 +3616,36 @@ impl CanonicalRepository {
             Ok(Err(_)) => Ok(()),
             Err(e) => Err(DomainError::new(DomainErrorCode::Validation, e.to_string())),
         }
+    }
+
+    /// Look up a recorded session-attempt outcome WITHOUT touching session
+    /// state: owner + digest checked, TTL deliberately not consulted —
+    /// replaying a committed outcome creates no new effects, so a dead
+    /// epoch or a terminal session must not hide it. Used by the adapter
+    /// replay pre-check (a retried envelope replays even after its session
+    /// ended). Digest mismatch rejects as key reuse, like the tx path.
+    pub fn session_attempt_receipt(
+        &self,
+        scope: &OperationScope,
+    ) -> DomainResult<Option<(SessionHandle, u32)>> {
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let snapshot = self.db.read_tx();
+        let raw = snapshot
+            .get(&self.session_ops, scope.op_key())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let rec: SessionReceipt = serde_json::from_slice(raw.as_ref())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        Self::check_scope_owner(rec.scope.as_ref(), scope)?;
+        if rec.digest != scope.request_digest {
+            return Err(DomainError::new(
+                DomainErrorCode::KeyReuseDifferentInput,
+                "operation key reused with different input",
+            ));
+        }
+        Ok(Some((rec.session, rec.seq.unwrap_or(0))))
     }
 
     /// Record a session attempt as ONE canonical operation (re-review P1-3):
@@ -4426,7 +4485,9 @@ impl CanonicalRepository {
         Ok(self.get_suggestions()?.into_iter().find(|s| s.id == id))
     }
 
-    /// Store a suggestion (keyed by ID).
+    /// Store a suggestion (keyed by ID). Blind write (no receipt): tests,
+    /// bench seeding and offline repair only — production tool writes go
+    /// through `respond_suggestion_idempotent`.
     pub fn put_suggestion(
         &self,
         suggestion: &ltmrs_domain::session::Suggestion,
@@ -4465,13 +4526,14 @@ impl CanonicalRepository {
     /// reuse. A missing suggestion errors unlogged, so a retry re-evaluates.
     pub fn respond_suggestion_idempotent(
         &self,
-        scope: &OperationScope,
+        admitted: &AdmittedScope,
         suggestion_id: u64,
         status: ltmrs_domain::session::SuggestionStatus,
         now_millis: u64,
     ) -> DomainResult<RecordedSuggestionOp> {
+        // Admission-once: TTL was checked at tool entry, not revalidated here.
+        let scope = admitted.scope();
         let _restore_guard = self.restore_lock.read().unwrap();
-        self.validate_scope(scope)?;
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
         let op_key = scope.op_key();
         for _attempt in 0..MAX_RETRIES {
@@ -6479,6 +6541,61 @@ mod tests {
         let err = repo.store_generation().unwrap_err();
         assert_eq!(err.code, DomainErrorCode::Validation);
         assert!(err.message.contains("corrupt"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn committed_operation_replays_after_namespace_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = std::sync::Arc::new(ltmrs_domain::clock::FrozenClock::new(1000));
+        let repo =
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), clock.clone())
+                .unwrap();
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+        repo.issue_namespace(fe, ch(2), 1000).unwrap();
+        repo.apply(
+            &ctx(1, "d1"),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(1), "x"),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+        drop(repo);
+        // Past the 24h TTL: the namespace is dead, but the durable receipt
+        // must still replay instead of refusing as stale.
+        let late = std::sync::Arc::new(ltmrs_domain::clock::FrozenClock::new(
+            1000 + crate::repository::DEFAULT_NAMESPACE_TTL_MILLIS + 1,
+        ));
+        let repo2 =
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), late).unwrap();
+        let replayed = repo2
+            .apply(
+                &ctx(1, "d1"),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(1), "x"),
+                    session: None,
+                    auto_link: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            replayed.operation_id,
+            ctx(1, "d1").operation_id,
+            "expired epoch must replay the recorded receipt"
+        );
+        // …while genuinely fresh work under the dead epoch still refuses.
+        let err = repo2
+            .apply(
+                &ctx(2, "d2"),
+                &DomainCommand::AddMemory {
+                    memory: memory(eid(2), "y"),
+                    session: None,
+                    auto_link: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::StaleReplay);
     }
 
     #[test]
@@ -8643,19 +8760,9 @@ mod tests {
         );
         assert!(err.message.contains("expired"), "got: {err:?}");
         assert!(repo.get_session(handle).unwrap().is_none());
-        let err = repo
-            .practice_guide_idempotent(
-                &scope(801, "d-exp"),
-                "git",
-                "dev-tool",
-                None,
-                &[],
-                &[],
-                &[],
-                None,
-                expired_at,
-            )
-            .unwrap_err();
+        // Admission-once: the expired envelope is rejected at the gate,
+        // before any store call runs.
+        let err = repo.admit_scope(&scope(801, "d-exp")).unwrap_err();
         assert_eq!(
             err.code,
             ltmrs_domain::command::DomainErrorCode::StaleReplay
@@ -9105,7 +9212,7 @@ mod tests {
         let rev_beta = repo.get_guide("beta").unwrap().unwrap().entity_revision;
         // Concurrent update AFTER planning (practice bumps the revision).
         repo.practice_guide_idempotent(
-            &scope(900, "digest-1"),
+            &repo.admit_scope(&scope(900, "digest-1")).unwrap(),
             "alpha",
             "dev-tool",
             None,
@@ -9180,7 +9287,7 @@ mod tests {
         let rev = repo.get_guide("g").unwrap().unwrap().entity_revision;
         // Concurrent writer bumps the revision (practice path).
         repo.practice_guide_idempotent(
-            &scope(901, "d1"),
+            &repo.admit_scope(&scope(901, "d1")).unwrap(),
             "g",
             "dev-tool",
             None,
@@ -9215,7 +9322,7 @@ mod tests {
         let (repo, _dir) = repo_with_ns();
         let practice = || {
             repo.practice_guide_idempotent(
-                &scope(902, "digest-p"),
+                &repo.admit_scope(&scope(902, "digest-p")).unwrap(),
                 "git",
                 "dev-tool",
                 None,
