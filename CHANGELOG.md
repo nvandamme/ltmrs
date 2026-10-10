@@ -5,7 +5,24 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-09 — Tool-atomicity wave: staged completion, FTS honesty, evidence
+## 2026-10-10 — Whole-tree file-split wave (1500/800 LOC rule)
+
+- Whole-tree file-split wave (AGENTS.md rule 2, 1500 LOC ceiling / 800 preferred): `crates/daemon/src/tools.rs` 5800+ -> 236 lib-only lines (25 domain modules + 15 test modules); `crates/service/src/repository.rs` 9400 -> ~760 lib lines (11 domain modules + 13 test modules). All moves verbatim (git-HEAD-verified where repaired); gates: fmt clean, clippy clean (daemon+service), daemon lib 231/231, service lib 108/108.
+- Split incident repairs (all verified): 5 brace/import off-by-ones recovered byte-identical from HEAD; one +2 shift junction repaired; E0252 dupes removed; cross-sibling privates upgraded to pub(crate) with compiler-enumerated precision; empty mod shells deleted.
+- `crates/daemon/src/server.rs` 2316 -> ~350 lib lines (workers/connection/guards + lifecycle/projection/test_support); `handle_connection` stays `pub` via `pub mod connection` with call-site path updates (client.rs, frontend, visualizer; no shim). Gates: daemon lib 231/231 green, check clean.
+- `crates/frontend/src/frontend/mcp.rs` 3160 -> lib core (4 parse modules + handler + connection/resume/route/test_support); `handle_connection` publicity restored via `pub mod connection` with call-site path updates (no shim). Gates: frontend lib 96/96 green, check clean.
+- `crates/search/src/retrieval/engine.rs` 2886 -> lib core (legs/shaping submodules + 5 test modules); `include_str!` fixture path adjusted for new depth. Gates: search lib 178/178 green, check clean.
+- `crates/search/src/search/projector.rs` 1985 -> lib core (worker submodule + 4 test modules). Notable: tokio-vs-std Mutex caught by compiler; glob-import lint lesson (test files need explicit imports). Gates: search lib 178/178 green, check clean.
+- `crates/search/src/search/table.rs` 1591 -> lib core (reads/writes/maintenance submodules + 3 test modules). Lesson: cross-crate APIs must stay `pub` (pub(crate) broke daemon callers); glob-import lint gap confirmed again. Gates: search lib 178/178 green, check clean.
+- `crates/domain/src/interpreter.rs` 1572 -> struct+ctor core (4 domain modules + 6 test modules). Gates: domain lib 48/48 green, check clean.
+- `crates/interchange/src/restore.rs` 1658 -> types core (coordinator/verify submodules + 4 test modules). Cross-crate API preserved (`pub mod verify`, ConfirmRequest stays parent, daemon paths updated). Gates: interchange lib 30/30 green, check clean.
+- `crates/search/src/search/backend.rs` 1075 -> core + embedders/e5 submodules + backend_tests. Cross-crate embedder paths updated in daemon (no shim). Gates: search lib 178/178 green, check clean.
+- `crates/frontend/src/frontend/serve.rs` 1113 -> layout core (daemon submodule (pub) + 2 test modules); binary import paths updated. Gates: frontend lib 96/96 green, check clean.
+- `crates/embeddings/src/e5_small.rs` 1125 -> types core (adapter submodule + e5_tests; impl move never moves the type, paths unchanged). Gates: embeddings lib 25/25 green, check clean.
+- `src/bench/quality.rs` 1207 -> harness core (quality_tests + quality_fixture_tests). Full workspace gate: 810 passed / 0 failed, fmt clean, clippy clean.
+- Review: formal pass (exact fn+type parity HEAD-vs-worktree on all 13 splits) + functional pass (810/810 green, byte-identical recoveries). 221 files census: zero over 800 LOC.
+
+## 02deede (2026-10-09) — Tool-atomicity wave: staged completion, FTS honesty, evidence
 
 ### Tool-atomicity wave (staged completion)
 - Staged tool completion (`crates/daemon/src/tools.rs`,

@@ -301,7 +301,7 @@ pub async fn run_foreground(port: Option<u16>, store: &str) -> Result<String, Cl
     println!("serving at http://127.0.0.1:{port}/?token={token}");
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        ltmrs_frontend::frontend::serve::shutdown_signal().await;
+        ltmrs_frontend::frontend::serve::daemon::shutdown_signal().await;
         let _ = tx.send(());
     });
     serve_with_token(listener, store.to_string(), rx, token.clone()).await?;
@@ -348,7 +348,7 @@ pub async fn run_background(port: Option<u16>) -> Result<String, CliError> {
         .stderr(std::process::Stdio::inherit());
     // Detach from our terminal signal group (shared with the daemon spawn):
     // new session on unix, CREATE_NEW_PROCESS_GROUP on Windows.
-    ltmrs_frontend::frontend::serve::detach_child(&mut child);
+    ltmrs_frontend::frontend::serve::daemon::detach_child(&mut child);
     let mut child = child
         .spawn()
         .map_err(|e| CliError::Runtime(format!("cannot spawn visualizer child: {e}")))?;

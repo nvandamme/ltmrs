@@ -288,7 +288,8 @@ mod tests {
     use crate::envelope::DomainRequest;
     use crate::envelope::{IpcEnvelope, PROTOCOL_VERSION};
     use crate::runtime::RuntimePaths;
-    use crate::server::{Daemon, DaemonConfig, handle_connection};
+    use crate::server::connection::handle_connection;
+    use crate::server::{Daemon, DaemonConfig};
     use ltmrs_domain::command::Scope;
     use ltmrs_domain::id::{ChannelId, FrontendId, OperationId, StoreGeneration};
     use uuid::Uuid;

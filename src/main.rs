@@ -15,10 +15,10 @@ use ltmrs_frontend::cli::{
     CliError, Command, help_text, install_shim_command, install_skill_command, parse_args,
     provision_models_command, run_library, version_text,
 };
-use ltmrs_frontend::frontend::serve::{
-    daemon_idle_ms, daemon_socket_path, ensure_daemon_process, home_dir, resolve_home,
-    run_daemon_foreground, serve_stdio, stdio_layout,
+use ltmrs_frontend::frontend::serve::daemon::{
+    daemon_idle_ms, daemon_socket_path, ensure_daemon_process, run_daemon_foreground, serve_stdio,
 };
+use ltmrs_frontend::frontend::serve::{home_dir, resolve_home, stdio_layout};
 
 #[tokio::main]
 async fn main() {
