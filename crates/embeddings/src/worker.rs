@@ -372,6 +372,21 @@ mod tests {
         }
     }
 
+    /// Wait until `cond` holds (deadline-bounded convergence): the outcome
+    /// is deterministic — passes on state, fails loudly on timeout. Time
+    /// only bounds failure, never decides success. Ordering that must be
+    /// proven before acting uses fixture gate channels instead.
+    fn wait_for(desc: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {desc}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn worker_processes_requests_and_accounts_batches() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -442,14 +457,34 @@ mod tests {
 
     #[test]
     fn cancel_all_drops_queued_requests_without_inference() {
-        // Slow adapter so queued requests are still pending when we cancel.
-        struct SlowEmbedder;
-        impl SyncEmbedder for SlowEmbedder {
+        // Gated adapter: the test proves the worker picked up request 1
+        // (entry signal) before queueing request 2, so "still pending"
+        // is structural, never a 5ms hope.
+        struct GatedSlowEmbedder {
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl SyncEmbedder for GatedSlowEmbedder {
             fn embed_batch(
                 &mut self,
                 inputs: &[EmbedInput],
             ) -> ArtifactResult<Vec<EmbeddedSequence>> {
-                std::thread::sleep(Duration::from_millis(50));
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = rx.recv();
+                }
                 Ok(inputs
                     .iter()
                     .map(|_| EmbeddedSequence {
@@ -461,15 +496,21 @@ mod tests {
             }
         }
 
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (handle, _worker) = spawn_worker(
-            SlowEmbedder,
+            GatedSlowEmbedder {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            },
             EmbeddingWorkerConfig {
                 max_batch_size: 1,
                 max_queue_depth: 8,
             },
         );
 
-        // Submit two requests while the worker is busy with the first.
+        // Submit request 1 and prove the worker picked it up (it now
+        // blocks on the release gate); queue request 2 behind it.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (rx1, _) = handle
@@ -478,8 +519,9 @@ mod tests {
                     role: Role::Query,
                 }])
                 .unwrap();
-            // Worker picks up request 1 and sleeps; queue request 2.
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("worker must pick up request 1");
             let (rx2, _) = handle
                 .submit(vec![EmbedInput {
                     text: "b".into(),
@@ -487,19 +529,20 @@ mod tests {
                 }])
                 .unwrap();
 
-            // Cancel everything queued after this point.
+            // Cancel everything queued after this point, then release:
+            // request 1 was already picked up (cooperative cancellation
+            // applies at pop time), so it runs to completion; request 2
+            // is stale when popped and must drop without inference.
             handle.cancel_all();
+            let _ = release_tx.send(());
 
             match rx1.await.unwrap() {
-                Ok(_) => {} // processed before cancel — acceptable (cooperative)
-                Err(ServiceError::Cancelled) => {}
-                Err(e) => panic!("unexpected error: {e}"),
+                Ok(_) => {}
+                Err(e) => panic!("picked-up request must complete, got: {e}"),
             }
-            // The second request must be cancelled, never inferred.
             match rx2.await.unwrap() {
-                Ok(_) => panic!("request after cancel_all must not succeed"),
                 Err(ServiceError::Cancelled) => {}
-                Err(e) => panic!("expected Cancelled, got: {e}"),
+                other => panic!("queued request must cancel without inference, got: {other:?}"),
             }
         });
 
@@ -527,25 +570,47 @@ mod tests {
             .unwrap();
         drop(rx);
 
-        // Let the worker process the request.
-        std::thread::sleep(Duration::from_millis(50));
-        let stats = handle.stats();
-        assert!(
-            stats.cancelled_requests >= 1,
-            "dropped receiver must count as cancellation"
+        // Wait for the worker to process and account the drop (bounded
+        // convergence, not a fixed hope-sleep).
+        wait_for(
+            "dropped-receiver cancellation",
+            Duration::from_secs(10),
+            || handle.stats().cancelled_requests >= 1,
         );
         handle.shutdown();
     }
 
     #[test]
     fn full_queue_reports_busy_backpressure() {
-        struct SlowEmbedder;
-        impl SyncEmbedder for SlowEmbedder {
+        // Gated adapter: the worker holds request 1 (proven via the entry
+        // signal) while the test fills the queue, so "full" is structural,
+        // never a 5ms hope. Queue depth 2 with one request in the worker
+        // fits two more queued; the fourth submit is deterministically Busy.
+        struct GatedEmbedder {
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl SyncEmbedder for GatedEmbedder {
             fn embed_batch(
                 &mut self,
                 inputs: &[EmbedInput],
             ) -> ArtifactResult<Vec<EmbeddedSequence>> {
-                std::thread::sleep(Duration::from_millis(50));
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = rx.recv();
+                }
                 Ok(inputs
                     .iter()
                     .map(|_| EmbeddedSequence {
@@ -557,44 +622,56 @@ mod tests {
             }
         }
 
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (handle, _worker) = spawn_worker(
-            SlowEmbedder,
+            GatedEmbedder {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            },
             EmbeddingWorkerConfig {
                 max_batch_size: 1,
                 max_queue_depth: 2,
             },
         );
 
-        // The worker processes one at a time; queue depth 2 means 3 requests fit.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            // Fill the queue while the worker is busy with the first request.
             let (rx1, _) = handle
                 .submit(vec![EmbedInput {
                     text: "a".into(),
                     role: Role::Query,
                 }])
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("worker must pick up request 1");
+            // Worker holds request 1; fill both queue slots behind it.
             let (rx2, _) = handle
                 .submit(vec![EmbedInput {
                     text: "b".into(),
                     role: Role::Query,
                 }])
                 .unwrap();
+            let (rx3, _) = handle
+                .submit(vec![EmbedInput {
+                    text: "c".into(),
+                    role: Role::Query,
+                }])
+                .unwrap();
 
-            // Third request should hit the full queue (or succeed if timing differs).
+            // Queue full: the next submit is Busy, deterministically.
             match handle.submit(vec![EmbedInput {
-                text: "c".into(),
+                text: "d".into(),
                 role: Role::Query,
             }]) {
                 Err(ServiceError::Busy) => {}
-                Ok((rx3, _)) => {
-                    let _ = rx1.await;
-                    let _ = rx2.await;
-                    let _ = rx3.await;
-                }
-                Err(other) => panic!("unexpected submit error in backpressure test: {other}"),
+                other => panic!("full queue must report Busy, got: {other:?}"),
+            }
+
+            let _ = release_tx.send(());
+            for rx in [rx1, rx2, rx3] {
+                rx.await.unwrap().unwrap();
             }
         });
 

@@ -214,36 +214,74 @@ mod tests {
 
     #[tokio::test]
     async fn service_cancellation_via_drop() {
-        struct SlowEmbedder;
-        impl SyncEmbedder for SlowEmbedder {
+        // Gated adapter: the entry signal proves the worker picked up the
+        // request before the abort (no 20ms hope); the completion signal
+        // proves the worker finished the attempt and accounted it (no
+        // 150ms hope). The inference window itself stays a bounded sleep
+        // (fixture duration, not a race).
+        struct GatedSlowEmbedder {
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            done: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        }
+        impl SyncEmbedder for GatedSlowEmbedder {
             fn embed_batch(
                 &mut self,
                 inputs: &[EmbedInput],
             ) -> crate::artifacts::ArtifactResult<Vec<EmbeddedSequence>> {
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                Ok(inputs
+                let result = Ok(inputs
                     .iter()
                     .map(|_| EmbeddedSequence {
                         vector: vec![1.0],
                         input_ids: vec![],
                         attention_mask: vec![],
                     })
-                    .collect())
+                    .collect());
+                if let Some(tx) = self.done.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = tx.send(());
+                }
+                result
             }
         }
 
-        let svc = EmbeddingService::spawn(SlowEmbedder, EmbeddingWorkerConfig::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let svc = EmbeddingService::spawn(
+            GatedSlowEmbedder {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                done: std::sync::Mutex::new(Some(done_tx)),
+            },
+            EmbeddingWorkerConfig::default(),
+        );
 
         // Start an embed but cancel it by dropping the future.
         let inner_svc = svc.clone();
         let handle = tokio::spawn(async move { inner_svc.embed("long text", Role::Query).await });
 
-        // Give the worker time to pick up the request, then abort.
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        // Abort only after the worker provably picked up the request.
+        let entered = tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        entered.expect("worker must pick up the request");
         handle.abort();
 
-        // Wait for the worker to notice the cancellation.
-        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        // Wait for the worker to finish the attempt and account it.
+        let done = tokio::task::spawn_blocking(move || {
+            done_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        done.expect("worker must finish the attempt");
 
         let stats = svc.stats();
         assert!(

@@ -5,7 +5,11 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-10 — Whole-tree file-split wave (1500/800 LOC rule)
+## 2026-10-10 — Companion rule-hygiene + deterministic tests
+
+- Companion rule-hygiene + deterministic tests (user WIP): AGENTS.md module-hygiene rules text (1500 LOC ceiling / 800 preferred, shared-first, no shims/re-exports); `crates/service/src/lib.rs` re-export facade removal per rule 6; gated (signal-based, no sleep-hopes) cancellation/worker tests in `crates/embeddings/src/service.rs` + `worker.rs`.
+
+## db3371f (2026-10-10) — Whole-tree file-split wave (1500/800 LOC rule)
 
 - Whole-tree file-split wave (AGENTS.md rule 2, 1500 LOC ceiling / 800 preferred): `crates/daemon/src/tools.rs` 5800+ -> 236 lib-only lines (25 domain modules + 15 test modules); `crates/service/src/repository.rs` 9400 -> ~760 lib lines (11 domain modules + 13 test modules). All moves verbatim (git-HEAD-verified where repaired); gates: fmt clean, clippy clean (daemon+service), daemon lib 231/231, service lib 108/108.
 - Split incident repairs (all verified): 5 brace/import off-by-ones recovered byte-identical from HEAD; one +2 shift junction repaired; E0252 dupes removed; cross-sibling privates upgraded to pub(crate) with compiler-enumerated precision; empty mod shells deleted.
