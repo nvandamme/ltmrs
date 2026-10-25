@@ -11,7 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The 26 tools (11 WP-08 + 15 WP-09).
+/// The served tools: 26 frozen (11 WP-08 + 15 WP-09) plus ltmrs-native
+/// extensions appended after (never interleaved with the frozen prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
@@ -44,6 +45,7 @@ pub enum ToolName {
     BackupCreate,
     BackupPreview,
     BackupRestore,
+    BackupImportLemma,
 }
 
 impl ToolName {
@@ -79,6 +81,7 @@ impl ToolName {
             Self::BackupCreate => "backup_create",
             Self::BackupPreview => "backup_preview",
             Self::BackupRestore => "backup_restore",
+            Self::BackupImportLemma => "backup_import_lemma",
         }
     }
 
@@ -114,6 +117,7 @@ impl ToolName {
             "backup_create" => Self::BackupCreate,
             "backup_preview" => Self::BackupPreview,
             "backup_restore" => Self::BackupRestore,
+            "backup_import_lemma" => Self::BackupImportLemma,
             _ => return None,
         })
     }
@@ -265,6 +269,15 @@ pub struct BackupRestoreArgs {
     pub confirm: Option<bool>,
 }
 
+/// backup_import_lemma arguments (ltmrs-native tool; unconfirmed previews a
+/// legacy backup with loss accounting, explicit confirmation executes the
+/// fenced replace — mirroring the backup_preview/restore two-step pattern).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackupImportLemmaArgs {
+    pub path: Option<String>,
+    pub confirm: Option<bool>,
+}
+
 /// semantic_search arguments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticSearchArgs {
@@ -273,8 +286,9 @@ pub struct SemanticSearchArgs {
     pub top_k: Option<usize>,
     pub offset: Option<usize>,
     /// Hybrid dense+lexical retrieval. None (absent) means hybrid when a
-    /// backend is attached (current default); Some(false) forces
-    /// lexical-only (upstream parity on demand); Some(true) is hybrid.
+    /// backend is attached (current default); Some(false) serves the
+    /// Lemma-faithful TF-IDF reference profile (corpus-wide TF-IDF cosine +
+    /// threshold, no dense leg, no FTS index); Some(true) is hybrid.
     pub hybrid: Option<bool>,
     pub explain: bool,
     pub response_format: Option<ResponseFormat>,
@@ -444,6 +458,7 @@ pub enum ToolArgs {
     BackupCreate(BackupCreateArgs),
     BackupPreview(BackupPreviewArgs),
     BackupRestore(BackupRestoreArgs),
+    BackupImportLemma(BackupImportLemmaArgs),
 }
 
 impl ToolArgs {
@@ -479,11 +494,11 @@ impl ToolArgs {
             Self::BackupCreate(_) => ToolName::BackupCreate,
             Self::BackupPreview(_) => ToolName::BackupPreview,
             Self::BackupRestore(_) => ToolName::BackupRestore,
+            Self::BackupImportLemma(_) => ToolName::BackupImportLemma,
         }
     }
 
-    /// Whether this tool can mutate canonical store state (data rows,
-    /// receipts, watermarks — including the access-count side effects of
+    /// Whether this tool can mutate canonical store state (data rows,    /// receipts, watermarks — including the access-count side effects of
     /// read-shaped tools routed through the command gateway, which is why
     /// `MemoryRead` counts as mutating here even though its frozen MCP
     /// annotation stays read-only). The dispatcher requires a live retry
@@ -521,8 +536,28 @@ impl ToolArgs {
             | Self::SessionAttempt(_)
             | Self::SessionEnd(_)
             | Self::SuggestionRespond(_)
-            | Self::BackupRestore(_) => true,
+            | Self::BackupRestore(_)
+            | Self::BackupImportLemma(_) => true,
         }
+    }
+}
+
+/// The wire legacy project for a tool call (already normalized at the
+/// parse boundary; `None` covers absent and `"global"`). Shared by the
+/// frontend (envelope identity) and the daemon (scope resolution) so the
+/// two never disagree on which arg carries the legacy scope.
+pub fn tool_project(tool: &ToolArgs) -> Option<String> {
+    match tool {
+        ToolArgs::MemoryRead(a) => a.project.clone(),
+        ToolArgs::MemoryAdd(a) => a.project.clone(),
+        ToolArgs::MemoryMerge(a) => a.project.clone(),
+        ToolArgs::MemoryStats(a) => a.project.clone(),
+        ToolArgs::MemoryLibrary(a) => a.project.clone(),
+        ToolArgs::SemanticSearch(a) => a.project.clone(),
+        ToolArgs::ConflictScan(a) => a.project.clone(),
+        ToolArgs::ProactiveAnalysis(a) => a.project.clone(),
+        ToolArgs::ProjectAnalytics(a) => a.project.clone(),
+        _ => None,
     }
 }
 
@@ -614,6 +649,58 @@ mod tests {
                 initial_approach: None,
             })
             .mutates_store()
+        );
+    }
+
+    /// The wire legacy project for a tool call (already normalized at the
+    /// parse boundary; `None` covers absent and `"global"`).
+    #[test]
+    fn tool_project_extracts_wire_project() {
+        assert_eq!(
+            super::tool_project(&ToolArgs::MemoryRead(MemoryReadArgs {
+                project: Some("shop".into()),
+                ..Default::default()
+            })),
+            Some("shop".to_string())
+        );
+        assert_eq!(
+            super::tool_project(&ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: "f".into(),
+                ..Default::default()
+            })),
+            None
+        );
+        assert_eq!(
+            super::tool_project(&ToolArgs::SessionStart(SessionStartArgs {
+                task_type: "t".into(),
+                ..Default::default()
+            })),
+            None
+        );
+    }
+
+    /// backup_import_lemma rides the wire name both ways and gates on a
+    /// live namespace (its confirm path replaces the store).
+    #[test]
+    fn backup_import_lemma_wire_name_and_mutation() {
+        assert_eq!(
+            ToolName::parse("backup_import_lemma"),
+            Some(ToolName::BackupImportLemma)
+        );
+        assert_eq!(ToolName::BackupImportLemma.as_str(), "backup_import_lemma");
+        assert!(
+            ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
+                path: None,
+                confirm: None,
+            })
+            .mutates_store()
+        );
+        assert_eq!(
+            super::tool_project(&ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
+                path: None,
+                confirm: None,
+            })),
+            None
         );
     }
 }

@@ -97,6 +97,10 @@ pub struct Session {
     pub handle: SessionHandle,
     pub channel_id: ChannelId,
     pub project: Option<String>,
+    /// Stable project identity (Wave A3b): mirrors `Memory::project_id`.
+    /// Serde default keeps pre-wave rows loadable as `None`.
+    #[serde(default)]
+    pub project_id: Option<EntityId>,
     pub task_type: Option<String>,
     pub technologies: Vec<String>,
     pub status: SessionStatus,
@@ -230,6 +234,44 @@ pub enum SessionOp<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stable-id sessions (Wave A3b): a session carries the resolved
+    /// `project_id` alongside the frozen bare-string `project`; pre-wave
+    /// rows decode as `None`.
+    #[test]
+    fn session_carries_project_id() {
+        use crate::id::{ChannelId, EntityId};
+        use crate::memory::Instant;
+        use uuid::Uuid;
+        let pid = EntityId::new(Uuid::from_u128(0x0456));
+        let s = Session {
+            handle: SessionHandle::new(Uuid::from_u128(9)),
+            channel_id: ChannelId::new(Uuid::from_u128(8)),
+            project: Some("shop".into()),
+            project_id: Some(pid),
+            task_type: None,
+            technologies: vec![],
+            status: SessionStatus::Active,
+            attempts: vec![],
+            outcome: None,
+            final_approach: None,
+            lessons: vec![],
+            initial_approach: None,
+            guides_used: vec![],
+            memories_read: vec![],
+            memories_created: vec![],
+            refinement_attempts: 0,
+            self_critique_count: 0,
+            started_at: Instant::new(1000),
+            ended_at: None,
+            is_virtual: false,
+        };
+        assert_eq!(s.project_id, Some(pid));
+        let mut v = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("project_id");
+        let back: Session = serde_json::from_value(v).unwrap();
+        assert_eq!(back.project_id, None, "old rows load as None");
+    }
 
     #[test]
     fn enums_roundtrip() {

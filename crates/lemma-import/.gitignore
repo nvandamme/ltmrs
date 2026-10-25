@@ -1,0 +1,3 @@
+/target
+# Cargo.lock is COMMITTED for this excluded helper: exact transitive pins
+# make the runtime-loaded cdylib reproducible (reviewed, Wave B5c).

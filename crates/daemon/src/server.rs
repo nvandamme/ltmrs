@@ -1139,6 +1139,7 @@ mod tests {
                 retry_epoch: 1,
                 deadline_millis: None,
                 scope: Scope::default(),
+                identity: crate::envelope::EnvelopeIdentity::default(),
                 body: DomainRequest::ListMemories,
             }
         };
@@ -1481,6 +1482,7 @@ mod tests {
             retry_epoch: 1,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::ListMemories,
         };
         env.frontend_id = FrontendId::new(Uuid::from_u128(99));
@@ -1521,6 +1523,7 @@ mod tests {
             retry_epoch: 1,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
             body: env,
         };
         let resp = client.roundtrip(&envelope).await.unwrap();
@@ -1576,6 +1579,7 @@ mod tests {
                 retry_epoch: hs.retry_epoch,
                 deadline_millis: None,
                 scope: Scope::default(),
+                identity: crate::envelope::EnvelopeIdentity::default(),
                 body: DomainRequest::AddMemory {
                     memory: test_memory(n),
                 },
@@ -1594,6 +1598,7 @@ mod tests {
             retry_epoch: hs.retry_epoch,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::ListMemories,
         };
         let resp = client.roundtrip(&env).await.unwrap();
@@ -1673,6 +1678,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Fact,
             project: None,
+            project_id: None,
             source: MemorySource::Ai,
             confidence: 0.5,
             quality_score: None,
@@ -1831,6 +1837,7 @@ mod tests {
             retry_epoch: hs.retry_epoch,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::AddMemory {
                 memory: test_memory(1),
             },

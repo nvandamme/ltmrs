@@ -220,6 +220,7 @@ impl FrontendRegistry {
             handle,
             channel_id,
             project: None,
+            project_id: None,
             task_type: None,
             technologies: Vec::new(),
             status: SessionStatus::Active,
@@ -349,13 +350,26 @@ impl FrontendRegistry {
     /// Record created-memory links on a virtual session (deduped).
     /// Virtual sessions are routing-ephemeral, so this is best-effort
     /// attribution, never durability. No-op for unknown handles. (Guides
-    /// used and memories read only ever attach to traced sessions, which
-    /// live in the canonical store.)
+    /// used only ever attach to traced sessions, which live in the
+    /// canonical store; reads attach to virtual sessions in-memory only.)
     pub fn track_virtual_created(&mut self, handle: SessionHandle, ids: &[String]) {
         if let Some(session) = self.virtual_sessions.get_mut(&handle) {
             for id in ids {
                 if !session.memories_created.contains(id) {
                     session.memories_created.push(id.clone());
+                }
+            }
+        }
+    }
+
+    /// Record read-memory links on a virtual session (deduped, same rule
+    /// as the canonical preload helper). In-memory routing only, never
+    /// durability. No-op for unknown handles.
+    pub fn track_virtual_read(&mut self, handle: SessionHandle, ids: &[String]) {
+        if let Some(session) = self.virtual_sessions.get_mut(&handle) {
+            for id in ids {
+                if !session.memories_read.contains(id) {
+                    session.memories_read.push(id.clone());
                 }
             }
         }
@@ -638,6 +652,7 @@ mod tests {
             handle: hs(77),
             channel_id: ch(1),
             project: Some("proj".into()),
+            project_id: None,
             task_type: Some("debug".into()),
             technologies: Vec::new(),
             status: ltmrs_domain::session::SessionStatus::Active,

@@ -15,6 +15,11 @@ use crate::session::TaskOutcome;
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Scope {
     pub project: Option<String>,
+    /// Stable project identity (Wave A3b): the full `prj_<name>_<ulid>`
+    /// string. Serde default keeps pre-wave scopes loadable as `None`
+    /// (legacy-only scoping). Parsed by `EffectiveScope::resolve`.
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub fragment_types: Option<Vec<FragmentType>>,
     pub after: Option<u64>,
     pub before: Option<u64>,

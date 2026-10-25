@@ -6,6 +6,7 @@ pub mod dispatcher;
 pub mod envelope;
 pub mod health;
 pub mod idle;
+pub mod lemma_import;
 pub mod limits;
 pub mod registry;
 pub mod runtime;

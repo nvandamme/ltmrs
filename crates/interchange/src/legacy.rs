@@ -1,8 +1,13 @@
 //! Legacy Lemma interchange verdict (WP-11c; T-IMPORT-02 scope note).
 //!
-//! Lemma `.lemma-backup` files carry a base64 SQLite payload. Opening one
-//! requires a C database engine, which the audited native-code policy
-//! (RQ-21: no C++ database engine; CPU release) excludes. The verdict is
+//! Lemma `.lemma-backup` files carry a base64 SQLite payload. The native
+//! backup tools (`backup_preview`/`backup_restore`) refuse these envelopes
+//! explicitly rather than converting them: opening one requires a C
+//! database engine, which the audited native-code policy (RQ-21; no C++
+//! database engine; CPU release) excludes from the main tree. Actual
+//! legacy import is the separate `backup_import_lemma` tool, served by the
+//! runtime-loaded `ltmrs-lemma-import` cdylib (Wave B5c; the only
+//! `rusqlite` edge, never linked into the daemon). The native verdict is
 //! therefore explicit refusal, not conversion:
 //! - [`LEGACY_FORMAT`] envelopes are detected by marker and rejected with
 //!   [`crate::backup::BackupError::LegacyUnsupported`]
@@ -63,6 +68,10 @@ mod tests {
         assert!(
             err.to_string().contains("RQ-21"),
             "reason recorded, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("backup_import_lemma"),
+            "refusal must name the import path, got: {err}"
         );
         let after = Sha256::digest(std::fs::read(&foreign).unwrap());
         assert_eq!(before[..], after[..], "source untouched by refusal");

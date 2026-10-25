@@ -30,7 +30,7 @@ pub enum BackupError {
     #[error("not an ltmrs backup (format marker: {found:?})")]
     Format { found: Option<String> },
     #[error(
-        "legacy Lemma backup {format} v{version:?}: SQLite payloads require a C database engine, excluded by RQ-21; recorded as an unsupported conformance target, never silently converted"
+        "legacy Lemma backup {format} v{version:?}: SQLite payloads require a C database engine, excluded by RQ-21; never silently converted — import legacy backups with backup_import_lemma instead"
     )]
     LegacyUnsupported {
         format: String,
@@ -394,6 +394,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Fact,
             project: None,
+            project_id: None,
             source: MemorySource::Ai,
             confidence: 1.0,
             quality_score: None,
@@ -495,7 +496,7 @@ mod tests {
             Some("Backup fixture guide."),
             &[],
             &[],
-            &[],
+            None,
             None,
             1000,
         )

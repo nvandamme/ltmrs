@@ -20,3 +20,4 @@ pub mod graph_expansion;
 pub mod mmr;
 pub mod ranking;
 pub mod scope;
+pub mod tfidf;

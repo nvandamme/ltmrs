@@ -291,4 +291,52 @@ mod tests {
             other => panic!("expected Download, got {other:?}"),
         }
     }
+
+    /// T-SEC-04: every provision re-verifies digests. A tampered
+    /// pre-existing file fails closed with DigestMismatch even though no
+    /// download is needed (the file exists, so the offline path is not
+    /// taken either) — tampering can never ride along on a cached file.
+    #[tokio::test]
+    async fn ensure_model_reverifies_preexisting_tampered_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ArtifactCache::new(dir.path());
+        let good = sha256_hex(b"real bytes");
+        let m = model("m", &[("a.bin", &good)]);
+        let mdir = cache.model_dir(&m);
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("a.bin"), b"tampered bytes").unwrap();
+
+        match cache.ensure_model(&m, None).await {
+            Err(ArtifactError::DigestMismatch { .. }) => {}
+            other => panic!("expected DigestMismatch for tampered file, got {other:?}"),
+        }
+    }
+
+    /// T-SEC-04 offline mode: a fully provisioned cache serves locally with
+    /// no network client. Closest executable proxy for "post-provision
+    /// local runs need no network" (a real network cut cannot be a unit
+    /// test; the residual gap is documented in the RQ-21 evidence).
+    #[tokio::test]
+    async fn provision_then_run_local_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"model bytes";
+        let digest = sha256_hex(payload);
+        let m = model("m", &[("a.bin", &digest)]);
+        let mdir = ArtifactCache::new(dir.path()).model_dir(&m);
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("a.bin"), payload).unwrap();
+
+        // Provision step with NO client: nothing to download, verification
+        // of the existing file succeeds.
+        ArtifactCache::new(dir.path())
+            .ensure_model(&m, None)
+            .await
+            .expect("provisioned files verify without network");
+        // Run-local step: offline cache loads the same dir, still no client.
+        let offline = ArtifactCache::new(dir.path()).offline();
+        assert!(offline.is_offline());
+        offline
+            .load_cached(&m)
+            .expect("offline load serves provisioned files");
+    }
 }

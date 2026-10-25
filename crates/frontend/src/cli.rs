@@ -24,6 +24,23 @@ pub enum Command {
     Visualize { foreground: bool, port: Option<u16> },
     /// Install/update the managed skill (wired in a later slice).
     InstallSkill,
+    /// Bind this checkout to a stable project identity (Wave A3b):
+    /// writes `<checkout>/.ltmrs/project.json` (`0600`).
+    ProjectBind {
+        here: bool,
+        root: Option<String>,
+        name: Option<String>,
+    },
+    /// Show this checkout's bound identity (bind file + env override).
+    ProjectStatus { root: Option<String> },
+    /// Attach a legacy bucket to this checkout's bound identity (Wave A3c):
+    /// records `--slug` in the id's `legacy_slugs` (explicit intent, warns
+    /// on slugs shared with other identities).
+    ProjectAdopt {
+        here: bool,
+        root: Option<String>,
+        slug: String,
+    },
     /// Install the opt-in legacy `lemma` executable shim.
     InstallShim,
     /// Download + verify the pinned E5 embedding artifacts into the managed home.
@@ -80,6 +97,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         InstallShim,
         ProvisionModels,
         Daemon,
+        Project,
     }
     let mut selected: Option<Selected> = None;
     let mut select = |next: Selected| -> Result<(), CliError> {
@@ -99,6 +117,10 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
     let mut daemon_foreground = false;
     let mut daemon_idle_ms: Option<u64> = None;
     let mut port: Option<u16> = None;
+    let mut here = false;
+    let mut project_root: Option<String> = None;
+    let mut project_name: Option<String> = None;
+    let mut project_slug: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -135,6 +157,25 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                     .ok_or_else(|| CliError::Usage("--socket requires a path".to_string()))?;
                 socket = Some(reject_flag_value("--socket", raw)?);
             }
+            "--here" => here = true,
+            "--root" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--root requires a path".to_string()))?;
+                project_root = Some(reject_flag_value("--root", raw)?);
+            }
+            "--name" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--name requires a value".to_string()))?;
+                project_name = Some(reject_flag_value("--name", raw)?);
+            }
+            "--slug" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--slug requires a value".to_string()))?;
+                project_slug = Some(reject_flag_value("--slug", raw)?);
+            }
             // Daemon subcommand (Part I §7): `ltmrs daemon [--foreground]`.
             "daemon" => select(Selected::Daemon)?,
             other if other.starts_with('-') => {
@@ -144,16 +185,37 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         }
     }
     if !positional.is_empty() {
-        return Err(CliError::Usage(format!(
-            "unexpected arguments: {}",
-            positional.join(" ")
-        )));
+        // Project subcommand: `project bind|status` (positionals, since the
+        // top-level parser is flag-oriented). Anything else stays an error.
+        if positional.len() == 2
+            && positional[0] == "project"
+            && (positional[1] == "bind" || positional[1] == "status" || positional[1] == "adopt")
+        {
+            if selected.is_some() {
+                return Err(CliError::Usage(
+                    "commands are mutually exclusive; pick one".to_string(),
+                ));
+            }
+            selected = Some(Selected::Project);
+        } else {
+            return Err(CliError::Usage(format!(
+                "unexpected arguments: {}",
+                positional.join(" ")
+            )));
+        }
     }
     if selected.as_ref().is_some_and(|s| *s != Selected::Daemon)
         && (daemon_foreground || daemon_idle_ms.is_some())
     {
         return Err(CliError::Usage(
             "--foreground/--daemon-idle-ms require daemon".to_string(),
+        ));
+    }
+    if selected.as_ref().is_some_and(|s| *s != Selected::Project)
+        && (here || project_root.is_some() || project_name.is_some() || project_slug.is_some())
+    {
+        return Err(CliError::Usage(
+            "--here/--root/--name/--slug require project bind/status/adopt".to_string(),
         ));
     }
     match selected {
@@ -205,6 +267,77 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 ));
             }
             Ok(Command::ProvisionModels)
+        }
+        Some(Selected::Project) => {
+            if store.is_some()
+                || socket.is_some()
+                || foreground
+                || port.is_some()
+                || daemon_foreground
+                || daemon_idle_ms.is_some()
+            {
+                return Err(CliError::Usage(
+                    "project takes only bind/status/adopt selectors".to_string(),
+                ));
+            }
+            match positional.get(1).map(|s| s.as_str()) {
+                Some("bind") => {
+                    if here && project_root.is_some() {
+                        return Err(CliError::Usage(
+                            "--here and --root are mutually exclusive".to_string(),
+                        ));
+                    }
+                    if !here && project_root.is_none() {
+                        return Err(CliError::Usage(
+                            "project bind needs a checkout: pass --here or --root DIR".to_string(),
+                        ));
+                    }
+                    if project_slug.is_some() {
+                        return Err(CliError::Usage(
+                            "--slug is for project adopt, not bind".to_string(),
+                        ));
+                    }
+                    Ok(Command::ProjectBind {
+                        here,
+                        root: project_root,
+                        name: project_name,
+                    })
+                }
+                Some("status") => {
+                    if here || project_name.is_some() || project_slug.is_some() {
+                        return Err(CliError::Usage("status takes only --root".to_string()));
+                    }
+                    Ok(Command::ProjectStatus { root: project_root })
+                }
+                Some("adopt") => {
+                    let slug = project_slug.ok_or_else(|| {
+                        CliError::Usage("project adopt needs --slug <slug>".to_string())
+                    })?;
+                    if here && project_root.is_some() {
+                        return Err(CliError::Usage(
+                            "--here and --root are mutually exclusive".to_string(),
+                        ));
+                    }
+                    if !here && project_root.is_none() {
+                        return Err(CliError::Usage(
+                            "project adopt needs a checkout: pass --here or --root DIR".to_string(),
+                        ));
+                    }
+                    if project_name.is_some() {
+                        return Err(CliError::Usage(
+                            "--name is for project bind, not adopt".to_string(),
+                        ));
+                    }
+                    Ok(Command::ProjectAdopt {
+                        here,
+                        root: project_root,
+                        slug,
+                    })
+                }
+                _ => Err(CliError::Usage(
+                    "project requires a subcommand: bind, status or adopt".to_string(),
+                )),
+            }
         }
         None => {
             if store.is_some() {
@@ -263,9 +396,14 @@ ltmrs — local MCP memory service
 Usage: ltmrs [command] [options]
 
 Commands (default with no arguments: stdio):
-  (no args)               Serve MCP over stdio [--socket PATH]
+  (no args)                Serve MCP over stdio [--socket PATH]
   daemon                  Run the shared daemon: ensure serving and exit,
                           or serve inline with --foreground
+   project bind            Bind this checkout to a stable project identity
+                           [--here | --root DIR] [--name NAME]
+   project status          Show this checkout's bound identity [--root DIR]
+   project adopt           Attach a legacy bucket to this checkout's identity
+                           [--here | --root DIR] --slug SLUG
   -lib, --library         Print a knowledge-base snapshot [--store PATH]
   -vis, --visualize       Run the visualizer [--fg] [-p PORT | --port PORT]
   --install-skill         Install/update the managed skill
@@ -280,6 +418,10 @@ Options:
   --foreground            Serve the daemon inline (with daemon)
   --daemon-idle-ms MS    Daemon idle shutdown in ms, 0 = forever
                           (with daemon; default 60000)
+   --here                  Bind the current directory (with project bind/adopt)
+   --root DIR              Bind the given checkout directory (with project bind/status/adopt)
+   --name NAME             Project display name (with project bind; default: directory basename)
+   --slug SLUG             Legacy bucket to attach (with project adopt)
   --fg                    Visualizer in foreground (with -vis)
   -p PORT, --port PORT    Visualizer port 1-65535 (with -vis)
 
@@ -438,6 +580,226 @@ pub async fn provision_models_command(home: Option<String>) -> Result<String, Cl
         models.display(),
         e5_small_artifact().digests.len(),
     ))
+}
+
+/// Bind a checkout to a fresh stable project identity (Wave A3b).
+/// Writes `<checkout>/.ltmrs/project.json` (`0600`); refuses when bound.
+/// The name defaults to the checkout basename (sanitized); the same-name
+/// legacy bucket attaches daemon-side on first acknowledged write, and the
+/// daemon-reported count is printed best-effort here (offline when no
+/// daemon serves).
+pub async fn project_bind_command(
+    here: bool,
+    root: Option<&str>,
+    name: Option<&str>,
+    home: Option<String>,
+) -> Result<String, CliError> {
+    use crate::project::{BIND_DIR, Binding, canonical_root, write_bind};
+    if here && root.is_some() {
+        return Err(CliError::Usage(
+            "--here and --root are mutually exclusive".to_string(),
+        ));
+    }
+    if !here && root.is_none() {
+        return Err(CliError::Usage(
+            "project bind needs a checkout: pass --here or --root DIR".to_string(),
+        ));
+    }
+    let checkout = match root {
+        Some(r) => std::path::PathBuf::from(r),
+        None => std::env::current_dir()
+            .map_err(|e| CliError::Runtime(format!("cannot resolve checkout directory: {e}")))?,
+    };
+    if !checkout.is_dir() {
+        return Err(CliError::Usage(format!(
+            "no checkout at {}",
+            checkout.display()
+        )));
+    }
+    let base = checkout
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let display = match name {
+        Some(n) => ltmrs_domain::project_id::sanitize_name(n),
+        None => ltmrs_domain::project_id::sanitize_name(&base),
+    };
+    let (id_str, _id) = ltmrs_domain::project_id::generate_project_id(&display);
+    let binding = Binding {
+        project_id: id_str.clone(),
+        name: display.clone(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    let path = write_bind(&checkout, &binding).map_err(CliError::Runtime)?;
+    let mut out = format!(
+        "Bound {} to {id_str} (name '{display}')\nWrote {} (owner-only)",
+        checkout.display(),
+        path.display()
+    );
+    out.push_str(&format!(
+        "\nAdd `{BIND_DIR}/` to .gitignore so the binding stays local to this checkout."
+    ));
+    match crate::project::daemon_unattached_count(&display, home).await {
+        Some(n) => out.push_str(&format!(
+            "\n{n} legacy '{display}' fragment(s) will attach to {id_str} on first write."
+        )),
+        None => {
+            let root_note =
+                canonical_root(&checkout).unwrap_or_else(|| checkout.display().to_string());
+            out.push_str(&format!(
+                "\n(daemon unreachable; the legacy '{display}' bucket of {root_note} attaches on first write)"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Show a checkout's bound identity: bind file plus env override.
+pub fn project_status_command(
+    root: Option<String>,
+    env_override: Option<String>,
+    home: Option<String>,
+) -> Result<String, CliError> {
+    use crate::project::{ENV_PROJECT_ID, read_bind};
+    let checkout = match root {
+        Some(r) => std::path::PathBuf::from(r),
+        None => std::env::current_dir()
+            .map_err(|e| CliError::Runtime(format!("cannot resolve checkout directory: {e}")))?,
+    };
+    let mut out = format!("Checkout: {}\n", checkout.display());
+    let bound = read_bind(&checkout).map_err(CliError::Runtime)?;
+    match &bound {
+        Some(b) => out.push_str(&format!(
+            "Bind file: {} (name '{}', created {})\n",
+            b.project_id, b.name, b.created_at
+        )),
+        None => out.push_str("Bind file: none (unbound; writes are unattributed)\n"),
+    }
+    let env = env_override.or_else(|| std::env::var(ENV_PROJECT_ID).ok());
+    let winning: Option<String> = match env.filter(|s| !s.trim().is_empty()) {
+        Some(v) => {
+            out.push_str(&format!(
+                "{ENV_PROJECT_ID}: {} (wins over the bind file)\n",
+                v.trim()
+            ));
+            Some(v.trim().to_string())
+        }
+        None => {
+            out.push_str(&format!("{ENV_PROJECT_ID}: unset\n"));
+            bound.map(|b| b.project_id)
+        }
+    };
+    out.push_str(&attached_slugs_report(winning.as_deref(), home));
+    Ok(out)
+}
+
+/// Best-effort attached-slug line for `project status`: names the slugs the
+/// winning identity attached, or why they are unknown (offline store).
+fn attached_slugs_report(winning: Option<&str>, home: Option<String>) -> String {
+    let Some(full) = winning else {
+        return "Attached slugs: none (unbound)\n".to_string();
+    };
+    let Some((_, id)) = ltmrs_domain::project_id::parse_project_id(full) else {
+        return format!("Attached slugs: unknown (bound identity is malformed: {full})\n");
+    };
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return "Attached slugs: unknown (no home for the local store)\n".to_string();
+    };
+    let store_path = std::path::Path::new(&home)
+        .join(crate::frontend::serve::MANAGED_HOME_DIR)
+        .join(crate::frontend::serve::STORE_DIR_NAME);
+    if !store_path.exists() {
+        return "Attached slugs: unknown (no local store)\n".to_string();
+    }
+    match ltmrs_service::repository::CanonicalRepository::open(
+        store_path.to_str().unwrap_or_default(),
+    ) {
+        Ok(repo) => match repo.project_record(id) {
+            Ok(Some(rec)) if rec.legacy_slugs.is_empty() => "Attached slugs: none\n".to_string(),
+            Ok(Some(rec)) => format!("Attached slugs: {}\n", rec.legacy_slugs.join(", ")),
+            _ => "Attached slugs: unknown (identity not registered yet)\n".to_string(),
+        },
+        Err(_) => "Attached slugs: unknown (store unreachable)\n".to_string(),
+    }
+}
+
+/// Attach a legacy bucket to the checkout's bound identity (Wave A3c).
+/// Requires a bound identity (bind file or `LTMRS_PROJECT_ID` env);
+/// records the normalized slug in the id's `legacy_slugs` and reports the
+/// newly visible row count. Rows are never rewritten.
+pub async fn project_adopt_command(
+    here: bool,
+    root: Option<&str>,
+    slug: &str,
+    home: Option<String>,
+    env_override: Option<String>,
+) -> Result<String, CliError> {
+    use crate::project::{canonical_root, resolve_project_id};
+    if here && root.is_some() {
+        return Err(CliError::Usage(
+            "--here and --root are mutually exclusive".to_string(),
+        ));
+    }
+    if !here && root.is_none() {
+        return Err(CliError::Usage(
+            "project adopt needs a checkout: pass --here or --root DIR".to_string(),
+        ));
+    }
+    let bucket = ltmrs_compat::lemma::tool_args::normalize_project(slug).ok_or_else(|| {
+        CliError::Usage(
+            "project adopt needs a bucket name: pass --slug <slug> (not empty or 'global')"
+                .to_string(),
+        )
+    })?;
+    let checkout = match root {
+        Some(r) => std::path::PathBuf::from(r),
+        None => std::env::current_dir()
+            .map_err(|e| CliError::Runtime(format!("cannot resolve checkout directory: {e}")))?,
+    };
+    if !checkout.is_dir() {
+        return Err(CliError::Usage(format!(
+            "no checkout at {}",
+            checkout.display()
+        )));
+    }
+    let binding = resolve_project_id(Some(&checkout), env_override)
+        .map_err(CliError::Runtime)?
+        .ok_or_else(|| {
+            CliError::Runtime(
+                "no bound identity for this checkout; run `ltmrs project bind --here` (or `--root DIR`) first"
+                    .to_string(),
+            )
+        })?;
+    let (_, id) =
+        ltmrs_domain::project_id::parse_project_id(&binding.project_id).ok_or_else(|| {
+            CliError::Runtime(format!(
+                "bound identity is malformed: {}",
+                binding.project_id
+            ))
+        })?;
+    let canonical = canonical_root(&checkout);
+    let report = crate::project::daemon_adopt_slug(home, &binding.project_id, canonical, &bucket)
+        .await
+        .map_err(CliError::Runtime)?;
+    let full = ltmrs_domain::project_id::format_project_id(&report.record_name, id);
+    let mut out = if report.already_attached {
+        format!("'{bucket}' is already attached to {full} (0 new fragments)")
+    } else {
+        format!(
+            "Attached {} legacy '{bucket}' fragment(s) to {full}",
+            report.attached
+        )
+    };
+    if report.created {
+        out.push_str(" (registered the identity for this checkout)");
+    }
+    if let Some(w) = report.warning {
+        out.push_str(&format!("\nWarning: {w}"));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -839,5 +1201,373 @@ mod tests {
         for flag in ["daemon", "--foreground", "--daemon-idle-ms"] {
             assert!(help.contains(flag), "help must document {flag}");
         }
+    }
+
+    /// `project bind` parses its checkout selectors and name override.
+    #[test]
+    fn project_bind_parses() {
+        assert_eq!(
+            parse(&["project", "bind", "--here"]).unwrap(),
+            Command::ProjectBind {
+                here: true,
+                root: None,
+                name: None,
+            }
+        );
+        // Bare `project bind` (no checkout selector) errors with guidance
+        // instead of silently binding the cwd (explicit-errors philosophy).
+        let err = parse(&["project", "bind"]).unwrap_err();
+        assert!(
+            err.to_string().contains("--here"),
+            "must guide to a selector, got: {err}"
+        );
+        assert_eq!(
+            parse(&["project", "bind", "--root", "/tmp/x", "--name", "shop"]).unwrap(),
+            Command::ProjectBind {
+                here: false,
+                root: Some("/tmp/x".to_string()),
+                name: Some("shop".to_string()),
+            }
+        );
+        assert!(matches!(
+            parse(&["project", "status"]).unwrap(),
+            Command::ProjectStatus { .. }
+        ));
+    }
+
+    /// Project needs a subcommand; selectors conflict; project conflicts
+    /// with every other command.
+    #[test]
+    fn project_usage_and_conflicts() {
+        assert!(parse(&["project"]).is_err());
+        assert!(parse(&["project", "frobnicate"]).is_err());
+        assert!(parse(&["project", "bind", "--here", "--root", "/tmp/x"]).is_err());
+        assert!(parse(&["project", "bind", "--here", "--missing-value"]).is_err());
+        assert!(parse(&["project", "bind", "-lib"]).is_err());
+        assert!(parse(&["-lib", "project", "status"]).is_err());
+        assert!(parse(&["project", "status", "--store", "/tmp/s"]).is_err());
+    }
+
+    /// Help documents the project surface.
+    #[test]
+    fn help_documents_project() {
+        let help = help_text();
+        for flag in [
+            "project", "bind", "status", "adopt", "--here", "--root", "--name", "--slug",
+        ] {
+            assert!(help.contains(flag), "help must document {flag}");
+        }
+    }
+
+    /// `project bind --root` writes a bind file offline (no daemon needed).
+    #[tokio::test]
+    async fn project_bind_writes_file_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        let out = project_bind_command(
+            false,
+            Some(root.to_str().unwrap()),
+            None,
+            Some("/nonexistent-home-xyz".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("prj_shop_"), "got: {out}");
+        assert!(
+            out.contains(".gitignore"),
+            "must name the gitignore hint, got: {out}"
+        );
+        let binding = crate::project::read_bind(&root).unwrap().unwrap();
+        assert_eq!(binding.name, "shop");
+        assert!(binding.project_id.starts_with("prj_shop_"));
+    }
+
+    /// Re-binding refuses; `project status` shows the binding.
+    #[tokio::test]
+    async fn project_bind_refuses_and_status_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        project_bind_command(
+            false,
+            Some(root.to_str().unwrap()),
+            None,
+            Some("/nonexistent-home-xyz".to_string()),
+        )
+        .await
+        .unwrap();
+        let err = project_bind_command(false, Some(root.to_str().unwrap()), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already bound"), "got: {err}");
+        let status =
+            project_status_command(Some(root.to_str().unwrap().to_string()), None, None).unwrap();
+        assert!(status.contains("prj_shop_"), "got: {status}");
+    }
+
+    /// `project adopt --slug` parses its selectors; bare `project adopt`
+    /// (no --slug) errors with usage naming the flag.
+    #[test]
+    fn project_adopt_parses_and_bare_errors() {
+        assert_eq!(
+            parse(&["project", "adopt", "--slug", "other", "--here"]).unwrap(),
+            Command::ProjectAdopt {
+                here: true,
+                root: None,
+                slug: "other".to_string(),
+            }
+        );
+        assert_eq!(
+            parse(&["project", "adopt", "--slug", "other", "--root", "/tmp/x"]).unwrap(),
+            Command::ProjectAdopt {
+                here: false,
+                root: Some("/tmp/x".to_string()),
+                slug: "other".to_string(),
+            }
+        );
+        for argv in [
+            vec!["project", "adopt", "--here"],
+            vec!["project", "adopt"],
+            vec!["project", "adopt", "--here", "--root", "/tmp/x"],
+        ] {
+            let err = parse(&argv).unwrap_err();
+            assert!(
+                err.to_string().contains("--slug") || err.to_string().contains("--here"),
+                "adopt misuse must error with usage, got: {err}"
+            );
+        }
+        let err = parse(&["project", "adopt"]).unwrap_err();
+        assert!(
+            err.to_string().contains("--slug"),
+            "bare adopt must name --slug, got: {err}"
+        );
+    }
+
+    /// Adopt rejects conflicting selectors and foreign flags.
+    #[test]
+    fn project_adopt_usage_and_conflicts() {
+        assert!(
+            parse(&[
+                "project", "adopt", "--slug", "x", "--here", "--root", "/tmp/x"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["project", "adopt", "--slug", "x"]).is_err());
+        assert!(parse(&["project", "adopt", "--slug", "x", "--name", "y", "--here"]).is_err());
+        assert!(parse(&["project", "bind", "--here", "--slug", "x"]).is_err());
+        assert!(parse(&["project", "status", "--slug", "x"]).is_err());
+        assert!(parse(&["project", "adopt", "--slug", "-lib", "--here"]).is_err());
+    }
+
+    /// Adopt on an unbound checkout errors guiding to `project bind --here`.
+    #[tokio::test]
+    async fn project_adopt_requires_bound_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        let err = project_adopt_command(
+            false,
+            Some(root.to_str().unwrap()),
+            "other",
+            Some(dir.path().to_str().unwrap().to_string()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("project bind --here"),
+            "must guide to bind, got: {err}"
+        );
+    }
+
+    fn legacy_memory(n: u128, slug: &str) -> ltmrs_domain::memory::Memory {
+        use ltmrs_domain::memory::{FragmentType, Instant, Memory, MemoryLifecycle, MemorySource};
+        Memory {
+            id: ltmrs_domain::id::EntityId::new(uuid::Uuid::from_u128(n)),
+            external_alias: None,
+            title: format!("legacy {slug}"),
+            fragment: format!("legacy {slug} fragment"),
+            description: String::new(),
+            fragment_type: FragmentType::Fact,
+            project: Some(slug.into()),
+            project_id: None,
+            source: MemorySource::Ai,
+            confidence: 0.5,
+            quality_score: None,
+            lifecycle: MemoryLifecycle::Live,
+            tags: vec![],
+            associated_with: vec![],
+            relations: vec![],
+            parent_id: None,
+            child_ids: vec![],
+            session_id: None,
+            task_type: None,
+            related_guides: vec![],
+            evidence: vec![],
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: ltmrs_domain::id::EntityRevision::new(1),
+            document_revision: ltmrs_domain::id::DocumentRevision::new(1),
+            eligibility_revision: ltmrs_domain::id::EligibilityRevision::new(1),
+            created_at: Instant::new(100),
+            updated_at: Instant::new(100),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn add_legacy_row(repo: &ltmrs_service::repository::CanonicalRepository, n: u128, slug: &str) {
+        use ltmrs_domain::command::DomainCommand;
+        use ltmrs_domain::id::{ChannelId, FrontendId, OperationId, StoreGeneration};
+        let fe = FrontendId::new(uuid::Uuid::from_u128(1));
+        let ch = ChannelId::new(uuid::Uuid::from_u128(2));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ns = repo.issue_namespace(fe, ch, now).unwrap();
+        let ctx = ltmrs_domain::command::CommandContext {
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe,
+            channel_id: ch,
+            session: None,
+            operation_id: OperationId::new(uuid::Uuid::from_u128(n + 100)),
+            request_digest: format!("adopt-fixture-{n}"),
+            deadline_millis: None,
+            scope: Default::default(),
+            retry_epoch: ns.retry_epoch,
+        };
+        repo.apply(
+            &ctx,
+            &DomainCommand::AddMemory {
+                memory: legacy_memory(n, slug),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Adopt needs the running daemon: with no daemon serving the managed
+    /// home, the CLI errors naming the daemon instead of opening the store
+    /// directly (no concurrent-write dual-open).
+    #[tokio::test]
+    async fn project_adopt_needs_running_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap().to_string();
+        let root = dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        project_bind_command(
+            false,
+            Some(root.to_str().unwrap()),
+            None,
+            Some(home.clone()),
+        )
+        .await
+        .unwrap();
+        let err = project_adopt_command(
+            false,
+            Some(root.to_str().unwrap()),
+            "other",
+            Some(home),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("daemon"),
+            "must name the daemon, got: {err}"
+        );
+    }
+
+    /// Adopt attaches through daemon IPC: a live local daemon executes the
+    /// request on its own store handle and the CLI reports the count.
+    #[tokio::test]
+    async fn project_adopt_attaches_via_daemon_ipc() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap().to_string();
+        let layout = crate::frontend::serve::stdio_layout(&dir.path().join(".ltmrs"));
+        let (mut daemon, _client) = crate::frontend::serve::start_local_daemon(&layout)
+            .await
+            .unwrap();
+        add_legacy_row(daemon.dispatcher().repo(), 7, "other");
+        let root = dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        project_bind_command(
+            false,
+            Some(root.to_str().unwrap()),
+            None,
+            Some(home.clone()),
+        )
+        .await
+        .unwrap();
+        let out = project_adopt_command(
+            false,
+            Some(root.to_str().unwrap()),
+            "other",
+            Some(home),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains("1") && out.contains("other"),
+            "must report the attached count, got: {out}"
+        );
+        daemon.shutdown();
+    }
+
+    /// Status shows attached slugs from the local store (read-only open,
+    /// matching the run_library precedent — only writes moved to IPC).
+    #[tokio::test]
+    async fn project_status_shows_attached_slugs() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap().to_string();
+        let store_path = dir.path().join(".ltmrs").join("store");
+        let repo =
+            ltmrs_service::repository::CanonicalRepository::open(store_path.to_str().unwrap())
+                .unwrap();
+        add_legacy_row(&repo, 7, "other");
+        let root = dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        project_bind_command(
+            false,
+            Some(root.to_str().unwrap()),
+            None,
+            Some(home.clone()),
+        )
+        .await
+        .unwrap();
+        let binding = crate::project::read_bind(&root).unwrap().unwrap();
+        let (name, id) = ltmrs_domain::project_id::parse_project_id(&binding.project_id).unwrap();
+        let canonical = crate::project::canonical_root(&root);
+        repo.adopt_legacy_slug(id, &name, canonical.as_deref(), "other")
+            .unwrap();
+        drop(repo);
+        let status =
+            project_status_command(Some(root.to_str().unwrap().to_string()), None, Some(home))
+                .unwrap();
+        assert!(
+            status.contains("other"),
+            "status must show attached slugs, got: {status}"
+        );
+    }
+
+    /// Bare `project bind` at the command layer (neither --here nor --root)
+    /// errors with guidance instead of silently binding the cwd
+    /// (explicit-errors philosophy, M6 hygiene).
+    #[tokio::test]
+    async fn project_bind_bare_errors_with_guidance() {
+        let err = project_bind_command(false, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--here"), "got: {err}");
+        assert!(err.to_string().contains("--root"), "got: {err}");
     }
 }

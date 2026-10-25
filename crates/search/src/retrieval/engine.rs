@@ -70,6 +70,10 @@ pub struct RetrievalRequest {
     pub direct_ids: Vec<EntityId>,
     /// The raw request scope.
     pub scope: Scope,
+    /// Legacy slugs attached to `scope.project_id` by an explicit bind
+    /// (Wave A3b): the stable scope additionally sees legacy rows carrying
+    /// these slugs. Empty by default (legacy-only scoping, unchanged).
+    pub attached_slugs: Vec<String>,
     /// The store generation to read. None resolves the active pointer per
     /// request (blue-green cutover); Some pins a generation (rollback reads,
     /// tests). Never a commit cursor (RV-07).
@@ -107,6 +111,7 @@ impl Default for RetrievalRequest {
             query: String::new(),
             direct_ids: vec![],
             scope: Scope::default(),
+            attached_slugs: vec![],
             store_generation: None,
             model_fingerprint: None,
             candidate_limit: 50,
@@ -136,6 +141,14 @@ pub struct RetrievalResult {
     pub context: context::ContextResult,
     /// The explanation for this call.
     pub explanation: RetrievalExplanation,
+    /// Eligible matching-set size behind the served page: exact while no
+    /// candidate leg hit its fetch cap, otherwise a lower bound (see
+    /// `pool_truncated`). Never inferred from `results.len()`.
+    pub total: usize,
+    /// True when a candidate leg hit its fetch cap: more matches may exist
+    /// beyond the ranked pool, so `total` is a lower bound and callers must
+    /// keep `has_more` set.
+    pub pool_truncated: bool,
 }
 
 /// Leg readiness for a retrieval call (task 10).
@@ -167,8 +180,9 @@ impl Engine {
         req: &RetrievalRequest,
         embedder: &dyn QueryEmbedder,
     ) -> DomainResult<RetrievalResult> {
-        // Stage 1: resolve the effective scope ONCE.
-        let scope = EffectiveScope::resolve(&req.scope)?;
+        // Stage 1: resolve the effective scope ONCE (with the bound legacy
+        // slugs, so a stable scope sees its attached bucket).
+        let scope = EffectiveScope::resolve_for(&req.scope, &req.attached_slugs)?;
         // Unpinned requests follow the active pointer per call so a cutover
         // takes effect on the next query; pinned requests stay put. A
         // repository error propagates (never masked as generation 1).
@@ -439,6 +453,16 @@ impl Engine {
             .copied()
             .collect();
 
+        // Honest totals (Wave A3a): the matching-set size is the eligible
+        // ranked pool, not the served window. A leg that returned exactly its
+        // fetch cap may hold more matches, so the total is a lower bound and
+        // the pool counts as truncated. A failed dense leg likewise hides
+        // dense-only matches (partial already signals the degraded leg).
+        let pool_truncated = lexical_rows.len() == req.candidate_limit
+            || (req.model_fingerprint.is_some()
+                && (dense_failed || dense_rows.len() == req.candidate_limit));
+        let total = mmr_candidates.len();
+
         let mut results = Vec::new();
         for id in &selected {
             if let Some(m) = memories_map.get(id).cloned() {
@@ -507,6 +531,8 @@ impl Engine {
             results,
             context,
             explanation,
+            total,
+            pool_truncated,
         })
     }
 
@@ -575,10 +601,13 @@ impl Engine {
         // The leg flags are informational here (legs are unused); only
         // the lag drives partial on this path, deliberately.
         explanation.partial = readiness.projection_lag > 0;
+        let total = results.len();
         Ok(RetrievalResult {
             results,
             context,
             explanation,
+            total,
+            pool_truncated: false,
         })
     }
 
@@ -602,6 +631,7 @@ impl Engine {
                 .then_with(|| b.positive_feedback.cmp(&a.positive_feedback))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        let total = eligible.len();
         eligible.truncate(req.result_limit);
 
         let results = eligible
@@ -626,6 +656,8 @@ impl Engine {
             results,
             context,
             explanation,
+            total,
+            pool_truncated: false,
         })
     }
 
@@ -656,6 +688,8 @@ impl Engine {
             results: vec![],
             context: context::ContextResult::default(),
             explanation,
+            total: 0,
+            pool_truncated: false,
         })
     }
 
@@ -876,6 +910,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Fact,
             project: project.map(|s| s.to_string()),
+            project_id: None,
             source: MemorySource::Ai,
             confidence: 0.5,
             quality_score: None,
@@ -1599,6 +1634,7 @@ mod tests {
             char_start: 0,
             char_end: 46,
             project: None,
+            project_id: None,
             fragment_type: "fact".into(),
             created_at_millis: 100,
             confidence: 0.5,
@@ -1841,6 +1877,7 @@ mod tests {
             char_start: 0,
             char_end: 23,
             project: None,
+            project_id: None,
             fragment_type: "fact".into(),
             created_at_millis: 100,
             confidence: 0.5,
@@ -2224,6 +2261,7 @@ mod tests {
                 char_start: 0,
                 char_end: 1,
                 project: None,
+                project_id: None,
                 fragment_type: "fact".to_string(),
                 created_at_millis: 0,
                 confidence: 0.5,
@@ -2273,6 +2311,7 @@ mod tests {
                 char_start: 0,
                 char_end: 1,
                 project: None,
+                project_id: None,
                 fragment_type: "fact".to_string(),
                 created_at_millis: 0,
                 confidence: 0.5,
@@ -2314,6 +2353,7 @@ mod tests {
                 char_start: 0,
                 char_end: 1,
                 project: None,
+                project_id: None,
                 fragment_type: "fact".to_string(),
                 created_at_millis: 0,
                 confidence: 0.5,
@@ -2353,6 +2393,7 @@ mod tests {
                 char_start: 0,
                 char_end: 1,
                 project: None,
+                project_id: None,
                 fragment_type: "fact".to_string(),
                 created_at_millis: 0,
                 confidence: 0.5,
@@ -2393,6 +2434,7 @@ mod tests {
                 char_start: 0,
                 char_end: 1,
                 project: None,
+                project_id: None,
                 fragment_type: "fact".to_string(),
                 created_at_millis: 0,
                 confidence: 0.5,

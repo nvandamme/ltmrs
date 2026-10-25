@@ -841,6 +841,7 @@ mod tests {
                 char_start: 0,
                 char_end: 9,
                 project: None,
+                project_id: None,
                 fragment_type: "fact".to_string(),
                 created_at_millis: 1,
                 confidence: 0.5,

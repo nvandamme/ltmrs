@@ -274,6 +274,7 @@ mod tests {
             retry_epoch: 1,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::GetMemories { ids: vec![] },
         }
     }

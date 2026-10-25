@@ -5,6 +5,7 @@
 //! storage, idempotency, uniqueness and supersession-cycle enforcement.
 
 pub mod migrations;
+pub mod projects;
 pub mod repository;
 
 mod repository_internal;

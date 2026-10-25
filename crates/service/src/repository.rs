@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::migrations::{MigrationOutcome, MigrationPlan, MigrationRunner, MigrationSafetyRules};
-use crate::repository_internal::{CommandState, TxAction, apply_command};
+use crate::repository_internal::{CommandState, TxAction, apply_boost_confidence, apply_command};
 use ltmrs_domain::command::{
     CommandContext, CommandReceipt, DomainCommand, DomainError, DomainErrorCode, DomainResult,
     OperationScope, ReceiptOutcome, RetryNamespace,
@@ -29,7 +29,7 @@ use ltmrs_domain::projection::{GenerationRecord, GenerationStatus};
 use ltmrs_domain::relation::Relation;
 use ltmrs_domain::session::{Session, SessionOp, SessionReceipt};
 
-const MAX_RETRIES: u32 = 8;
+pub(crate) const MAX_RETRIES: u32 = 8;
 /// Default retry namespace TTL: 24 hours (initial policy per design §5.2).
 pub const DEFAULT_NAMESPACE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1000;
 
@@ -68,6 +68,16 @@ pub struct FaultInjector {
     /// persisting: callers must fail the ACK, never report success on
     /// buffered-only data.
     persist_failures: std::sync::atomic::AtomicU32,
+    /// Number of times to fail a Wave-A2 tool-tail effect before
+    /// succeeding. When > 0, the next N single-transaction tool writes
+    /// (session-start boosts/links, memory-add session link, guide-practice
+    /// session link) return an error BEFORE committing, so the transaction
+    /// drops with nothing persisted and no receipt recorded. A barrier fault
+    /// cannot prove this: the commit already succeeded in memory and only
+    /// durability is unestablished. Test-only atomicity probe, same pattern
+    /// as the commit/migration/barrier faults above; production inputs can
+    /// never arm it.
+    tail_effect_failures: std::sync::atomic::AtomicU32,
 }
 
 impl FaultInjector {
@@ -93,6 +103,12 @@ impl FaultInjector {
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Configure N upcoming tool-tail effects to fail before committing.
+    pub fn set_tail_effect_failures(&self, n: u32) {
+        self.tail_effect_failures
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Consume one unknown-outcome fault. Returns true if a fault was injected.
     pub fn inject_unknown_outcome(&self) -> bool {
         Self::consume(&self.commit_unknown_outcomes)
@@ -101,6 +117,11 @@ impl FaultInjector {
     /// Consume one migration fault. Returns true if a fault was injected.
     pub fn inject_migration_fault(&self) -> bool {
         Self::consume(&self.migration_failures)
+    }
+
+    /// Consume one tool-tail fault. Returns true if injected.
+    pub fn inject_tail_effect_failure(&self) -> bool {
+        Self::consume(&self.tail_effect_failures)
     }
 
     /// Consume one durability-barrier fault. Returns true if injected.
@@ -160,6 +181,13 @@ pub struct CanonicalRepository {
     /// rendered at first execution. Replay returns them verbatim —
     /// no planning, no mutation, no recomputation.
     tool_results: OptimisticTxKeyspace,
+    /// Stable project registry (Wave A3b, Part I 01:§6.3): identity
+    /// (`prj_<name>_<ulid>`) → [`ProjectRecord`]. Machine-local checkout
+    /// bindings (canonical roots are absolute paths): drained on restore
+    /// like retry namespaces, re-registered on first acknowledged write.
+    projects: OptimisticTxKeyspace,
+    /// Secondary index for the registry: canonical root → project id.
+    project_roots: OptimisticTxKeyspace,
     /// Post-commit wake-up hook (P2-1 projection latency): fired once per
     /// committed mutation so the projection worker drives the new job
     /// immediately instead of waiting out its maintenance interval. Replays
@@ -367,6 +395,15 @@ pub enum SessionLinkField {
     MemoryCreated,
 }
 
+/// Preload follow-ups staged inside [`CanonicalRepository::session_start_full_tx`].
+#[derive(Debug, Clone, Default)]
+pub struct SessionStartEffects {
+    /// Pre-loaded memories to boost (+0.02, upstream boostConfidence).
+    pub boosts: Vec<EntityId>,
+    /// Legacy ids linked as memories_read on the new session.
+    pub read_links: Vec<String>,
+}
+
 impl CanonicalRepository {
     /// Open a repository with the production wall-clock.
     pub fn open(base_path: &str) -> DomainResult<Self> {
@@ -427,6 +464,8 @@ impl CanonicalRepository {
         let session_ops = Self::keyspace(&db, "session_ops")?;
         let suggestion_ops = Self::keyspace(&db, "suggestion_ops")?;
         let tool_results = Self::keyspace(&db, "tool_results")?;
+        let projects = Self::keyspace(&db, "projects")?;
+        let project_roots = Self::keyspace(&db, "project_roots")?;
 
         Ok(Self {
             db,
@@ -445,6 +484,8 @@ impl CanonicalRepository {
             session_ops,
             suggestion_ops,
             tool_results,
+            projects,
+            project_roots,
             commit_hook: std::sync::Mutex::new(None),
             fault_injector,
             clock,
@@ -461,6 +502,31 @@ impl CanonicalRepository {
     /// Access the fault injector for crash/durability testing (RV-18).
     pub fn fault_injector(&self) -> &std::sync::Arc<FaultInjector> {
         &self.fault_injector
+    }
+
+    /// Crate-internal accessors for the project registry (Wave A3b): the
+    /// registry lives in [`crate::projects`] but the keyspaces stay owned
+    /// here with the rest of the store topology.
+    pub(crate) fn projects_ks(&self) -> &OptimisticTxKeyspace {
+        &self.projects
+    }
+    pub(crate) fn project_roots_ks(&self) -> &OptimisticTxKeyspace {
+        &self.project_roots
+    }
+    pub(crate) fn memories_ks(&self) -> &OptimisticTxKeyspace {
+        &self.memories
+    }
+    pub(crate) fn db_ref(&self) -> &OptimisticTxDatabase {
+        &self.db
+    }
+    pub(crate) fn restore_read_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.restore_lock.read().unwrap()
+    }
+    pub(crate) fn durability_barrier(&self) -> DomainResult<()> {
+        self.persist_barrier()
+    }
+    pub(crate) fn clock_now(&self) -> u64 {
+        self.clock.now_millis()
     }
 
     /// Set the post-commit wake-up hook (P2-1): fired once per committed
@@ -985,6 +1051,30 @@ impl CanonicalRepository {
 
     /// Centralized command application: idempotent, atomic, precondition-checked.
     pub fn apply(&self, ctx: &CommandContext, cmd: &DomainCommand) -> DomainResult<CommandReceipt> {
+        self.apply_inner(ctx, cmd, None)
+    }
+
+    /// Apply one command and append a MemoryCreated session link in the SAME
+    /// transaction (Wave A2): the memory, its auto-link, the session link
+    /// and the receipt commit together, so a link failure errors with no
+    /// receipt instead of freezing a partial success. Replay keys and the
+    /// receipt shape are identical to [`CanonicalRepository::apply`].
+    pub fn apply_with_session_link(
+        &self,
+        ctx: &CommandContext,
+        cmd: &DomainCommand,
+        handle: SessionHandle,
+        link_id: &str,
+    ) -> DomainResult<CommandReceipt> {
+        self.apply_inner(ctx, cmd, Some((handle, link_id)))
+    }
+
+    fn apply_inner(
+        &self,
+        ctx: &CommandContext,
+        cmd: &DomainCommand,
+        session_link: Option<(SessionHandle, &str)>,
+    ) -> DomainResult<CommandReceipt> {
         let _restore_guard = self.restore_lock.read().unwrap();
         // Validate the retry namespace: expired or unknown namespaces are
         // refused as stale, not silently converted into new work.
@@ -1007,7 +1097,7 @@ impl CanonicalRepository {
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            match self.apply_in_tx(&mut tx, ctx, cmd)? {
+            match self.apply_in_tx(&mut tx, ctx, cmd, session_link)? {
                 TxAction::Commit(receipt) => {
                     // Fault injection: simulate an unknown commit outcome
                     // (write may or may not have succeeded, ACK lost).
@@ -1054,6 +1144,7 @@ impl CanonicalRepository {
         tx: &mut OptimisticWriteTx,
         ctx: &CommandContext,
         cmd: &DomainCommand,
+        session_link: Option<(SessionHandle, &str)>,
     ) -> DomainResult<TxAction<CommandReceipt>> {
         // Re-check the receipt inside the transaction to handle the race where
         // another transaction committed it after our fast-path read.
@@ -1090,6 +1181,25 @@ impl CanonicalRepository {
             self.clock.now_millis(),
         );
         let outcome = apply_command(&mut state, ctx, cmd)?;
+
+        // Wave-A2 session link in the same transaction: a link failure
+        // errors before anything commits, so no receipt records a partial
+        // success. Replays return above and never reach this point.
+        if let Some((handle, link_id)) = session_link {
+            let owned = link_id.to_string();
+            self.link_session_in_tx(
+                tx,
+                handle,
+                SessionLinkField::MemoryCreated,
+                std::slice::from_ref(&owned),
+            )?;
+            if self.fault_injector.inject_tail_effect_failure() {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "injected tool-tail failure",
+                ));
+            }
+        }
 
         // Store the receipt atomically with the command.
         let receipt = CommandReceipt {
@@ -2061,6 +2171,12 @@ impl CanonicalRepository {
     /// digest is rejected as key reuse. Fresh-read inside each retry
     /// preserves concurrent updates.
     #[allow(clippy::too_many_arguments)]
+    /// Practice a guide and append the GuideUsed session link in the SAME
+    /// transaction (Wave A2): the mutation, the link and the idempotency log
+    /// commit together, so a link failure errors with nothing applied.
+    /// `session_link` is the channel's traced session when bound; None
+    /// leaves validated_by empty with no link, as before. Session lookup
+    /// errors propagate; a missing session degrades to no link.
     pub fn practice_guide_idempotent(
         &self,
         scope: &OperationScope,
@@ -2069,7 +2185,7 @@ impl CanonicalRepository {
         description: Option<&str>,
         contexts: &[String],
         learnings: &[String],
-        validated_by: &[String],
+        session_link: Option<SessionHandle>,
         outcome: Option<bool>,
         now_millis: u64,
     ) -> DomainResult<ltmrs_domain::guide::Guide> {
@@ -2127,6 +2243,28 @@ impl CanonicalRepository {
                     "unrecognized practice log entry",
                 ));
             }
+            // Fresh session attribution inside the tx: the link target's
+            // pre-loaded reads become validated_by, and lookup errors
+            // propagate instead of degrading to a default.
+            let validated: Vec<String> = match session_link {
+                Some(handle) => {
+                    let hkey = handle.as_uuid().to_string();
+                    let raw = tx.get(&self.sessions, &hkey).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    match raw {
+                        Some(raw) => {
+                            let session: Session =
+                                serde_json::from_slice(raw.as_ref()).map_err(|e| {
+                                    DomainError::new(DomainErrorCode::Validation, e.to_string())
+                                })?;
+                            session.memories_read.clone()
+                        }
+                        None => Vec::new(),
+                    }
+                }
+                None => Vec::new(),
+            };
             // Fresh guide state inside the tx.
             let key = guide_name.to_lowercase();
             let existing: Option<ltmrs_domain::guide::Guide> = tx
@@ -2211,7 +2349,7 @@ impl CanonicalRepository {
                     g
                 }
             };
-            for mem_id in validated_by {
+            for mem_id in &validated {
                 if !updated.validated_by.contains(mem_id) {
                     updated.validated_by.push(mem_id.clone());
                 }
@@ -2219,6 +2357,57 @@ impl CanonicalRepository {
             let raw = serde_json::to_vec(&updated)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.guides, &key, raw.as_slice());
+            let normalized_guide = updated.name.clone();
+            for legacy_id in &validated {
+                let eid_opt: Option<ltmrs_domain::id::EntityId> = {
+                    if let Some(raw) = tx
+                        .get(&self.aliases, legacy_id)
+                        .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                    {
+                        let s = String::from_utf8_lossy(raw.as_ref()).to_string();
+                        uuid::Uuid::parse_str(&s)
+                            .ok()
+                            .map(ltmrs_domain::id::EntityId::new)
+                    } else {
+                        uuid::Uuid::parse_str(legacy_id)
+                            .ok()
+                            .map(ltmrs_domain::id::EntityId::new)
+                    }
+                };
+                let Some(eid) = eid_opt else { continue };
+                let mem_key = eid.as_uuid().to_string();
+                let Some(raw) = tx
+                    .get(&self.memories, &mem_key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                else {
+                    continue;
+                };
+                let mut mem: Memory = serde_json::from_slice(raw.as_ref())
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                if mem.related_guides.iter().any(|g| g == &normalized_guide) {
+                    continue;
+                }
+                mem.related_guides.push(normalized_guide.clone());
+                mem.entity_revision = mem.entity_revision.next();
+                let raw = serde_json::to_vec(&mem)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+                tx.insert(&self.memories, &mem_key, raw.as_slice());
+            }
+            if let Some(handle) = session_link {
+                let owned = updated.name.clone();
+                self.link_session_in_tx(
+                    &mut tx,
+                    handle,
+                    SessionLinkField::GuideUsed,
+                    std::slice::from_ref(&owned),
+                )?;
+                if self.fault_injector.inject_tail_effect_failure() {
+                    return Err(DomainError::new(
+                        DomainErrorCode::Validation,
+                        "injected tool-tail failure",
+                    ));
+                }
+            }
             let log = PracticeLog {
                 name: updated.name.clone(),
                 digest: scope.request_digest.clone(),
@@ -3321,6 +3510,41 @@ impl CanonicalRepository {
         abandon: Option<SessionHandle>,
         now_millis: u64,
     ) -> DomainResult<SessionOp<SessionHandle>> {
+        self.session_start_full_tx(
+            scope,
+            handle,
+            project,
+            None,
+            task_type,
+            technologies,
+            initial_approach,
+            abandon,
+            SessionStartEffects::default(),
+            now_millis,
+        )
+    }
+
+    /// Start a session with its preload follow-ups in ONE transaction
+    /// (Wave A2): abandon-previous, create (with memories_read links),
+    /// confidence boosts and receipt commit together, so a follow-up failure
+    /// errors with nothing persisted instead of freezing a partial success.
+    /// Continuity boosts keep their receipt-claimed continuation (P2-B),
+    /// and the frozen response still freezes afterwards via the established
+    /// receipt path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_start_full_tx(
+        &self,
+        scope: &OperationScope,
+        handle: SessionHandle,
+        project: Option<String>,
+        project_id: Option<EntityId>,
+        task_type: Option<String>,
+        technologies: Vec<String>,
+        initial_approach: Option<String>,
+        abandon: Option<SessionHandle>,
+        effects: SessionStartEffects,
+        now_millis: u64,
+    ) -> DomainResult<SessionOp<SessionHandle>> {
         let _restore_guard = self.restore_lock.read().unwrap();
         self.validate_scope(scope)?;
         let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
@@ -3371,10 +3595,19 @@ impl CanonicalRepository {
             // Attempt-decay runs post-commit (see below): scanning the
             // sessions keyspace inside this transaction would turn
             // independent concurrent starts into optimistic conflicts.
+            // The preload links seed the session directly: no separate
+            // link write can fail after the create commits.
+            let mut memories_read: Vec<String> = Vec::new();
+            for id in &effects.read_links {
+                if !memories_read.contains(id) {
+                    memories_read.push(id.clone());
+                }
+            }
             let session = Session {
                 handle,
                 channel_id: scope.channel_id,
                 project: project.clone(),
+                project_id,
                 task_type: task_type.clone(),
                 technologies: technologies.clone(),
                 status: ltmrs_domain::session::SessionStatus::Active,
@@ -3384,7 +3617,7 @@ impl CanonicalRepository {
                 lessons: Vec::new(),
                 initial_approach: initial_approach.clone(),
                 guides_used: Vec::new(),
-                memories_read: Vec::new(),
+                memories_read,
                 memories_created: Vec::new(),
                 refinement_attempts: 0,
                 self_critique_count: 0,
@@ -3396,6 +3629,23 @@ impl CanonicalRepository {
             let raw = serde_json::to_vec(&session)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.sessions, &hkey, raw.as_slice());
+            // Preload boosts stage in the same transaction: either the
+            // create, the links and the boosts commit together or nothing
+            // does. Continuity boosts keep their receipt-claimed
+            // continuation below (P2-B exactly-once), as before.
+            if !effects.boosts.is_empty() {
+                let mut state = CommandState::new(
+                    &mut tx,
+                    &self.memories,
+                    &self.relations,
+                    &self.aliases,
+                    &self.projections,
+                    &self.generations,
+                    &self.feedback_events,
+                    now_millis,
+                );
+                apply_boost_confidence(&mut state, &effects.boosts)?;
+            }
             let receipt = SessionReceipt {
                 digest: scope.request_digest.clone(),
                 session: handle,
@@ -3407,6 +3657,12 @@ impl CanonicalRepository {
             let log_raw = serde_json::to_vec(&receipt)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.session_ops, &op_key, log_raw.as_slice());
+            if self.fault_injector.inject_tail_effect_failure() {
+                return Err(DomainError::new(
+                    DomainErrorCode::Validation,
+                    "injected tool-tail failure",
+                ));
+            }
             self.bump_op_seq_tx(&mut tx, &seq_key)?;
             match tx.commit() {
                 Ok(Ok(())) => {
@@ -3794,6 +4050,56 @@ impl CanonicalRepository {
 
     /// Track session links (guides used, memories read/created) with
     /// order-preserving deduplication, committed atomically.
+    /// Append link ids to one session field (deduped; guide names fold
+    /// case). Shared by the standalone link call below and the Wave-A2
+    /// single-transaction tool writes so the dedup rule lives in one place.
+    fn push_session_link(session: &mut Session, field: SessionLinkField, ids: &[String]) {
+        let target = match field {
+            SessionLinkField::GuideUsed => &mut session.guides_used,
+            SessionLinkField::MemoryRead => &mut session.memories_read,
+            SessionLinkField::MemoryCreated => &mut session.memories_created,
+        };
+        if field == SessionLinkField::GuideUsed {
+            for id in ids {
+                let lower = id.to_lowercase();
+                if !target.contains(&lower) {
+                    target.push(lower);
+                }
+            }
+        } else {
+            for id in ids {
+                if !target.contains(id) {
+                    target.push(id.clone());
+                }
+            }
+        }
+    }
+
+    /// Stage one session link inside the caller's transaction. A missing
+    /// session is a no-op, matching the standalone call below.
+    fn link_session_in_tx(
+        &self,
+        tx: &mut OptimisticWriteTx,
+        handle: SessionHandle,
+        field: SessionLinkField,
+        ids: &[String],
+    ) -> DomainResult<()> {
+        let hkey = handle.as_uuid().to_string();
+        let raw = tx
+            .get(&self.sessions, &hkey)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        let mut session: Session = serde_json::from_slice(raw.as_ref())
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        Self::push_session_link(&mut session, field, ids);
+        let raw = serde_json::to_vec(&session)
+            .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+        tx.insert(&self.sessions, &hkey, raw.as_slice());
+        Ok(())
+    }
+
     pub fn track_session_link(
         &self,
         admitted: &AdmittedScope,
@@ -3818,25 +4124,7 @@ impl CanonicalRepository {
             };
             let mut session: Session = serde_json::from_slice(raw.as_ref())
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            let target = match field {
-                SessionLinkField::GuideUsed => &mut session.guides_used,
-                SessionLinkField::MemoryRead => &mut session.memories_read,
-                SessionLinkField::MemoryCreated => &mut session.memories_created,
-            };
-            if field == SessionLinkField::GuideUsed {
-                for id in ids {
-                    let lower = id.to_lowercase();
-                    if !target.contains(&lower) {
-                        target.push(lower);
-                    }
-                }
-            } else {
-                for id in ids {
-                    if !target.contains(id) {
-                        target.push(id.clone());
-                    }
-                }
-            }
+            Self::push_session_link(&mut session, field, ids);
             let raw = serde_json::to_vec(&session)
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
             tx.insert(&self.sessions, &hkey, raw.as_slice());
@@ -3853,6 +4141,152 @@ impl CanonicalRepository {
             }
         }
         Err(Self::exhausted_contention("session link conflicted"))
+    }
+
+    /// Co-read linking for one query/batch read (Wave B2): updates
+    /// `associated_with` both directions for every gated pair and inserts
+    /// up to 3 `related_to` relations (pre-planned, highest-confidence
+    /// first). Caller gates pairs with the stable visibility predicate;
+    /// this method trusts the gated set. Best-effort on validation:
+    /// missing endpoints and duplicate edges skip, storage errors
+    /// propagate (fail-loud). One transaction, deduped, idempotent.
+    pub fn apply_coread_links(
+        &self,
+        admitted: &AdmittedScope,
+        pairs: &[(EntityId, EntityId)],
+        relations: &[Relation],
+    ) -> DomainResult<()> {
+        if pairs.is_empty() && relations.is_empty() {
+            return Ok(());
+        }
+        let _restore_guard = self.restore_lock.read().unwrap();
+        let scope = admitted.scope();
+        let seq_key = op_seq_key_for_scope(scope.frontend_id, scope.channel_id);
+        for _attempt in 0..MAX_RETRIES {
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
+            let mut involved: std::collections::BTreeSet<EntityId> = Default::default();
+            for (a, b) in pairs {
+                involved.insert(*a);
+                involved.insert(*b);
+            }
+            for r in relations {
+                involved.insert(r.source);
+                involved.insert(r.target);
+            }
+            let mut fresh: std::collections::BTreeMap<EntityId, Memory> =
+                std::collections::BTreeMap::new();
+            for id in &involved {
+                let key = id.as_uuid().to_string();
+                if let Some(raw) = tx
+                    .get(&self.memories, &key)
+                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+                {
+                    let mem: Memory = serde_json::from_slice(raw.as_ref()).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    fresh.insert(*id, mem);
+                }
+            }
+            let legacy_of = |id: &EntityId| -> Option<String> {
+                fresh.get(id).map(|m| {
+                    m.external_alias
+                        .as_ref()
+                        .map(|a| a.as_str().to_string())
+                        .unwrap_or_else(|| id.as_uuid().to_string())
+                })
+            };
+            let mut partners: std::collections::BTreeMap<EntityId, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (a, b) in pairs {
+                if !fresh.contains_key(a) || !fresh.contains_key(b) {
+                    continue;
+                }
+                if let Some(lb) = legacy_of(b) {
+                    partners.entry(*a).or_default().push(lb);
+                }
+                if let Some(la) = legacy_of(a) {
+                    partners.entry(*b).or_default().push(la);
+                }
+            }
+            for (id, adds) in &partners {
+                if let Some(mem) = fresh.get_mut(id) {
+                    let mut changed = false;
+                    for legacy in adds {
+                        if !mem.associated_with.contains(legacy) {
+                            mem.associated_with.push(legacy.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        mem.entity_revision = mem.entity_revision.next();
+                        let key = id.as_uuid().to_string();
+                        let raw = serde_json::to_vec(mem).map_err(|e| {
+                            DomainError::new(DomainErrorCode::Validation, e.to_string())
+                        })?;
+                        tx.insert(&self.memories, &key, raw.as_slice());
+                    }
+                }
+            }
+            let existing: Vec<Relation> = {
+                let mut out = Vec::new();
+                for kv in tx.iter(&self.relations) {
+                    let (_k, v) = kv.into_inner().map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    let rel: Relation = serde_json::from_slice(v.as_ref()).map_err(|e| {
+                        DomainError::new(DomainErrorCode::Validation, e.to_string())
+                    })?;
+                    out.push(rel);
+                }
+                out
+            };
+            for rel in relations {
+                if !fresh.contains_key(&rel.source) || !fresh.contains_key(&rel.target) {
+                    continue;
+                }
+                let duplicate = existing.iter().any(|r| {
+                    r.relation_type == rel.relation_type
+                        && ((r.source == rel.source && r.target == rel.target)
+                            || (r.relation_type.is_symmetric()
+                                && r.source == rel.target
+                                && r.target == rel.source))
+                });
+                if duplicate {
+                    continue;
+                }
+                let live = |id: EntityId| -> bool {
+                    fresh
+                        .get(&id)
+                        .map(|m| m.lifecycle.is_recallable())
+                        .unwrap_or(false)
+                };
+                match ltmrs_domain::graph::validate_new_edge(rel, existing.iter(), live) {
+                    ltmrs_domain::graph::GraphValidation::Ok => {
+                        let key = rel.id.as_uuid().to_string();
+                        let raw = serde_json::to_vec(rel).map_err(|e| {
+                            DomainError::new(DomainErrorCode::Validation, e.to_string())
+                        })?;
+                        tx.insert(&self.relations, &key, raw.as_slice());
+                    }
+                    ltmrs_domain::graph::GraphValidation::Reject(_) => continue,
+                }
+            }
+            self.bump_op_seq_tx(&mut tx, &seq_key)?;
+            match tx.commit() {
+                Ok(Ok(())) => {
+                    self.persist_barrier()?;
+                    return Ok(());
+                }
+                Ok(Err(_)) => continue,
+                Err(e) => {
+                    return Err(DomainError::new(DomainErrorCode::Validation, e.to_string()));
+                }
+            }
+        }
+        Err(Self::exhausted_contention("coread link conflicted"))
     }
 
     /// Adjust one attempt's confidence (suggestion feedback): boost capped
@@ -4838,6 +5272,11 @@ impl CanonicalRepository {
             &self.guide_ops,
             &self.suggestion_ops,
             &self.tool_results,
+            // Stable project registry (Wave A3b): machine-local checkout
+            // bindings (absolute roots), drained like retry namespaces —
+            // checkouts re-register on their first acknowledged write.
+            &self.projects,
+            &self.project_roots,
         ] {
             for key in drain(&tx, ks)? {
                 tx.remove(ks, key);
@@ -5125,6 +5564,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Fact,
             project: None,
+            project_id: None,
             source: MemorySource::Ai,
             confidence: 0.5,
             quality_score: None,
@@ -8339,7 +8779,7 @@ mod tests {
                 None,
                 &[],
                 &[],
-                &[],
+                None,
                 None,
                 expired_at,
             )
@@ -8799,7 +9239,7 @@ mod tests {
             None,
             &[],
             &["new learning".to_string()],
-            &[],
+            None,
             None,
             1000,
         )
@@ -8874,7 +9314,7 @@ mod tests {
             None,
             &[],
             &[],
-            &[],
+            None,
             None,
             1,
         )
@@ -8909,7 +9349,7 @@ mod tests {
                 None,
                 &[],
                 &["learn it".to_string()],
-                &[],
+                None,
                 Some(true),
                 1000,
             )

@@ -245,12 +245,12 @@ impl<'a> CommandState<'a> {
     }
 }
 
-fn encode<T: serde::Serialize>(value: &T) -> DomainResult<Vec<u8>> {
+pub(crate) fn encode<T: serde::Serialize>(value: &T) -> DomainResult<Vec<u8>> {
     serde_json::to_vec(value)
         .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
 }
 
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> DomainResult<T> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> DomainResult<T> {
     serde_json::from_slice(bytes)
         .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
 }
@@ -554,7 +554,7 @@ fn apply_access(
 
 /// Upstream boostConfidence (session_start pre-load): +0.02 confidence,
 /// +1 access_count, last_accessed_at. No context tag, no quality recompute.
-fn apply_boost_confidence(
+pub(crate) fn apply_boost_confidence(
     state: &mut CommandState<'_>,
     memory_ids: &[EntityId],
 ) -> DomainResult<ReceiptOutcome> {

@@ -11,9 +11,11 @@ use ltmrs_domain::memory::{FragmentType, Memory};
 
 /// The resolved, immutable scope for a single retrieval call.
 ///
-/// Constructed once via [`EffectiveScope::resolve`], then shared by reference
-/// across the lexical leg, dense leg, hydration, and graph expansion. Every
-/// predicate check MUST flow through this type so no leg can drift.
+/// Constructed once via [`EffectiveScope::resolve`] (or
+/// [`EffectiveScope::resolve_for`] with attached legacy slugs), then
+/// shared by reference across the lexical leg, dense leg, hydration, and
+/// graph expansion. Every predicate check MUST flow through this type so
+/// no leg can drift.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveScope {
     /// The raw request scope (project, filters, etc.).
@@ -21,10 +23,16 @@ pub struct EffectiveScope {
     /// Whether the scope includes global (project-less) memories.
     /// Project + global inheritance is deliberate, not "all projects".
     pub includes_global: bool,
-    /// The specific project this scope targets, if any.
+    /// The specific legacy project this scope targets, if any.
     pub project: Option<String>,
     /// Whether to include all projects (explicit cross-project mode).
     pub all_projects: bool,
+    /// The stable project identity (Wave A3b), if any. Eligibility keys
+    /// on this when present; the legacy string stays disjoint.
+    pub project_id: Option<EntityId>,
+    /// Legacy slugs attached to `project_id` by an explicit bind (visible
+    /// to the stable scope alongside its own rows).
+    pub attached: Vec<String>,
 }
 
 impl EffectiveScope {
@@ -38,6 +46,13 @@ impl EffectiveScope {
     /// stay constructible for tests; production code must go through
     /// here.)
     pub fn resolve(raw: &Scope) -> DomainResult<Self> {
+        Self::resolve_for(raw, &[])
+    }
+
+    /// Resolve with attached legacy slugs (Wave A3b): the stable scope of
+    /// `raw.project_id` additionally sees legacy rows carrying one of these
+    /// slugs (explicit bind adoption). Legacy-only scopes ignore the list.
+    pub fn resolve_for(raw: &Scope, attached: &[String]) -> DomainResult<Self> {
         if let Some(min) = raw.min_confidence
             && !min.is_finite()
         {
@@ -46,6 +61,18 @@ impl EffectiveScope {
                 "min_confidence must be finite",
             ));
         }
+        let project_id = match &raw.project_id {
+            None => None,
+            Some(full) => match ltmrs_domain::project_id::parse_project_id(full) {
+                Some((_name, id)) => Some(id),
+                None => {
+                    return Err(DomainError::new(
+                        DomainErrorCode::Validation,
+                        format!("malformed project_id: {full}"),
+                    ));
+                }
+            },
+        };
         // Project + global inheritance is deliberate (design §6.3): global
         // (project-less) memories are always inherited by any scope. This is
         // not "all projects" — a project scope still excludes other projects.
@@ -53,23 +80,49 @@ impl EffectiveScope {
             includes_global: true,
             project: raw.project.clone(),
             all_projects: raw.all_projects,
+            project_id,
+            attached: attached.to_vec(),
             raw: raw.clone(),
         })
     }
 
-    /// Whether a memory's project field is in scope.
-    pub fn project_includes(&self, record_project: Option<&str>) -> bool {
+    /// Whether a memory's project identity is in scope.
+    ///
+    /// Stable scopes key on the stable id: own rows, attached legacy rows
+    /// and global rows. Legacy and global scopes never match stable rows
+    /// (disjoint without a bind).
+    pub fn project_includes_id(
+        &self,
+        record_id: Option<EntityId>,
+        record_project: Option<&str>,
+    ) -> bool {
         if self.all_projects {
             return true;
         }
-        match (&self.project, record_project) {
-            // Global (None) memory: included only if we allow global.
-            (None, None) => self.includes_global,
-            (Some(_), None) => self.includes_global,
-            (Some(p), Some(rp)) => p == rp,
-            // A memory with a project when we have no project scope: excluded.
-            (None, Some(_)) => false,
+        if let Some(pid) = self.project_id {
+            match (record_id, record_project) {
+                (Some(rid), _) if rid == pid => true,
+                (None, None) => self.includes_global,
+                (None, Some(rp)) if self.attached.iter().any(|s| s == rp) => true,
+                _ => false,
+            }
+        } else {
+            match (&self.project, record_id, record_project) {
+                // Global (None) memory: included only if we allow global.
+                (None, None, None) => self.includes_global,
+                (Some(_), None, None) => self.includes_global,
+                // Stable rows are invisible to legacy/global scopes.
+                (_, Some(_), _) => false,
+                (Some(p), None, Some(rp)) => p == rp,
+                // A memory with a project when we have no project scope: excluded.
+                (None, None, Some(_)) => false,
+            }
         }
+    }
+
+    /// Whether a memory's project field is in scope (legacy view: no id).
+    pub fn project_includes(&self, record_project: Option<&str>) -> bool {
+        self.project_includes_id(None, record_project)
     }
 
     /// Whether a memory's fragment type is in scope.
@@ -115,7 +168,7 @@ impl EffectiveScope {
     /// This is the canonical check used by hydration and backfill. A memory is
     /// eligible only if it passes ALL scope dimensions AND is lifecycle-recallable.
     pub fn is_eligible(&self, memory: &Memory) -> bool {
-        self.project_includes(memory.project.as_deref())
+        self.project_includes_id(memory.project_id, memory.project.as_deref())
             && self.type_includes(&memory.fragment_type)
             && self.date_includes(memory.created_at.as_millis())
             && self.confidence_includes(memory.confidence)
@@ -130,12 +183,34 @@ impl EffectiveScope {
         let mut parts: Vec<String> = Vec::new();
 
         if !self.all_projects {
-            if let Some(ref p) = self.project {
-                // Project scope: include this project OR global (NULL).
-                parts.push(format!("(project = '{}' OR project IS NULL)", sql_quote(p)));
+            if let Some(pid) = self.project_id {
+                // Stable scope: own id, or id-less rows that are attached
+                // legacy or global. Stable rows of other ids never match.
+                let uuid = pid.as_uuid().to_string();
+                if self.attached.is_empty() {
+                    parts.push(format!(
+                        "(project_id = '{uuid}' OR (project_id IS NULL AND project IS NULL))"
+                    ));
+                } else {
+                    let quoted: Vec<String> = self
+                        .attached
+                        .iter()
+                        .map(|s| format!("'{}'", sql_quote(s)))
+                        .collect();
+                    parts.push(format!(
+                        "(project_id = '{uuid}' OR (project_id IS NULL AND (project IN ({}) OR project IS NULL)))",
+                        quoted.join(", ")
+                    ));
+                }
+            } else if let Some(ref p) = self.project {
+                // Legacy scope: this slug or global — never stable rows.
+                parts.push(format!(
+                    "(project_id IS NULL AND (project = '{}' OR project IS NULL))",
+                    sql_quote(p)
+                ));
             } else {
-                // No project scope: only global (NULL) memories.
-                parts.push("project IS NULL".to_string());
+                // Global scope: only id-less, project-less memories.
+                parts.push("(project_id IS NULL AND project IS NULL)".to_string());
             }
         }
 
@@ -175,6 +250,7 @@ impl EffectiveScope {
     /// Whether this scope is "unrestricted" (no filters at all).
     pub fn is_unrestricted(&self) -> bool {
         self.all_projects
+            && self.project_id.is_none()
             && self.raw.fragment_types.is_none()
             && self.raw.after.is_none()
             && self.raw.before.is_none()
@@ -213,7 +289,13 @@ mod tests {
         EntityId::new(Uuid::from_u128(n as u128))
     }
 
-    fn memory(id: EntityId, project: Option<&str>, ft: FragmentType, conf: f64) -> Memory {
+    fn memory(
+        id: EntityId,
+        project: Option<&str>,
+        project_id: Option<EntityId>,
+        ft: FragmentType,
+        conf: f64,
+    ) -> Memory {
         Memory {
             id,
             external_alias: None,
@@ -222,6 +304,7 @@ mod tests {
             description: String::new(),
             fragment_type: ft,
             project: project.map(|s| s.to_string()),
+            project_id,
             source: MemorySource::Ai,
             confidence: conf,
             quality_score: None,
@@ -328,10 +411,10 @@ mod tests {
         })
         .unwrap();
 
-        let in_scope = memory(eid(1), Some("app"), FragmentType::Fact, 0.6);
-        let wrong_project = memory(eid(2), Some("other"), FragmentType::Fact, 0.6);
-        let wrong_type = memory(eid(3), Some("app"), FragmentType::Warning, 0.6);
-        let low_conf = memory(eid(4), Some("app"), FragmentType::Fact, 0.3);
+        let in_scope = memory(eid(1), Some("app"), None, FragmentType::Fact, 0.6);
+        let wrong_project = memory(eid(2), Some("other"), None, FragmentType::Fact, 0.6);
+        let wrong_type = memory(eid(3), Some("app"), None, FragmentType::Warning, 0.6);
+        let low_conf = memory(eid(4), Some("app"), None, FragmentType::Fact, 0.3);
 
         assert!(scope.is_eligible(&in_scope));
         assert!(!scope.is_eligible(&wrong_project));
@@ -391,6 +474,117 @@ mod tests {
         assert_eq!(sql_quote("'''"), "''''''");
         assert_eq!(sql_quote("a\\b"), "a\\b");
         assert_eq!(sql_quote("x'; DROP TABLE t;--"), "x''; DROP TABLE t;--");
+    }
+
+    /// Stable-id eligibility (Wave A3b, T-SCOPE-02 extension): a stable
+    /// scope sees its own project_id rows + global + attached legacy rows;
+    /// other stable ids and unattached legacy rows stay disjoint.
+    #[test]
+    fn stable_scope_keys_on_project_id() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (full_x, xid) = generate_project_id("shop");
+        let (_full_y, yid) = generate_project_id("shop");
+        let scope = EffectiveScope::resolve_for(
+            &Scope {
+                project_id: Some(full_x),
+                ..Default::default()
+            },
+            &["shop".to_string()],
+        )
+        .unwrap();
+        assert_eq!(scope.project_id, Some(xid));
+        assert!(scope.project_includes_id(Some(xid), Some("shop")));
+        assert!(scope.project_includes_id(None, None));
+        assert!(scope.project_includes_id(None, Some("shop")));
+        assert!(!scope.project_includes_id(Some(yid), Some("shop")));
+        assert!(!scope.project_includes_id(None, Some("other")));
+        assert!(!scope.project_includes_id(Some(yid), None));
+        let own = memory(eid(1), Some("shop"), Some(xid), FragmentType::Fact, 0.6);
+        let attached = memory(eid(2), Some("shop"), None, FragmentType::Fact, 0.6);
+        let foreign = memory(eid(3), Some("shop"), Some(yid), FragmentType::Fact, 0.6);
+        let global = memory(eid(4), None, None, FragmentType::Fact, 0.6);
+        assert!(scope.is_eligible(&own));
+        assert!(scope.is_eligible(&attached));
+        assert!(scope.is_eligible(&global));
+        assert!(!scope.is_eligible(&foreign));
+    }
+
+    /// Legacy scopes never see stable-id rows (disjoint without a bind).
+    #[test]
+    fn legacy_scope_excludes_stable_rows() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (_full, xid) = generate_project_id("shop");
+        let scope = EffectiveScope::resolve(&Scope {
+            project: Some("shop".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let stable = memory(eid(1), Some("shop"), Some(xid), FragmentType::Fact, 0.6);
+        let legacy = memory(eid(2), Some("shop"), None, FragmentType::Fact, 0.6);
+        let global = memory(eid(3), None, None, FragmentType::Fact, 0.6);
+        assert!(!scope.is_eligible(&stable));
+        assert!(scope.is_eligible(&legacy));
+        assert!(scope.is_eligible(&global));
+    }
+
+    /// Global scopes never see stable-id rows.
+    #[test]
+    fn global_scope_excludes_stable_rows() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (_full, xid) = generate_project_id("shop");
+        let scope = EffectiveScope::resolve(&Scope::default()).unwrap();
+        let stable = memory(eid(1), None, Some(xid), FragmentType::Fact, 0.6);
+        let global = memory(eid(2), None, None, FragmentType::Fact, 0.6);
+        assert!(!scope.is_eligible(&stable));
+        assert!(scope.is_eligible(&global));
+    }
+
+    /// A malformed project_id is rejected at the single entry point, never
+    /// passed to a filter.
+    #[test]
+    fn malformed_project_id_is_rejected() {
+        let err = EffectiveScope::resolve(&Scope {
+            project_id: Some("not-a-project-id".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation);
+    }
+
+    /// Stable-id Lance pushdown mirrors canonical eligibility: own id, or
+    /// attached/global rows with no id.
+    #[test]
+    fn stable_lance_filter_pushes_project_id_down() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (full_x, xid) = generate_project_id("shop");
+        let scope = EffectiveScope::resolve_for(
+            &Scope {
+                project_id: Some(full_x),
+                ..Default::default()
+            },
+            &["shop".to_string()],
+        )
+        .unwrap();
+        let filter = scope.to_lance_filter().unwrap();
+        assert!(
+            filter.contains(&format!("project_id = '{}'", xid.as_uuid())),
+            "own id must push down, got: {filter}"
+        );
+        assert!(filter.contains("project_id IS NULL"), "got: {filter}");
+        assert!(filter.contains("project IS NULL"), "got: {filter}");
+    }
+
+    /// Legacy Lance pushdown excludes stable rows at the source.
+    #[test]
+    fn legacy_lance_filter_excludes_stable_rows_at_source() {
+        let scope = EffectiveScope::resolve(&Scope {
+            project: Some("shop".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let filter = scope.to_lance_filter().unwrap();
+        assert!(filter.contains("project_id IS NULL"), "got: {filter}");
+        assert!(filter.contains("project = 'shop'"), "got: {filter}");
     }
 
     /// A non-finite min_confidence (only constructible natively) is

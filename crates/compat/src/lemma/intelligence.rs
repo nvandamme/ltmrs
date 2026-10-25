@@ -5,8 +5,10 @@
 //! contract. These are heuristic/advisory — they never mutate canonical state.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use ltmrs_domain::guide::Guide;
+use ltmrs_domain::id::{EntityId, EntityRevision};
 use ltmrs_domain::memory::Memory;
 use ltmrs_domain::session::Session;
 
@@ -43,10 +45,19 @@ pub struct ConflictPair {
 
 fn has_negation(text: &str) -> bool {
     let lower = text.to_lowercase();
-    NEGATION_PATTERNS.iter().any(|pattern| {
-        regex::Regex::new(pattern)
-            .map(|re| re.is_match(&lower))
-            .unwrap_or(false)
+    negation_res().iter().any(|re| re.is_match(&lower))
+}
+
+/// Compiled negation patterns, built once: the same literals as
+/// NEGATION_PATTERNS, so matching behavior is unchanged — per-call
+/// compilation only wasted time on hot paths (e.g. per-add advisory).
+fn negation_res() -> &'static [regex::Regex] {
+    static COMPILED: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        NEGATION_PATTERNS
+            .iter()
+            .filter_map(|p| regex::Regex::new(p).ok())
+            .collect()
     })
 }
 
@@ -101,18 +112,65 @@ fn score_conflict(fragment_a: &str, fragment_b: &str, overlap: f64, negation_dif
 
 fn detect_contradiction_signals(text_a: &str, text_b: &str) -> f64 {
     let mut max_score: f64 = 0.0;
-    for (pattern_a, pattern_b, weight) in CONTRADICTION_SIGNALS {
-        let re_a = regex::Regex::new(pattern_a).ok();
-        let re_b = regex::Regex::new(pattern_b).ok();
-        if let (Some(re_a), Some(re_b)) = (re_a, re_b) {
-            let a_has = re_a.is_match(text_a) && re_b.is_match(text_b);
-            let b_has = re_b.is_match(text_a) && re_a.is_match(text_b);
-            if a_has || b_has {
-                max_score = max_score.max(*weight);
-            }
+    for (re_a, re_b, weight) in signal_res() {
+        let a_has = re_a.is_match(text_a) && re_b.is_match(text_b);
+        let b_has = re_b.is_match(text_a) && re_a.is_match(text_b);
+        if a_has || b_has {
+            max_score = max_score.max(*weight);
         }
     }
     max_score
+}
+
+/// Compiled contradiction signal patterns, built once: the same
+/// literals as CONTRADICTION_SIGNALS (see negation_res).
+fn signal_res() -> &'static [(regex::Regex, regex::Regex, f64)] {
+    static COMPILED: OnceLock<Vec<(regex::Regex, regex::Regex, f64)>> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        CONTRADICTION_SIGNALS
+            .iter()
+            .filter_map(|(a, b, w)| {
+                Some((regex::Regex::new(a).ok()?, regex::Regex::new(b).ok()?, *w))
+            })
+            .collect()
+    })
+}
+
+/// Shared pair predicate for conflict detection: topic overlap plus
+/// negation/signal scoring under the module thresholds. Both the
+/// all-pairs scan and the target-anchored scan below use it, so the two
+/// entry points can never drift into separate detectors.
+fn pair_conflict(
+    fragment_a: &str,
+    fragment_b: &str,
+    sig_a: &HashSet<String>,
+    sig_b: &HashSet<String>,
+    neg_a: bool,
+    neg_b: bool,
+) -> Option<(String, f64)> {
+    let overlap = topic_overlap(sig_a, sig_b);
+    if overlap < CONFLICT_MIN_OVERLAP {
+        return None;
+    }
+    let neg_differs = neg_a != neg_b;
+    let conflict_score = score_conflict(fragment_a, fragment_b, overlap, neg_differs);
+    if conflict_score < CONFLICT_EMIT_THRESHOLD {
+        return None;
+    }
+    let reason = if neg_differs {
+        "Opposing sentiment on same topic"
+    } else {
+        "Contradiction signals detected"
+    };
+    Some((reason.to_string(), (conflict_score * 100.0).round() / 100.0))
+}
+
+fn sort_conflicts(conflicts: &mut [ConflictPair]) {
+    conflicts.sort_by(|a, b| {
+        b.overlap_score
+            .partial_cmp(&a.overlap_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 pub fn scan_for_conflicts(
@@ -133,39 +191,143 @@ pub fn scan_for_conflicts(
 
     for i in 0..n {
         for j in (i + 1)..n {
-            let overlap = topic_overlap(&signatures[i], &signatures[j]);
-            if overlap < CONFLICT_MIN_OVERLAP {
-                continue;
-            }
-            let neg_differs = negations[i] != negations[j];
-            let conflict_score = score_conflict(
+            if let Some((reason, overlap_score)) = pair_conflict(
                 &memories[i].fragment,
                 &memories[j].fragment,
-                overlap,
-                neg_differs,
-            );
-            if conflict_score >= CONFLICT_EMIT_THRESHOLD {
+                &signatures[i],
+                &signatures[j],
+                negations[i],
+                negations[j],
+            ) {
                 conflicts.push(ConflictPair {
                     memory_a_id: legacy_id_of(&memories[i]),
                     memory_a_title: memories[i].title.clone(),
                     memory_b_id: legacy_id_of(&memories[j]),
                     memory_b_title: memories[j].title.clone(),
-                    reason: if neg_differs {
-                        "Opposing sentiment on same topic".to_string()
-                    } else {
-                        "Contradiction signals detected".to_string()
-                    },
-                    overlap_score: (conflict_score * 100.0).round() / 100.0,
+                    reason,
+                    overlap_score,
                 });
             }
         }
     }
 
-    conflicts.sort_by(|a, b| {
-        b.overlap_score
-            .partial_cmp(&a.overlap_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_conflicts(&mut conflicts);
+    conflicts
+}
+
+/// Target-anchored conflict scan (Wave B3): the same pair predicate as
+/// scan_for_conflicts, evaluated only for pairs involving `target`
+/// (linear, not quadratic — the all-pairs scan per add would make bulk
+/// ingestion cubic). Emitted pairs orient the target as side A, sorted
+/// by overlap descending like the full scan.
+pub fn scan_conflicts_for_target(
+    target: &Memory,
+    candidates: &[Memory],
+    legacy_id_of: impl Fn(&Memory) -> String,
+) -> Vec<ConflictPair> {
+    scan_conflicts_for_target_cached(target, candidates, legacy_id_of, &mut SignatureCache::new())
+}
+
+/// Per-memory conflict-signature cache (Wave B3-perf): one extraction per
+/// add instead of one per candidate per add. Keyed on (EntityId,
+/// EntityRevision) so every fragment mutation invalidates: the canonical
+/// apply_update_memory bumps entity_revision on ALL paths — content writes
+/// via advance_document (crates/domain/src/memory.rs:162, which also bumps
+/// document_revision) and absolute-only writes via the entity-only next()
+/// (crates/service/src/repository_internal.rs:432; mirrored by the
+/// reference interpreter at crates/domain/src/interpreter.rs:273,277) —
+/// and all tool mutations flow through it. Feedback/access/boost never
+/// touch the fragment, so their revision-stable rows stay valid.
+/// Merge/forget only flip lifecycle (+eligibility), never the fragment, and
+/// non-recallable rows never reach the scan; the forget path
+/// (crates/daemon/src/tools.rs:2337) and the merge path
+/// (crates/daemon/src/tools.rs:2485) still prune for hygiene, and
+/// whole-store restore clears the cache outright
+/// (crates/daemon/src/tools.rs:5852) because a verbatim row swap can
+/// reuse an (id, revision) with a different fragment.
+pub struct SignatureCache {
+    entries: HashMap<EntityId, (EntityRevision, HashSet<String>, bool)>,
+}
+
+impl SignatureCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn get_or_extract(&mut self, memory: &Memory) -> (HashSet<String>, bool) {
+        if let Some((rev, sig, neg)) = self.entries.get(&memory.id)
+            && *rev == memory.entity_revision
+        {
+            return (sig.clone(), *neg);
+        }
+        let sig = extract_topic_signature(&memory.fragment);
+        let neg = has_negation(&memory.fragment);
+        self.entries
+            .insert(memory.id, (memory.entity_revision, sig.clone(), neg));
+        (sig, neg)
+    }
+
+    pub fn prune(&mut self, id: EntityId) {
+        self.entries.remove(&id);
+    }
+
+    /// Drop every entry: whole-store restore swaps rows verbatim, so a
+    /// post-replace (id, revision) may carry a different fragment from a
+    /// diverged history. Called on the restore path, never per add.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl Default for SignatureCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn scan_conflicts_for_target_cached(
+    target: &Memory,
+    candidates: &[Memory],
+    legacy_id_of: impl Fn(&Memory) -> String,
+    cache: &mut SignatureCache,
+) -> Vec<ConflictPair> {
+    let (target_sig, target_neg) = cache.get_or_extract(target);
+    let target_id = legacy_id_of(target);
+    let mut conflicts = Vec::new();
+    for m in candidates {
+        if m.id == target.id {
+            continue;
+        }
+        let (sig, neg) = cache.get_or_extract(m);
+        if let Some((reason, overlap_score)) = pair_conflict(
+            &target.fragment,
+            &m.fragment,
+            &target_sig,
+            &sig,
+            target_neg,
+            neg,
+        ) {
+            conflicts.push(ConflictPair {
+                memory_a_id: target_id.clone(),
+                memory_a_title: target.title.clone(),
+                memory_b_id: legacy_id_of(m),
+                memory_b_title: m.title.clone(),
+                reason,
+                overlap_score,
+            });
+        }
+    }
+    sort_conflicts(&mut conflicts);
     conflicts
 }
 
@@ -732,4 +894,189 @@ pub fn format_project_progress(progress: &ProjectProgress) -> String {
 
     output.push_str("\n====================");
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ltmrs_domain::id::{DocumentRevision, EligibilityRevision, EntityId, EntityRevision};
+    use ltmrs_domain::memory::{FragmentType, Instant, MemoryLifecycle, MemorySource};
+
+    fn memory(id: u128, title: &str, fragment: &str) -> Memory {
+        Memory {
+            id: EntityId::new(uuid::Uuid::from_u128(id)),
+            external_alias: None,
+            title: title.to_string(),
+            fragment: fragment.to_string(),
+            description: String::new(),
+            fragment_type: FragmentType::Fact,
+            project: None,
+            project_id: None,
+            source: MemorySource::Ai,
+            confidence: 1.0,
+            quality_score: None,
+            lifecycle: MemoryLifecycle::Live,
+            tags: vec![],
+            associated_with: vec![],
+            relations: vec![],
+            parent_id: None,
+            child_ids: vec![],
+            session_id: None,
+            task_type: None,
+            related_guides: vec![],
+            evidence: vec![],
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: EntityRevision::new(0),
+            document_revision: DocumentRevision::new(0),
+            eligibility_revision: EligibilityRevision::new(0),
+            created_at: Instant::new(1000),
+            updated_at: Instant::new(1000),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn legacy(m: &Memory) -> String {
+        format!("m{}", m.id.as_uuid().as_u128())
+    }
+
+    #[test]
+    fn single_target_matches_full_scan_for_new_memory() {
+        let a = memory(
+            1,
+            "Redis always",
+            "Always use Redis for caching session data in the API layer.",
+        );
+        let b = memory(
+            2,
+            "Redis never",
+            "Never use Redis for caching session data; pick Memcached instead.",
+        );
+        let c = memory(
+            3,
+            "Soil",
+            "## Garden\n\n### Context\nAn unrelated observation about garden soil.",
+        );
+        let all = vec![a.clone(), b.clone(), c.clone()];
+        let full = scan_for_conflicts(&all, legacy);
+        assert_eq!(full.len(), 1, "full scan must find the a/b pair");
+        let targeted = scan_conflicts_for_target(&b, &[a.clone(), c.clone()], legacy);
+        assert_eq!(targeted.len(), 1, "targeted scan must find the same pair");
+        assert_eq!(targeted[0].memory_a_id, legacy(&b));
+        assert_eq!(targeted[0].memory_a_title, b.title);
+        assert_eq!(targeted[0].memory_b_id, legacy(&a));
+        assert_eq!(targeted[0].memory_b_title, a.title);
+        assert_eq!(targeted[0].reason, full[0].reason);
+        assert_eq!(targeted[0].overlap_score, full[0].overlap_score);
+    }
+
+    /// Staleness tripwire (Wave B3-perf): a fragment mutation MUST
+    /// invalidate the cached signature. Fails against a naive id-only
+    /// cache, passes once the key carries the revision.
+    #[test]
+    fn signature_cache_invalidates_on_fragment_update() {
+        let mut cache = SignatureCache::new();
+        let mut m = memory(
+            1,
+            "Redis policy",
+            "Always use Redis for caching session data.",
+        );
+        let (sig_before, neg_before) = cache.get_or_extract(&m);
+        assert!(!neg_before, "baseline fragment carries no negation");
+        assert!(!sig_before.contains("never"));
+        // Canonical content mutation: the fragment changes and the entity
+        // revision bumps via advance_document (the same transition the
+        // canonical apply_update_memory performs on every content write).
+        m.fragment = "Never use Redis for caching; Memcached instead, however.".to_string();
+        m.advance_document();
+        let (sig_after, neg_after) = cache.get_or_extract(&m);
+        assert!(
+            neg_after,
+            "updated fragment carries negation; a stale cache would report false"
+        );
+        assert!(
+            sig_after.contains("never"),
+            "updated signature must reflect the new fragment"
+        );
+        assert_ne!(sig_before, sig_after);
+    }
+
+    /// Cached scan must equal the uncached scan even when the cache was
+    /// warmed with pre-mutation rows: an updated memory (fragment +
+    /// revision bump) and a merged-then-archived one (lifecycle only,
+    /// entity revision untouched — the merge-archive shape).
+    #[test]
+    fn cached_target_scan_matches_uncached_including_update_and_archive() {
+        let a = memory(
+            1,
+            "Redis always",
+            "Always use Redis for caching session data in the API layer.",
+        );
+        let b = memory(
+            2,
+            "Redis never",
+            "Never use Redis for caching session data; pick Memcached instead.",
+        );
+        let c = memory(
+            3,
+            "Soil",
+            "## Garden\n\n### Context\nAn unrelated observation about garden soil.",
+        );
+        // Warm the cache with the pre-mutation set.
+        let mut cache = SignatureCache::new();
+        let stale_warm =
+            scan_conflicts_for_target_cached(&b, &[a.clone(), c.clone()], legacy, &mut cache);
+        assert_eq!(stale_warm.len(), 1, "warm scan must find the a/b pair");
+        // Canonical update: b now agrees with a; revision bumps.
+        let mut b2 = b.clone();
+        b2.fragment =
+            "Always use Redis for caching session data in the API layer, exactly like the first fragment."
+                .to_string();
+        b2.advance_document();
+        // Canonical merge-archive shape: lifecycle flips, eligibility
+        // bumps, entity revision (and fragment) untouched.
+        let mut c2 = c.clone();
+        c2.lifecycle = MemoryLifecycle::Archived {
+            at: Instant::new(2000),
+        };
+        c2.advance_eligibility();
+        let candidates = vec![a.clone(), c2.clone()];
+        let cached = scan_conflicts_for_target_cached(&b2, &candidates, legacy, &mut cache);
+        let uncached = scan_conflicts_for_target(&b2, &candidates, legacy);
+        assert!(
+            uncached.is_empty(),
+            "updated b agrees with a: no conflict must remain"
+        );
+        assert_eq!(
+            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(&uncached).unwrap(),
+            "cached scan must match uncached scan exactly after update + archive"
+        );
+    }
+
+    #[test]
+    fn signature_cache_forget_prunes_entry() {
+        let mut cache = SignatureCache::new();
+        let m = memory(9, "T", "Always use Redis for caching session data.");
+        let _ = cache.get_or_extract(&m);
+        assert_eq!(cache.len(), 1);
+        cache.prune(m.id);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn signature_cache_clear_drops_all_entries() {
+        let mut cache = SignatureCache::new();
+        let m = memory(9, "T", "Always use Redis for caching session data.");
+        let _ = cache.get_or_extract(&m);
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        assert!(cache.is_empty());
+    }
 }

@@ -41,10 +41,21 @@ pub struct Dispatcher {
     /// Restore preview registry (WP-11): single-use TTL tokens bound to
     /// backup digest + live store generation. Daemon-lifetime state.
     restore: Mutex<ltmrs_interchange::restore::RestoreCoordinator>,
+    /// Legacy import lease registry (Wave B5c): single-use TTL leases
+    /// keyed by channel + source path (the import tool carries no bearer
+    /// token). Daemon-lifetime state.
+    lemma_import: Mutex<ltmrs_interchange::restore::ImportCoordinator>,
     /// Sessions snapshot path for eager durability (P1): every acknowledged
     /// session mutation persists before success returns, so kill-after-ack
     /// loses nothing. None disables persistence (tests without a path).
     sessions_path: Mutex<Option<std::path::PathBuf>>,
+    /// Conflict-signature cache (Wave B3-perf): per-memory topic
+    /// signatures + negation flags keyed on (id, entity_revision), shared
+    /// across adds so each add extracts one signature (the new memory) and
+    /// reuses the rest. Guarded by a mutex for `&self` access; poison is
+    /// recovered like the restore coordinator below (entries are
+    /// recomputable, never authoritative).
+    conflict_sigs: Mutex<ltmrs_compat::lemma::intelligence::SignatureCache>,
 }
 
 impl Dispatcher {
@@ -59,7 +70,9 @@ impl Dispatcher {
             clock,
             search: None,
             restore: Mutex::new(ltmrs_interchange::restore::RestoreCoordinator::default()),
+            lemma_import: Mutex::new(ltmrs_interchange::restore::ImportCoordinator::default()),
             sessions_path: Mutex::new(None),
+            conflict_sigs: Mutex::new(ltmrs_compat::lemma::intelligence::SignatureCache::new()),
         }
     }
 
@@ -231,6 +244,35 @@ impl Dispatcher {
                     result,
                 ))
             }
+            DomainRequest::AdoptLegacySlug {
+                project_id,
+                canonical_root,
+                slug,
+            } => {
+                let (name, id) =
+                    ltmrs_domain::project_id::parse_project_id(project_id).ok_or_else(|| {
+                        DomainError::new(
+                            DomainErrorCode::Validation,
+                            format!(
+                                "malformed project_id '{project_id}' (want prj_<name>_<26-char ULID>)"
+                            ),
+                        )
+                    })?;
+                let outcome =
+                    self.repo
+                        .adopt_legacy_slug(id, &name, canonical_root.as_deref(), slug)?;
+                Ok(IpcResponse::success(
+                    envelope.operation_id,
+                    ReceiptOutcome::Success { affected: vec![] },
+                    DomainPayload::Adopted {
+                        attached: outcome.attached,
+                        already_attached: outcome.already_attached,
+                        created: outcome.created,
+                        warning: outcome.warning,
+                        record_name: outcome.record.name,
+                    },
+                ))
+            }
             DomainRequest::GetMemories { ids } => {
                 let memories = self.repo.get_memories(ids)?;
                 Ok(IpcResponse::success(
@@ -398,6 +440,22 @@ impl Dispatcher {
         self.restore.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Access the legacy import lease registry (lock briefly; never hold
+    /// across IO — the cdylib read happens before the lease is touched).
+    pub fn import_coordinator(
+        &self,
+    ) -> std::sync::MutexGuard<'_, ltmrs_interchange::restore::ImportCoordinator> {
+        self.lemma_import.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Access the conflict-signature cache (lock briefly; never hold
+    /// across IO — extraction is CPU-only over in-memory rows).
+    pub fn conflict_signatures(
+        &self,
+    ) -> std::sync::MutexGuard<'_, ltmrs_compat::lemma::intelligence::SignatureCache> {
+        self.conflict_sigs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Access the clock (for tool execution timestamps).
     pub fn clock(&self) -> &Arc<dyn Clock + Send + Sync> {
         &self.clock
@@ -475,6 +533,7 @@ mod tests {
             retry_epoch: 1,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
             body,
         }
     }

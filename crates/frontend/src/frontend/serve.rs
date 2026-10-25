@@ -525,6 +525,10 @@ pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result
         }
     };
     let frontend = LtmrsFrontend::new(identity, client);
+    // Wave B1: prefetch the memory snapshot so the first `initialize`
+    // carries a populated index. Best-effort: a failed prefetch degrades
+    // to the lazy path on the first tool call, never fails startup.
+    frontend.prefetch_snapshot().await;
     let service = rmcp::serve_server(frontend, rmcp::transport::stdio())
         .await
         .map_err(|e| CliError::Runtime(format!("stdio transport failed: {e}")))?;
@@ -607,6 +611,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Fact,
             project: None,
+            project_id: None,
             source: MemorySource::Ai,
             confidence: 0.5,
             quality_score: None,
@@ -666,6 +671,7 @@ mod tests {
             retry_epoch: hs.retry_epoch,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: ltmrs_daemon::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::AddMemory {
                 memory: test_memory(),
             },
@@ -754,6 +760,7 @@ mod tests {
             retry_epoch: hs.retry_epoch,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: ltmrs_daemon::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::ListMemories,
         };
         let resp = client.roundtrip(&env).await.unwrap();
@@ -836,6 +843,7 @@ mod tests {
             retry_epoch: hs.retry_epoch,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: ltmrs_daemon::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::ToolCall {
                 tool: ToolArgs::SemanticSearch(SemanticSearchArgs {
                     query: "bridged write".into(),

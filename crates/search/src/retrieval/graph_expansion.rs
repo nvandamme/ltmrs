@@ -88,6 +88,21 @@ pub fn expand(
     is_in_scope: &impl Fn(EntityId) -> bool,
     policy: &GraphPolicy,
 ) -> GraphExpansion {
+    expand_ranked(seeds, neighbors, is_in_scope, &|_| 0.0, policy)
+}
+
+/// Rank-ordered bounded expansion: the shared traversal core with
+/// confidence-ordered candidate selection. Candidates at each node are
+/// ordered by `rank` (descending, EntityId tiebreak) BEFORE the fanout cap
+/// applies, so the strongest neighbors traverse when the cap binds. A
+/// constant rank reproduces [`expand`]'s EntityId order exactly.
+pub fn expand_ranked(
+    seeds: &[EntityId],
+    neighbors: &impl Fn(EntityId) -> Vec<Relation>,
+    is_in_scope: &impl Fn(EntityId) -> bool,
+    rank: &impl Fn(EntityId) -> f64,
+    policy: &GraphPolicy,
+) -> GraphExpansion {
     let mut result = GraphExpansion::default();
     let mut visited: BTreeSet<EntityId> = BTreeSet::new();
     let mut queue: VecDeque<(EntityId, EntityId, usize, GraphPath)> = VecDeque::new();
@@ -131,23 +146,23 @@ pub fn expand(
         }
 
         let edges = neighbors(node);
-        let mut candidates: Vec<(EntityId, RelationType)> = edges
+        let mut candidates: Vec<(EntityId, RelationType, f64)> = edges
             .iter()
             .filter_map(|e| {
                 let other = if e.source == node { e.target } else { e.source };
                 if other == node {
                     return None;
                 }
-                Some((other, e.relation_type))
+                Some((other, e.relation_type, rank(other)))
             })
             .collect();
 
-        // Deterministic order: by entity ID.
-        candidates.sort_by_key(|(id, _)| *id);
-        candidates.dedup_by_key(|(id, _)| *id);
+        // Rank order (strongest first), deterministic EntityId tiebreak.
+        candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        candidates.dedup_by_key(|(id, _, _)| *id);
 
         let mut traversed = 0usize;
-        for (other, etype) in candidates {
+        for (other, etype, _) in candidates {
             if traversed >= policy.max_fan_out {
                 result.truncated = true;
                 break;
@@ -199,6 +214,26 @@ fn traversable(etype: RelationType, policy: &GraphPolicy) -> bool {
         RelationType::Supersedes | RelationType::SupersededBy => policy.traverse_supersession,
         RelationType::Contradicts => policy.traverse_contradiction,
         RelationType::Supports | RelationType::RelatedTo => policy.traverse_related,
+    }
+}
+
+/// Upstream reference decay for tool-level graph scores (upstream core.ts:
+/// score = confidence x 0.6^depth). Single owner for the constant so the
+/// engine and tool paths cannot drift.
+pub const TOOL_SCORE_DECAY: f64 = 0.6;
+
+/// Tool-level graph score: the reached memory's confidence decayed by depth.
+pub fn tool_score(confidence: f64, depth: u32) -> f64 {
+    confidence * TOOL_SCORE_DECAY.powi(depth as i32)
+}
+
+/// Tool-level traversal policy: the upstream bounds (fanout 5 per node,
+/// depth 2) on the shared engine node budget. The fanout differs from
+/// [`GraphPolicy::default`] by reference contract, not invention.
+pub fn tool_policy() -> GraphPolicy {
+    GraphPolicy {
+        max_fan_out: 5,
+        ..Default::default()
     }
 }
 
@@ -302,6 +337,85 @@ mod tests {
         );
         assert!(exp.truncated);
         assert!(exp.nodes.len() <= 5);
+    }
+
+    /// Wave C0: traversal order is pinned, not incidental. `expand` must
+    /// visit same-rank neighbors in EntityId order even when the adjacency
+    /// list arrives scrambled ( BTreeMap iteration is sorted, but storage
+    /// order is not the contract — selection order is).
+    #[test]
+    fn expansion_order_is_deterministic_entity_id() {
+        // Hub 1 with leaves inserted in scrambled order; fanout 2 must
+        // take the two smallest EntityIds regardless of insertion order.
+        let mut hub_edges = Vec::new();
+        for i in [30u64, 10, 50, 20, 40] {
+            hub_edges.push(rel(i, eid(1), eid(i), RelationType::RelatedTo));
+        }
+        let edges: BTreeMap<EntityId, Vec<Relation>> = BTreeMap::from([(eid(1), hub_edges)]);
+        let policy = GraphPolicy {
+            max_fan_out: 2,
+            ..Default::default()
+        };
+        let exp = expand(
+            &[eid(1)],
+            &|id| edges.get(&id).cloned().unwrap_or_default(),
+            &|_| true,
+            &policy,
+        );
+        assert!(exp.nodes.contains_key(&eid(1)));
+        assert!(
+            exp.nodes.contains_key(&eid(10)),
+            "smallest leaf must traverse"
+        );
+        assert!(
+            exp.nodes.contains_key(&eid(20)),
+            "second-smallest leaf must traverse"
+        );
+        assert!(
+            !exp.nodes.contains_key(&eid(30)),
+            "fanout cap must stop at 2 leaves"
+        );
+        assert!(exp.truncated, "capped traversal must report truncation");
+    }
+
+    /// Wave C0: ranked selection takes the strongest neighbors first, with
+    /// EntityId order as the deterministic tiebreak.
+    #[test]
+    fn ranked_expansion_selects_strongest_first_with_id_tiebreak() {
+        let mut hub_edges = Vec::new();
+        for i in [10u64, 20, 30] {
+            hub_edges.push(rel(i, eid(1), eid(i), RelationType::RelatedTo));
+        }
+        let edges: BTreeMap<EntityId, Vec<Relation>> = BTreeMap::from([(eid(1), hub_edges)]);
+        let rank = |id: EntityId| {
+            if id == eid(20) {
+                0.5
+            } else {
+                0.9
+            }
+        };
+        let policy = GraphPolicy {
+            max_fan_out: 2,
+            ..Default::default()
+        };
+        let exp = expand_ranked(
+            &[eid(1)],
+            &|id| edges.get(&id).cloned().unwrap_or_default(),
+            &|_| true,
+            &rank,
+            &policy,
+        );
+        // Tie 30 vs 10 at 0.9 breaks toward the smaller id.
+        assert!(
+            exp.nodes.contains_key(&eid(10)),
+            "tie must break to smaller id"
+        );
+        assert!(exp.nodes.contains_key(&eid(30)), "0.9 outranks 0.5");
+        assert!(
+            !exp.nodes.contains_key(&eid(20)),
+            "fanout cap must drop the weakest"
+        );
+        assert!(exp.truncated);
     }
 
     #[test]
@@ -446,5 +560,55 @@ mod tests {
         let memories: BTreeMap<EntityId, Memory> = BTreeMap::new();
         let pred = scope_predicate(&scope, &memories);
         assert!(!pred(eid(1)));
+    }
+
+    /// Wave B5a: rank-ordered selection — a hub with more neighbors than
+    /// the fanout cap traverses the highest-ranked ones (confidence order
+    /// for the tool path), and the cap is indicated as truncation.
+    #[test]
+    fn ranked_expansion_prefers_high_confidence_neighbors() {
+        let mut hub_edges = Vec::new();
+        for i in 1..=8u64 {
+            hub_edges.push(rel(i, eid(1), eid(i + 10), RelationType::RelatedTo));
+        }
+        let edges: BTreeMap<EntityId, Vec<Relation>> = BTreeMap::from([(eid(1), hub_edges)]);
+        // Rank = confidence doubles as the order key: leaf 11 lowest.
+        let rank = |id: EntityId| (id.as_uuid().as_u128() - 10) as f64 / 10.0;
+        let exp = expand_ranked(
+            &[eid(1)],
+            &|id| edges.get(&id).cloned().unwrap_or_default(),
+            &|_| true,
+            &rank,
+            &tool_policy(),
+        );
+        assert!(exp.truncated, "fanout cap must be indicated");
+        let mut reached: Vec<EntityId> = exp
+            .nodes
+            .keys()
+            .copied()
+            .filter(|id| *id != eid(1))
+            .collect();
+        reached.sort();
+        let expected: Vec<EntityId> = (14..=18).map(eid).collect();
+        assert_eq!(reached, expected, "only the top-5 ranks may traverse");
+    }
+
+    /// Wave B5a: tool scores follow the upstream reference contract
+    /// confidence x 0.6^depth (depth 0 is the seed: full confidence).
+    #[test]
+    fn tool_score_matches_upstream_decay() {
+        assert!((tool_score(0.4, 1) - 0.24).abs() < 1e-12);
+        assert!((tool_score(0.95, 2) - 0.95 * 0.36).abs() < 1e-12);
+        assert!((tool_score(0.7, 0) - 0.7).abs() < 1e-12);
+    }
+
+    /// Wave B5a: the tool policy pins the upstream bounds (fanout 5,
+    /// depth 2) on the shared engine budget (max nodes).
+    #[test]
+    fn tool_policy_matches_upstream_bounds() {
+        let policy = tool_policy();
+        assert_eq!(policy.max_fan_out, 5);
+        assert_eq!(policy.max_depth, 2);
+        assert_eq!(policy.max_nodes, GraphPolicy::default().max_nodes);
     }
 }

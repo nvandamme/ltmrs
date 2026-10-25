@@ -15,13 +15,13 @@ use crate::dispatcher::Dispatcher;
 use crate::envelope::{DomainPayload, IpcEnvelope};
 use ltmrs_compat::lemma::privacy;
 use ltmrs_compat::lemma::tool_args::{
-    BackupCreateArgs, BackupPreviewArgs, BackupRestoreArgs, ConflictScanArgs, GuideCreateArgs,
-    GuideDistillArgs, GuideForgetArgs, GuideGetArgs, GuideMergeArgs, GuidePracticeArgs,
-    GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs, MemoryFeedbackArgs, MemoryForgetArgs,
-    MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs,
-    MemoryUpdateArgs, ProactiveAnalysisArgs, ProjectAnalyticsArgs, ResponseFormat,
-    SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs, SessionStartArgs, SessionStatsArgs,
-    SuggestionRespondArgs, ToolArgs,
+    BackupCreateArgs, BackupImportLemmaArgs, BackupPreviewArgs, BackupRestoreArgs,
+    ConflictScanArgs, GuideCreateArgs, GuideDistillArgs, GuideForgetArgs, GuideGetArgs,
+    GuideMergeArgs, GuidePracticeArgs, GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs,
+    MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs,
+    MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs, ProactiveAnalysisArgs,
+    ProjectAnalyticsArgs, ResponseFormat, SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs,
+    SessionStartArgs, SessionStatsArgs, SuggestionRespondArgs, ToolArgs,
 };
 use ltmrs_domain::command::{
     CommandContext, CommandReceipt, DomainCommand, DomainError, DomainErrorCode, DomainResult,
@@ -33,6 +33,8 @@ use ltmrs_domain::memory::{Evidence, FragmentType, Instant, Memory, MemorySource
 use ltmrs_domain::relation::{Relation, RelationType};
 use ltmrs_domain::session::SessionOp;
 use ltmrs_domain::session::{AttemptOutcome, Session, SuggestionStatus, TaskOutcome};
+use ltmrs_search::retrieval::scope::EffectiveScope;
+use ltmrs_service::projects::{IdentityClaim, ResolvedScope};
 use ltmrs_service::repository::AdmittedScope;
 use ltmrs_service::repository::{GuideMutation, RecordedGuideOp};
 use serde_json::{Value, json};
@@ -64,18 +66,35 @@ pub fn execute_tool(
             .as_ref()
             .expect("execute_tool admits every mutating tool before dispatching it")
     };
-    match tool {
-        ToolArgs::MemoryRead(args) => exec_memory_read(disp, envelope, args),
-        ToolArgs::MemoryAdd(args) => exec_memory_add(disp, envelope, adm(), args),
-        ToolArgs::MemoryUpdate(args) => exec_memory_update(disp, envelope, adm(), args),
-        ToolArgs::MemoryFeedback(args) => exec_memory_feedback(disp, envelope, adm(), args),
-        ToolArgs::MemoryForget(args) => exec_memory_forget(disp, envelope, adm(), args),
-        ToolArgs::MemoryMerge(args) => exec_memory_merge(disp, envelope, adm(), args),
-        ToolArgs::MemoryRelate(args) => exec_memory_relate(disp, envelope, adm(), args),
-        ToolArgs::MemoryStats(args) => exec_memory_stats(disp, args),
+    // Project identity (Wave A3b): resolve the envelope identity (env /
+    // bind file / flag winner) plus the wire legacy project into one
+    // scope. Memory reads never register (reads stay side-effect-free for
+    // identity) but obey the resolved scope; mutations may register,
+    // learn a moved root, or refuse with candidates + remediation.
+    let wire_project = ltmrs_compat::lemma::tool_args::tool_project(tool);
+    let claim = IdentityClaim {
+        project_id: envelope.identity.project_id.as_deref(),
+        canonical_root: envelope.identity.canonical_root.as_deref(),
+        legacy_project: wire_project.as_deref(),
+        legacy_explicit: envelope.identity.legacy_explicit,
+        all: matches!(tool, ToolArgs::MemoryRead(a) if a.all),
+    };
+    let is_write = tool.mutates_store() && !matches!(tool, ToolArgs::MemoryRead(_));
+    let resolved = disp.repo().resolve_identity(&claim, is_write)?;
+    let mut payload = match tool {
+        ToolArgs::MemoryRead(args) => exec_memory_read(disp, envelope, adm(), args, &resolved),
+        ToolArgs::MemoryAdd(args) => exec_memory_add(disp, envelope, adm(), args, &resolved),
+        ToolArgs::MemoryUpdate(args) => exec_memory_update(disp, envelope, adm(), args, &resolved),
+        ToolArgs::MemoryFeedback(args) => {
+            exec_memory_feedback(disp, envelope, adm(), args, &resolved)
+        }
+        ToolArgs::MemoryForget(args) => exec_memory_forget(disp, envelope, adm(), args, &resolved),
+        ToolArgs::MemoryMerge(args) => exec_memory_merge(disp, envelope, adm(), args, &resolved),
+        ToolArgs::MemoryRelate(args) => exec_memory_relate(disp, envelope, adm(), args, &resolved),
+        ToolArgs::MemoryStats(args) => exec_memory_stats(disp, args, &resolved),
         ToolArgs::MemoryAudit(args) => exec_memory_audit(disp, args),
-        ToolArgs::MemoryLibrary(args) => exec_memory_library(disp, args),
-        ToolArgs::SemanticSearch(args) => exec_semantic_search(disp, envelope, args),
+        ToolArgs::MemoryLibrary(args) => exec_memory_library(disp, args, &resolved),
+        ToolArgs::SemanticSearch(args) => exec_semantic_search(disp, envelope, args, &resolved),
         ToolArgs::GuideGet(args) => exec_guide_get(disp, args),
         ToolArgs::GuidePractice(args) => exec_guide_practice(disp, envelope, args),
         ToolArgs::GuideCreate(args) => exec_guide_create(disp, envelope, args),
@@ -83,7 +102,7 @@ pub fn execute_tool(
         ToolArgs::GuideUpdate(args) => exec_guide_update(disp, envelope, args),
         ToolArgs::GuideForget(args) => exec_guide_forget(disp, envelope, args),
         ToolArgs::GuideMerge(args) => exec_guide_merge(disp, envelope, args),
-        ToolArgs::SessionStart(args) => exec_session_start(disp, envelope, adm(), args),
+        ToolArgs::SessionStart(args) => exec_session_start(disp, envelope, adm(), args, &resolved),
         ToolArgs::SessionAttempt(args) => exec_session_attempt(disp, envelope, adm(), args),
         ToolArgs::SessionEnd(args) => exec_session_end(disp, envelope, adm(), args),
         ToolArgs::SessionStats(args) => exec_session_stats(disp, envelope, args),
@@ -94,7 +113,55 @@ pub fn execute_tool(
         ToolArgs::BackupCreate(args) => exec_backup_create(disp, args),
         ToolArgs::BackupPreview(args) => exec_backup_preview(disp, envelope, args),
         ToolArgs::BackupRestore(args) => exec_backup_restore(disp, envelope, args),
+        ToolArgs::BackupImportLemma(args) => exec_backup_import_lemma(disp, envelope, args),
+    }?;
+    // Proceed-with-warning (Wave A3b shadow matrix): the resolution note
+    // rides the human-readable text; the frozen structured shape is
+    // untouched and frozen replays stay verbatim (they return above).
+    if let Some(note) = resolved.warning.as_deref()
+        && let DomainPayload::ToolResult { text, .. } = &mut payload
+    {
+        text.push_str(&format!("\n\nNote: {note}"));
     }
+    Ok(payload)
+}
+
+/// Build the retrieval scope for a read path (Wave A3b): the stable id
+/// (with its attached legacy slugs) or the legacy/global fallback, plus
+/// the call's filters. `all` is the wire cross-project flag; the resolved
+/// claim already carries it for the calls that have one.
+fn effective_for_read(
+    resolved: &ResolvedScope,
+    min_confidence: Option<f64>,
+    after: Option<u64>,
+    before: Option<u64>,
+    all: bool,
+) -> DomainResult<EffectiveScope> {
+    let raw = ltmrs_domain::command::Scope {
+        project: if resolved.project_id.is_some() {
+            None
+        } else {
+            resolved.legacy.clone()
+        },
+        project_id: resolved.project_id_str.clone(),
+        all_projects: resolved.all || all,
+        min_confidence,
+        after,
+        before,
+        ..Default::default()
+    };
+    EffectiveScope::resolve_for(&raw, &resolved.attached)
+}
+
+/// Stable-scope existence gate for single-target tools (Wave A3b): under
+/// a stable identity a foreign row is treated as missing (no leak, no
+/// cross-project write). Legacy/global scopes stay permissive.
+fn stable_visible(resolved: &ResolvedScope, m: &Memory) -> DomainResult<bool> {
+    if resolved.project_id.is_none() {
+        return Ok(true);
+    }
+    let scope = effective_for_read(resolved, None, None, None, false)?;
+    Ok(scope.project_includes_id(m.project_id, m.project.as_deref()))
 }
 
 // ---- Result constructors ----
@@ -144,11 +211,28 @@ fn legacy_id_of_from_id(
     repo: &ltmrs_service::repository::CanonicalRepository,
     id: EntityId,
 ) -> String {
+    // Presentational fallback: display ids degrade to the raw UUID when the
+    // read fails. Callers only render text; canonical state is untouched.
     repo.get_memories(&[id])
         .ok()
         .and_then(|v| v.into_iter().next())
         .map(|m| repo.legacy_id(&m))
         .unwrap_or_else(|| id.as_uuid().to_string())
+}
+
+/// Presentational fallback for rendering a recorded link: the link itself
+/// commits canonically in the tool transaction, so a read failure here
+/// only drops the informational auto-link tail from the response text —
+/// never the link. Failing the whole tool after a committed success would
+/// brick retries (the receipt exists, the read still fails).
+fn find_recorded_link_for_render(
+    repo: &ltmrs_service::repository::CanonicalRepository,
+    id: EntityId,
+) -> Option<Relation> {
+    repo.all_relations()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.id == id)
 }
 
 fn resolve_id(
@@ -406,15 +490,127 @@ fn new_relation(
     Relation::new(rid, source, target, rtype, note, Instant::new(0))
 }
 
+/// Attribute a successful read to the channel's active session (Wave B2):
+/// traced sessions get canonical MemoryRead links (fail-loud via `?`,
+/// same dedup as the preload helper); virtual sessions get an in-memory
+/// routing record only; no traced session is a canonical no-op.
+fn attribute_read_to_session(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
+    legacy_ids: &[String],
+) -> DomainResult<()> {
+    if legacy_ids.is_empty() {
+        return Ok(());
+    }
+    if let Some(handle) = disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
+        disp.repo().track_session_link(
+            admitted,
+            handle,
+            ltmrs_service::repository::SessionLinkField::MemoryRead,
+            legacy_ids,
+        )?;
+    } else {
+        let now = disp.clock().now_millis();
+        let vhandle =
+            disp.registry()
+                .ensure_virtual_session(envelope.frontend_id, envelope.channel_id, now);
+        disp.registry().track_virtual_read(vhandle, legacy_ids);
+    }
+    Ok(())
+}
+
+/// Plan co-read links for one returned set (Wave B2): gate every pair
+/// with the stable visibility predicate (no cross-boundary edges, even
+/// under all=true), return all gated pairs for associatedWith plus up to
+/// 3 relations star-anchored on the highest-confidence memory.
+#[allow(clippy::type_complexity)]
+fn plan_coread(
+    envelope: &IpcEnvelope,
+    resolved: &ResolvedScope,
+    memories: &[Memory],
+) -> DomainResult<(Vec<(EntityId, EntityId)>, Vec<Relation>)> {
+    if memories.len() < 2 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut gated: Vec<&Memory> = Vec::new();
+    for m in memories {
+        if stable_visible(resolved, m)? {
+            gated.push(m);
+        }
+    }
+    if gated.len() < 2 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut pairs: Vec<(EntityId, EntityId)> = Vec::new();
+    for i in 0..gated.len() {
+        for j in (i + 1)..gated.len() {
+            let (a, b) = (gated[i].id, gated[j].id);
+            let both_visible =
+                stable_visible(resolved, gated[i])? && stable_visible(resolved, gated[j])?;
+            if both_visible {
+                pairs.push((a, b));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut by_conf: Vec<&Memory> = gated.clone();
+    by_conf.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut relations: Vec<Relation> = Vec::new();
+    let top = by_conf[0].id;
+    for other in by_conf.iter().skip(1).take(3) {
+        if pairs
+            .iter()
+            .any(|(a, b)| (*a == top && *b == other.id) || (*a == other.id && *b == top))
+        {
+            relations.push(new_relation(
+                envelope,
+                top,
+                other.id,
+                RelationType::RelatedTo,
+                Some("Co-read: returned together".to_string()),
+            ));
+        }
+        if relations.len() >= 3 {
+            break;
+        }
+    }
+    Ok((pairs, relations))
+}
+
 // ---- memory_read ----
+
+/// Maximum page size for memory_read (frozen upstream contract).
+const MEMORY_READ_PAGE_MAX: usize = 100;
+/// Maximum page size for semantic_search (frozen upstream contract).
+const SEMANTIC_PAGE_MAX: usize = 30;
 
 fn exec_memory_read(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
+    admitted: &AdmittedScope,
     args: &MemoryReadArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let format = args.response_format;
+    // Stable-id direct reads obey scope (Part I 01:§6.3): a stable identity
+    // never resolves foreign rows by ID (treated as not found, never
+    // leaked). Legacy/global scopes keep the permissive frozen behavior.
+    // Only the project dimension applies to explicit IDs (no confidence /
+    // date filtering on a direct read).
+    let id_scope = effective_for_read(resolved, None, None, None, args.all)?;
+    let in_scope = |m: &Memory| {
+        resolved.project_id.is_none()
+            || id_scope.project_includes_id(m.project_id, m.project.as_deref())
+    };
 
     // Single-ID detail.
     if let Some(id) = &args.id {
@@ -425,6 +621,9 @@ fn exec_memory_read(
         let Some(m_pre) = mems.first() else {
             return Ok(err_result(&format!("Fragment with ID '{id}' not found")));
         };
+        if !in_scope(m_pre) {
+            return Ok(err_result(&format!("Fragment with ID '{id}' not found")));
+        }
         let mut selections: Vec<RecallSelection> = vec![RecallSelection {
             memory: m_pre,
             method: "explicit_id",
@@ -433,6 +632,12 @@ fn exec_memory_read(
             graph: None,
         }];
         record_access(disp, envelope, &[m_pre.id], args.context.as_deref())?;
+        attribute_read_to_session(
+            disp,
+            envelope,
+            admitted,
+            std::slice::from_ref(&repo.legacy_id(m_pre)),
+        )?;
         // Render the post-boost record (upstream boostOnAccess returns the
         // boosted fragment which is what gets formatted).
         let mems = repo.get_memories(&[eid])?;
@@ -442,40 +647,58 @@ fn exec_memory_read(
         let resolver = |eid: &EntityId| legacy_id_of_from_id(repo, *eid);
         let mut text = render_detail(&legacy_id_of(repo, m), m, &resolver);
         let mut related_graph: Vec<Value> = Vec::new();
-        let graph = if args.expand_graph {
-            expand_graph(repo, m.id)?
+        // Bounded tool-level expansion (Wave B5a): BFS with per-node
+        // fanout cap, total-node budget and confidence x 0.6^depth scoring,
+        // reusing the engine's traversal core. Eligibility is the call's
+        // full scope (project, lifecycle, confidence) plus the stable
+        // visibility gate, so expansion — a derived read — never leaks
+        // across the boundary even when the seed was read with all=true.
+        // Bound outside the flag branch: selections borrows the reached
+        // memories past the traversal.
+        let (nodes, graph_truncated): (ExpandedNodes, bool) = if args.expand_graph {
+            let scope = effective_for_read(
+                resolved,
+                args.min_confidence,
+                args.after_date.as_deref().and_then(parse_iso_date),
+                args.before_date.as_deref().and_then(parse_iso_date),
+                args.all,
+            )?;
+            expand_graph(repo, &scope, resolved, m.id)?
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
-        if !graph.is_empty() {
+        if !nodes.is_empty() {
             text.push_str("\n\n## Related knowledge (graph, depth ≤ 2)");
-            for (gm, depth, score) in &graph {
-                related_graph.push(json!({
-                    "id": legacy_id_of(repo, gm),
-                    "title": gm.title,
-                    "depth": depth,
-                    "score": score,
-                }));
-                selections.push(RecallSelection {
-                    memory: gm,
-                    method: "graph_expansion",
-                    rank: None,
-                    score: Some(*score),
-                    graph: Some((legacy_id_of(repo, m), *depth)),
-                });
-                text.push_str(&format!(
-                    "\n- [{}] (depth {}, score {:.2}) {}: {}",
-                    legacy_id_of(repo, gm),
-                    depth,
-                    score,
-                    gm.title,
-                    if gm.description.is_empty() {
-                        gm.fragment.chars().take(80).collect::<String>()
-                    } else {
-                        gm.description.clone()
-                    }
-                ));
+            if graph_truncated {
+                text.push_str(" (truncated: bounded traversal)");
             }
+        }
+        for (gm, depth, score) in &nodes {
+            related_graph.push(json!({
+                "id": legacy_id_of(repo, gm),
+                "title": gm.title,
+                "depth": depth,
+                "score": score,
+            }));
+            selections.push(RecallSelection {
+                memory: gm,
+                method: "graph_expansion",
+                rank: None,
+                score: Some(*score),
+                graph: Some((legacy_id_of(repo, m), *depth)),
+            });
+            text.push_str(&format!(
+                "\n- [{}] (depth {}, score {:.2}) {}: {}",
+                legacy_id_of(repo, gm),
+                depth,
+                score,
+                gm.title,
+                if gm.description.is_empty() {
+                    gm.fragment.chars().take(80).collect::<String>()
+                } else {
+                    gm.description.clone()
+                }
+            ));
         }
         let recall_explanation = if args.explain {
             Some(explain_recall(repo, &selections, "explicit_ids", None))
@@ -494,6 +717,13 @@ fn exec_memory_read(
         if !related_graph.is_empty() {
             data["related_graph"] = json!(related_graph);
         }
+        // Minimal shape extension (Wave B5a): the frozen related_graph
+        // items are untouched; a top-level graph_truncated flag carries the
+        // traversal budget outcome, mirroring the citations_truncated
+        // precedent in recall explanations.
+        if args.expand_graph {
+            data["graph_truncated"] = json!(graph_truncated);
+        }
         if let Some(exp) = recall_explanation {
             data["recall_explanation"] = json!(exp);
         }
@@ -504,27 +734,50 @@ fn exec_memory_read(
     if let Some(ids) = &args.ids
         && !ids.is_empty()
     {
-        let mut results: Vec<String> = Vec::new();
-        let mut fragments: Vec<Value> = Vec::new();
         let mut accessed: Vec<EntityId> = Vec::new();
         let mut found: Vec<Memory> = Vec::new();
-        let resolver = |eid: &EntityId| legacy_id_of_from_id(repo, *eid);
         for id in ids {
             let m = match resolve_id(repo, id) {
                 Ok(eid) => repo.get_memories(&[eid])?.first().cloned(),
                 Err(_) => None,
             };
-            match m {
-                Some(m) => {
-                    accessed.push(m.id);
-                    fragments.push(fragment_detail_json(repo, &m));
-                    results.push(render_detail(&legacy_id_of(repo, &m), &m, &resolver));
-                    found.push(m);
-                }
-                None => results.push(format!("Fragment [{id}] not found.")),
+            // Stable scopes never resolve foreign rows by ID (no leak:
+            // out-of-scope renders exactly like a missing fragment).
+            let m = m.filter(|m| in_scope(m));
+            if let Some(m) = m {
+                accessed.push(m.id);
+                found.push(m);
             }
         }
         record_access(disp, envelope, &accessed, args.context.as_deref())?;
+        let legacy_ids: Vec<String> = found.iter().map(|m| repo.legacy_id(m)).collect();
+        attribute_read_to_session(disp, envelope, admitted, &legacy_ids)?;
+        let (pairs, relations) = plan_coread(envelope, resolved, &found)?;
+        if !pairs.is_empty() || !relations.is_empty() {
+            disp.repo()
+                .apply_coread_links(admitted, &pairs, &relations)?;
+        }
+        // Re-fetch post-access (and post-link) records so detail reflects
+        // boosted counters and updated associatedWith. Shapes unchanged,
+        // input order preserved.
+        let fresh: Vec<Memory> = repo.get_memories(&accessed)?;
+        let fresh_by_id: std::collections::BTreeMap<EntityId, &Memory> =
+            fresh.iter().map(|m| (m.id, m)).collect();
+        let resolver = |eid: &EntityId| legacy_id_of_from_id(repo, *eid);
+        let mut results: Vec<String> = Vec::new();
+        let mut fragments: Vec<Value> = Vec::new();
+        for id in ids {
+            let eid_opt = resolve_id(repo, id).ok();
+            if let Some(eid) = eid_opt
+                && let Some(m) = fresh_by_id.get(&eid)
+                && in_scope(m)
+            {
+                fragments.push(fragment_detail_json(repo, m));
+                results.push(render_detail(&legacy_id_of(repo, m), m, &resolver));
+            } else {
+                results.push(format!("Fragment [{id}] not found."));
+            }
+        }
         let selections: Vec<RecallSelection> = found
             .iter()
             .map(|m| RecallSelection {
@@ -556,55 +809,35 @@ fn exec_memory_read(
         return Ok(format_result(text, data, format));
     }
 
-    // Browse or query mode.
-    let limit = args.limit.unwrap_or(30).clamp(1, 100);
-    let offset = args.offset.unwrap_or(0);
-
-    let mut memories = recall_browse(disp, args)?;
-
-    // Post-filters (dates, min_confidence) applied on top of the search result.
-    memories.retain(|m| {
-        if let Some(min) = args.min_confidence
-            && m.confidence < min
-        {
-            return false;
-        }
-        if let Some(after) = args.after_date.as_deref().and_then(parse_iso_date)
-            && m.created_at.as_millis() < after
-        {
-            return false;
-        }
-        if let Some(before) = args.before_date.as_deref().and_then(parse_iso_date)
-            && m.created_at.as_millis() > before
-        {
-            return false;
-        }
-        true
-    });
-
-    let total = memories.len();
-    let page: Vec<Memory> = memories.iter().skip(offset).take(limit).cloned().collect();
-    let has_more = offset + limit < total;
-    let next_offset = if has_more { offset + limit } else { 0 };
+    // Browse or query mode: one validated window, paged by the retrieval
+    // choke point (recall_browse) which owns the total. Totals never come
+    // from a truncated vector.
+    let browsed = recall_browse(disp, args, resolved)?;
+    let (pairs, total, offset, has_more, next_offset) = (
+        &browsed.page.items,
+        browsed.page.total,
+        browsed.page.offset,
+        browsed.page.has_more,
+        browsed.page.next_offset,
+    );
+    let method = browsed.method;
 
     // Build the recall explanation from the pre-boost page (upstream captures
     // provenance before boostOnAccess mutates confidence/access counters).
-    let method = if args.query.is_some() && !args.query.as_deref().unwrap().is_empty() {
-        "fts5_bm25"
-    } else {
-        "confidence_browse"
-    };
-    let selections: Vec<RecallSelection> = page
+    // Scores are the values that determined the served order on each path.
+    let selections: Vec<RecallSelection> = pairs
         .iter()
         .enumerate()
-        .map(|(i, m)| RecallSelection {
+        .map(|(i, (m, s))| RecallSelection {
             memory: m,
             method,
-            rank: Some(offset as u64 + i as u64 + 1),
-            score: None,
+            rank: Some(offset.saturating_add(i).saturating_add(1) as u64),
+            score: Some(*s),
             graph: None,
         })
         .collect();
+    let page_mem: Vec<Memory> = pairs.iter().map(|(m, _)| m.clone()).collect();
+    let page = &page_mem;
     let recall_explanation = if args.explain && !selections.is_empty() {
         Some(explain_recall(
             repo,
@@ -626,6 +859,22 @@ fn exec_memory_read(
 
     let accessed: Vec<EntityId> = page.iter().map(|m| m.id).collect();
     record_access(disp, envelope, &accessed, args.context.as_deref())?;
+    let legacy_ids: Vec<String> = page.iter().map(|m| repo.legacy_id(m)).collect();
+    attribute_read_to_session(disp, envelope, admitted, &legacy_ids)?;
+    let (pairs, relations) = plan_coread(envelope, resolved, page)?;
+    if !pairs.is_empty() || !relations.is_empty() {
+        disp.repo()
+            .apply_coread_links(admitted, &pairs, &relations)?;
+    }
+    // Re-fetch post-access records so summary confidence values are
+    // post-boost. Explain stays pre-boost (provenance). Shapes unchanged.
+    let fresh_page: Vec<Memory> = repo.get_memories(&accessed)?;
+    let fresh_by_id: std::collections::BTreeMap<EntityId, &Memory> =
+        fresh_page.iter().map(|m| (m.id, m)).collect();
+    let ordered_fresh: Vec<&Memory> = page
+        .iter()
+        .filter_map(|m| fresh_by_id.get(&m.id).copied())
+        .collect();
 
     let scope_info = if args.all {
         "all projects".to_string()
@@ -633,18 +882,20 @@ fn exec_memory_read(
         args.project.clone().unwrap_or_else(|| "global".to_string())
     };
     let lid = |m: &Memory| legacy_id_of(repo, m);
-    let mut text = render_summary_index(&page, &scope_info, &lid);
+    let render_page: Vec<Memory> = ordered_fresh.into_iter().cloned().collect();
+    let mut text = render_summary_index(&render_page, &scope_info, &lid);
     if has_more {
         text.push_str(&format!(
-            "\nShowing {} of {} fragments (offset {}). Pass offset={next_offset} for the next page, or use the query parameter to search.",
-            page.len(),
+            "\nShowing {} of {} fragments (offset {}). Pass offset={} for the next page, or use the query parameter to search.",
+            render_page.len(),
             total,
-            offset
+            offset,
+            next_offset.unwrap_or(offset),
         ));
     } else if args.query.is_none() {
         text.push_str(&format!(
             "\nShowing top {} fragments (ranked by relevance). Use query parameter to search, or id for a specific fragment.",
-            page.len()
+            render_page.len()
         ));
     }
 
@@ -652,7 +903,7 @@ fn exec_memory_read(
         text.push_str(&format_recall_explanation(exp));
     }
 
-    let fragments: Vec<Value> = page
+    let fragments: Vec<Value> = render_page
         .iter()
         .map(|m| {
             json!({
@@ -667,11 +918,11 @@ fn exec_memory_read(
         .collect();
 
     let mut data = json!({
-        "count": page.len(),
+        "count": render_page.len(),
         "total": total,
         "fragments": fragments,
         "has_more": has_more,
-        "next_offset": if has_more { Some(next_offset) } else { None },
+        "next_offset": next_offset,
     });
     if let Some(exp) = recall_explanation {
         data["recall_explanation"] = json!(exp);
@@ -695,116 +946,267 @@ fn fragment_detail_json(
     })
 }
 
-/// Bounded graph expansion from a memory (depth ≤ 2).
+/// Reached graph nodes for the tool-level read: memory, depth, score.
+type ExpandedNodes = Vec<(Memory, u32, f64)>;
+
+/// Bounded tool-level graph expansion from a memory (Wave B5a).
+///
+/// Breadth-first traversal reusing the engine's ranked core
+/// (`ltmrs_search::retrieval::graph_expansion::expand_ranked`) with the
+/// tool policy (fanout 5 per node, depth ≤ 2, shared node budget) and
+/// confidence-ordered candidate selection. Every expanded node passes the
+/// call's full eligibility (project, lifecycle, confidence) plus the
+/// stable visibility gate — expansion is a derived read and must not leak
+/// what a direct read would refuse. The single relation snapshot is
+/// indexed once (no per-node full scan). Returns the reached memories
+/// with (depth, confidence x 0.6^depth) scores in deterministic
+/// score-descending order, plus whether a bound truncated the traversal.
 fn expand_graph(
     repo: &ltmrs_service::repository::CanonicalRepository,
+    scope: &EffectiveScope,
+    resolved: &ResolvedScope,
     root: EntityId,
-) -> DomainResult<Vec<(Memory, u32, f64)>> {
+) -> DomainResult<(ExpandedNodes, bool)> {
+    use ltmrs_search::retrieval::graph_expansion::{expand_ranked, tool_policy, tool_score};
+
     let relations = repo.all_relations()?;
-    let mut seen: BTreeMap<EntityId, u32> = BTreeMap::new();
-    seen.insert(root, 0);
-    let mut frontier: Vec<(EntityId, u32)> = vec![(root, 0)];
-    while let Some((id, depth)) = frontier.pop()
-        && depth < 2
-    {
-        for r in &relations {
-            let next = if r.source == id {
-                Some(r.target)
-            } else if r.target == id {
-                Some(r.source)
-            } else {
-                None
-            };
-            if let Some(nid) = next
-                && !seen.contains_key(&nid)
-            {
-                seen.insert(nid, depth + 1);
-                frontier.push((nid, depth + 1));
-            }
-        }
+    let mut neighbor_map: BTreeMap<EntityId, Vec<Relation>> = BTreeMap::new();
+    for r in &relations {
+        neighbor_map.entry(r.source).or_default().push(r.clone());
+        neighbor_map.entry(r.target).or_default().push(r.clone());
     }
+    let memory_of = |id: EntityId| {
+        repo.get_memories(&[id])
+            .ok()
+            .and_then(|v| v.into_iter().next())
+    };
+    // Stable gate on top of scope eligibility: under a stable identity a
+    // foreign row is never traversed (even when the seed was read with
+    // all=true); legacy/global scopes stay permissive via stable_visible.
+    let eligible = |id: EntityId| {
+        memory_of(id)
+            .is_some_and(|m| scope.is_eligible(&m) && stable_visible(resolved, &m).unwrap_or(false))
+    };
+    let rank = |id: EntityId| {
+        memory_of(id)
+            .map(|m| m.confidence)
+            .unwrap_or(f64::NEG_INFINITY)
+    };
+    let expansion = expand_ranked(
+        &[root],
+        &|id| neighbor_map.get(&id).cloned().unwrap_or_default(),
+        &eligible,
+        &rank,
+        &tool_policy(),
+    );
     let mut out = Vec::new();
-    for (id, depth) in &seen {
+    for (id, node) in &expansion.nodes {
         if *id == root {
             continue;
         }
-        if let Some(m) = repo.get_memories(&[*id])?.first() {
-            out.push((m.clone(), *depth, 1.0 / *depth as f64));
+        if let Some(m) = memory_of(*id) {
+            out.push((
+                m.clone(),
+                node.depth as u32,
+                tool_score(m.confidence, node.depth as u32),
+            ));
         }
     }
-    out.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(out)
+    out.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.id.cmp(&b.0.id)));
+    Ok((out, expansion.truncated))
+}
+
+/// Scored browse/query recall (Wave B5d): the served page with the
+/// per-item score that determined the served order, plus the method label
+/// naming the actual serving path (one label = one ranking).
+struct ScoredRecall {
+    page: ltmrs_compat::lemma::pagination::Page<(Memory, f64)>,
+    method: &'static str,
 }
 
 /// Recall memories for browse/query mode: search backend when available,
 /// else a canonical snapshot scan (lexical fallback). An attached but empty
 /// backend (e.g. a fresh E5 start before projection runs) also falls back —
 /// an empty dense/lexical index must never hide canonical knowledge.
-fn recall_browse(disp: &Dispatcher, args: &MemoryReadArgs) -> DomainResult<Vec<Memory>> {
+///
+/// Single pagination choke point for memory_read: validates the window,
+/// applies post-filters, and returns the page with the full matching-set
+/// total. Totals never come from an already-truncated vector: the engine
+/// reports its pool total; the fallback counts its full filtered scan.
+fn recall_browse(
+    disp: &Dispatcher,
+    args: &MemoryReadArgs,
+    resolved: &ResolvedScope,
+) -> DomainResult<ScoredRecall> {
+    use ltmrs_compat::lemma::pagination::{MAX_PAGINATION_WINDOW, paginate_vec, validate_window};
+    let limit = args.limit.unwrap_or(30);
+    if limit == 0 || limit > MEMORY_READ_PAGE_MAX {
+        return Err(DomainError::new(
+            DomainErrorCode::Validation,
+            format!("memory_read limit {limit} out of range 1..={MEMORY_READ_PAGE_MAX}"),
+        ));
+    }
+    let offset = args.offset.unwrap_or(0);
+    let window_end = validate_window(offset, limit)?;
+
+    // One effective scope for every path below (Wave A3b): stable ids key
+    // eligibility (own + attached + global), legacy/global scopes stay
+    // disjoint from stable rows. The engine resolves the same scope for
+    // its legs (attached slugs travel in the request); the fallback
+    // applies the identical predicate to the full canonical scan, so the
+    // total stays honest on both paths.
+    let scope = effective_for_read(
+        resolved,
+        args.min_confidence,
+        args.after_date.as_deref().and_then(parse_iso_date),
+        args.before_date.as_deref().and_then(parse_iso_date),
+        args.all,
+    )?;
+
+    // Date/confidence filters travel in the engine scope so the pool total
+    // counts only the passing set; the snapshot fallback applies the same
+    // predicates post-scan. The engine path must not filter post-hoc: the
+    // total is already fixed when the page is sliced.
+    let post_filter = |m: &Memory| {
+        if let Some(min) = args.min_confidence
+            && m.confidence < min
+        {
+            return false;
+        }
+        if let Some(after) = args.after_date.as_deref().and_then(parse_iso_date)
+            && m.created_at.as_millis() < after
+        {
+            return false;
+        }
+        if let Some(before) = args.before_date.as_deref().and_then(parse_iso_date)
+            && m.created_at.as_millis() > before
+        {
+            return false;
+        }
+        true
+    };
+
     if let Some(sb) = disp.search() {
         let req = ltmrs_search::retrieval::engine::RetrievalRequest {
             query: args.query.clone().unwrap_or_default(),
             scope: ltmrs_domain::command::Scope {
-                project: args.project.clone(),
-                all_projects: args.all,
+                project: scope.project.clone(),
+                project_id: resolved.project_id_str.clone(),
+                all_projects: scope.all_projects,
                 min_confidence: args.min_confidence,
+                after: args.after_date.as_deref().and_then(parse_iso_date),
+                before: args.before_date.as_deref().and_then(parse_iso_date),
                 ..Default::default()
             },
+            attached_slugs: scope.attached.clone(),
             // An attached backend means dense retrieval is available: run
             // the dense leg in the pinned E5 space (empty tables yield no
             // dense hits and fall back gracefully below).
             model_fingerprint: Some(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
-            result_limit: 100,
+            // Legs fetch the full application window so the pool total is
+            // exact for any matching set within it; the served window starts
+            // at rank 0 and the choke point slices the requested page.
+            candidate_limit: MAX_PAGINATION_WINDOW,
+            result_limit: window_end,
+            mmr_config: ltmrs_search::retrieval::mmr::MmrConfig {
+                max_items: window_end.max(1),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if let Ok(result) = sb.retrieve_sync(&req)
             && !result.results.is_empty()
         {
-            return Ok(result.results.into_iter().map(|r| r.memory).collect());
+            let total = result.total;
+            let truncated = result.pool_truncated;
+            // A query served by the engine reports the fused engine
+            // relevance; browse (empty query) is the engine list mode,
+            // which orders by stored confidence, so the score stays
+            // confidence under the browse label.
+            if args.query.as_deref().is_some_and(|q| !q.is_empty()) {
+                let candidates = result.explanation.candidates;
+                let pairs: Vec<(Memory, f64)> = result
+                    .results
+                    .into_iter()
+                    .map(|r| {
+                        let s = engine_selection_score(&candidates, r.memory.id);
+                        (r.memory, s)
+                    })
+                    .collect();
+                let page = paginate_vec(pairs, total, offset, limit, truncated)?;
+                return Ok(ScoredRecall {
+                    page,
+                    method: "engine_rrf",
+                });
+            }
+            let pairs: Vec<(Memory, f64)> = result
+                .results
+                .into_iter()
+                .map(|r| {
+                    let s = r.memory.confidence;
+                    (r.memory, s)
+                })
+                .collect();
+            let page = paginate_vec(pairs, total, offset, limit, truncated)?;
+            return Ok(ScoredRecall {
+                page,
+                method: "confidence_browse",
+            });
         }
     }
 
     // Canonical snapshot fallback.
     let repo = disp.repo();
     let export = repo.export_snapshot()?;
-    let mut memories: Vec<Memory> = export
+    let memories: Vec<Memory> = export
         .memories
         .into_iter()
         .filter(|m| m.lifecycle.is_recallable())
-        .filter(|m| {
-            if args.all {
-                true
-            } else {
-                match (&args.project, m.project.as_deref()) {
-                    (None, None) => true,
-                    (Some(_), None) => true,
-                    (Some(p), Some(mp)) => p == mp,
-                    (None, Some(_)) => false,
-                }
-            }
-        })
+        .filter(|m| scope.is_eligible(m))
+        .filter(|m| post_filter(m))
         .collect();
 
     if let Some(query) = &args.query
         && !query.is_empty()
     {
         let q = query.to_lowercase();
-        memories.sort_by(|a, b| {
-            let ra = relevance(a, &q);
-            let rb = relevance(b, &q);
-            rb.partial_cmp(&ra)
+        let mut scored: Vec<(Memory, f64)> = memories
+            .into_iter()
+            .map(|m| {
+                let s = relevance(&m, &q);
+                (m, s)
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.0.id.cmp(&b.0.id))
         });
-    } else {
-        memories.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
+        let total = scored.len();
+        let page = paginate_vec(scored, total, offset, limit, false)?;
+        return Ok(ScoredRecall {
+            page,
+            method: "substring_relevance",
         });
     }
-    Ok(memories)
+    let mut scored: Vec<(Memory, f64)> = memories
+        .into_iter()
+        .map(|m| {
+            let s = m.confidence;
+            (m, s)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.id.cmp(&b.0.id))
+    });
+    let total = scored.len();
+    let page = paginate_vec(scored, total, offset, limit, false)?;
+    Ok(ScoredRecall {
+        page,
+        method: "confidence_browse",
+    })
 }
 
 fn relevance(m: &Memory, query: &str) -> f64 {
@@ -813,6 +1215,18 @@ fn relevance(m: &Memory, query: &str) -> f64 {
         .split_whitespace()
         .filter(|t| text.contains(*t))
         .count() as f64
+}
+
+/// The engine selection score: native/legacy max, the same derivation
+/// semantic_search reports for hybrid_rrf_mmr (one derivation, one meaning).
+fn engine_selection_score(
+    candidates: &BTreeMap<EntityId, ltmrs_search::retrieval::explain::CandidateExplanation>,
+    id: EntityId,
+) -> f64 {
+    candidates
+        .get(&id)
+        .map(|c| c.scores.native_score.max(c.scores.legacy_reference))
+        .unwrap_or(0.5)
 }
 
 /// Format epoch millis as a date-only string (upstream `Created:` field).
@@ -883,8 +1297,18 @@ const RECALL_METHODS: &[(&str, &str, Option<&str>)] = &[
     ),
     (
         "substring_fallback",
-        "FTS search failed; the fallback matched text with LIKE and ordered by stored confidence.",
-        Some("stored_confidence"),
+        "Matched the keyword query with a substring scan; ordered by hit count (higher scores rank first).",
+        Some("hit_count_higher_is_better"),
+    ),
+    (
+        "substring_relevance",
+        "Matched the keyword query with a substring scan; ordered by hit count (higher scores rank first).",
+        Some("hit_count_higher_is_better"),
+    ),
+    (
+        "engine_rrf",
+        "Matched the keyword query; fused engine relevance (higher scores rank first).",
+        Some("engine_relevance_higher_is_better"),
     ),
     (
         "tfidf_cosine",
@@ -893,7 +1317,7 @@ const RECALL_METHODS: &[(&str, &str, Option<&str>)] = &[
     ),
     (
         "hybrid_rrf_mmr",
-        "Selected from fused lexical and TF-IDF ranks, adjusted by recall priority and diversity. Display order includes MMR diversity reranking.",
+        "Selected from fused dense and lexical ranks, adjusted by recall priority and diversity. Display order includes MMR diversity reranking.",
         Some("hybrid_relevance_before_diversity"),
     ),
 ];
@@ -1179,6 +1603,72 @@ fn render_detail(legacy_id: &str, m: &Memory, resolve: &dyn Fn(&EntityId) -> Str
 
 // ---- memory_add ----
 
+/// One automatic conflict advisory entry for a fresh add (Wave B3):
+/// the conflicting existing memory plus the reason, for text; the
+/// frozen structured shape carries id + title only.
+struct AddConflict {
+    id: String,
+    title: String,
+    reason: String,
+    overlap: f64,
+}
+
+/// Automatic conflict advisory for a fresh add (Wave B3): pure-read
+/// enrichment over the post-commit snapshot, reusing the
+/// conflict-detection pair predicate (no second detector). Candidates are recallable memories other than
+/// the new one, each gated by the stable visibility predicate so no
+/// cross-boundary conflict surfaces. A detection failure never fails
+/// the add: it degrades visibly to empty conflicts plus a notice.
+fn conflict_advisory_for_add(
+    disp: &Dispatcher,
+    resolved: &ResolvedScope,
+    memories: &[Memory],
+    new_memory: &Memory,
+) -> (Vec<AddConflict>, Option<String>) {
+    let mut candidates: Vec<Memory> = Vec::new();
+    for m in memories {
+        if m.id == new_memory.id || !m.lifecycle.is_recallable() {
+            continue;
+        }
+        match stable_visible(resolved, m) {
+            Ok(true) => candidates.push(m.clone()),
+            Ok(false) => {}
+            Err(e) => {
+                return (
+                    Vec::new(),
+                    Some(format!(
+                        "automatic conflict check unavailable ({}); conflicts omitted — run conflict_scan for details",
+                        e.message
+                    )),
+                );
+            }
+        }
+    }
+    let repo = disp.repo();
+    // Target-anchored scan: the same pair predicate as conflict_scan,
+    // linear in the candidate set (an all-pairs scan per add would make
+    // bulk ingestion cubic). The new memory is always side A. Candidate
+    // signatures come from the dispatcher cache (one extraction per add,
+    // keyed on (id, revision) so content mutations invalidate).
+    let mut cache = disp.conflict_signatures();
+    let pairs = ltmrs_compat::lemma::intelligence::scan_conflicts_for_target_cached(
+        new_memory,
+        &candidates,
+        |m| repo.legacy_id(m),
+        &mut cache,
+    );
+    let mut out = Vec::new();
+    for p in pairs {
+        out.push(AddConflict {
+            id: p.memory_b_id,
+            title: p.memory_b_title,
+            reason: p.reason,
+            overlap: p.overlap_score,
+        });
+    }
+    (out, None)
+}
+
 /// Shared add-response tail for the fresh path: topic overlaps, the
 /// recorded auto-link, privacy/distill notes and the structured payload.
 /// The link section renders the transactionally recorded link only —
@@ -1186,6 +1676,7 @@ fn render_detail(legacy_id: &str, m: &Memory, resolve: &dyn Fn(&EntityId) -> Str
 /// instead; see below).
 fn finish_add_response(
     disp: &Dispatcher,
+    resolved: &ResolvedScope,
     args: &MemoryAddArgs,
     memory: &Memory,
     final_fragment: &str,
@@ -1200,7 +1691,14 @@ fn finish_add_response(
     let title = memory.title.clone();
     let description = memory.description.clone();
     // Other overlaps, for the informational list (read-only: no effects).
-    let overlaps: Vec<&Memory> = export
+    // Gated by the stable visibility predicate (Wave B3 fix): foreign
+    // titles must never render, mirroring plan_coread gating. A gating
+    // error degrades to invisible (presentational fallback, like
+    // find_recorded_link_for_render — never fail a committed add over an
+    // informational list); the conflict advisory below surfaces the same
+    // failure visibly.
+    let mut overlaps: Vec<&Memory> = Vec::new();
+    for m in export
         .memories
         .iter()
         .filter(|m| m.lifecycle.is_recallable())
@@ -1209,8 +1707,19 @@ fn finish_add_response(
             let score = word_overlap(final_fragment, &m.fragment);
             (0.25..0.95).contains(&score)
         })
-        .take(5)
-        .collect();
+    {
+        if stable_visible(resolved, m).unwrap_or(false) {
+            overlaps.push(m);
+            if overlaps.len() == 5 {
+                break;
+            }
+        }
+    }
+
+    // Automatic conflict advisory (Wave B3): pure-read enrichment over
+    // this snapshot; a detection failure degrades visibly, never fails.
+    let (advisories, conflict_notice) =
+        conflict_advisory_for_add(disp, resolved, &export.memories, memory);
 
     // Build response text.
     let scope_info = project
@@ -1225,7 +1734,12 @@ fn finish_add_response(
             memory.fragment_type.as_str()
         ));
     }
-    if has_secrets && !args.confirm {
+    let has_critical = has_secrets && privacy::contains_critical_secret(&args.fragment);
+    if has_critical {
+        response.push_str(
+            "\n\n⚠️ Privacy: critical secret(s) detected and auto-redacted despite confirm:true (irrevocable credentials are never stored verbatim).",
+        );
+    } else if has_secrets && !args.confirm {
         response.push_str(
             "\n\n⚠️ Privacy: potential secret(s) detected and auto-redacted. Use confirm: true to store as-is.",
         );
@@ -1277,10 +1791,36 @@ fn finish_add_response(
         ));
     }
 
+    // Advisory conflict tail (Wave B3): informational only — confidence
+    // is unchanged and nothing is auto-linked. Mirrors the upstream
+    // advisory shape (ids, titles, reason, memory_relate contradicts).
+    if !advisories.is_empty() {
+        response.push_str(
+            "\n\nPotential conflicts (advisory — confidence unchanged, nothing auto-linked):",
+        );
+        for a in &advisories {
+            response.push_str(&format!(
+                "\n  [{}] \"{}\" ({:.2}) — {}",
+                a.id, a.title, a.overlap, a.reason
+            ));
+        }
+        response
+            .push_str("\nUse memory_relate with type \"contradicts\" to link a conflicting pair.");
+    }
+    // Degraded detection surfaces visibly (proceed-with-warning "Note:"
+    // convention); the frozen structured shape stays conflicts: [].
+    if let Some(notice) = conflict_notice {
+        response.push_str(&format!("\n\nNote: {notice}"));
+    }
+
+    let conflict_entries: Vec<Value> = advisories
+        .iter()
+        .map(|a| json!({"id": a.id, "title": a.title}))
+        .collect();
     let structured = json!({
         "success": true,
         "id": legacy_id,
-        "conflicts": [],
+        "conflicts": conflict_entries,
     });
     Ok(ok_result(response, structured))
 }
@@ -1290,12 +1830,18 @@ fn exec_memory_add(
     envelope: &IpcEnvelope,
     admitted: &AdmittedScope,
     args: &MemoryAddArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
     // Privacy: redact secrets unless confirm=true (design 12.1, DEV-002).
+    // Critical secrets (irrevocable credentials) are always redacted.
+    // The has_critical disjunct keeps critical redaction live even if a
+    // secret-list edit ever stops matching a critical literal.
     let has_secrets = privacy::contains_secret(&args.fragment);
-    let final_fragment = if has_secrets && !args.confirm {
+    let has_critical = privacy::contains_critical_secret(&args.fragment);
+    let should_redact = has_critical || (has_secrets && !args.confirm);
+    let final_fragment = if should_redact {
         privacy::redact(&args.fragment)
     } else {
         args.fragment.clone()
@@ -1320,16 +1866,11 @@ fn exec_memory_add(
             )
         })?;
         let stored = disp.repo().get_memories(&[created])?.into_iter().next();
-        let recorded_link = linked.and_then(|id| {
-            disp.repo()
-                .all_relations()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|r| r.id == id)
-        });
+        let recorded_link = linked.and_then(|id| find_recorded_link_for_render(disp.repo(), id));
         match stored {
             Some(memory) => finish_add_response(
                 disp,
+                resolved,
                 args,
                 &memory,
                 &final_fragment,
@@ -1398,6 +1939,14 @@ fn exec_memory_add(
     // Resolve project.
     let project = args.project.as_deref().and_then(normalize_project);
 
+    // Stable identity dual-write (Wave A3b): the resolved id keys
+    // eligibility; the bare string stays for compat display/export.
+    let project_id = resolved.project_id;
+    let project = project
+        .clone()
+        .or(resolved.name.clone())
+        .or(resolved.legacy.clone());
+
     // Generate title and description.
     let title = args
         .title
@@ -1435,9 +1984,7 @@ fn exec_memory_add(
             Some(handle) => {
                 let task_type = disp
                     .repo()
-                    .get_session(handle)
-                    .ok()
-                    .flatten()
+                    .get_session(handle)?
                     .and_then(|s| s.task_type.clone())
                     .unwrap_or_default();
                 (handle, task_type)
@@ -1468,6 +2015,7 @@ fn exec_memory_add(
         description: description.clone(),
         fragment_type,
         project: project.clone(),
+        project_id,
         source,
         confidence: 1.0,
         quality_score: None,
@@ -1497,11 +2045,33 @@ fn exec_memory_add(
         unknown_fields: std::collections::BTreeMap::new(),
     };
 
+    // Wave B3b: refuse before apply so a refused add leaves no memory,
+    // no receipt, no relations and no boosts (retry replays as Miss).
+    // A detection failure degrades (empty + notice) and still commits.
+    let (pre_conflicts, _) = conflict_advisory_for_add(disp, resolved, &export.memories, &memory);
+    if !pre_conflicts.is_empty() {
+        let mut listed = String::new();
+        for c in &pre_conflicts {
+            listed.push_str(&format!("\n  [{}] \"{}\" — {}", c.id, c.title, c.reason));
+        }
+        return Err(DomainError::new(
+            DomainErrorCode::Validation,
+            format!(
+                "Conflicting memory_add refused: the new fragment conflicts with{}.\nConflicting fragments cannot coexist as separate live memories; there is no override. If the belief changed, memory_update [{}] first, then re-add (keeps history coherent). Once both claims exist, link them with memory_relate type \"contradicts\".",
+                listed, pre_conflicts[0].id
+            ),
+        ));
+    }
+
     // Apply the command, with the planned auto-link inside the same
     // transaction (both endpoints live here: the memory below, the
     // target from the pre-apply snapshot). Planning output rides the
-    // receipt, so replay never re-plans it.
-    let planned_link = export
+    // receipt, so replay never re-plans it. Candidates are gated by the
+    // stable visibility predicate (Wave B3 fix): a cross-boundary
+    // RelatedTo edge would violate 01:§6.3 and leak foreign titles
+    // into the response.
+    let mut link_target = None;
+    for m in export
         .memories
         .iter()
         .filter(|m| m.lifecycle.is_recallable())
@@ -1510,59 +2080,57 @@ fn exec_memory_add(
             let score = word_overlap(&final_fragment, &m.fragment);
             (0.25..0.95).contains(&score)
         })
-        .take(5)
-        .next()
-        .map(|strongest| {
-            new_relation(
-                envelope,
-                eid,
-                strongest.id,
-                RelationType::RelatedTo,
-                Some(format!(
-                    "Auto-linked: topic overlap ({:.2})",
-                    word_overlap(&final_fragment, &strongest.fragment)
-                )),
-            )
-        });
+    {
+        if stable_visible(resolved, m)? {
+            link_target = Some(m);
+            break;
+        }
+    }
+    let planned_link = link_target.map(|strongest| {
+        new_relation(
+            envelope,
+            eid,
+            strongest.id,
+            RelationType::RelatedTo,
+            Some(format!(
+                "Auto-linked: topic overlap ({:.2})",
+                word_overlap(&final_fragment, &strongest.fragment)
+            )),
+        )
+    });
     let cmd = DomainCommand::AddMemory {
         memory: memory.clone(),
         session: None,
         auto_link: planned_link.clone(),
     };
     let ctx = sub_command_ctx(envelope, 0)?;
-    let receipt = disp.repo().apply(&ctx, &cmd)?;
+    // ONE canonical transaction (Wave A2): the memory, its auto-link, the
+    // MemoryCreated session link and the receipt commit together. A link
+    // failure errors with no receipt instead of freezing a partial success.
+    // Virtual sessions have no canonical record: their link stays an
+    // in-memory routing attribution after the commit.
+    let receipt = if disp.registry().virtual_record(session_handle).is_some() {
+        let receipt = disp.repo().apply(&ctx, &cmd)?;
+        disp.registry()
+            .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id));
+        receipt
+    } else {
+        disp.repo()
+            .apply_with_session_link(&ctx, &cmd, session_handle, &legacy_id)?
+    };
     // The recorded link (if the transaction created it — a duplicate
     // edge skips) is what the response renders, never a recomputation.
     let recorded_link = match &receipt.outcome {
-        ltmrs_domain::command::ReceiptOutcome::Success { affected } => {
-            affected.get(1).copied().and_then(|id| {
-                repo.all_relations()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|r| r.id == id)
-            })
-        }
+        ltmrs_domain::command::ReceiptOutcome::Success { affected } => affected
+            .get(1)
+            .copied()
+            .and_then(|id| find_recorded_link_for_render(repo, id)),
         _ => None,
     };
 
-    // Attribute the created memory to the session in the canonical store
-    // (deduped), or to the virtual record when session-less (best-effort
-    // routing attribution). The canonical record already carries the link
-    // (set before AddMemory).
-    if disp.registry().virtual_record(session_handle).is_some() {
-        disp.registry()
-            .track_virtual_created(session_handle, std::slice::from_ref(&legacy_id));
-    } else {
-        let _ = disp.repo().track_session_link(
-            admitted,
-            session_handle,
-            ltmrs_service::repository::SessionLinkField::MemoryCreated,
-            std::slice::from_ref(&legacy_id),
-        );
-    }
-
     let payload = finish_add_response(
         disp,
+        resolved,
         args,
         &memory,
         &final_fragment,
@@ -1579,6 +2147,7 @@ fn exec_memory_update(
     envelope: &IpcEnvelope,
     admitted: &AdmittedScope,
     args: &MemoryUpdateArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
@@ -1595,6 +2164,15 @@ fn exec_memory_update(
             args.id
         )));
     };
+    // Stable-scope gate (Wave A3b): under a stable identity a foreign row
+    // is missing (no leak, no cross-project write). Legacy/global scopes
+    // keep the permissive frozen behavior.
+    if !stable_visible(resolved, m)? {
+        return Ok(err_result(&format!(
+            "Fragment with ID '{}' not found",
+            args.id
+        )));
+    }
 
     // Validate confidence range.
     if let Some(c) = args.confidence
@@ -1705,6 +2283,7 @@ fn exec_memory_feedback(
     envelope: &IpcEnvelope,
     admitted: &AdmittedScope,
     args: &MemoryFeedbackArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
@@ -1766,6 +2345,14 @@ fn exec_memory_feedback(
             args.id
         )));
     }
+    if let Some(m) = mems.first()
+        && !stable_visible(resolved, m)?
+    {
+        return Ok(err_result(&format!(
+            "Fragment with ID '{}' not found",
+            args.id
+        )));
+    }
 
     let cmd = DomainCommand::Feedback {
         memory_id: eid,
@@ -1808,6 +2395,7 @@ fn exec_memory_forget(
     envelope: &IpcEnvelope,
     admitted: &AdmittedScope,
     args: &MemoryForgetArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
@@ -1846,6 +2434,14 @@ fn exec_memory_forget(
     };
     let mems = repo.get_memories(&[eid])?;
     if mems.is_empty() {
+        return Ok(err_result(&format!(
+            "Fragment with ID '{}' not found",
+            args.id
+        )));
+    }
+    if let Some(m) = mems.first()
+        && !stable_visible(resolved, m)?
+    {
         return Ok(err_result(&format!(
             "Fragment with ID '{}' not found",
             args.id
@@ -1891,6 +2487,9 @@ fn exec_memory_forget(
         disp.repo().apply(&ctx, &cmd)?;
         format!("Forgot fragment with ID: {}", args.id)
     };
+    // Conflict-signature hygiene: the row is gone or non-recallable, so
+    // drop its cached entry (ids never reuse — this only bounds growth).
+    disp.conflict_signatures().prune(eid);
 
     let structured = json!({
         "success": true,
@@ -1908,6 +2507,7 @@ fn exec_memory_merge(
     envelope: &IpcEnvelope,
     admitted: &AdmittedScope,
     args: &MemoryMergeArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
@@ -1954,16 +2554,18 @@ fn exec_memory_merge(
         return Ok(replayed);
     }
 
-    // Resolve all source IDs; any missing is a hard error.
+    // Resolve all source IDs; any missing is a hard error. Under a stable
+    // identity foreign sources refuse as not found (C1: no cross-project
+    // consolidation or archival); legacy/global scopes stay permissive.
     let mut source_ids: Vec<EntityId> = Vec::new();
     let mut not_found: Vec<String> = Vec::new();
     for id in &args.ids {
         match resolve_id(repo, id) {
             Ok(eid) => {
-                if repo.get_memories(&[eid])?.is_empty() {
-                    not_found.push(id.clone());
-                } else {
-                    source_ids.push(eid);
+                let mems = repo.get_memories(&[eid])?;
+                match mems.first() {
+                    Some(m) if stable_visible(resolved, m)? => source_ids.push(eid),
+                    _ => not_found.push(id.clone()),
                 }
             }
             Err(_) => not_found.push(id.clone()),
@@ -1991,7 +2593,11 @@ fn exec_memory_merge(
         fragment: args.fragment.clone(),
         description: generate_description(&args.fragment),
         fragment_type: FragmentType::Fact,
-        project: project.clone(),
+        project: project
+            .clone()
+            .or(resolved.name.clone())
+            .or(resolved.legacy.clone()),
+        project_id: resolved.project_id,
         source: MemorySource::Ai,
         confidence: 1.0,
         quality_score: None,
@@ -2022,12 +2628,17 @@ fn exec_memory_merge(
     };
 
     let cmd = DomainCommand::Merge {
-        source_ids,
+        source_ids: source_ids.clone(),
         result,
         consolidate: args.consolidate,
     };
     let ctx = sub_command_ctx(envelope, 0)?;
     disp.repo().apply(&ctx, &cmd)?;
+    // Archived sources are non-recallable: drop their cached signatures
+    // (ids never reuse — this only bounds growth).
+    for id in &source_ids {
+        disp.conflict_signatures().prune(*id);
+    }
 
     // Consolidation edges record inside the merge transaction above
     // (sources archive there): no post-commit relation tail, which would
@@ -2070,6 +2681,7 @@ fn exec_memory_relate(
     envelope: &IpcEnvelope,
     admitted: &AdmittedScope,
     args: &MemoryRelateArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
 
@@ -2121,13 +2733,22 @@ fn exec_memory_relate(
         return Ok(replayed);
     }
 
-    if repo.get_memories(&[source_eid])?.is_empty() {
+    // Stable-scope endpoint gates (C1): under a stable identity a foreign
+    // endpoint refuses as not found (no leak, no cross-project edge);
+    // legacy/global scopes keep the permissive frozen behavior.
+    let endpoint_visible = |mems: Vec<Memory>| -> DomainResult<bool> {
+        match mems.first() {
+            Some(m) => stable_visible(resolved, m),
+            None => Ok(false),
+        }
+    };
+    if !endpoint_visible(repo.get_memories(&[source_eid])?)? {
         return Ok(err_result(&format!(
             "Source fragment [{}] not found",
             args.source_id
         )));
     }
-    if repo.get_memories(&[target_eid])?.is_empty() {
+    if !endpoint_visible(repo.get_memories(&[target_eid])?)? {
         return Ok(err_result(&format!(
             "Target fragment [{}] not found",
             args.target_id
@@ -2272,17 +2893,59 @@ fn format_stats(stats: &Value) -> String {
     text
 }
 
-fn exec_memory_stats(disp: &Dispatcher, args: &MemoryStatsArgs) -> DomainResult<DomainPayload> {
+fn exec_memory_stats(
+    disp: &Dispatcher,
+    args: &MemoryStatsArgs,
+    resolved: &ResolvedScope,
+) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let export = repo.export_snapshot()?;
 
-    let stats = calculate_stats(&export.memories, args.project.as_deref());
+    // Scope stats by id to match recall (I1): a stable identity counts
+    // its whole scope (own + attached + global, wire ignored — already
+    // validated at resolution); a legacy string filter excludes stable
+    // rows via eligibility but keeps the frozen wire filter (which
+    // excludes global when filtering). Fully unattributed calls keep the
+    // frozen list-all/filter behavior.
+    let stats = if resolved.project_id.is_some() {
+        let scope = effective_for_read(resolved, None, None, None, false)?;
+        let scoped: Vec<Memory> = export
+            .memories
+            .into_iter()
+            .filter(|m| scope.is_eligible(m))
+            .collect();
+        calculate_stats(&scoped, None)
+    } else if resolved.legacy.is_some() {
+        let scope = effective_for_read(resolved, None, None, None, false)?;
+        let scoped: Vec<Memory> = export
+            .memories
+            .into_iter()
+            .filter(|m| scope.is_eligible(m))
+            .collect();
+        calculate_stats(&scoped, args.project.as_deref())
+    } else {
+        calculate_stats(&export.memories, args.project.as_deref())
+    };
     let text = format_stats(&stats);
 
     Ok(format_result(text, stats, args.response_format))
 }
 
 // ---- memory_audit ----
+
+/// Presentational existence check for the audit report: an unresolvable or
+/// unreadable association renders as dangling in the report instead of
+/// failing the whole read-only audit. Canonical state is untouched.
+fn audit_assoc_exists_presentational(
+    repo: &ltmrs_service::repository::CanonicalRepository,
+    assoc: &str,
+) -> bool {
+    repo.resolve_id(assoc)
+        .ok()
+        .and_then(|eid| repo.get_memories(&[eid]).ok())
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
 
 /// Audit memory integrity (upstream `auditMemory` semantics).
 /// `legacy_id_of` maps a memory to its display ID; `assoc_exists` reports
@@ -2390,13 +3053,7 @@ fn exec_memory_audit(disp: &Dispatcher, args: &MemoryAuditArgs) -> DomainResult<
         &export.memories,
         &export.relations,
         |m| legacy_id_of(repo, m),
-        |assoc| {
-            repo.resolve_id(assoc)
-                .ok()
-                .and_then(|eid| repo.get_memories(&[eid]).ok())
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-        },
+        |assoc| audit_assoc_exists_presentational(repo, assoc),
         |id| legacy_id_of_from_id(repo, id),
     );
     let text = format_audit_report(&result);
@@ -2406,7 +3063,11 @@ fn exec_memory_audit(disp: &Dispatcher, args: &MemoryAuditArgs) -> DomainResult<
 
 // ---- memory_library ----
 
-fn exec_memory_library(disp: &Dispatcher, args: &MemoryLibraryArgs) -> DomainResult<DomainPayload> {
+fn exec_memory_library(
+    disp: &Dispatcher,
+    args: &MemoryLibraryArgs,
+    resolved: &ResolvedScope,
+) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let export = repo.export_snapshot()?;
     let now = disp.clock().now_millis();
@@ -2416,6 +3077,13 @@ fn exec_memory_library(disp: &Dispatcher, args: &MemoryLibraryArgs) -> DomainRes
     let offset = args.offset.unwrap_or(0);
 
     let project_filter = args.project.as_deref().map(|p| p.trim().to_lowercase());
+
+    // Eligibility (Wave A3b): stable identities see own + attached + global
+    // rows; legacy scopes exclude stable rows; a fully unattributed call
+    // keeps the frozen list-all behavior.
+    let scope = effective_for_read(resolved, None, None, None, false)?;
+    let unattributed =
+        resolved.project_id.is_none() && resolved.legacy.is_none() && args.project.is_none();
 
     let need_fragments = matches!(focus, "full" | "stale" | "duplicates" | "orphans");
     let need_guides = matches!(focus, "full" | "guides");
@@ -2430,10 +3098,13 @@ fn exec_memory_library(disp: &Dispatcher, args: &MemoryLibraryArgs) -> DomainRes
         .memories
         .iter()
         .filter(|m| {
-            if let Some(pf) = &project_filter {
-                m.project.as_deref().map(|p| p == pf).unwrap_or(false)
-            } else {
+            if unattributed {
                 true
+            } else if let Some(pf) = &project_filter {
+                m.project.as_deref().map(|p| p == pf).unwrap_or(false)
+                    && scope.project_includes_id(m.project_id, m.project.as_deref())
+            } else {
+                scope.is_eligible(m)
             }
         })
         .collect();
@@ -2445,8 +3116,11 @@ fn exec_memory_library(disp: &Dispatcher, args: &MemoryLibraryArgs) -> DomainRes
 
     let frag_total = fragments.len();
     let page: Vec<&Memory> = fragments.iter().skip(offset).take(limit).copied().collect();
-    let has_more = offset + limit < frag_total;
-    let next_offset = if has_more { offset + limit } else { 0 };
+    // Absurd offsets cannot panic: saturation keeps the comparison honest
+    // (an offset past the end serves an empty page, never a wrapped window).
+    let window_end = offset.saturating_add(limit);
+    let has_more = window_end < frag_total;
+    let next_offset = if has_more { window_end } else { 0 };
 
     let fragment_jsons: Vec<Value> = page
         .iter()
@@ -2663,28 +3337,77 @@ fn exec_semantic_search(
     disp: &Dispatcher,
     _envelope: &IpcEnvelope,
     args: &SemanticSearchArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let format = args.response_format;
 
-    let top_k = args.top_k.unwrap_or(10).clamp(1, 30);
+    let top_k = args.top_k.unwrap_or(10);
+    if top_k == 0 || top_k > SEMANTIC_PAGE_MAX {
+        return Err(DomainError::new(
+            DomainErrorCode::Validation,
+            format!("semantic_search top_k {top_k} out of range 1..={SEMANTIC_PAGE_MAX}"),
+        ));
+    }
     let offset = args.offset.unwrap_or(0);
+    let window_end = ltmrs_compat::lemma::pagination::validate_window(offset, top_k)?;
 
     // Use the search backend when available.
     let mut scored: Vec<(Memory, f64)> = Vec::new();
+    let mut engine_total: Option<usize> = None;
+    let mut engine_truncated = false;
     let mut engine_explanation: Option<ltmrs_search::retrieval::explain::RetrievalExplanation> =
         None;
-    if let Some(sb) = disp.search() {
-        // hybrid:false forces lexical-only (upstream parity on demand);
-        // absent/true runs the hybrid engine when a backend is attached.
-        let use_dense = args.hybrid != Some(false);
+    let mut fallback_count: Option<usize> = None;
+    // hybrid:false serves the Lemma-faithful TF-IDF reference profile
+    // (DEV-011): corpus-wide TF-IDF cosine over the served snapshot, with no
+    // dense leg and no FTS index, so the flag is truthful about parity.
+    let tfidf_served = args.hybrid == Some(false);
+    if tfidf_served {
+        let export = repo.export_snapshot()?;
+        let scope = effective_for_read(resolved, None, None, None, false)?;
+        let docs: Vec<(EntityId, String)> = export
+            .memories
+            .iter()
+            .filter(|m| m.lifecycle.is_recallable())
+            .filter(|m| scope.is_eligible(m))
+            .map(|m| {
+                (
+                    m.id,
+                    ltmrs_search::retrieval::tfidf::corpus_text(
+                        &m.title,
+                        &m.fragment,
+                        &m.description,
+                    ),
+                )
+            })
+            .collect();
+        let by_id: std::collections::HashMap<EntityId, &Memory> =
+            export.memories.iter().map(|m| (m.id, m)).collect();
+        scored = ltmrs_search::retrieval::tfidf::rank(&args.query, &docs)
+            .into_iter()
+            .filter_map(|(id, s)| by_id.get(&id).map(|m| ((*m).clone(), s)))
+            .collect();
+        fallback_count = Some(scored.len());
+    }
+    if !tfidf_served && let Some(sb) = disp.search() {
+        // hybrid is absent/true here, so the dense leg runs when a backend
+        // is attached (the enhanced hybrid default); lexical-only selection
+        // now lives on the TF-IDF arm above.
+        let use_dense = true;
+        // One effective scope (Wave A3b): stable ids key eligibility in
+        // every leg; the attached slugs travel for the engine's own
+        // resolution.
+        let scope = effective_for_read(resolved, None, None, None, false)?;
         let req = ltmrs_search::retrieval::engine::RetrievalRequest {
             query: args.query.clone(),
             scope: ltmrs_domain::command::Scope {
-                project: args.project.clone(),
-                all_projects: false,
+                project: scope.project.clone(),
+                project_id: resolved.project_id_str.clone(),
+                all_projects: scope.all_projects,
                 ..Default::default()
             },
+            attached_slugs: scope.attached.clone(),
             // Dense leg in the pinned E5 space when a backend is attached;
             // no backend (or no dense hits) falls back to lexical below.
             model_fingerprint: if use_dense {
@@ -2692,7 +3415,12 @@ fn exec_semantic_search(
             } else {
                 None
             },
-            result_limit: top_k + offset,
+            candidate_limit: ltmrs_compat::lemma::pagination::MAX_PAGINATION_WINDOW,
+            result_limit: window_end,
+            mmr_config: ltmrs_search::retrieval::mmr::MmrConfig {
+                max_items: window_end.max(1),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if let Ok(result) = sb.retrieve_sync(&req) {
@@ -2701,12 +3429,11 @@ fn exec_semantic_search(
             // identical TF-IDF — the legacy `score` field is a display value.
             let scores = &result.explanation.candidates;
             for r in result.results {
-                let s = scores
-                    .get(&r.memory.id)
-                    .map(|c| c.scores.native_score.max(c.scores.legacy_reference))
-                    .unwrap_or(0.5);
+                let s = engine_selection_score(scores, r.memory.id);
                 scored.push((r.memory, s));
             }
+            engine_total = Some(result.total);
+            engine_truncated = result.pool_truncated;
             engine_explanation = Some(result.explanation);
         }
     }
@@ -2718,7 +3445,21 @@ fn exec_semantic_search(
     fn explain_search(
         explanation: &Option<ltmrs_search::retrieval::explain::RetrievalExplanation>,
         fallback_candidates: usize,
+        tfidf_served: bool,
     ) -> serde_json::Value {
+        if tfidf_served {
+            // The TF-IDF reference arm uses neither the dense leg nor the
+            // FTS index: readiness flags stay false, honestly.
+            return serde_json::json!({
+                "mode": "lexical",
+                "dense_ready": false,
+                "fts_ready": false,
+                "partial": false,
+                "no_match": false,
+                "candidates": fallback_candidates,
+                "conflict_notice": null,
+            });
+        }
         match explanation {
             Some(exp) => serde_json::json!({
                 "mode": if exp.model_fingerprint.is_some() { "hybrid" } else { "lexical" },
@@ -2744,20 +3485,19 @@ fn exec_semantic_search(
     }
 
     // Lexical fallback when the backend is unavailable or returned nothing.
-    if scored.is_empty() {
+    // The substring scan covers the full snapshot, so its total is exact;
+    // the engine arm carries the pool total reported above. The TF-IDF arm
+    // never falls through here: its empty result is the profile's own
+    // abstention signal, not a trigger for a weaker scan.
+    if scored.is_empty() && !tfidf_served {
         let export = repo.export_snapshot()?;
+        let scope = effective_for_read(resolved, None, None, None, false)?;
         let q = args.query.to_lowercase();
         let mut candidates: Vec<(Memory, f64)> = export
             .memories
             .iter()
             .filter(|m| m.lifecycle.is_recallable())
-            .filter(|m| {
-                if let Some(p) = &args.project {
-                    m.project.as_deref() == Some(p.as_str()) || m.project.is_none()
-                } else {
-                    true
-                }
-            })
+            .filter(|m| scope.is_eligible(m))
             .map(|m| (m.clone(), relevance(m, &q)))
             .filter(|(_, s)| *s > 0.0)
             .collect();
@@ -2766,6 +3506,7 @@ fn exec_semantic_search(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
+        fallback_count = Some(candidates.len());
         scored = candidates;
         // The served rows come from the substring fallback, not the engine:
         // drop the engine explanation so explain:true reports the effective
@@ -2773,18 +3514,23 @@ fn exec_semantic_search(
         // fallback also finds nothing, the engine no-match is preserved.)
         if !scored.is_empty() {
             engine_explanation = None;
+            engine_total = None;
+            engine_truncated = false;
         }
     }
 
-    let total = scored.len();
-    let page: Vec<(Memory, f64)> = scored
-        .iter()
-        .skip(offset)
-        .take(top_k)
-        .map(|(m, s)| (m.clone(), *s))
-        .collect();
-    let has_more = offset + top_k < total;
-    let next_offset = if has_more { offset + top_k } else { 0 };
+    // Page through the choke point: the total is the engine pool total or
+    // the full fallback count, never the served vector's length.
+    let total = engine_total.or(fallback_count).unwrap_or(0);
+    let paged = ltmrs_compat::lemma::pagination::paginate_vec(
+        scored,
+        total,
+        offset,
+        top_k,
+        engine_truncated,
+    )?;
+    let (page, has_more, next_offset) = (paged.items, paged.has_more, paged.next_offset);
+    let fallback_candidates = fallback_count.unwrap_or(total);
 
     if page.is_empty() {
         let text = format!(
@@ -2796,10 +3542,11 @@ fn exec_semantic_search(
             "total": total,
             "results": [],
             "has_more": has_more,
-            "next_offset": if has_more { Some(next_offset) } else { None },
+            "next_offset": next_offset,
         });
         if args.explain {
-            data["explanation"] = explain_search(&engine_explanation, scored.len());
+            data["explanation"] =
+                explain_search(&engine_explanation, fallback_candidates, tfidf_served);
         }
         return Ok(format_result(text, data, format));
     }
@@ -2828,7 +3575,8 @@ fn exec_semantic_search(
     }
     if has_more {
         text.push_str(&format!(
-            "\nMore results available. Pass offset={next_offset} for the next page."
+            "\nMore results available. Pass offset={} for the next page.",
+            next_offset.unwrap_or(offset),
         ));
     }
 
@@ -2837,10 +3585,51 @@ fn exec_semantic_search(
         "total": total,
         "results": results_json,
         "has_more": has_more,
-        "next_offset": if has_more { Some(next_offset) } else { None },
+        "next_offset": next_offset,
     });
     if args.explain {
-        data["explanation"] = explain_search(&engine_explanation, scored.len());
+        data["explanation"] =
+            explain_search(&engine_explanation, fallback_candidates, tfidf_served);
+    }
+    // Upstream-shaped supplement (DEV-012): the legs that actually served
+    // name the selection method; ranks are the effective served positions.
+    let recall_method = if tfidf_served {
+        "tfidf_cosine"
+    } else if let Some(exp) = engine_explanation.as_ref() {
+        if exp.model_fingerprint.is_some() {
+            "hybrid_rrf_mmr"
+        } else {
+            "fts5_bm25"
+        }
+    } else {
+        "substring_fallback"
+    };
+    let selections: Vec<RecallSelection> = page
+        .iter()
+        .enumerate()
+        .map(|(i, (m, s))| RecallSelection {
+            memory: m,
+            method: recall_method,
+            rank: Some(offset.saturating_add(i).saturating_add(1) as u64),
+            score: Some(*s),
+            graph: None,
+        })
+        .collect();
+    let recall_explanation = if args.explain && !selections.is_empty() {
+        Some(explain_recall(
+            repo,
+            &selections,
+            "project_and_global",
+            args.project.as_deref(),
+        ))
+    } else {
+        None
+    };
+    if let Some(exp) = &recall_explanation {
+        text.push_str(&format_recall_explanation(exp));
+    }
+    if let Some(exp) = recall_explanation {
+        data["recall_explanation"] = json!(exp);
     }
     Ok(format_result(text, data, format))
 }
@@ -3610,29 +4399,10 @@ fn exec_guide_practice(
     let now = disp.clock().now_millis();
     let digest = envelope.request_digest()?;
     let scope = envelope.operation_scope(digest.clone());
-    // Track into the active session (canonical store, best-effort) before
-    // the guide mutation so validated_by links the session's pre-loaded
-    // reads. Virtual sessions have no canonical record: their link is a
-    // no-op and validated_by stays empty.
-    let validated: Vec<String> =
-        match disp.resolve_session(envelope.frontend_id, envelope.channel_id) {
-            Some(handle) => {
-                let track_admitted = disp.repo().admit_scope(&scope)?;
-                let _ = disp.repo().track_session_link(
-                    &track_admitted,
-                    handle,
-                    ltmrs_service::repository::SessionLinkField::GuideUsed,
-                    std::slice::from_ref(&args.guide.to_lowercase().trim().to_string()),
-                );
-                disp.repo()
-                    .get_session(handle)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.memories_read.clone())
-                    .unwrap_or_default()
-            }
-            None => Vec::new(),
-        };
+    // The channel's traced session, when bound. The GuideUsed link and the
+    // validated_by reads resolve inside the practice transaction below —
+    // lookup errors propagate, and virtual sessions link nothing.
+    let session = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let outcome_bool = match args.outcome.as_deref() {
         Some("success") => Some(true),
         Some("failure") => Some(false),
@@ -3647,7 +4417,7 @@ fn exec_guide_practice(
         args.description.as_deref(),
         &args.contexts,
         &args.learnings,
-        &validated,
+        session,
         outcome_bool,
         now,
     ) {
@@ -4297,16 +5067,19 @@ fn exec_session_start(
     envelope: &IpcEnvelope,
     admitted: &AdmittedScope,
     args: &SessionStartArgs,
+    resolved: &ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     if args.task_type.trim().is_empty() {
         return Ok(err_result("'task_type' parameter is required"));
     }
     let now = disp.clock().now_millis();
-    // The frozen session_start schema carries no project field; the channel's
-    // session is project-less (upstream resolves it from cwd, which the daemon
-    // does not observe).
-    let project: Option<String> = None;
+    // Sessions carry the resolved stable identity (Wave A3b, dual-written
+    // with the frozen bare-string project for compat display/export). The
+    // frozen session_start schema carries no project field; the identity
+    // comes from the envelope (env / bind file / flag winner).
+    let project: Option<String> = resolved.name.clone().or(resolved.legacy.clone());
+    let project_id = resolved.project_id;
 
     // ONE canonical operation (re-review P1-3): abandon-previous, decay,
     // create and receipt commit together in the store. A replay resolves
@@ -4316,14 +5089,40 @@ fn exec_session_start(
     let scope = envelope.operation_scope(digest.clone());
     let abandon = disp.resolve_session(envelope.frontend_id, envelope.channel_id);
     let new_handle = ltmrs_domain::id::SessionHandle::new(uuid::Uuid::now_v7());
-    let handle = match repo.session_start_tx(
+    // Preload planning reads before the single transaction. recall_browse
+    // owns both rank paths (engine ranking + snapshot scan), so preload
+    // never diverges from browse recall.
+    let task_desc = format!("{} {}", args.task_type, args.technologies.join(" "));
+    let browse_args = MemoryReadArgs {
+        query: Some(task_desc.clone()),
+        project: None,
+        all: true,
+        ..Default::default()
+    };
+    let mut relevant: Vec<Memory> = recall_browse(disp, &browse_args, resolved)?
+        .page
+        .items
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    relevant.truncate(3);
+    let boosted: Vec<EntityId> = relevant.iter().map(|m| m.id).collect();
+    let read_ids: Vec<String> = relevant.iter().map(|m| legacy_id_of(repo, m)).collect();
+    let (continuity, boost_targets) =
+        build_continuity_recall(disp, &args.task_type, project.as_deref(), now)?;
+    let handle = match repo.session_start_full_tx(
         &scope,
         new_handle,
         project.clone(),
+        project_id,
         Some(args.task_type.clone()),
         args.technologies.clone(),
         args.initial_approach.clone(),
         abandon,
+        ltmrs_service::repository::SessionStartEffects {
+            boosts: boosted,
+            read_links: read_ids.clone(),
+        },
         now,
     ) {
         Ok(SessionOp::Applied(h)) => h,
@@ -4348,42 +5147,9 @@ fn exec_session_start(
     persist_before_ack(disp)?;
 
     // Guide suggestions for the task description.
-    let task_desc = format!("{} {}", args.task_type, args.technologies.join(" "));
     let guides = repo.get_guides()?;
     let suggestions = suggest_guides(&task_desc, &guides);
     let formatted_suggestions = format_guide_suggestions(&suggestions);
-
-    // Pre-load relevant memories: dense-ranked recall when a search
-    // backend is attached, identical lexical fallback otherwise.
-    // recall_browse owns both paths (engine ranking + snapshot scan),
-    // so preload never diverges from browse recall.
-    let browse_args = MemoryReadArgs {
-        query: Some(task_desc.clone()),
-        project: None,
-        all: true,
-        ..Default::default()
-    };
-    let mut relevant: Vec<Memory> = recall_browse(disp, &browse_args)?;
-    relevant.truncate(3);
-
-    // Boost pre-loaded memories (upstream boostConfidence 0.02).
-    let boosted: Vec<EntityId> = relevant.iter().map(|m| m.id).collect();
-    if !boosted.is_empty() {
-        let ctx = sub_command_ctx(envelope, 0)?;
-        let cmd = DomainCommand::BoostConfidence {
-            memory_ids: boosted,
-        };
-        let _ = disp.repo().apply(&ctx, &cmd);
-    }
-
-    // Track read memories into the session (canonical store, deduped).
-    let read_ids: Vec<String> = relevant.iter().map(|m| legacy_id_of(repo, m)).collect();
-    repo.track_session_link(
-        admitted,
-        handle,
-        ltmrs_service::repository::SessionLinkField::MemoryRead,
-        &read_ids,
-    )?;
 
     let mut response = format!(
         "Session started: {} ({})\n",
@@ -4415,8 +5181,7 @@ fn exec_session_start(
     // Recalled-attempt boosts apply exactly once per operation (P2-B):
     // claimed through the session receipt flag, so a crash between the
     // boost and the response freeze cannot double-apply on continuation.
-    let (continuity, boost_targets) =
-        build_continuity_recall(disp, &args.task_type, project.as_deref(), now);
+    // (Planned before the transaction above; claimed here.)
     if !boost_targets.is_empty() {
         match repo.claim_continuity_boost(admitted, &boost_targets, 0.015, now) {
             Ok(_) => {}
@@ -4465,14 +5230,15 @@ fn exec_session_start(
 }
 
 /// Continuity recall: dead-ends, lessons and warnings from prior sessions
-/// (upstream buildContinuityRecall).
+/// (upstream buildContinuityRecall). Repository reads propagate: silently
+/// skipping recall would drop canonical continuity boosts.
 fn build_continuity_recall(
     disp: &Dispatcher,
     task_type: &str,
     project: Option<&str>,
     _now: u64,
-) -> (String, Vec<(SessionHandle, u32)>) {
-    let sessions = disp.repo().all_sessions().unwrap_or_default();
+) -> DomainResult<(String, Vec<(SessionHandle, u32)>)> {
+    let sessions = disp.repo().all_sessions()?;
 
     // Layer 1 — dead ends from similar prior sessions.
     let mut dead_ends: Vec<(SessionHandle, u32, String, Option<String>)> = Vec::new();
@@ -4526,7 +5292,7 @@ fn build_continuity_recall(
 
     // Layer 3 — warning fragments for this project (or global).
     let repo = disp.repo();
-    let export = repo.export_snapshot().unwrap_or_default();
+    let export = repo.export_snapshot()?;
     let warnings: Vec<&Memory> = export
         .memories
         .iter()
@@ -4540,7 +5306,7 @@ fn build_continuity_recall(
         .collect();
 
     if dead_ends.is_empty() && lessons.is_empty() && warnings.is_empty() {
-        return (String::new(), Vec::new());
+        return Ok((String::new(), Vec::new()));
     }
 
     let mut block = format!("\n\n## Prior reasoning on similar {task_type} tasks");
@@ -4575,10 +5341,20 @@ fn build_continuity_recall(
             block.push_str(&format!("\n- {text}"));
         }
     }
-    (block, boosted)
+    Ok((block, boosted))
 }
 
 // ---- session_attempt ----
+
+/// Best-effort auxiliary reference for attempt records: an unresolvable
+/// related-memory id records the attempt without the link instead of
+/// failing the primary record. The attempt itself still commits.
+fn resolve_related_memory_best_effort(
+    repo: &ltmrs_service::repository::CanonicalRepository,
+    id: &str,
+) -> Option<EntityId> {
+    repo.resolve_id(id).ok()
+}
 
 fn exec_session_attempt(
     disp: &Dispatcher,
@@ -4615,11 +5391,13 @@ fn exec_session_attempt(
         ));
     };
 
-    // Resolve the related memory ID (best-effort).
+    // Resolve the related memory ID (best-effort auxiliary reference: an
+    // unresolvable id records the attempt without the link instead of
+    // failing the primary record).
     let related_memory_id = args
         .related_memory_id
         .as_deref()
-        .and_then(|id| disp.repo().resolve_id(id).ok());
+        .and_then(|id| resolve_related_memory_best_effort(disp.repo(), id));
 
     let now = disp.clock().now_millis();
 
@@ -4829,6 +5607,16 @@ fn exec_session_end(
 
 // ---- session_stats ----
 
+/// Presentational read for the read-only stats surface: a session that
+/// vanishes between routing and rendering shows as absent instead of
+/// failing the stats call. Canonical state is untouched.
+fn read_active_session_presentational(
+    repo: &ltmrs_service::repository::CanonicalRepository,
+    handle: SessionHandle,
+) -> Option<Session> {
+    repo.get_session(handle).unwrap_or(None)
+}
+
 fn exec_session_stats(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
@@ -4851,7 +5639,7 @@ fn exec_session_stats(
     // Active session for this channel (canonical liveness).
     let active = disp
         .resolve_session(envelope.frontend_id, envelope.channel_id)
-        .and_then(|h| disp.repo().get_session(h).unwrap_or(None));
+        .and_then(|h| read_active_session_presentational(disp.repo(), h));
 
     let mut output = String::from("## Session Stats\n");
     if let Some(current) = &active {
@@ -5305,6 +6093,10 @@ fn exec_backup_restore(
     let new_generation = ltmrs_domain::id::StoreGeneration::new(live_generation + 1);
     let report = restore_verified_guarded(disp.repo(), &restore_guard, &verified, new_generation)
         .map_err(|e| fail(format!("backup restore failed: {e}")))?;
+    // Verbatim row swap: a post-replace (id, revision) may carry a
+    // different fragment from a diverged history, so no cached signature
+    // survives the generation cut.
+    disp.conflict_signatures().clear();
     // Generation cut invalidates every pre-restore execution context (P2-A):
     // traced routes, leases, virtual routes/leases and the virtual session
     // store are all reset (the next call on each channel binds fresh).
@@ -5375,6 +6167,272 @@ fn exec_backup_restore(
             "live_writes_since_preview": live_writes_since_preview,
         }),
     ))
+}
+
+// ---- backup_import_lemma (Wave B5c; legacy import via runtime cdylib) ----
+
+/// Load legacy staging through the runtime cdylib (never linked: a missing
+/// library is an explicit build-hint error, never a silent fallback).
+fn load_lemma_staging(
+    path: &std::path::Path,
+) -> Result<crate::lemma_import::ParsedStaging, ltmrs_domain::command::DomainError> {
+    use ltmrs_domain::command::{DomainError, DomainErrorCode};
+    let fail = |message: String| DomainError::new(DomainErrorCode::Validation, message);
+    let lib = crate::lemma_import::LemmaImportLib::open_default()
+        .map_err(|e| fail(format!("backup import failed: {e}")))?;
+    let text = lib
+        .import_json(path)
+        .map_err(|e| fail(format!("backup import failed: {e}")))?;
+    crate::lemma_import::parse_staging(&text)
+        .map_err(|e| fail(format!("backup import failed: {e}")))
+}
+
+/// Loss lines for the human-readable report (every counted caveat shows).
+fn import_loss_text(staging: &crate::lemma_import::ParsedStaging) -> String {
+    if staging.loss.is_empty() {
+        return "no loss items counted".to_string();
+    }
+    staging
+        .loss
+        .iter()
+        .map(|l| format!("{} x{} ({})", l.kind, l.count, l.detail))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Staged rows with no storage keyspace yet (mirrors the restore report's
+/// projects/archives/history zeros): disclosed, never silently dropped.
+fn import_unrestored_text(staging: &crate::lemma_import::ParsedStaging) -> Option<String> {
+    let staged: u64 = ["projects", "archives", "history"]
+        .iter()
+        .map(|k| staging.verified.counts.get(*k).copied().unwrap_or(0))
+        .sum();
+    if staged == 0 {
+        None
+    } else {
+        Some(format!(
+            "{staged} staged project/archive/history row(s) have no storage keyspace yet and will not restore (counted above, kept in staging only)"
+        ))
+    }
+}
+
+/// Preview a legacy import without replacing anything: stage through the
+/// cdylib, bind a channel+path lease, and report loss accounting.
+pub(crate) fn preview_import_staging(
+    disp: &Dispatcher,
+    channel: &str,
+    source: &std::path::Path,
+    staging: &crate::lemma_import::ParsedStaging,
+) -> DomainResult<DomainPayload> {
+    use ltmrs_domain::command::{DomainError, DomainErrorCode};
+    let fail = |message: String| DomainError::new(DomainErrorCode::Validation, message);
+    let live = live_counts(disp)?;
+    let generation = disp
+        .repo()
+        .store_generation()
+        .map_err(|e| fail(format!("backup import preview failed: {}", e.message)))?
+        .as_u64();
+    let now = disp.clock().now_millis();
+    let channels = disp.registry().live_connection_count();
+    let live_op_seq = disp
+        .repo()
+        .op_seq()
+        .map_err(|e| fail(format!("backup import preview failed: {}", e.message)))?;
+    let preview =
+        disp.import_coordinator()
+            .preview(ltmrs_interchange::restore::ImportPreviewRequest {
+                backup: &staging.verified,
+                source_path: source,
+                channel,
+                live_counts: &live,
+                live_generation: generation,
+                active_channels: channels,
+                now_millis: now,
+                live_op_seq,
+            });
+    let loss = import_loss_text(staging);
+    let unrestored = import_unrestored_text(staging);
+    let text = if preview.ready {
+        format!(
+            "Import preview: READY. {}\nLoss accounting (counted, not restored silently): {loss}.{}{}",
+            preview.message,
+            unrestored.map(|u| format!("\n{u}")).unwrap_or_default(),
+            "\nConfirm replaces the live store (never merges): call backup_import_lemma with the same path and confirm=true."
+        )
+    } else {
+        format!(
+            "Import preview: BLOCKED. {}\nKeep this connection open and preview again after other connections close.",
+            preview.message
+        )
+    };
+    Ok(ok_result(
+        text,
+        serde_json::json!({
+            "readiness": {"status": if preview.ready { "ready" } else { "blocked" }, "message": preview.message},
+            "unknown_top_level": preview.unknown_top_level,
+            "loss": staging.loss,
+            "counts": staging.verified.counts,
+            "digest": staging.verified.digest,
+            "schema_version": staging.schema_version,
+            "lemma_version": staging.lemma_version,
+        }),
+    ))
+}
+
+/// Execute a previewed legacy import (REPLACE, never merge): re-stage
+/// fresh, confirm the lease, write a safety backup first, replace the
+/// records, bump the generation and report. Mirrors the restore confirm
+/// flow including fences, lease re-checks and context resets.
+pub(crate) fn confirm_import_staging(
+    disp: &Dispatcher,
+    channel: &str,
+    source: &std::path::Path,
+    staging: &crate::lemma_import::ParsedStaging,
+) -> DomainResult<DomainPayload> {
+    use ltmrs_domain::command::{DomainError, DomainErrorCode};
+    use ltmrs_interchange::backup::{encode_backup, export_backup_to};
+    use ltmrs_interchange::restore::{ImportError, safety_backup_path};
+    let fail = |message: String| DomainError::new(DomainErrorCode::Validation, message);
+    // Exclusive restore fence (same quiescence as restore): in-flight
+    // mutations drain before the safety snapshot is taken.
+    let restore_guard = disp.repo().restore_write_guard();
+    let live_generation = disp
+        .repo()
+        .store_generation()
+        .map_err(|e| fail(format!("backup import failed: {}", e.message)))?
+        .as_u64();
+    let now = disp.clock().now_millis();
+    let active_channels = disp.registry().live_connection_count();
+    let live_op_seq = disp
+        .repo()
+        .op_seq()
+        .map_err(|e| fail(format!("backup import failed: {}", e.message)))?;
+    let (_, live_writes_since_preview) = disp
+        .import_coordinator()
+        .confirm(ltmrs_interchange::restore::ImportConfirmRequest {
+            channel,
+            source_path: source,
+            digest: &staging.verified.digest,
+            live_generation,
+            active_channels,
+            now_millis: now,
+            live_op_seq,
+        })
+        .map_err(|e| match e {
+            ImportError::NeedsPreview | ImportError::Expired | ImportError::AlreadyUsed => fail(
+                format!("backup import refused: {e} (preview again for a fresh lease)"),
+            ),
+            other => fail(format!("backup import refused: {other}")),
+        })?;
+    // Safety backup of the live store first (rollback source on failure).
+    let safety_path = safety_backup_path(source, now);
+    let live_export = disp
+        .repo()
+        .export_full()
+        .map_err(|e| fail(format!("safety backup failed: {}", e.message)))?;
+    let (safety_bytes, _, _) = encode_backup(&live_export, live_generation, now)
+        .map_err(|e| fail(format!("safety backup failed: {e}")))?;
+    export_backup_to(&safety_path, &safety_bytes)
+        .map_err(|e| fail(format!("safety backup failed: {e}")))?;
+    let new_generation = ltmrs_domain::id::StoreGeneration::new(live_generation + 1);
+    let report = ltmrs_interchange::restore::restore_verified_guarded(
+        disp.repo(),
+        &restore_guard,
+        &staging.verified,
+        new_generation,
+    )
+    .map_err(|e| fail(format!("backup import failed: {e}")))?;
+    // Verbatim row swap: no cached signature survives the generation cut.
+    disp.conflict_signatures().clear();
+    // Generation cut invalidates every pre-import execution context.
+    let bindings_dropped = disp.registry().reset_execution_contexts();
+    drop(restore_guard);
+    disp.persist_sessions()
+        .map_err(|e| fail(format!("backup import failed: {e}")))?;
+    let sessions_restored = report.restored.get("sessions").copied().unwrap_or(0);
+    let quarantined = report
+        .quarantined
+        .iter()
+        .map(|q| format!("{} (missing {})", q.relation, q.missing))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let loss = import_loss_text(staging);
+    let text = format!(
+        "Imported {} memories, {} guides, {} sessions from {}\nGeneration {} active; safety backup at {}.{}{}{}{}\nLoss accounting: {loss}",
+        report.restored.get("memories").copied().unwrap_or(0),
+        report.restored.get("guides").copied().unwrap_or(0),
+        sessions_restored,
+        source.display(),
+        report.generation,
+        safety_path.display(),
+        if report.sessions_marked_abandoned == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n{} formerly-active session(s) marked abandoned.",
+                report.sessions_marked_abandoned
+            )
+        },
+        if quarantined.is_empty() {
+            String::new()
+        } else {
+            format!("\nQuarantined (skipped, kept for repair): {quarantined}")
+        },
+        match import_unrestored_text(staging) {
+            None => String::new(),
+            Some(u) => format!("\n{u}"),
+        },
+        if live_writes_since_preview == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n{live_writes_since_preview} live write(s) landed after the preview and were replaced (recoverable from the safety backup)."
+            )
+        },
+    );
+    Ok(ok_result(
+        text,
+        serde_json::json!({
+            "restored": report.restored,
+            "quarantined": report.quarantined,
+            "unknown_top_level": report.unknown_top_level,
+            "loss": staging.loss,
+            "generation": report.generation,
+            "safety_backup": safety_path.to_string_lossy(),
+            "restored_sessions": sessions_restored,
+            "sessions_marked_abandoned": report.sessions_marked_abandoned,
+            "bindings_dropped": bindings_dropped,
+            "live_writes_since_preview": live_writes_since_preview,
+        }),
+    ))
+}
+
+/// Legacy Lemma backup import through the runtime cdylib (Wave B5c):
+/// unconfirmed stages + loss-accounts the preview, explicit confirmation
+/// executes the fenced replace. The cdylib is loaded at runtime and never
+/// linked; the import itself runs inside the daemon's store handle with
+/// the restore fences and transactions preserved.
+fn exec_backup_import_lemma(
+    disp: &Dispatcher,
+    envelope: &IpcEnvelope,
+    args: &BackupImportLemmaArgs,
+) -> DomainResult<DomainPayload> {
+    let path = match args.path.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            return Ok(err_result(
+                "backup_import_lemma requires a `path` to a .lemma-backup file",
+            ));
+        }
+    };
+    let channel = envelope.channel_id.as_uuid().to_string();
+    let source = std::path::Path::new(&path);
+    let staging = load_lemma_staging(source)?;
+    if args.confirm == Some(true) {
+        confirm_import_staging(disp, &channel, source, &staging)
+    } else {
+        preview_import_staging(disp, &channel, source, &staging)
+    }
 }
 
 fn exec_project_analytics(
@@ -5516,6 +6574,7 @@ mod tests {
             retry_epoch: 1,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
             body,
         }
     }
@@ -5561,6 +6620,50 @@ mod tests {
             DomainPayload::ToolResult { text, .. } => text.clone(),
             _ => String::new(),
         }
+    }
+
+    /// Wave B5a test helper: set an exact confidence (validates the update
+    /// succeeded; panics otherwise).
+    fn set_confidence(disp: &Dispatcher, op: u64, id: &str, confidence: f64) {
+        let tool = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: id.to_string(),
+            confidence: Some(confidence),
+            ..Default::default()
+        });
+        let result = run(disp, &tool_call(op, tool.clone()), &tool);
+        assert!(
+            !result_is_error(&result),
+            "set_confidence failed: {}",
+            result_text(&result)
+        );
+    }
+
+    /// Wave B5a test helper: link two fragments (panics on failure).
+    fn relate(disp: &Dispatcher, op: u64, source: &str, target: &str, ty: &str) {
+        let tool = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: source.to_string(),
+            target_id: target.to_string(),
+            relation_type: ty.to_string(),
+            note: None,
+        });
+        let result = run(disp, &tool_call(op, tool.clone()), &tool);
+        assert!(
+            !result_is_error(&result),
+            "relate failed: {}",
+            result_text(&result)
+        );
+    }
+
+    /// Wave B5a test helper: read one fragment's related_graph ids in order.
+    fn related_ids(result: &DomainPayload) -> Vec<String> {
+        let structured = result_structured(result).unwrap();
+        structured["related_graph"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|n| n["id"].as_str().map(|s| s.to_string()))
+            .collect()
     }
 
     fn result_structured(p: &DomainPayload) -> Option<Value> {
@@ -5663,6 +6766,117 @@ mod tests {
         let eid = disp.repo().resolve_id(&id).unwrap();
         let mems = disp.repo().get_memories(&[eid]).unwrap();
         assert!(mems[0].fragment.contains("sk_abc1234567890"));
+    }
+
+    #[test]
+    fn memory_add_confirm_true_critical_still_redacted() {
+        let (disp, _dir) = test_dispatcher();
+        let frag = "deploy key AKIAIOSFODNN7EXAMPLE must rotate";
+        let env = tool_call(
+            1,
+            ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                confirm: true,
+                ..Default::default()
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                confirm: true,
+                ..Default::default()
+            }),
+        );
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let id = structured["id"].as_str().unwrap().to_string();
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(mems[0].fragment.contains("[REDACTED]"));
+        assert!(!mems[0].fragment.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn memory_add_confirm_true_non_critical_stays_verbatim() {
+        let (disp, _dir) = test_dispatcher();
+        let frag = "api_key = sk_abc1234567890";
+        let env = tool_call(
+            1,
+            ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                confirm: true,
+                ..Default::default()
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                confirm: true,
+                ..Default::default()
+            }),
+        );
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let id = structured["id"].as_str().unwrap().to_string();
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(mems[0].fragment.contains("sk_abc1234567890"));
+        assert!(!mems[0].fragment.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn memory_add_no_confirm_redacts_github_pat() {
+        let (disp, _dir) = test_dispatcher();
+        let frag = "token ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let env = tool_call(
+            1,
+            ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                ..Default::default()
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                ..Default::default()
+            }),
+        );
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let id = structured["id"].as_str().unwrap().to_string();
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(mems[0].fragment.contains("[REDACTED]"));
+        assert!(!mems[0].fragment.contains("ghp_abcdefghij"));
+    }
+
+    #[test]
+    fn memory_add_no_confirm_critical_notice_omits_override_hint() {
+        let (disp, _dir) = test_dispatcher();
+        let frag = "deploy key AKIAIOSFODNN7EXAMPLE must rotate";
+        let env = tool_call(
+            1,
+            ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                ..Default::default()
+            }),
+        );
+        let result = run(
+            &disp,
+            &env,
+            &ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: frag.to_string(),
+                ..Default::default()
+            }),
+        );
+        assert!(!result_is_error(&result));
+        assert!(!result_text(&result).contains("Use confirm: true to store as-is"));
     }
 
     #[test]
@@ -5787,12 +7001,18 @@ mod tests {
 
         // retrieve_sync bridges onto the runtime and must run from a
         // synchronous context, exactly like the dispatcher's spawn_blocking.
-        let out = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
-            .await
-            .unwrap()
-            .unwrap();
+        let out = tokio::task::spawn_blocking(move || {
+            recall_browse(
+                &disp,
+                &args,
+                &ltmrs_service::projects::ResolvedScope::unattributed(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            out.len(),
+            out.page.items.len(),
             1,
             "empty backend must fall back to the snapshot scan"
         );
@@ -5854,11 +7074,21 @@ mod tests {
             ..Default::default()
         };
 
-        let out = tokio::task::spawn_blocking(move || recall_browse(&disp, &args))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(out.len(), 1, "empty table falls back to the snapshot");
+        let out = tokio::task::spawn_blocking(move || {
+            recall_browse(
+                &disp,
+                &args,
+                &ltmrs_service::projects::ResolvedScope::unattributed(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            out.page.items.len(),
+            1,
+            "empty table falls back to the snapshot"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -6133,6 +7363,66 @@ mod tests {
         assert_eq!(exp["items"][0]["freshness"]["status"], json!("no_evidence"));
     }
 
+    /// T-SEC-04: logs/explanations never carry unredacted fragments. The only
+    /// path that ever persists a raw secret is an explicit `confirm=true`
+    /// on a non-critical pattern; even then the recall explanation (JSON +
+    /// rendered text) must not repeat it. The control below is non-vacuous:
+    /// the authorized record section DOES carry the verbatim secret, so the
+    /// needle is live and the explanation assertions prove absence.
+    #[test]
+    fn t_sec_04_explanations_carry_no_unredacted_fragment_text() {
+        let (disp, _dir) = test_dispatcher();
+        let secret = "api_key = sk_live_abc123XYZ456";
+        let fragment = format!("## Deploys\n\n### Context\nRotate the key {secret} before Friday.");
+        assert!(privacy::contains_secret(&fragment));
+        assert!(!privacy::contains_critical_secret(secret));
+
+        let add = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: fragment.clone(),
+            confirm: true,
+            ..Default::default()
+        });
+        let added = run(&disp, &tool_call(1, add.clone()), &add);
+        assert!(!result_is_error(&added));
+        let id = result_structured(&added).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(id.clone()),
+            explain: true,
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(2, read.clone()), &read);
+        assert!(!result_is_error(&result));
+
+        let structured = result_structured(&result).unwrap();
+        let exp_json = serde_json::to_string(&structured["recall_explanation"]).unwrap();
+        assert!(
+            !exp_json.contains(secret),
+            "recall_explanation JSON must not carry the raw secret"
+        );
+        // Non-vacuity lock (M4): the explanation carries exactly the read
+        // record, so the absence above is proven on a populated explanation.
+        let items = structured["recall_explanation"]["items"]
+            .as_array()
+            .expect("explanation items present");
+        assert_eq!(items.len(), 1, "explicit-id read explains one record");
+        assert_eq!(items[0]["id"].as_str().unwrap(), id);
+        let text = result_text(&result);
+        let expl_at = text
+            .find("## Why these memories?")
+            .expect("explain text present");
+        assert!(
+            !text[expl_at..].contains(secret),
+            "rendered explanation must not carry the raw secret"
+        );
+        // Non-vacuous control: the stored record IS verbatim (confirm path)
+        // and the authorized detail section shows it.
+        assert!(text[..expl_at].contains(secret));
+    }
+
     #[test]
     fn memory_read_explain_query_mode_uses_ranked_method() {
         let (disp, _dir) = test_dispatcher();
@@ -6164,8 +7454,272 @@ mod tests {
         assert_eq!(exp["scope"]["mode"], json!("project_and_global"));
         let items = exp["items"].as_array().unwrap();
         assert!(!items.is_empty());
-        assert_eq!(items[0]["selection"]["method"], json!("fts5_bm25"));
+        // Wave B5d: the no-backend query fallback reports substring_relevance
+        // (was fts5_bm25, which never described this ranking).
+        assert_eq!(
+            items[0]["selection"]["method"],
+            json!("substring_relevance")
+        );
         assert_eq!(items[0]["selection"]["rank"], json!(1));
+    }
+
+    /// Wave B5d: the no-backend query fallback serves hit-count scores with
+    /// the substring_relevance method (the LIKE scan orders higher-first by
+    /// hit count, never by BM25 or stored confidence).
+    #[test]
+    fn memory_read_b5d_fallback_serves_hit_count_scores() {
+        let (disp, _dir) = test_dispatcher();
+        let id_a = add_fragment(
+            &disp,
+            1,
+            "## Alpha Beta Gamma\n\n### Context\nAlpha beta gamma ledger.",
+        );
+        let id_b = add_fragment(
+            &disp,
+            2,
+            "## Harbor Lantern Manifest\n\n### Context\nMaritime shipping log.",
+        );
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            query: Some("alpha beta gamma".to_string()),
+            explain: true,
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(3, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let items = result_structured(&result).unwrap()["recall_explanation"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], json!(id_a));
+        assert_eq!(
+            items[0]["selection"]["method"],
+            json!("substring_relevance")
+        );
+        assert_eq!(items[0]["selection"]["score"], json!(3.0));
+        assert_eq!(
+            items[0]["selection"]["score_kind"],
+            json!("hit_count_higher_is_better")
+        );
+        assert_eq!(items[1]["id"], json!(id_b));
+        assert_eq!(
+            items[1]["selection"]["method"],
+            json!("substring_relevance")
+        );
+        assert_eq!(items[1]["selection"]["score"], json!(0.0));
+        assert_eq!(
+            items[1]["selection"]["score_kind"],
+            json!("hit_count_higher_is_better")
+        );
+    }
+
+    /// Wave B5d: browse serves stored confidence with confidence_browse
+    /// (the score equals the ranking criterion on this path).
+    #[test]
+    fn memory_read_b5d_browse_serves_confidence_scores() {
+        let (disp, _dir) = test_dispatcher();
+        let id_a = add_fragment(
+            &disp,
+            1,
+            "## Sundial Courtyard Plaque\n\n### Context\nBronze gnomon inscription.",
+        );
+        let id_b = add_fragment(
+            &disp,
+            2,
+            "## Kiln Firing Schedule\n\n### Context\nEarthenware bisque temperatures.",
+        );
+        set_confidence(&disp, 3, &id_a, 0.9);
+        set_confidence(&disp, 4, &id_b, 0.3);
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            explain: true,
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(5, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let items = result_structured(&result).unwrap()["recall_explanation"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], json!(id_a));
+        assert_eq!(items[0]["selection"]["method"], json!("confidence_browse"));
+        assert_eq!(items[0]["selection"]["score"], json!(0.9));
+        assert_eq!(
+            items[0]["selection"]["score_kind"],
+            json!("stored_confidence")
+        );
+        assert_eq!(items[1]["id"], json!(id_b));
+        assert_eq!(items[1]["selection"]["score"], json!(0.3));
+    }
+
+    /// Wave B5d: explicit-ID selections stay scoreless (no ranking applied).
+    #[test]
+    fn memory_read_b5d_explicit_id_stays_scoreless() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(
+            &disp,
+            1,
+            "## Explain Fragment\n\n### Context\nFor scoreless testing.",
+        );
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(id.clone()),
+            explain: true,
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(2, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let items = result_structured(&result).unwrap()["recall_explanation"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["selection"]["method"], json!("explicit_id"));
+        assert!(items[0]["selection"]["score"].is_null());
+        assert!(items[0]["selection"]["score_kind"].is_null());
+    }
+
+    /// Wave B5d: graph selections carry the B5a depth-penalty score already
+    /// available at the construction site (same value as related_graph).
+    #[test]
+    fn memory_read_b5d_graph_selection_carries_depth_penalty_score() {
+        let (disp, _dir) = test_dispatcher();
+        let seed = add_fragment(
+            &disp,
+            1,
+            "## Sundial Courtyard Plaque\n\n### Context\nBronze gnomon inscription marking solstice shadows.",
+        );
+        let near = add_fragment(
+            &disp,
+            2,
+            "## Kiln Firing Schedule\n\n### Context\nEarthenware bisque temperatures and glaze cooling curves.",
+        );
+        set_confidence(&disp, 3, &near, 0.4);
+        relate(&disp, 4, &seed, &near, "related_to");
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(seed.clone()),
+            expand_graph: true,
+            explain: true,
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(5, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let graph = structured["related_graph"].as_array().unwrap().clone();
+        assert_eq!(graph.len(), 1);
+        let items = structured["recall_explanation"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["id"], json!(near));
+        assert_eq!(items[1]["selection"]["method"], json!("graph_expansion"));
+        assert_eq!(
+            items[1]["selection"]["score"],
+            json!(graph[0]["score"].clone())
+        );
+        assert_eq!(
+            items[1]["selection"]["score_kind"],
+            json!("graph_score_with_depth_penalty")
+        );
+    }
+
+    /// Wave B5d: the engine path serves the fused engine relevance score —
+    /// the same native/legacy max derivation semantic_search reports for
+    /// hybrid_rrf_mmr — with the engine_rrf method.
+    #[tokio::test]
+    async fn memory_read_b5d_engine_serves_fused_scores() {
+        use ltmrs_search::search::backend::{ClosureEmbedder, SearchBackend};
+        use ltmrs_search::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Engine Recall Ledger\n\n### Context\nFused engine relevance scores.",
+        );
+
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        publish_search_row(
+            &repo,
+            &table,
+            "engine recall ledger fused relevance",
+            ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT,
+        )
+        .await;
+        table.create_fts_index().await.unwrap();
+        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                embedder,
+            )),
+        ));
+        let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
+            .with_search(backend);
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            query: Some("engine recall".to_string()),
+            explain: true,
+            ..Default::default()
+        });
+        let search = ToolArgs::SemanticSearch(SemanticSearchArgs {
+            query: "engine recall".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: None,
+            explain: true,
+            response_format: None,
+        });
+
+        let (read_result, search_result) = tokio::task::spawn_blocking(move || {
+            let read_out = run(&disp, &tool_call(2, read.clone()), &read);
+            let search_out = run(&disp, &tool_call(3, search.clone()), &search);
+            (read_out, search_out)
+        })
+        .await
+        .unwrap();
+        assert!(!result_is_error(&read_result));
+        assert!(!result_is_error(&search_result));
+        let read_items = result_structured(&read_result).unwrap()["recall_explanation"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let search_items =
+            result_structured(&search_result).unwrap()["recall_explanation"]["items"]
+                .as_array()
+                .unwrap()
+                .clone();
+        assert_eq!(read_items.len(), 1);
+        assert_eq!(search_items.len(), 1);
+        assert_eq!(read_items[0]["id"], search_items[0]["id"]);
+        assert_eq!(read_items[0]["selection"]["method"], json!("engine_rrf"));
+        assert_eq!(read_items[0]["selection"]["rank"], json!(1));
+        assert_eq!(
+            read_items[0]["selection"]["score_kind"],
+            json!("engine_relevance_higher_is_better")
+        );
+        let read_score = read_items[0]["selection"]["score"].as_f64().unwrap();
+        let search_score = search_items[0]["selection"]["score"].as_f64().unwrap();
+        assert!(
+            (read_score - search_score).abs() < 1e-12,
+            "memory_read engine score {read_score} must equal the semantic score {search_score}"
+        );
     }
 
     #[test]
@@ -6231,6 +7785,398 @@ mod tests {
         assert!(mems[0].last_accessed_at.is_some());
         assert!((mems[0].confidence - 0.515).abs() < 1e-9);
         assert!(mems[0].tags.contains(&"refactoring".to_string()));
+    }
+
+    /// Wave B2: single-ID read tracks the id in the channel's active
+    /// session (MemoryRead link, same dedup as preload). Fragments are
+    /// added AFTER start so preload cannot mask the read attribution.
+    #[test]
+    fn memory_read_single_tracks_session() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let id = add_fragment(&disp, 2, "## Track Single\n\n### Context\nSession link.");
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(id.clone()),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(3, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let handle = disp.registry().channel_session(fe(1), ch(1)).unwrap();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
+        assert!(
+            session.memories_read.contains(&id),
+            "single read must link session, got {:?}",
+            session.memories_read
+        );
+    }
+
+    /// Wave B2: batch-IDs read tracks all ids in the active session.
+    #[test]
+    fn memory_read_batch_tracks_session() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let id_a = add_fragment(&disp, 2, "## Batch A\n\n### Context\nFirst.");
+        let id_b = add_fragment(&disp, 3, "## Batch B\n\n### Context\nSecond.");
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            ids: Some(vec![id_a.clone(), id_b.clone()]),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(4, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let handle = disp.registry().channel_session(fe(1), ch(1)).unwrap();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
+        assert!(session.memories_read.contains(&id_a), "batch must link A");
+        assert!(session.memories_read.contains(&id_b), "batch must link B");
+    }
+
+    /// Wave B2: query-path read tracks returned ids in the active session.
+    #[test]
+    fn memory_read_query_tracks_session() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let id = add_fragment(
+            &disp,
+            2,
+            "## Query Track Zebra\n\n### Context\nUnique zebra query tracking.",
+        );
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            query: Some("zebra".to_string()),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(3, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let handle = disp.registry().channel_session(fe(1), ch(1)).unwrap();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
+        assert!(
+            session.memories_read.contains(&id),
+            "query read must link session, got {:?}",
+            session.memories_read
+        );
+    }
+
+    /// Wave B2: no traced session bound → canonical no-op (still succeeds,
+    /// no canonical session created). Virtual routing stays in-memory only.
+    #[test]
+    fn memory_read_without_session_is_canonical_noop() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(&disp, 1, "## No Session\n\n### Context\nLonely.");
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(id.clone()),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(2, read.clone()), &read);
+        assert!(
+            !result_is_error(&result),
+            "read must succeed without session"
+        );
+        assert!(
+            disp.repo().all_sessions().unwrap().is_empty(),
+            "no canonical session must be created"
+        );
+    }
+
+    /// Wave C0: a session-less read must still attribute to the channel's
+    /// virtual session (in-memory routing record, never canonical).
+    #[test]
+    fn memory_read_without_session_tracks_virtual_read() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(&disp, 1, "## Virtual Read\n\n### Context\nVirtual.");
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(id.clone()),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(2, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let handle = disp
+            .registry()
+            .virtual_session(fe(1), ch(1))
+            .expect("channel must have a virtual session after a session-less read");
+        let registry = disp.registry();
+        let rec = registry
+            .virtual_record(handle)
+            .expect("virtual record must exist");
+        assert!(
+            rec.memories_read.contains(&id),
+            "virtual record must carry the read id, got {:?}",
+            rec.memories_read
+        );
+        assert!(
+            disp.repo().all_sessions().unwrap().is_empty(),
+            "no canonical session must be created"
+        );
+    }
+
+    /// Wave B2: batch co-read links associatedWith both ways and creates
+    /// up to 3 related_to relations. Fragments use disjoint vocab so the
+    /// memory_add auto-link (topic overlap) cannot mask the co-read link.
+    #[test]
+    fn memory_read_batch_coread_links() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let id_a = add_fragment(
+            &disp,
+            2,
+            "## Quartz Basalt Columns\n\n### Context\nGeology quarry ledger.",
+        );
+        let id_b = add_fragment(
+            &disp,
+            3,
+            "## Harbor Lantern Manifest\n\n### Context\nMaritime shipping log.",
+        );
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            ids: Some(vec![id_a.clone(), id_b.clone()]),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(4, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let eid_a = disp.repo().resolve_id(&id_a).unwrap();
+        let eid_b = disp.repo().resolve_id(&id_b).unwrap();
+        let mems = disp.repo().get_memories(&[eid_a, eid_b]).unwrap();
+        let (ma, mb) = (&mems[0], &mems[1]);
+        let (ma, mb) = if ma.id == eid_a { (ma, mb) } else { (mb, ma) };
+        assert!(
+            ma.associated_with.contains(&id_b),
+            "A must list B, got {:?}",
+            ma.associated_with
+        );
+        assert!(
+            mb.associated_with.contains(&id_a),
+            "B must list A, got {:?}",
+            mb.associated_with
+        );
+        let rels = disp.repo().all_relations().unwrap();
+        let coread: Vec<_> = rels
+            .iter()
+            .filter(|r| {
+                r.relation_type == ltmrs_domain::relation::RelationType::RelatedTo
+                    && ((r.source == eid_a && r.target == eid_b)
+                        || (r.source == eid_b && r.target == eid_a))
+            })
+            .collect();
+        assert!(
+            !coread.is_empty() && coread.len() <= 3,
+            "expected 1..=3 related_to, got {}",
+            coread.len()
+        );
+    }
+
+    /// Wave B2: cross-project pair under a stable id is never linked,
+    /// even when returned together via all=true. Disjoint vocab avoids
+    /// the memory_add auto-link so only co-read could link.
+    #[test]
+    fn memory_read_coread_cross_project_not_linked() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_a, _id_a) = generate_project_id("shop");
+        let (full_b, _id_b) = generate_project_id("shop");
+        let out_a = add_with(
+            &disp,
+            1,
+            "## Quartz Basalt Columns\n\n### Context\nGeology quarry ledger.",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        assert!(!result_is_error(&out_a));
+        let out_b = add_with(
+            &disp,
+            3,
+            "## Harbor Lantern Manifest\n\n### Context\nMaritime shipping log.",
+            Some("shop"),
+            ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+        );
+        assert!(!result_is_error(&out_b));
+        let id_a = result_structured(&out_a).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let id_b = result_structured(&out_b).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "t".into(),
+            ..Default::default()
+        });
+        let env = tool_call_with(
+            5,
+            start.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        execute_tool(&disp, &env, &start).unwrap();
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            ids: Some(vec![id_a.clone(), id_b.clone()]),
+            all: true,
+            ..Default::default()
+        });
+        let env = tool_call_with(
+            6,
+            read.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let result = execute_tool(&disp, &env, &read).unwrap();
+        assert!(!result_is_error(&result));
+        let eid_a = disp.repo().resolve_id(&id_a).unwrap();
+        let eid_b = disp.repo().resolve_id(&id_b).unwrap();
+        let mems = disp.repo().get_memories(&[eid_a, eid_b]).unwrap();
+        for m in &mems {
+            assert!(
+                m.associated_with.is_empty(),
+                "cross-project must not link, got {:?}",
+                m.associated_with
+            );
+        }
+        let rels = disp.repo().all_relations().unwrap();
+        assert!(
+            rels.iter()
+                .filter(|r| {
+                    r.relation_type == ltmrs_domain::relation::RelationType::RelatedTo
+                        && ((r.source == eid_a && r.target == eid_b)
+                            || (r.source == eid_b && r.target == eid_a))
+                })
+                .count()
+                == 0,
+            "cross-project must create no relation"
+        );
+    }
+
+    /// Wave B2: batch detail renders post-access values (boosted
+    /// confidence), like the single-ID path already does.
+    #[test]
+    fn memory_read_batch_detail_is_post_boost() {
+        let (disp, _dir) = test_dispatcher();
+        let id_a = add_fragment(&disp, 1, "## Post Boost A\n\n### Context\nBoost A.");
+        let id_b = add_fragment(&disp, 2, "## Post Boost B\n\n### Context\nBoost B.");
+        for (op, id) in [(3u64, &id_a), (4, &id_b)] {
+            let upd = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+                id: id.clone(),
+                confidence: Some(0.5),
+                ..Default::default()
+            });
+            run(&disp, &tool_call(op, upd.clone()), &upd);
+        }
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            ids: Some(vec![id_a.clone(), id_b.clone()]),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(5, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        for frag in structured["fragments"].as_array().unwrap() {
+            let conf = frag["confidence"].as_f64().unwrap();
+            assert!(
+                (conf - 0.515).abs() < 1e-9,
+                "batch detail must be post-boost 0.515, got {conf}"
+            );
+        }
+    }
+
+    /// Wave C0: query summary renders post-access values (boosted
+    /// confidence), like batch detail does.
+    #[test]
+    fn memory_read_query_summary_is_post_boost() {
+        let (disp, _dir) = test_dispatcher();
+        let id_a = add_fragment(&disp, 1, "## Post Boost QA\n\n### Context\nBoostQA.");
+        let id_b = add_fragment(&disp, 2, "## Post Boost QB\n\n### Context\nBoostQB.");
+        for (op, id) in [(3u64, &id_a), (4, &id_b)] {
+            let upd = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+                id: id.clone(),
+                confidence: Some(0.5),
+                ..Default::default()
+            });
+            run(&disp, &tool_call(op, upd.clone()), &upd);
+        }
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            query: Some("BoostQA BoostQB".to_string()),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(5, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(structured["total"], json!(2));
+        for frag in structured["fragments"].as_array().unwrap() {
+            let conf = frag["confidence"].as_f64().unwrap();
+            assert!(
+                (conf - 0.515).abs() < 1e-9,
+                "query summary must be post-boost 0.515, got {conf}"
+            );
+        }
+    }
+
+    /// Wave B2: guide practice patches the reciprocal memory-side
+    /// related_guides in the same transaction (validated_by still correct).
+    /// The fragment is added AFTER start so preload cannot mask the read.
+    #[test]
+    fn guide_practice_patches_related_guides() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let id = add_fragment(
+            &disp,
+            2,
+            "## Practice Reciprocal\n\n### Context\nGuide link.",
+        );
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(id.clone()),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(3, read.clone()), &read);
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "reciprocal-guide".to_string(),
+            category: "dev-tool".to_string(),
+            description: "## Reciprocal\n\n### Protocol\nSteps.".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        assert!(!result_is_error(&run(
+            &disp,
+            &tool_call(4, create.clone()),
+            &create
+        )));
+        let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "reciprocal-guide".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec!["ctx".to_string()],
+            learnings: vec!["learn".to_string()],
+            outcome: None,
+        });
+        let result = run(&disp, &tool_call(5, practice.clone()), &practice);
+        assert!(!result_is_error(&result));
+        let guide = disp.repo().get_guide("reciprocal-guide").unwrap().unwrap();
+        assert!(
+            guide.validated_by.contains(&id),
+            "validated_by must hold the read id, got {:?}",
+            guide.validated_by
+        );
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            mems[0]
+                .related_guides
+                .iter()
+                .any(|g| g == "reciprocal-guide"),
+            "memory.related_guides must contain guide, got {:?}",
+            mems[0].related_guides
+        );
     }
 
     // ---- memory_update ----
@@ -6414,6 +8360,298 @@ mod tests {
         assert!(result_text(&result).contains("Invalidated fragment"));
         let mems = disp.repo().get_memories(&[eid]).unwrap();
         assert!(!mems[0].lifecycle.is_recallable());
+    }
+
+    // ---- Wave B5a: bounded tool-level graph expansion (features-review #11) ----
+
+    /// A hub with more neighbors than the fanout cap plus a depth-3 chain
+    /// must yield a bounded, truncated, deterministically ordered graph:
+    /// top-5 depth-1 neighbors by confidence, reached depth-2 children, no
+    /// depth-3 node, truncation indicated, identical order across reads.
+    /// (Disjoint vocab: the memory_add auto-link must not pre-link the
+    /// fixture; the topology below is built explicitly.)
+    #[test]
+    fn expand_graph_hub_is_bounded_truncated_and_deterministic() {
+        let (disp, _dir) = test_dispatcher();
+        let hub = add_fragment(
+            &disp,
+            1,
+            "## Cartography Atlas Index\n\n### Context\nSurvey charts of archipelago harbors and meridian baselines.",
+        );
+        let topics = [
+            "## Basalt Quarry Ledger\n\n### Context\nExcavation tallies of obsidian strata and pumice veins.",
+            "## Maritime Lantern Log\n\n### Context\nHarbor beacon rotations and tide signal schedules.",
+            "## Observatory Star Charts\n\n### Context\nNocturnal telescope sightings of comet perihelion passages.",
+            "## Bakery Oven Roster\n\n### Context\nSourdough fermentation timetables and rye flour quotas.",
+            "## Clockwork Gear Census\n\n### Context\nBrass escapement inventories and pendulum calibration drafts.",
+            "## Vineyard Harvest Almanac\n\n### Context\nAutumn grape pressing yields and barrel cooperage orders.",
+            "## Lighthouse Beacon Registry\n\n### Context\nCoastal foghorn maintenance windows and keeper shift rosters.",
+            "## Falconry Meadow Notes\n\n### Context\nRaptor molting cycles and lure training meadow rotations.",
+        ];
+        let mut leaves = Vec::new();
+        for (i, fragment) in topics.iter().enumerate() {
+            let id = add_fragment(&disp, 2 + i as u64, fragment);
+            // Ascending confidence: leaf i holds 0.1 * (i + 1).
+            set_confidence(&disp, 10 + i as u64, &id, 0.1 * (i as f64 + 1.0));
+            leaves.push(id);
+        }
+        let child = add_fragment(
+            &disp,
+            20,
+            "## Apiary Honey Census\n\n### Context\nHive brood inspections and wax foundation replacements.",
+        );
+        set_confidence(&disp, 21, &child, 0.9);
+        let grandchild = add_fragment(
+            &disp,
+            22,
+            "## Glacier Crevasse Survey\n\n### Context\nIcefall serac mapping and meltwater channel soundings.",
+        );
+        // Hub fanout: link all eight leaves; chain hangs off the top leaf.
+        for (i, leaf) in leaves.iter().enumerate() {
+            relate(&disp, 30 + i as u64, &hub, leaf, "related_to");
+        }
+        relate(&disp, 40, &leaves[7], &child, "related_to");
+        relate(&disp, 41, &child, &grandchild, "related_to");
+
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(hub.clone()),
+            expand_graph: true,
+            ..Default::default()
+        });
+        let first = run(&disp, &tool_call(50, read.clone()), &read);
+        assert!(!result_is_error(&first));
+        let ids = related_ids(&first);
+        // Depth-1 top five by confidence (0.8..0.4) plus the depth-2 child
+        // (0.9 * 0.36 = 0.324 slots between 0.36 and 0.30).
+        let expected = vec![
+            leaves[7].clone(),
+            leaves[6].clone(),
+            leaves[5].clone(),
+            child.clone(),
+            leaves[4].clone(),
+            leaves[3].clone(),
+        ];
+        assert_eq!(ids, expected, "graph must be confidence-ordered");
+        for excluded in [&leaves[0], &leaves[1], &leaves[2], &grandchild] {
+            assert!(
+                !ids.contains(excluded),
+                "fanout-pruned or too-deep node must be absent: {excluded}"
+            );
+        }
+        let structured = result_structured(&first).unwrap();
+        assert_eq!(
+            structured["graph_truncated"],
+            json!(true),
+            "fanout cap must be indicated"
+        );
+        assert!(
+            result_text(&first).contains("truncated"),
+            "text must note the truncation"
+        );
+        // Deterministic: a second read yields the identical order.
+        let second = run(&disp, &tool_call(51, read.clone()), &read);
+        assert_eq!(related_ids(&second), ids);
+    }
+
+    /// A close low-confidence node must rank below a deeper high-confidence
+    /// node per confidence x 0.6^depth, with concrete scores asserted.
+    /// (Disjoint vocab so no auto-link preempts the explicit chain.)
+    #[test]
+    fn expand_graph_depth_penalty_orders_by_confidence_times_decay() {
+        let (disp, _dir) = test_dispatcher();
+        let seed = add_fragment(
+            &disp,
+            1,
+            "## Sundial Courtyard Plaque\n\n### Context\nBronze gnomon inscription marking solstice shadows.",
+        );
+        let near = add_fragment(
+            &disp,
+            2,
+            "## Kiln Firing Schedule\n\n### Context\nEarthenware bisque temperatures and glaze cooling curves.",
+        );
+        set_confidence(&disp, 3, &near, 0.4);
+        let far = add_fragment(
+            &disp,
+            4,
+            "## Tidal Mill Ledger\n\n### Context\nEstuary sluice tallies and millstone dressing intervals.",
+        );
+        set_confidence(&disp, 5, &far, 0.95);
+        relate(&disp, 6, &seed, &near, "related_to");
+        relate(&disp, 7, &near, &far, "related_to");
+
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(seed.clone()),
+            expand_graph: true,
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(8, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        assert_eq!(related_ids(&result), vec![far.clone(), near.clone()]);
+        let structured = result_structured(&result).unwrap();
+        let graph = structured["related_graph"].as_array().unwrap();
+        let far_score = graph[0]["score"].as_f64().unwrap();
+        let near_score = graph[1]["score"].as_f64().unwrap();
+        assert!(
+            (far_score - 0.95 * 0.6f64.powi(2)).abs() < 1e-9,
+            "far score must be 0.95 x 0.6^2, got {far_score}"
+        );
+        assert!(
+            (near_score - 0.4 * 0.6).abs() < 1e-9,
+            "near score must be 0.4 x 0.6, got {near_score}"
+        );
+        assert_eq!(structured["graph_truncated"], json!(false));
+    }
+
+    /// A cross-project neighbor linked permissively must be excluded from
+    /// expansion under a stable identity — even with all=true — while an
+    /// unattributed all=true read still traverses it (linkage control).
+    #[test]
+    fn expand_graph_excludes_cross_project_node_under_stable_id() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_a, _id_a) = generate_project_id("shop");
+        let (full_b, _id_b) = generate_project_id("shop");
+        let seed_out = add_with(
+            &disp,
+            1,
+            "## Shop seed\n\n### Context\nSeed under identity A.",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        assert!(!result_is_error(&seed_out));
+        let seed_id = result_structured(&seed_out).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let foreign_out = add_with(
+            &disp,
+            2,
+            "## Shop foreign\n\n### Context\nForeign node under identity B.",
+            Some("shop"),
+            ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+        );
+        assert!(!result_is_error(&foreign_out));
+        let foreign_id = result_structured(&foreign_out).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Cross-boundary link via the permissive unattributed path.
+        relate(&disp, 3, &seed_id, &foreign_id, "related_to");
+
+        // Under identity A the foreign node must not surface (all=false).
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(seed_id.clone()),
+            expand_graph: true,
+            ..Default::default()
+        });
+        let scoped = run(
+            &disp,
+            &tool_call_with(
+                4,
+                read.clone(),
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+            ),
+            &read,
+        );
+        assert!(!result_is_error(&scoped));
+        assert!(
+            !related_ids(&scoped).contains(&foreign_id),
+            "cross-project node must be excluded under the stable id"
+        );
+        assert!(
+            !result_text(&scoped).contains(&foreign_id),
+            "no foreign id may render"
+        );
+        // ... nor with all=true: expansion is a derived read and must not
+        // bootstrap across the boundary.
+        let read_all = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(seed_id.clone()),
+            expand_graph: true,
+            all: true,
+            ..Default::default()
+        });
+        let scoped_all = run(
+            &disp,
+            &tool_call_with(
+                5,
+                read_all.clone(),
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+            ),
+            &read_all,
+        );
+        assert!(!result_is_error(&scoped_all));
+        assert!(
+            !related_ids(&scoped_all).contains(&foreign_id),
+            "all=true must not leak cross-project nodes into expansion"
+        );
+        // Control: unattributed all=true traverses the link (it exists).
+        let control = run(&disp, &tool_call(6, read_all.clone()), &read_all);
+        assert!(!result_is_error(&control));
+        assert!(
+            related_ids(&control).contains(&foreign_id),
+            "unattributed all=true must traverse the existing link"
+        );
+    }
+
+    /// A non-recallable (invalidated) neighbor must be excluded from
+    /// expansion while remaining directly readable (row preserved).
+    /// (Disjoint vocab so no auto-link preempts the explicit edge.)
+    #[test]
+    fn expand_graph_excludes_non_recallable_node() {
+        let (disp, _dir) = test_dispatcher();
+        let seed = add_fragment(
+            &disp,
+            1,
+            "## Granary Inventory Scroll\n\n### Context\nWheat bushel counts and silo moisture readings.",
+        );
+        let retired = add_fragment(
+            &disp,
+            2,
+            "## Cooper Barrel Order\n\n### Context\nOak stave shipments for cider cask assembly.",
+        );
+        relate(&disp, 3, &seed, &retired, "related_to");
+        let forget = ToolArgs::MemoryForget(MemoryForgetArgs {
+            id: retired.clone(),
+            invalidate: true,
+            ..Default::default()
+        });
+        let forgot = run(&disp, &tool_call(4, forget.clone()), &forget);
+        assert!(!result_is_error(&forgot));
+
+        let read = ToolArgs::MemoryRead(MemoryReadArgs {
+            id: Some(seed.clone()),
+            expand_graph: true,
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(5, read.clone()), &read);
+        assert!(!result_is_error(&result));
+        assert!(
+            !related_ids(&result).contains(&retired),
+            "invalidated node must be excluded from expansion"
+        );
+        assert_eq!(
+            result_structured(&result).unwrap()["graph_truncated"],
+            json!(false)
+        );
+        // Control: the row itself is preserved and directly readable.
+        let direct = run(
+            &disp,
+            &tool_call(
+                6,
+                ToolArgs::MemoryRead(MemoryReadArgs {
+                    id: Some(retired.clone()),
+                    ..Default::default()
+                }),
+            ),
+            &ToolArgs::MemoryRead(MemoryReadArgs {
+                id: Some(retired.clone()),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            !result_is_error(&direct),
+            "invalidated row must stay directly readable"
+        );
     }
 
     // ---- memory_relate ----
@@ -6955,6 +9193,43 @@ mod tests {
         assert_eq!(structured["merged_ids"].as_array().unwrap().len(), 2);
     }
 
+    /// Archived merge sources must not linger in the signature cache:
+    /// they are non-recallable, so their entries are dead weight.
+    #[test]
+    fn memory_merge_prunes_archived_sources_from_signature_cache() {
+        let (disp, _dir) = test_dispatcher();
+        let id1 = add_fragment(
+            &disp,
+            1,
+            "## Merge Source One\n\n### Context\nFirst source of merge.",
+        );
+        let id2 = add_fragment(
+            &disp,
+            2,
+            "## Merge Source Two\n\n### Context\nSecond source of merge.",
+        );
+        assert_eq!(
+            disp.conflict_signatures().len(),
+            2,
+            "adds must seed the cache"
+        );
+        let tool = ToolArgs::MemoryMerge(MemoryMergeArgs {
+            ids: vec![id1, id2],
+            title: "Merged Result".to_string(),
+            fragment: "## Merged Result\n\n### Context\nCombined content.".to_string(),
+            project: None,
+            consolidate: false,
+        });
+        let env = tool_call(3, tool.clone());
+        let result = run(&disp, &env, &tool);
+        assert!(!result_is_error(&result));
+        assert_eq!(
+            disp.conflict_signatures().len(),
+            0,
+            "archived merge sources must leave the cache"
+        );
+    }
+
     #[test]
     fn memory_merge_requires_two_ids() {
         let (disp, _dir) = test_dispatcher();
@@ -7380,6 +9655,7 @@ mod tests {
                 char_start: 0,
                 char_end: lexical_text.len() as u64,
                 project: None,
+                project_id: None,
                 fragment_type: "fact".to_string(),
                 created_at_millis: 1000,
                 confidence: 0.9,
@@ -7465,14 +9741,460 @@ mod tests {
         );
     }
 
+    // ---- Wave A3a: honest pagination + overflow hardening ----
+
+    /// Seed `n` memories that all match the shared `pagetoken` query token.
+    /// Titles/bodies carry unique per-index tokens so pairwise Jaccard stays
+    /// far below the 0.80 memory_add dedup bar.
+    fn seed_pagetoken_memories(disp: &Dispatcher, start_op: u64, n: usize) {
+        for i in 0..n {
+            add_fragment(
+                disp,
+                start_op + i as u64,
+                &format!(
+                    "## Pagetoken fragment {i:04}\n\n### Context\nPagetoken shared query terms uniqueword{i} quux{i} zebra{i}.\n"
+                ),
+            );
+        }
+    }
+
+    /// Publish one lexical-only projection row per canonical memory (no
+    /// embeddings: the dense leg runs but contributes nothing) and build the
+    /// FTS index, so the engine — not the substring fallback — answers.
+    async fn publish_pagetoken_rows(
+        repo: &CanonicalRepository,
+        table: &ltmrs_search::search::table::SearchTable,
+        token: &str,
+    ) {
+        use ltmrs_domain::id::{ChunkId, DocumentRevision};
+        let memories = repo.export_snapshot().unwrap().memories;
+        let rows: Vec<ltmrs_search::search::row::SearchRow> = memories
+            .iter()
+            .map(|m| {
+                let lexical_text = format!(
+                    "{} {} {}",
+                    token,
+                    m.title.to_lowercase(),
+                    m.fragment.to_lowercase()
+                );
+                ltmrs_search::search::row::SearchRow {
+                    store_generation: StoreGeneration::FIRST,
+                    memory_id: m.id,
+                    document_revision: DocumentRevision::new(1),
+                    model_fingerprint: ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT,
+                    chunk_id: ChunkId::new(0),
+                    chunker_version: "v1".to_string(),
+                    lexical_text: lexical_text.clone(),
+                    char_start: 0,
+                    char_end: lexical_text.len() as u64,
+                    project: None,
+                    project_id: None,
+                    fragment_type: m.fragment_type.as_str().to_string(),
+                    created_at_millis: m.created_at.as_millis(),
+                    confidence: m.confidence,
+                    updated_at_millis: m.created_at.as_millis(),
+                    embedding: None,
+                }
+            })
+            .collect();
+        table.publish_rows(&rows).await.unwrap();
+        table.create_fts_index().await.unwrap();
+    }
+
+    /// Shared page-shape assertion: exact total, exact page length, honest
+    /// has_more/next_offset for the given limit/offset over `total` matches.
+    fn expect_pagination_page(structured: &Value, total: u64, limit: u64, offset: u64) {
+        assert_eq!(
+            structured["total"].as_u64().unwrap(),
+            total,
+            "total must count the full matching set"
+        );
+        assert_eq!(
+            structured["count"].as_u64().unwrap(),
+            total.saturating_sub(offset).min(limit),
+            "page length wrong for total={total} limit={limit} offset={offset}"
+        );
+        let more = offset + limit < total;
+        assert_eq!(
+            structured["has_more"].as_bool().unwrap(),
+            more,
+            "has_more wrong for total={total} limit={limit} offset={offset}"
+        );
+        if more {
+            assert_eq!(
+                structured["next_offset"].as_u64().unwrap(),
+                offset + limit,
+                "next_offset must continue the page"
+            );
+        } else {
+            assert!(
+                structured["next_offset"].is_null(),
+                "next_offset must be null on the last page"
+            );
+        }
+    }
+
+    /// memory_read over the lexical-only (no-backend substring) path reports
+    /// exact totals at every scale and offset.
+    #[test]
+    fn memory_read_pagination_honest_totals_lexical() {
+        for n in [31usize, 51, 100, 500] {
+            let (disp, _dir) = test_dispatcher();
+            seed_pagetoken_memories(&disp, 1, n);
+            let offsets = [0u64, 7, n as u64 / 2, n as u64 - 1, n as u64, n as u64 + 50];
+            for offset in offsets {
+                let args = MemoryReadArgs {
+                    query: Some("pagetoken".to_string()),
+                    all: true,
+                    offset: if offset == 0 {
+                        None
+                    } else {
+                        Some(offset as usize)
+                    },
+                    ..Default::default()
+                };
+                let env = tool_call(1000 + offset, ToolArgs::MemoryRead(args.clone()));
+                let result = run(&disp, &env, &ToolArgs::MemoryRead(args));
+                assert!(!result_is_error(&result), "offset {offset} of {n}");
+                let structured = result_structured(&result).unwrap();
+                expect_pagination_page(&structured, n as u64, 30, offset);
+            }
+        }
+    }
+
+    /// memory_read over the hybrid (backend-attached engine) path reports
+    /// exact totals at every scale and offset; the dense leg must run.
+    #[tokio::test]
+    async fn memory_read_pagination_honest_totals_hybrid() {
+        use ltmrs_search::search::backend::{ClosureEmbedder, SearchBackend};
+        use ltmrs_search::search::table::SearchTable;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for n in [31usize, 51, 100, 500] {
+            let dir = tempfile::tempdir().unwrap();
+            let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+                Arc::new(FrozenClock::new(1000));
+            let repo = Arc::new(
+                CanonicalRepository::open_with_clock(
+                    dir.path().to_str().unwrap(),
+                    Arc::clone(&clock),
+                )
+                .unwrap(),
+            );
+            repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+            let seed = Dispatcher::new(
+                Arc::clone(&repo),
+                crate::registry::FrontendRegistry::new(),
+                Arc::clone(&clock),
+            );
+            seed_pagetoken_memories(&seed, 1, n);
+
+            let lance_dir = tempfile::tempdir().unwrap();
+            let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+                .await
+                .unwrap();
+            publish_pagetoken_rows(&repo, &table, "pagetoken").await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let embedder = Arc::new(ClosureEmbedder::new({
+                let calls = Arc::clone(&calls);
+                move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![0.0; 384])
+                }
+            }));
+            let backend = Arc::new(SearchBackend::new(
+                Arc::clone(&repo),
+                table,
+                Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                    embedder,
+                )),
+            ));
+            let disp = std::sync::Arc::new(
+                Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
+                    .with_search(backend),
+            );
+
+            let offsets = [0u64, 7, n as u64 / 2, n as u64 - 1, n as u64, n as u64 + 50];
+            for offset in offsets {
+                let args = MemoryReadArgs {
+                    query: Some("pagetoken".to_string()),
+                    all: true,
+                    offset: if offset == 0 {
+                        None
+                    } else {
+                        Some(offset as usize)
+                    },
+                    ..Default::default()
+                };
+                let env = tool_call(1000 + offset, ToolArgs::MemoryRead(args.clone()));
+                let tool = ToolArgs::MemoryRead(args);
+                let d = std::sync::Arc::clone(&disp);
+                let result = tokio::task::spawn_blocking(move || run(&d, &env, &tool))
+                    .await
+                    .unwrap();
+                assert!(!result_is_error(&result), "offset {offset} of {n}");
+                let structured = result_structured(&result).unwrap();
+                expect_pagination_page(&structured, n as u64, 30, offset);
+            }
+            assert!(
+                calls.load(Ordering::SeqCst) >= 1,
+                "dense leg must run on the hybrid path"
+            );
+        }
+    }
+
+    /// semantic_search over the lexical-only (no-backend substring) path
+    /// reports exact totals at every scale and offset.
+    #[test]
+    fn semantic_search_pagination_honest_totals_lexical() {
+        for n in [31usize, 51, 100, 500] {
+            let (disp, _dir) = test_dispatcher();
+            seed_pagetoken_memories(&disp, 1, n);
+            let offsets = [0u64, 7, n as u64 / 2, n as u64 - 1, n as u64, n as u64 + 50];
+            for offset in offsets {
+                let args = SemanticSearchArgs {
+                    query: "pagetoken".to_string(),
+                    project: None,
+                    top_k: None,
+                    offset: if offset == 0 {
+                        None
+                    } else {
+                        Some(offset as usize)
+                    },
+                    hybrid: None,
+                    explain: false,
+                    response_format: None,
+                };
+                let env = tool_call(1000 + offset, ToolArgs::SemanticSearch(args.clone()));
+                let result = run(&disp, &env, &ToolArgs::SemanticSearch(args));
+                assert!(!result_is_error(&result), "offset {offset} of {n}");
+                let structured = result_structured(&result).unwrap();
+                expect_pagination_page(&structured, n as u64, 10, offset);
+            }
+        }
+    }
+
+    /// semantic_search over the hybrid (backend-attached engine) path reports
+    /// exact totals at every scale and offset; the dense leg must run.
+    #[tokio::test]
+    async fn semantic_search_pagination_honest_totals_hybrid() {
+        use ltmrs_search::search::backend::{ClosureEmbedder, SearchBackend};
+        use ltmrs_search::search::table::SearchTable;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for n in [31usize, 51, 100, 500] {
+            let dir = tempfile::tempdir().unwrap();
+            let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+                Arc::new(FrozenClock::new(1000));
+            let repo = Arc::new(
+                CanonicalRepository::open_with_clock(
+                    dir.path().to_str().unwrap(),
+                    Arc::clone(&clock),
+                )
+                .unwrap(),
+            );
+            repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+            let seed = Dispatcher::new(
+                Arc::clone(&repo),
+                crate::registry::FrontendRegistry::new(),
+                Arc::clone(&clock),
+            );
+            seed_pagetoken_memories(&seed, 1, n);
+
+            let lance_dir = tempfile::tempdir().unwrap();
+            let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+                .await
+                .unwrap();
+            publish_pagetoken_rows(&repo, &table, "pagetoken").await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let embedder = Arc::new(ClosureEmbedder::new({
+                let calls = Arc::clone(&calls);
+                move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![0.0; 384])
+                }
+            }));
+            let backend = Arc::new(SearchBackend::new(
+                Arc::clone(&repo),
+                table,
+                Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                    embedder,
+                )),
+            ));
+            let disp = std::sync::Arc::new(
+                Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
+                    .with_search(backend),
+            );
+
+            let offsets = [0u64, 7, n as u64 / 2, n as u64 - 1, n as u64, n as u64 + 50];
+            for offset in offsets {
+                let args = SemanticSearchArgs {
+                    query: "pagetoken".to_string(),
+                    project: None,
+                    top_k: None,
+                    offset: if offset == 0 {
+                        None
+                    } else {
+                        Some(offset as usize)
+                    },
+                    hybrid: None,
+                    explain: false,
+                    response_format: None,
+                };
+                let env = tool_call(1000 + offset, ToolArgs::SemanticSearch(args.clone()));
+                let tool = ToolArgs::SemanticSearch(args);
+                let d = std::sync::Arc::clone(&disp);
+                let result = tokio::task::spawn_blocking(move || run(&d, &env, &tool))
+                    .await
+                    .unwrap();
+                assert!(!result_is_error(&result), "offset {offset} of {n}");
+                let structured = result_structured(&result).unwrap();
+                expect_pagination_page(&structured, n as u64, 10, offset);
+            }
+            assert!(
+                calls.load(Ordering::SeqCst) >= 1,
+                "dense leg must run on the hybrid path"
+            );
+        }
+    }
+
+    /// Absurd pagination values are typed validation errors, never panics or
+    /// silently clamped windows: offset/limit/top_k at usize::MAX.
+    #[test]
+    fn pagination_absurd_values_are_validation_errors() {
+        use ltmrs_domain::command::DomainErrorCode;
+        let (disp, _dir) = test_dispatcher();
+        seed_pagetoken_memories(&disp, 1, 3);
+
+        let huge_offset = MemoryReadArgs {
+            query: Some("pagetoken".to_string()),
+            all: true,
+            offset: Some(usize::MAX),
+            ..Default::default()
+        };
+        let env = tool_call(11, ToolArgs::MemoryRead(huge_offset.clone()));
+        let err = execute_tool(&disp, &env, &ToolArgs::MemoryRead(huge_offset)).unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation, "memory_read offset");
+
+        let huge_limit = MemoryReadArgs {
+            query: Some("pagetoken".to_string()),
+            all: true,
+            limit: Some(usize::MAX),
+            ..Default::default()
+        };
+        let env = tool_call(12, ToolArgs::MemoryRead(huge_limit.clone()));
+        let err = execute_tool(&disp, &env, &ToolArgs::MemoryRead(huge_limit)).unwrap_err();
+        assert_eq!(err.code, DomainErrorCode::Validation, "memory_read limit");
+
+        let huge_search_offset = SemanticSearchArgs {
+            query: "pagetoken".to_string(),
+            project: None,
+            top_k: None,
+            offset: Some(usize::MAX),
+            hybrid: None,
+            explain: false,
+            response_format: None,
+        };
+        let env = tool_call(13, ToolArgs::SemanticSearch(huge_search_offset.clone()));
+        let err =
+            execute_tool(&disp, &env, &ToolArgs::SemanticSearch(huge_search_offset)).unwrap_err();
+        assert_eq!(
+            err.code,
+            DomainErrorCode::Validation,
+            "semantic_search offset"
+        );
+
+        let huge_top_k = SemanticSearchArgs {
+            query: "pagetoken".to_string(),
+            project: None,
+            top_k: Some(usize::MAX),
+            offset: None,
+            hybrid: None,
+            explain: false,
+            response_format: None,
+        };
+        let env = tool_call(14, ToolArgs::SemanticSearch(huge_top_k.clone()));
+        let err = execute_tool(&disp, &env, &ToolArgs::SemanticSearch(huge_top_k)).unwrap_err();
+        assert_eq!(
+            err.code,
+            DomainErrorCode::Validation,
+            "semantic_search top_k"
+        );
+    }
+
+    /// Date filters must reach the engine scope, not just the post-filter: a
+    /// backend-served page whose matches are all date-excluded reports total
+    /// 0, never the unfiltered pool with a phantom continuation.
+    #[tokio::test]
+    async fn memory_read_filtered_engine_total_counts_only_passing_set() {
+        use ltmrs_search::search::backend::{ClosureEmbedder, SearchBackend};
+        use ltmrs_search::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        seed_pagetoken_memories(&seed, 1, 3);
+
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        publish_pagetoken_rows(&repo, &table, "pagetoken").await;
+        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                embedder,
+            )),
+        ));
+        let disp = Arc::new(
+            Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
+                .with_search(backend),
+        );
+
+        // FrozenClock sits at 1000ms; after_date 1970-01-02 excludes every
+        // memory while the query still matches all three lexically.
+        let args = MemoryReadArgs {
+            query: Some("pagetoken".to_string()),
+            all: true,
+            limit: Some(2),
+            after_date: Some("1970-01-02".to_string()),
+            ..Default::default()
+        };
+        let env = tool_call(10, ToolArgs::MemoryRead(args.clone()));
+        let tool = ToolArgs::MemoryRead(args);
+        let d = Arc::clone(&disp);
+        let result = tokio::task::spawn_blocking(move || run(&d, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["total"].as_u64().unwrap(),
+            0,
+            "total must count only the date-passing set"
+        );
+        assert_eq!(structured["count"].as_u64().unwrap(), 0);
+        assert!(!structured["has_more"].as_bool().unwrap());
+        assert!(structured["next_offset"].is_null());
+    }
+
     /// explain:true with hybrid:false reports the lexical mode actually
     /// run, not hybrid: the mode names the effective legs, and the
     /// no-backend fallback does not claim a ready FTS index it never used.
     #[tokio::test]
     async fn semantic_search_explain_reports_effective_mode() {
-        use ltmrs_search::search::backend::{ClosureEmbedder, SearchBackend};
-        use ltmrs_search::search::table::SearchTable;
-
         let dir = tempfile::tempdir().unwrap();
         let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
             Arc::new(FrozenClock::new(1000));
@@ -7492,30 +10214,10 @@ mod tests {
             "## Explained Search\n\n### Context\nRecall with reasons.",
         );
 
-        let lance_dir = tempfile::tempdir().unwrap();
-        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
-            .await
-            .unwrap();
-        // Publish one row so the engine serves lexically (hybrid:false
-        // skips the dense leg): the mode must name the effective legs.
-        publish_search_row(
-            &repo,
-            &table,
-            "explained reasons recall",
-            ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT,
-        )
-        .await;
-        table.create_fts_index().await.unwrap();
-        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
-        let backend = Arc::new(SearchBackend::new(
-            Arc::clone(&repo),
-            table,
-            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
-                embedder,
-            )),
-        ));
-        let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
-            .with_search(backend);
+        // No backend is attached: hybrid:false serves the TF-IDF reference
+        // arm off the canonical snapshot, so the mode must name the
+        // reference path actually run (no dense leg, no FTS read).
+        let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock);
         let args = SemanticSearchArgs {
             query: "explained reasons".to_string(),
             project: None,
@@ -7682,6 +10384,209 @@ mod tests {
         assert!(result_text(&result).contains("No semantically similar memories found"));
     }
 
+    /// hybrid:false serves the Lemma-faithful TF-IDF reference profile, not
+    /// the substring-count fallback: cosine scores live in (0, 1] (the old
+    /// path reported raw hit counts, e.g. 2.0 for two matched query words),
+    /// and memories with no shared term are excluded from the total.
+    #[test]
+    fn semantic_search_hybrid_false_uses_tfidf_profile() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(
+            &disp,
+            1,
+            "## Rust Cargo Testing\n\n### Context\nHow to write tests in Rust with cargo test.",
+        );
+        add_fragment(
+            &disp,
+            2,
+            "## Bread Baking Recipes\n\n### Context\nHow to bake bread at home.",
+        );
+        let args = SemanticSearchArgs {
+            query: "rust cargo".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: Some(false),
+            explain: false,
+            response_format: None,
+        };
+        let env = tool_call(3, ToolArgs::SemanticSearch(args.clone()));
+        let result = run(&disp, &env, &ToolArgs::SemanticSearch(args));
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["count"].as_u64().unwrap(),
+            1,
+            "bread memory shares no query term and must be excluded"
+        );
+        assert_eq!(structured["total"].as_u64().unwrap(), 1);
+        let top = &structured["results"][0];
+        assert!(
+            top["title"].as_str().unwrap().contains("Rust"),
+            "TF-IDF must rank the rust memory first"
+        );
+        let score = top["score"].as_f64().unwrap();
+        assert!(
+            score > 0.0 && score <= 1.0,
+            "TF-IDF cosine lives in (0, 1]; substring counts exceed 1: {score}"
+        );
+    }
+
+    /// explain:true on the hybrid:false path supplements the native
+    /// explanation with the upstream-shaped recall_explanation (same keys as
+    /// memory_read's): applies_to/scope/notice/correction_tools/items, with
+    /// the tfidf_cosine selection method and effective rank.
+    #[test]
+    fn semantic_search_hybrid_false_explain_adds_recall_explanation() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(
+            &disp,
+            1,
+            "## Rust Cargo Testing\n\n### Context\nHow to write tests in Rust with cargo test.",
+        );
+        add_fragment(
+            &disp,
+            2,
+            "## Bread Baking Recipes\n\n### Context\nHow to bake bread at home.",
+        );
+        let args = SemanticSearchArgs {
+            query: "rust cargo".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: Some(false),
+            explain: true,
+            response_format: None,
+        };
+        let env = tool_call(3, ToolArgs::SemanticSearch(args.clone()));
+        let result = run(&disp, &env, &ToolArgs::SemanticSearch(args));
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["explanation"]["mode"], "lexical",
+            "native explanation stays, reporting the legs actually run"
+        );
+        let exp = &structured["recall_explanation"];
+        assert_eq!(exp["applies_to"], json!("this_call"));
+        assert!(exp["scope"].is_object());
+        assert!(exp["notice"].is_string());
+        assert!(exp["correction_tools"].is_array());
+        let items = exp["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["selection"]["method"], json!("tfidf_cosine"));
+        assert_eq!(items[0]["selection"]["rank"], json!(1));
+        assert!(items[0]["selection"]["score"].as_f64().unwrap() > 0.0);
+        assert!(result_text(&result).contains("## Why these memories?"));
+    }
+
+    /// explain:true on the no-backend fallback path also gains the
+    /// recall_explanation supplement (substring_fallback method) while the
+    /// native lexical-fallback explanation is preserved.
+    #[test]
+    fn semantic_search_fallback_explain_adds_recall_explanation() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(
+            &disp,
+            1,
+            "## Rust Cargo Testing\n\n### Context\nHow to write tests in Rust with cargo test.",
+        );
+        let args = SemanticSearchArgs {
+            query: "rust cargo".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: None,
+            explain: true,
+            response_format: None,
+        };
+        let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+        let result = run(&disp, &env, &ToolArgs::SemanticSearch(args));
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(structured["explanation"]["mode"], "lexical-fallback");
+        let exp = &structured["recall_explanation"];
+        assert_eq!(exp["applies_to"], json!("this_call"));
+        let items = exp["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["selection"]["method"], json!("substring_fallback"));
+        assert_eq!(items[0]["selection"]["rank"], json!(1));
+    }
+
+    /// explain:true on the engine (default hybrid) path also gains the
+    /// recall_explanation supplement (hybrid_rrf_mmr method) while the
+    /// native hybrid explanation is preserved.
+    #[tokio::test]
+    async fn semantic_search_engine_explain_adds_recall_explanation() {
+        use ltmrs_search::search::backend::{ClosureEmbedder, SearchBackend};
+        use ltmrs_search::search::table::SearchTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+                .unwrap(),
+        );
+        repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let seed = Dispatcher::new(
+            Arc::clone(&repo),
+            crate::registry::FrontendRegistry::new(),
+            Arc::clone(&clock),
+        );
+        add_fragment(
+            &seed,
+            1,
+            "## Explained Search\n\n### Context\nRecall with reasons.",
+        );
+
+        let lance_dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        publish_search_row(
+            &repo,
+            &table,
+            "explained reasons recall",
+            ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT,
+        )
+        .await;
+        table.create_fts_index().await.unwrap();
+        let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+        let backend = Arc::new(SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(ltmrs_search::search::backend::QueryEmbedderAdapter::new(
+                embedder,
+            )),
+        ));
+        let disp = Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock)
+            .with_search(backend);
+        let args = SemanticSearchArgs {
+            query: "explained reasons".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid: None,
+            explain: true,
+            response_format: None,
+        };
+        let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+        let tool = ToolArgs::SemanticSearch(args);
+        let result = tokio::task::spawn_blocking(move || run(&disp, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(structured["explanation"]["mode"], "hybrid");
+        let exp = &structured["recall_explanation"];
+        assert_eq!(exp["applies_to"], json!("this_call"));
+        let items = exp["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["selection"]["method"], json!("hybrid_rrf_mmr"));
+        assert_eq!(items[0]["selection"]["rank"], json!(1));
+        assert!(items[0]["selection"]["score"].is_number());
+    }
+
     // ---- Differential wire-contract tests (T-MCP-02 legacy_oracle) ----
     //
     // These replay an anonymized fixture derived from the real upstream
@@ -7728,6 +10633,7 @@ mod tests {
             description: f["description"].as_str().unwrap_or("").to_string(),
             fragment_type: FragmentType::Fact,
             project: f["project"].as_str().map(|s| s.to_string()),
+            project_id: None,
             // Upstream icon: "ai" → 🤖, anything else → 👤. Map accordingly.
             source: if f["source"].as_str() == Some("ai") {
                 MemorySource::Ai
@@ -8155,12 +11061,31 @@ mod tests {
         }
 
         // Step 6 session_end: ours equals the upstream text minus the
-        // coaching tail; same memories/guides attribution.
+        // coaching tail; same memories/guides attribution, plus the Wave B2
+        // Memories read line (upstream HEAD tracks reads; the frozen
+        // fixture predates it, so it carries no read line to compare).
         let fx_end = steps[6]["text"].as_str().unwrap();
         let (fx_head, _) = fx_end
             .split_once("\nAuto-detected technologies:")
             .expect("upstream end carries auto-detected techs");
-        assert_eq!(ours[6].1, fx_head, "end text parity before coaching tail");
+        let ours_end = &ours[6].1;
+        assert!(
+            ours_end.contains("Memories read:"),
+            "Wave B2 must list reads in the review, got: {ours_end}"
+        );
+        assert!(
+            ours_end.contains("[$M1]") && ours_end.contains("[$M2]"),
+            "review must name both reads, got: {ours_end}"
+        );
+        let ours_without_reads = ours_end
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("Memories read:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            ours_without_reads, fx_head,
+            "end text parity before coaching tail (minus the read line)"
+        );
         assert_eq!(ours[6].2["outcome_recorded"], Value::Bool(true));
         assert_eq!(ours[6].2["suggestions"], Value::Array(vec![]));
         assert!(
@@ -8358,6 +11283,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Fact,
             project: project.map(|s| s.to_string()),
+            project_id: None,
             source: MemorySource::parse(source).expect("valid source in oracle"),
             confidence,
             quality_score: None,
@@ -9392,6 +12318,141 @@ mod tests {
         assert!(!result_is_error(&result), "got: {}", result_text(&result));
     }
 
+    /// Hand-written staging shaped like the cdylib output (hermetic: no
+    /// .so). The digest is computed from the snapshot it carries.
+    fn import_staging_text() -> String {
+        let snapshot = serde_json::json!({
+            "memories": [{
+                "id": "22222222-2222-2222-2222-222222222222",
+                "external_alias": "m9",
+                "title": "Imported One",
+                "fragment": "## Imported One",
+                "description": "",
+                "fragment_type": "Fact",
+                "project": null,
+                "project_id": null,
+                "source": "Ai",
+                "confidence": 0.6,
+                "quality_score": null,
+                "lifecycle": "Live",
+                "tags": [],
+                "associated_with": [],
+                "relations": [],
+                "parent_id": null,
+                "child_ids": [],
+                "session_id": null,
+                "task_type": null,
+                "related_guides": [],
+                "evidence": [],
+                "access_count": 0,
+                "last_accessed_at": null,
+                "positive_feedback": 0,
+                "negative_feedback": 0,
+                "negative_hits": 0,
+                "refinement_count": 0,
+                "distill_candidate": false,
+                "entity_revision": 1,
+                "document_revision": 1,
+                "eligibility_revision": 1,
+                "created_at": 1000,
+                "updated_at": 1000,
+                "raw_created": null,
+                "unknown_fields": {}
+            }],
+            "relations": [],
+            "guides": [],
+            "sessions": [],
+            "feedback": [],
+            "suggestions": [],
+            "projects": [],
+            "archives": [],
+            "history": []
+        });
+        let export: ltmrs_domain::export::CanonicalExport =
+            serde_json::from_value(snapshot.clone()).unwrap();
+        serde_json::json!({
+            "ok": true,
+            "lemma_version": "0.21.0",
+            "schema_version": 8,
+            "digest": export.digest(),
+            "counts": {"memories": 1, "relations": 0, "guides": 0, "sessions": 0, "feedback": 0, "suggestions": 0, "projects": 0, "archives": 0, "history": 0},
+            "snapshot": snapshot,
+            "loss": [{"kind": "folded_guide_manual", "count": 1, "detail": "guide=\"g\""}]
+        })
+        .to_string()
+    }
+
+    /// backup_import_lemma needs a path before anything else.
+    #[test]
+    fn backup_import_lemma_requires_path() {
+        let (disp, _dir) = test_dispatcher();
+        let tool = ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
+            path: None,
+            confirm: None,
+        });
+        let result = run(&disp, &tool_call(1, tool.clone()), &tool);
+        assert!(result_is_error(&result));
+        assert!(
+            result_text(&result).contains("path"),
+            "got: {}",
+            result_text(&result)
+        );
+    }
+
+    /// Unconfirmed import previews with loss accounting (no store change).
+    #[test]
+    fn backup_import_lemma_preview_reports_loss() {
+        let (disp, _dir) = test_dispatcher();
+        let staging = crate::lemma_import::parse_staging(&import_staging_text()).unwrap();
+        let source = std::path::Path::new("/tmp/fixture.lemma-backup");
+        let payload =
+            preview_import_staging(&disp, &ch(1).as_uuid().to_string(), source, &staging).unwrap();
+        let text = match &payload {
+            DomainPayload::ToolResult { text, .. } => text.clone(),
+            other => panic!("unexpected payload: {other:?}"),
+        };
+        assert!(text.contains("READY"), "got: {text}");
+        assert!(
+            text.contains("folded_guide_manual"),
+            "loss must show, got: {text}"
+        );
+        // No store change from a preview.
+        assert_eq!(disp.repo().export_full().unwrap().memories.len(), 0);
+    }
+
+    /// Preview then confirm replaces the store; the lease is single-use
+    /// and a confirm without preview is refused.
+    #[test]
+    fn backup_import_lemma_execute_replaces_store() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## Stale One\n\n### Context\nStale fixture.");
+        let staging = crate::lemma_import::parse_staging(&import_staging_text()).unwrap();
+        let source = std::path::Path::new("/tmp/fixture.lemma-backup");
+        let channel = ch(1).as_uuid().to_string();
+        preview_import_staging(&disp, &channel, source, &staging).unwrap();
+        let payload = confirm_import_staging(&disp, &channel, source, &staging).unwrap();
+        let text = match &payload {
+            DomainPayload::ToolResult { text, .. } => text.clone(),
+            other => panic!("unexpected payload: {other:?}"),
+        };
+        assert!(text.contains("Imported 1"), "got: {text}");
+        let titles: Vec<String> = disp
+            .repo()
+            .export_full()
+            .unwrap()
+            .memories
+            .iter()
+            .map(|m| m.title.clone())
+            .collect();
+        assert_eq!(titles, vec!["Imported One".to_string()]);
+        // Single-use: the same confirm is now reuse.
+        let second = confirm_import_staging(&disp, &channel, source, &staging);
+        assert!(second.is_err(), "lease must be single-use");
+        // Another channel has no lease at all.
+        let foreign = confirm_import_staging(&disp, &ch(2).as_uuid().to_string(), source, &staging);
+        assert!(foreign.is_err(), "foreign channel must preview first");
+    }
+
     #[test]
     fn backup_create_tool_backs_up_and_verifies() {
         let (disp, _dir) = test_dispatcher();
@@ -10312,11 +13373,15 @@ mod tests {
         let result = run(&disp, &tool_call(12, attempt.clone()), &attempt);
         assert!(!result_is_error(&result));
 
-        // PERSIST: save the lesson; it links to the active session.
+        // PERSIST: save the lesson; it links to the active session. Wave
+        // B3b refuses negation-phrased adds against the same topic, so the
+        // lesson keeps its meaning in non-opposing phrasing (both fragments
+        // recommend spawn_blocking — the workflow intent, not a conflict;
+        // refusal itself is covered by the dedicated refusal tests).
         let new_id = add_fragment(
             &disp,
             13,
-            "## Blocking Lessons\n\n### Context\nNever block Tokio core workers; use spawn_blocking.",
+            "## Blocking Lessons\n\n### Context\nTokio core workers stay responsive with spawn_blocking for blocking work.",
         );
 
         // PRACTICE: create + practice a guide for the session.
@@ -10973,19 +14038,32 @@ mod tests {
         let (disp, _dir) = test_dispatcher();
         // Shared topic (redis/caching/session/data) with opposing negation
         // ("always" vs "never") — distinct enough to pass add-dedup, overlapping
-        // enough for the conflict heuristic to fire.
+        // enough for the conflict heuristic to fire. Wave B3b refuses the
+        // second add at the tool gate, so the pair is seeded by updating a
+        // neutral second fragment into the opposing text (memory_update has
+        // no conflict gate); the scan intent and both fixture strings are
+        // unchanged.
         add_fragment(
             &disp,
             1,
             "Always use Redis for caching session data in the API layer.",
         );
-        add_fragment(
-            &disp,
-            2,
-            "Never use Redis for caching session data; pick Memcached instead.",
+        let second_id = add_fragment(&disp, 2, "## Other fact\n\n### Context\nAn unrelated note.");
+        let update = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: second_id,
+            fragment: Some(
+                "Never use Redis for caching session data; pick Memcached instead.".to_string(),
+            ),
+            ..Default::default()
+        });
+        let updated = run(&disp, &tool_call(3, update.clone()), &update);
+        assert!(
+            !result_is_error(&updated),
+            "seeding update must succeed, got: {}",
+            result_text(&updated)
         );
 
-        let env = tool_call(3, ToolArgs::ConflictScan(ConflictScanArgs::default()));
+        let env = tool_call(4, ToolArgs::ConflictScan(ConflictScanArgs::default()));
         let result = run(
             &disp,
             &env,
@@ -10998,6 +14076,353 @@ mod tests {
             "expected a conflict pair"
         );
         assert!(result_text(&result).contains("CONFLICT DETECTION"));
+    }
+
+    // ---- Wave B3: automatic conflict advisory on memory_add ----
+
+    #[test]
+    fn memory_add_conflicting_fragment_refused_with_advice() {
+        let (disp, _dir) = test_dispatcher();
+        let first_id = add_fragment(
+            &disp,
+            1,
+            "Always use Redis for caching session data in the API layer.",
+        );
+        let before = disp.repo().export_snapshot().unwrap().memories.len();
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "Never use Redis for caching session data; pick Memcached instead."
+                .to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(2, tool.clone());
+        let err = execute_tool(&disp, &env, &tool).unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::Validation,
+            "conflicting add must refuse with Validation"
+        );
+        let first_title = disp
+            .repo()
+            .get_memories(&[resolve_id(disp.repo(), &first_id).unwrap()])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .title;
+        for needle in [
+            "refused",
+            first_id.as_str(),
+            first_title.as_str(),
+            "memory_update",
+            "memory_relate",
+            "contradicts",
+        ] {
+            assert!(
+                err.message.contains(needle),
+                "refusal must name {needle}, got: {}",
+                err.message
+            );
+        }
+        let after = disp.repo().export_snapshot().unwrap();
+        assert_eq!(
+            after.memories.len(),
+            before,
+            "refused add must commit no memory"
+        );
+        assert!(
+            after
+                .memories
+                .iter()
+                .all(|m| !m.fragment.contains("Memcached instead")),
+            "refused fragment must not be stored"
+        );
+        assert!(
+            disp.repo().all_relations().unwrap().is_empty(),
+            "refused add must create no relations"
+        );
+        let scope = sub_scope(&env, 0).unwrap();
+        assert!(
+            matches!(
+                disp.repo().check_tool_replay(&scope).unwrap(),
+                ltmrs_service::repository::ToolReplayStatus::Miss
+            ),
+            "refused add must record no receipt"
+        );
+    }
+
+    #[test]
+    fn memory_add_update_old_then_add_succeeds_without_conflict() {
+        let (disp, _dir) = test_dispatcher();
+        let first_id = add_fragment(
+            &disp,
+            1,
+            "Always use Redis for caching session data in the API layer.",
+        );
+        let update = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: first_id.clone(),
+            fragment: Some(
+                "## Redis retired\n\n### Context\nSession caching moved to Memcached; the old Redis guidance is superseded."
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        let result = run(&disp, &tool_call(2, update.clone()), &update);
+        assert!(
+            !result_is_error(&result),
+            "belief-change update must succeed, got: {}",
+            result_text(&result)
+        );
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "Never use Redis for caching session data; pick Memcached instead."
+                .to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(3, tool.clone());
+        let result = run(&disp, &env, &tool);
+        assert!(
+            !result_is_error(&result),
+            "update-then-add must succeed, got: {}",
+            result_text(&result)
+        );
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["conflicts"].as_array().unwrap().len(),
+            0,
+            "coherent-history add must report no conflict"
+        );
+        assert!(
+            !result_text(&result).contains("contradicts"),
+            "no advisory expected after the superseded claim was updated"
+        );
+    }
+
+    #[test]
+    fn memory_add_unrelated_fragment_reports_no_conflicts() {
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## A fact\n\n### Context\nSome durable fact.");
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Another fact\n\n### Context\nAn unrelated observation about garden soil."
+                .to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(2, tool.clone());
+        let result = run(&disp, &env, &tool);
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["conflicts"].as_array().unwrap().len(),
+            0,
+            "unrelated add must report no conflicts"
+        );
+        assert!(
+            !result_text(&result).contains("contradicts"),
+            "no advisory expected for an unrelated add"
+        );
+    }
+
+    #[test]
+    fn conflict_signature_cache_populates_across_adds_and_prunes_on_forget() {
+        let (disp, _dir) = test_dispatcher();
+        assert_eq!(disp.conflict_signatures().len(), 0);
+        let first_id = add_fragment(
+            &disp,
+            1,
+            "Always use Redis for caching session data in the API layer.",
+        );
+        assert_eq!(
+            disp.conflict_signatures().len(),
+            1,
+            "first add must cache its signature"
+        );
+        // Wave B3b refuses a conflicting second add at the tool gate, so
+        // this cache-mechanics fixture uses a non-conflicting second
+        // fragment (the conflict content was incidental here, not the
+        // intent — the refusal path has its own tests).
+        add_fragment(
+            &disp,
+            2,
+            "## Cache probe\n\n### Context\nPostgres indexes speed up ledger queries.",
+        );
+        assert_eq!(
+            disp.conflict_signatures().len(),
+            2,
+            "second add must reuse + extend the cache, not rebuild it"
+        );
+        let forget = ToolArgs::MemoryForget(MemoryForgetArgs {
+            id: first_id.clone(),
+            ..Default::default()
+        });
+        let env = tool_call(3, forget.clone());
+        let result = run(&disp, &env, &forget);
+        assert!(!result_is_error(&result));
+        assert_eq!(
+            disp.conflict_signatures().len(),
+            1,
+            "forget must prune the entry"
+        );
+    }
+
+    #[test]
+    fn memory_add_conflicting_pair_refused_preserves_confidence() {
+        let (disp, _dir) = test_dispatcher();
+        let first_id = add_fragment(
+            &disp,
+            1,
+            "Always use Redis for caching session data in the API layer.",
+        );
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "Never use Redis for caching session data; pick Memcached instead."
+                .to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(2, tool.clone());
+        let err = execute_tool(&disp, &env, &tool).unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::Validation,
+            "conflicting add must refuse, got: {}",
+            err.message
+        );
+        let eid = resolve_id(disp.repo(), &first_id).unwrap();
+        let mem = disp.repo().get_memories(&[eid]).unwrap().pop().unwrap();
+        assert_eq!(
+            mem.confidence, 1.0,
+            "refused add must not decay the existing claim"
+        );
+        assert!(
+            disp.repo()
+                .all_relations()
+                .unwrap()
+                .iter()
+                .all(|r| r.relation_type != RelationType::Contradicts),
+            "no automatic contradicts link may be created"
+        );
+    }
+
+    #[test]
+    fn memory_add_cross_project_conflict_not_surfaced_under_stable_id() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_a, _id_a) = generate_project_id("shop");
+        let (full_b, _id_b) = generate_project_id("shop");
+        let out_a = add_with(
+            &disp,
+            1,
+            "Always use Redis for caching session data in the API layer.",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        assert!(!result_is_error(&out_a));
+        let out_b = add_with(
+            &disp,
+            2,
+            "Never use Redis for caching session data; pick Memcached instead.",
+            Some("shop"),
+            ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+        );
+        assert!(
+            !result_is_error(&out_b),
+            "cross-project conflicting add must succeed: {}",
+            result_text(&out_b)
+        );
+        let structured = result_structured(&out_b).unwrap();
+        assert_eq!(
+            structured["conflicts"].as_array().unwrap().len(),
+            0,
+            "cross-boundary conflict must not surface"
+        );
+        let text = result_text(&out_b);
+        assert!(
+            !text.contains("contradicts"),
+            "no contradicts advisory expected across projects, got: {text}"
+        );
+        // Fix-round (Wave B3 review): the planned auto-link must also be
+        // scope-gated — no cross-boundary RelatedTo edge may persist, and
+        // no foreign id/title may render in the response text.
+        let foreign_id = result_structured(&out_a).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let foreign_eid = resolve_id(disp.repo(), &foreign_id).unwrap();
+        let foreign_title = disp
+            .repo()
+            .get_memories(&[foreign_eid])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .title;
+        let new_eid = resolve_id(
+            disp.repo(),
+            result_structured(&out_b).unwrap()["id"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            disp.repo()
+                .all_relations()
+                .unwrap()
+                .iter()
+                .all(|r| r.relation_type != RelationType::RelatedTo
+                    || (r.source != new_eid && r.target != new_eid)),
+            "cross-project add must not create a cross-boundary RelatedTo edge"
+        );
+        assert!(
+            !text.contains(foreign_id.as_str()) && !text.contains(foreign_title.as_str()),
+            "no foreign id/title may render, got: {text}"
+        );
+    }
+
+    #[test]
+    fn memory_add_conflict_check_failure_degrades_with_notice() {
+        use ltmrs_domain::id::EntityId;
+        let (disp, _dir) = test_dispatcher();
+        add_fragment(&disp, 1, "## A fact\n\n### Context\nSome durable fact.");
+        add_fragment(&disp, 2, "## Other fact\n\n### Context\nAn unrelated note.");
+        let stored = disp
+            .repo()
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .pop()
+            .unwrap();
+        let args = MemoryAddArgs {
+            fragment: stored.fragment.clone(),
+            ..Default::default()
+        };
+        let broken = ltmrs_service::projects::ResolvedScope {
+            project_id: Some(EntityId::new(uuid::Uuid::new_v4())),
+            project_id_str: Some("not-a-project-id".to_string()),
+            name: None,
+            legacy: None,
+            all: false,
+            attached: vec![],
+            warning: None,
+            adopted: 0,
+            moved: false,
+        };
+        let payload = super::finish_add_response(
+            &disp,
+            &broken,
+            &args,
+            &stored,
+            &stored.fragment,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !result_is_error(&payload),
+            "detection failure must not fail the add"
+        );
+        let structured = result_structured(&payload).unwrap();
+        assert_eq!(
+            structured["conflicts"].as_array().unwrap().len(),
+            0,
+            "failed check degrades to empty conflicts"
+        );
+        assert!(
+            result_text(&payload).contains("conflict check"),
+            "degradation must be visible, got: {}",
+            result_text(&payload)
+        );
     }
 
     #[test]
@@ -11456,6 +14881,168 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_start_tail_failure_errors_with_nothing_frozen() {
+        let (disp, _dir) = test_dispatcher();
+        let id = add_fragment(
+            &disp,
+            1,
+            "## Rust debugging fragment\n\n### Context\nRust debugging notes.",
+        );
+        let eid = disp.repo().resolve_id(&id).unwrap();
+        let upd = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+            id: id.clone(),
+            confidence: Some(0.5),
+            ..Default::default()
+        });
+        run(&disp, &tool_call(2, upd.clone()), &upd);
+        disp.repo().fault_injector().set_tail_effect_failures(1);
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec!["rust".to_string()],
+            initial_approach: None,
+        });
+        let env = tool_call(3, start.clone());
+        assert!(
+            execute_tool(&disp, &env, &start).is_err(),
+            "tail failure must error, not freeze a partial success"
+        );
+        assert!(
+            disp.repo().all_sessions().unwrap().is_empty(),
+            "failed start must persist no session"
+        );
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            (mems[0].confidence - 0.5).abs() < 1e-9,
+            "failed start must apply no boost, got {}",
+            mems[0].confidence
+        );
+        assert_eq!(mems[0].access_count, 0);
+        disp.repo().fault_injector().set_tail_effect_failures(0);
+        let result = run(&disp, &env, &start);
+        assert!(!result_is_error(&result));
+        assert!(result_text(&result).contains("Pre-loaded memories:"));
+        assert_eq!(disp.repo().all_sessions().unwrap().len(), 1);
+        let mems = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(
+            (mems[0].confidence - 0.52).abs() < 1e-9,
+            "healed retry must boost exactly once, got {}",
+            mems[0].confidence
+        );
+        assert_eq!(mems[0].access_count, 1);
+        let handle = disp.registry().channel_session(fe(1), ch(1)).unwrap();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
+        assert!(session.memories_read.contains(&id));
+    }
+
+    #[test]
+    fn memory_add_link_failure_errors_with_no_receipt() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        disp.repo().fault_injector().set_tail_effect_failures(1);
+        let add = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "## Atomic link ledger\n\n### Context\nQuarry ledger basalt columns."
+                .to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(2, add.clone());
+        assert!(
+            execute_tool(&disp, &env, &add).is_err(),
+            "link failure must error, not freeze a partial success"
+        );
+        let count = disp
+            .repo()
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .iter()
+            .filter(|m| m.fragment.contains("Quarry ledger"))
+            .count();
+        assert_eq!(count, 0, "failed add must persist no memory");
+        let scope = sub_scope(&env, 0).unwrap();
+        assert!(
+            matches!(
+                disp.repo().check_tool_replay(&scope).unwrap(),
+                ltmrs_service::repository::ToolReplayStatus::Miss
+            ),
+            "failed add must record no receipt"
+        );
+        disp.repo().fault_injector().set_tail_effect_failures(0);
+        let result = run(&disp, &env, &add);
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        let new_id = structured["id"].as_str().unwrap().to_string();
+        let count = disp
+            .repo()
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .iter()
+            .filter(|m| m.fragment.contains("Quarry ledger"))
+            .count();
+        assert_eq!(count, 1, "healed retry must create exactly one memory");
+        let handle = disp.registry().channel_session(fe(1), ch(1)).unwrap();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
+        assert!(session.memories_created.contains(&new_id));
+    }
+
+    #[test]
+    fn guide_practice_link_failure_errors_atomically() {
+        let (disp, _dir) = test_dispatcher();
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "debugging".to_string(),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        run(&disp, &tool_call(1, start.clone()), &start);
+        let create = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: "atomic-guide".to_string(),
+            category: "dev-tool".to_string(),
+            description: "## Atomic Guide\n\n### Protocol\nSingle steps.".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        assert!(!result_is_error(&run(
+            &disp,
+            &tool_call(2, create.clone()),
+            &create
+        )));
+        disp.repo().fault_injector().set_tail_effect_failures(1);
+        let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+            guide: "atomic-guide".to_string(),
+            category: "dev-tool".to_string(),
+            description: None,
+            contexts: vec!["ctx".to_string()],
+            learnings: vec!["learn".to_string()],
+            outcome: None,
+        });
+        let env = tool_call(3, practice.clone());
+        assert!(
+            execute_tool(&disp, &env, &practice).is_err(),
+            "link failure must error, not report a partial success"
+        );
+        let guide = disp.repo().get_guide("atomic-guide").unwrap().unwrap();
+        assert_eq!(guide.usage_count, 1, "failed practice must not count usage");
+        let handle = disp.registry().channel_session(fe(1), ch(1)).unwrap();
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
+        assert!(
+            session.guides_used.is_empty(),
+            "failed practice must link nothing"
+        );
+        disp.repo().fault_injector().set_tail_effect_failures(0);
+        let result = run(&disp, &env, &practice);
+        assert!(!result_is_error(&result));
+        let guide = disp.repo().get_guide("atomic-guide").unwrap().unwrap();
+        assert_eq!(guide.usage_count, 2);
+        let session = disp.repo().get_session(handle).unwrap().unwrap();
+        assert!(session.guides_used.contains(&"atomic-guide".to_string()));
+    }
+
     /// P2-A: a generation cut drops runtime channel bindings. After a
     /// restore, no pre-restore channel→session route may survive (the next
     /// call on each channel binds fresh).
@@ -11554,6 +15141,958 @@ mod tests {
         assert!(
             reloaded.channel_session(fe(1), ch(1)).is_none(),
             "reloaded file must not point at drained sessions"
+        );
+    }
+
+    /// Whole-store restore swaps rows verbatim: same (id, revision) with a
+    /// different fragment is reachable across diverged histories, so the
+    /// signature cache must be dropped post-replace, not trusted.
+    #[test]
+    fn restore_clears_conflict_signature_cache() {
+        let (disp, _dir) = test_dispatcher();
+        let first_id = add_fragment(
+            &disp,
+            1,
+            "Always use Redis for caching session data in the API layer.",
+        );
+        assert_eq!(
+            disp.conflict_signatures().len(),
+            1,
+            "add must seed the cache"
+        );
+        // Diverged-history backup: same (id, revision), different fragment.
+        let live_gen = disp.repo().store_generation().unwrap().as_u64();
+        let mut export = disp.repo().export_full().unwrap();
+        let row = export
+            .memories
+            .iter_mut()
+            .find(|m| disp.repo().legacy_id(m) == first_id)
+            .expect("added memory must be in the export");
+        row.fragment = "Never use Redis for caching session data; Memcached is mandatory, however."
+            .to_string();
+        let rev_before = row.entity_revision;
+        let (bytes, _, _) =
+            ltmrs_interchange::backup::encode_backup(&export, live_gen, 1000).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diverged.ltmrs-backup");
+        ltmrs_interchange::backup::export_backup_to(&path, &bytes).unwrap();
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(path.to_str().unwrap().to_string()),
+        });
+        let result = run(&disp, &tool_call(2, preview.clone()), &preview);
+        assert!(
+            !result_is_error(&result),
+            "preview failed: {}",
+            result_text(&result)
+        );
+        let token = result_structured(&result).unwrap()["confirmation_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+            confirmation_token: Some(token),
+            confirm: Some(true),
+        });
+        let result = run(&disp, &tool_call(3, restore.clone()), &restore);
+        assert!(
+            !result_is_error(&result),
+            "restore failed: {}",
+            result_text(&result)
+        );
+        assert_eq!(
+            disp.conflict_signatures().len(),
+            0,
+            "restore must clear the signature cache"
+        );
+        // Precondition for the staleness check: the verbatim swap landed.
+        let eid = disp.repo().resolve_id(&first_id).unwrap();
+        let stored = disp.repo().get_memories(&[eid]).unwrap();
+        assert!(stored[0].fragment.contains("Memcached is mandatory"));
+        assert_eq!(stored[0].entity_revision, rev_before);
+        // A fresh add re-extracts from the restored row: under Wave B3b it
+        // must refuse against the restored fragment, not the cached
+        // pre-restore one (a stale cache would see same-direction Always
+        // content and succeed with no conflict).
+        disp.repo().issue_namespace(fe(1), ch(1), 1000).unwrap();
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "Always use Redis for caching session data everywhere.".to_string(),
+            ..Default::default()
+        });
+        let env = tool_call(4, tool.clone());
+        let err = execute_tool(&disp, &env, &tool).unwrap_err();
+        assert_eq!(
+            err.code,
+            ltmrs_domain::command::DomainErrorCode::Validation,
+            "post-restore conflicting add must refuse, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(first_id.as_str()),
+            "refusal must name the restored fragment, got: {}",
+            err.message
+        );
+    }
+
+    // ---- Wave A3b: stable project identity (Part I 01:§6.3) ----
+
+    fn ident(
+        id: Option<&str>,
+        root: Option<&str>,
+        legacy: Option<&str>,
+        explicit: bool,
+    ) -> crate::envelope::EnvelopeIdentity {
+        crate::envelope::EnvelopeIdentity {
+            project_id: id.map(|s| s.to_string()),
+            canonical_root: root.map(|s| s.to_string()),
+            legacy_project: legacy.map(|s| s.to_string()),
+            legacy_explicit: explicit,
+        }
+    }
+
+    fn tool_call_with(
+        op: u64,
+        tool: ToolArgs,
+        identity: crate::envelope::EnvelopeIdentity,
+    ) -> IpcEnvelope {
+        IpcEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(1),
+            channel_id: ch(1),
+            operation_id: OperationId::new(Uuid::from_u128(op as u128)),
+            session: None,
+            retry_epoch: 1,
+            deadline_millis: None,
+            scope: Scope::default(),
+            identity,
+            body: DomainRequest::ToolCall { tool },
+        }
+    }
+
+    fn add_with(
+        disp: &Dispatcher,
+        op: u64,
+        fragment: &str,
+        project: Option<&str>,
+        identity: crate::envelope::EnvelopeIdentity,
+    ) -> DomainPayload {
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: fragment.to_string(),
+            project: project.map(|s| s.to_string()),
+            ..Default::default()
+        });
+        let env = tool_call_with(op, tool.clone(), identity);
+        execute_tool(disp, &env, &tool).unwrap()
+    }
+
+    fn read_count(
+        disp: &Dispatcher,
+        op: u64,
+        identity: crate::envelope::EnvelopeIdentity,
+    ) -> usize {
+        let tool = ToolArgs::MemoryRead(MemoryReadArgs::default());
+        let env = tool_call_with(op, tool.clone(), identity);
+        match execute_tool(disp, &env, &tool).unwrap() {
+            DomainPayload::ToolResult {
+                structured: Some(s),
+                is_error: false,
+                ..
+            } => s["count"].as_u64().unwrap() as usize,
+            other => panic!("memory_read failed: {other:?}"),
+        }
+    }
+
+    /// Two same-basename checkouts isolate: A's writes are invisible to B's
+    /// scope; B claiming A's id refuses; sessions carry the stable id.
+    #[test]
+    fn stable_identity_isolates_same_basename_checkouts() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_a, id_a) = generate_project_id("shop");
+        let (full_b, _id_b) = generate_project_id("shop");
+
+        // A binds (registers) and writes under its identity.
+        let out = add_with(
+            &disp,
+            1,
+            "A-only fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        assert!(
+            !result_is_error(&out),
+            "A write failed: {}",
+            result_text(&out)
+        );
+        assert!(
+            !result_text(&out).contains("attached"),
+            "no legacy rows to adopt, got: {}",
+            result_text(&out)
+        );
+
+        // B's scope sees nothing of A: B registers on its own first write
+        // (reads never register — unknown identities refuse), then each
+        // scope sees only its own write.
+        let out = add_with(
+            &disp,
+            3,
+            "B-only fragment",
+            Some("shop"),
+            ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+        );
+        assert!(!result_is_error(&out));
+        assert_eq!(
+            read_count(
+                &disp,
+                4,
+                ident(Some(&full_b), Some("/tmp/b/shop"), None, false)
+            ),
+            1,
+            "B sees only its own write"
+        );
+        assert_eq!(
+            read_count(
+                &disp,
+                5,
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false)
+            ),
+            1,
+            "A sees only its own write"
+        );
+
+        // B claiming A's id from B's root is a conflicting claim: refused.
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "hijack".into(),
+            ..Default::default()
+        });
+        let env = tool_call_with(
+            6,
+            tool.clone(),
+            ident(Some(&full_a), Some("/tmp/b/shop"), None, false),
+        );
+        let err = execute_tool(&disp, &env, &tool).unwrap_err();
+        assert!(
+            err.message.contains("project bind"),
+            "conflicting claim must name remediation, got: {}",
+            err.message
+        );
+
+        // Sessions carry the resolved stable identity.
+        let start = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: "t".into(),
+            ..Default::default()
+        });
+        let env = tool_call_with(
+            7,
+            start.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        execute_tool(&disp, &env, &start).unwrap();
+        let sessions = disp.repo().all_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_id, Some(id_a));
+        assert_eq!(sessions[0].project.as_deref(), Some("shop"));
+    }
+
+    /// Legacy-attached visibility: a pre-bind legacy row is adopted on
+    /// first write (count reported) and stays visible under the stable id.
+    #[test]
+    fn legacy_attached_visible_under_stable_id() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+
+        // Legacy row, no identity anywhere (unattributed envelope).
+        let out = add_with(
+            &disp,
+            1,
+            "legacy shop fragment",
+            Some("shop"),
+            ident(None, None, Some("shop"), true),
+        );
+        assert!(!result_is_error(&out));
+
+        // First stable write attaches the bucket and reports the count.
+        let (full_a, _id_a) = generate_project_id("shop");
+        let out = add_with(
+            &disp,
+            2,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let text = result_text(&out);
+        assert!(
+            text.contains("attached 1 legacy"),
+            "must report the adopted count, got: {text}"
+        );
+
+        // The stable scope sees both rows; a foreign stable id sees neither
+        // shop row (legacy excluded, own missing).
+        assert_eq!(
+            read_count(
+                &disp,
+                3,
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false)
+            ),
+            2
+        );
+        let (full_z, _id_z) = generate_project_id("other");
+        // Register Z elsewhere first so the read resolves (unknown ids
+        // refuse reads).
+        add_with(
+            &disp,
+            4,
+            "other fragment",
+            Some("other"),
+            ident(Some(&full_z), Some("/tmp/z/other"), Some("other"), true),
+        );
+        assert_eq!(
+            read_count(
+                &disp,
+                5,
+                ident(Some(&full_z), Some("/tmp/z/other"), None, false)
+            ),
+            1,
+            "Z sees only its own write"
+        );
+    }
+
+    /// Provisional writes from a shadowed checkout refuse with the bind
+    /// remediation (cwd is a clue, never an identity).
+    #[test]
+    fn provisional_write_from_shadowed_checkout_refused() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_a, _id_a) = generate_project_id("shop");
+        add_with(
+            &disp,
+            1,
+            "A fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "provisional".into(),
+            ..Default::default()
+        });
+        let env = tool_call_with(
+            2,
+            tool.clone(),
+            ident(None, Some("/tmp/c/shop"), None, false),
+        );
+        let err = execute_tool(&disp, &env, &tool).unwrap_err();
+        assert_eq!(err.code, ltmrs_domain::command::DomainErrorCode::Validation);
+        assert!(err.message.contains("project bind"), "got: {}", err.message);
+    }
+
+    /// C1: cross-project merge refuses the foreign source (not found, no
+    /// leak, no cross-scope consolidation); same-project merge still works.
+    #[test]
+    fn cross_project_merge_refused() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_a, _) = generate_project_id("shop");
+        let (full_b, _) = generate_project_id("other");
+        let out_a = add_with(
+            &disp,
+            1,
+            "A merge source",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let id_a = result_structured(&out_a).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out_b = add_with(
+            &disp,
+            2,
+            "B merge source",
+            Some("other"),
+            ident(Some(&full_b), Some("/tmp/b/other"), Some("other"), true),
+        );
+        let id_b = result_structured(&out_b).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tool = ToolArgs::MemoryMerge(MemoryMergeArgs {
+            ids: vec![id_a.clone(), id_b.clone()],
+            title: "merged".into(),
+            fragment: "merged body".into(),
+            project: Some("shop".into()),
+            consolidate: true,
+        });
+        let env = tool_call_with(
+            3,
+            tool.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let out = execute_tool(&disp, &env, &tool).unwrap();
+        assert!(
+            result_is_error(&out) && result_text(&out).contains(&id_b),
+            "foreign source must refuse as not found, got: {}",
+            result_text(&out)
+        );
+        // Same-project merge under the same identity still works.
+        let out_a2 = add_with(
+            &disp,
+            4,
+            "A second source",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let id_a2 = result_structured(&out_a2).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tool = ToolArgs::MemoryMerge(MemoryMergeArgs {
+            ids: vec![id_a, id_a2],
+            title: "merged".into(),
+            fragment: "merged body".into(),
+            project: Some("shop".into()),
+            consolidate: true,
+        });
+        let env = tool_call_with(
+            5,
+            tool.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let out = execute_tool(&disp, &env, &tool).unwrap();
+        assert!(
+            !result_is_error(&out),
+            "same-project merge failed: {}",
+            result_text(&out)
+        );
+    }
+
+    /// C1: cross-project relate refuses the foreign endpoint; same-project
+    /// relate still works.
+    #[test]
+    fn cross_project_relate_refused() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_a, _) = generate_project_id("shop");
+        let (full_b, _) = generate_project_id("other");
+        let out_a = add_with(
+            &disp,
+            1,
+            "A relate endpoint",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let id_a = result_structured(&out_a).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out_b = add_with(
+            &disp,
+            2,
+            "B relate endpoint",
+            Some("other"),
+            ident(Some(&full_b), Some("/tmp/b/other"), Some("other"), true),
+        );
+        let id_b = result_structured(&out_b).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tool = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: id_a.clone(),
+            target_id: id_b.clone(),
+            relation_type: "related_to".into(),
+            note: None,
+        });
+        let env = tool_call_with(
+            3,
+            tool.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let out = execute_tool(&disp, &env, &tool).unwrap();
+        assert!(
+            result_is_error(&out) && result_text(&out).contains(&id_b),
+            "foreign endpoint must refuse as not found, got: {}",
+            result_text(&out)
+        );
+        let tool = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: id_a.clone(),
+            target_id: id_a.clone(),
+            relation_type: "related_to".into(),
+            note: None,
+        });
+        let env = tool_call_with(
+            4,
+            tool.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let out = execute_tool(&disp, &env, &tool).unwrap();
+        assert!(
+            result_is_error(&out),
+            "self-relate must still refuse (distinct rule), got: {}",
+            result_text(&out)
+        );
+        let out_a2 = add_with(
+            &disp,
+            5,
+            "xylophone quantum zebra",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let id_a2 = result_structured(&out_a2).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tool = ToolArgs::MemoryRelate(MemoryRelateArgs {
+            source_id: id_a,
+            target_id: id_a2,
+            relation_type: "related_to".into(),
+            note: None,
+        });
+        let env = tool_call_with(
+            6,
+            tool.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+        );
+        let out = execute_tool(&disp, &env, &tool).unwrap();
+        assert!(
+            !result_is_error(&out),
+            "same-project relate failed: {}",
+            result_text(&out)
+        );
+    }
+
+    /// I2: a wire project that matches neither the bound name nor an
+    /// attached slug refuses under a stable id (no ("evil", shop-id)
+    /// divergence); matching or absent wire still works.
+    #[test]
+    fn merge_wire_mismatch_with_stable_id_refused() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let out_a = add_with(
+            &disp,
+            1,
+            "I2 first source",
+            None,
+            ident(None, None, None, true),
+        );
+        let id_a = result_structured(&out_a).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out_b = add_with(
+            &disp,
+            2,
+            "I2 second source",
+            None,
+            ident(None, None, None, true),
+        );
+        let id_b = result_structured(&out_b).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Fresh stable id, wire string from a foreign bucket.
+        let (full_n, _) = generate_project_id("shop");
+        let tool = ToolArgs::MemoryMerge(MemoryMergeArgs {
+            ids: vec![id_a.clone(), id_b.clone()],
+            title: "merged".into(),
+            fragment: "merged body".into(),
+            project: Some("evil".into()),
+            consolidate: false,
+        });
+        let env = tool_call_with(
+            3,
+            tool.clone(),
+            ident(Some(&full_n), Some("/tmp/n/shop"), None, false),
+        );
+        let err = execute_tool(&disp, &env, &tool).unwrap_err();
+        assert_eq!(err.code, ltmrs_domain::command::DomainErrorCode::Validation);
+        assert!(
+            err.message.contains("evil"),
+            "must name the offending wire string, got: {}",
+            err.message
+        );
+        // Matching wire still merges under the same fresh identity.
+        let tool = ToolArgs::MemoryMerge(MemoryMergeArgs {
+            ids: vec![id_a, id_b],
+            title: "merged".into(),
+            fragment: "merged body".into(),
+            project: Some("shop".into()),
+            consolidate: false,
+        });
+        let env = tool_call_with(
+            4,
+            tool.clone(),
+            ident(Some(&full_n), Some("/tmp/n/shop"), None, false),
+        );
+        let out = execute_tool(&disp, &env, &tool).unwrap();
+        assert!(
+            !result_is_error(&out),
+            "matching wire must work: {}",
+            result_text(&out)
+        );
+    }
+
+    /// I1: stats and recall agree — a stable row is invisible to a legacy
+    /// same-name filter in both, and visible to its own identity in both.
+    #[test]
+    fn stats_agree_with_recall_under_legacy_filter() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_x, _) = generate_project_id("shop");
+        add_with(
+            &disp,
+            1,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_x), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        add_with(
+            &disp,
+            2,
+            "legacy shop fragment",
+            Some("shop"),
+            ident(None, None, Some("shop"), true),
+        );
+        add_with(
+            &disp,
+            3,
+            "global fragment",
+            None,
+            ident(None, None, None, false),
+        );
+
+        // Legacy same-name filter: the stable row drops out of stats…
+        let stats_tool = ToolArgs::MemoryStats(MemoryStatsArgs {
+            project: Some("shop".into()),
+            response_format: None,
+        });
+        let env = tool_call_with(4, stats_tool.clone(), ident(None, None, None, false));
+        let stats_total = match execute_tool(&disp, &env, &stats_tool).unwrap() {
+            DomainPayload::ToolResult {
+                structured: Some(s),
+                is_error: false,
+                ..
+            } => s["total"].as_u64().unwrap(),
+            other => panic!("memory_stats failed: {other:?}"),
+        };
+        // …exactly as it drops out of recall (legacy L + global G only).
+        let read_tool = ToolArgs::MemoryRead(MemoryReadArgs {
+            project: Some("shop".into()),
+            ..Default::default()
+        });
+        let env = tool_call_with(5, read_tool.clone(), ident(None, None, None, false));
+        let read_count = match execute_tool(&disp, &env, &read_tool).unwrap() {
+            DomainPayload::ToolResult {
+                structured: Some(s),
+                is_error: false,
+                ..
+            } => s["count"].as_u64().unwrap(),
+            other => panic!("memory_read failed: {other:?}"),
+        };
+        assert_eq!(stats_total, 1, "legacy stats must exclude the stable row");
+        assert_eq!(read_count, 2, "legacy recall sees legacy + global only");
+
+        // Under the stable identity both see all three rows.
+        let env = tool_call_with(
+            6,
+            stats_tool.clone(),
+            ident(Some(&full_x), Some("/tmp/a/shop"), None, false),
+        );
+        let stats_total = match execute_tool(&disp, &env, &stats_tool).unwrap() {
+            DomainPayload::ToolResult {
+                structured: Some(s),
+                is_error: false,
+                ..
+            } => s["total"].as_u64().unwrap(),
+            other => panic!("memory_stats failed: {other:?}"),
+        };
+        assert_eq!(
+            stats_total, 3,
+            "stable stats must see own + attached + global"
+        );
+    }
+
+    /// Adopt attaches a cross-name legacy bucket: the previously invisible
+    /// row becomes visible under the stable id, with the count reported.
+    #[test]
+    fn adopt_makes_legacy_rows_visible_under_stable_id() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        add_with(
+            &disp,
+            1,
+            "legacy other fragment",
+            Some("other"),
+            ident(None, None, Some("other"), true),
+        );
+        let (full_a, id_a) = generate_project_id("shop");
+        add_with(
+            &disp,
+            2,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        assert_eq!(
+            read_count(
+                &disp,
+                3,
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false)
+            ),
+            1,
+            "before adopt the cross-name row stays invisible"
+        );
+        let outcome = disp
+            .repo()
+            .adopt_legacy_slug(id_a, "shop", Some("/tmp/a/shop"), "other")
+            .unwrap();
+        assert_eq!(outcome.attached, 1);
+        assert_eq!(
+            read_count(
+                &disp,
+                4,
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false)
+            ),
+            2,
+            "after adopt the attached row is visible under the id"
+        );
+    }
+
+    /// Adopting an unknown slug is a typed refusal naming the slug and the
+    /// known buckets.
+    #[test]
+    fn adopt_unknown_slug_errors_with_known_list() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        add_with(
+            &disp,
+            1,
+            "legacy other fragment",
+            Some("other"),
+            ident(None, None, Some("other"), true),
+        );
+        let (full_a, id_a) = generate_project_id("shop");
+        add_with(
+            &disp,
+            2,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let err = disp
+            .repo()
+            .adopt_legacy_slug(id_a, "shop", Some("/tmp/a/shop"), "nope")
+            .unwrap_err();
+        assert_eq!(err.code, ltmrs_domain::command::DomainErrorCode::Validation);
+        assert!(
+            err.message.contains("nope"),
+            "must name the slug, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("other"),
+            "must list known slugs, got: {}",
+            err.message
+        );
+    }
+
+    /// Re-adopting an attached slug is idempotent: success, zero new rows.
+    #[test]
+    fn adopt_same_slug_twice_is_idempotent() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        add_with(
+            &disp,
+            1,
+            "legacy other fragment",
+            Some("other"),
+            ident(None, None, Some("other"), true),
+        );
+        let (full_a, id_a) = generate_project_id("shop");
+        add_with(
+            &disp,
+            2,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let first = disp
+            .repo()
+            .adopt_legacy_slug(id_a, "shop", Some("/tmp/a/shop"), "other")
+            .unwrap();
+        assert_eq!(first.attached, 1);
+        assert!(!first.already_attached);
+        let second = disp
+            .repo()
+            .adopt_legacy_slug(id_a, "shop", Some("/tmp/a/shop"), "other")
+            .unwrap();
+        assert!(second.already_attached);
+        assert_eq!(second.attached, 0);
+    }
+
+    /// A slug already attached elsewhere adopts with a warning naming the
+    /// other id (explicit intent shares visibility, never refuses).
+    #[test]
+    fn adopt_shared_slug_warns_and_shares_visibility() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        add_with(
+            &disp,
+            1,
+            "legacy shared fragment",
+            Some("shared"),
+            ident(None, None, Some("shared"), true),
+        );
+        let (full_a, id_a) = generate_project_id("shop");
+        add_with(
+            &disp,
+            2,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let (full_b, id_b) = generate_project_id("other");
+        add_with(
+            &disp,
+            3,
+            "stable other fragment",
+            Some("other"),
+            ident(Some(&full_b), Some("/tmp/b/other"), Some("other"), true),
+        );
+        let a = disp
+            .repo()
+            .adopt_legacy_slug(id_a, "shop", Some("/tmp/a/shop"), "shared")
+            .unwrap();
+        assert!(a.warning.is_none());
+        let b = disp
+            .repo()
+            .adopt_legacy_slug(id_b, "other", Some("/tmp/b/other"), "shared")
+            .unwrap();
+        assert!(
+            b.warning.as_deref().is_some_and(|w| w.contains(&full_a)),
+            "must name the other id, got: {:?}",
+            b.warning
+        );
+        assert_eq!(
+            read_count(
+                &disp,
+                4,
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false)
+            ),
+            2,
+            "A sees own + shared"
+        );
+        assert_eq!(
+            read_count(
+                &disp,
+                5,
+                ident(Some(&full_b), Some("/tmp/b/other"), None, false)
+            ),
+            2,
+            "B sees own + shared"
+        );
+    }
+
+    /// Adopt routes through daemon IPC: the adopt request executes on the
+    /// daemon's store handle and reports the count (no direct CLI open).
+    #[test]
+    fn adopt_request_executes_on_daemon_store() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        add_with(
+            &disp,
+            1,
+            "legacy other fragment",
+            Some("other"),
+            ident(None, None, Some("other"), true),
+        );
+        let (full_a, _id_a) = generate_project_id("shop");
+        add_with(
+            &disp,
+            2,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let env = IpcEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: disp.store_generation(),
+            frontend_id: fe(1),
+            channel_id: ch(1),
+            operation_id: OperationId::new(Uuid::from_u128(3)),
+            session: None,
+            retry_epoch: 1,
+            deadline_millis: None,
+            scope: Scope::default(),
+            identity: ident(Some(&full_a), Some("/tmp/a/shop"), None, false),
+            body: DomainRequest::AdoptLegacySlug {
+                project_id: full_a.clone(),
+                canonical_root: Some("/tmp/a/shop".to_string()),
+                slug: "other".to_string(),
+            },
+        };
+        let resp = disp.handle(&env).unwrap();
+        match resp.result {
+            crate::envelope::IpcResult::Success {
+                payload:
+                    DomainPayload::Adopted {
+                        attached,
+                        already_attached,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(attached, 1);
+                assert!(!already_attached);
+            }
+            other => panic!("adopt request failed: {other:?}"),
+        }
+        assert_eq!(
+            read_count(
+                &disp,
+                4,
+                ident(Some(&full_a), Some("/tmp/a/shop"), None, false)
+            ),
+            2,
+            "adopted row is visible under the stable id"
+        );
+    }
+
+    /// Stable-recall half of the stats/recall agreement: recall under the
+    /// stable id returns own + attached + global (3), matching the stats
+    /// total asserted above.
+    #[test]
+    fn stable_recall_sees_own_attached_and_global() {
+        use ltmrs_domain::project_id::generate_project_id;
+        let (disp, _dir) = test_dispatcher();
+        let (full_x, _) = generate_project_id("shop");
+        add_with(
+            &disp,
+            1,
+            "stable shop fragment",
+            Some("shop"),
+            ident(Some(&full_x), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        add_with(
+            &disp,
+            2,
+            "legacy shop fragment",
+            Some("shop"),
+            ident(None, None, Some("shop"), true),
+        );
+        add_with(
+            &disp,
+            3,
+            "global fragment",
+            None,
+            ident(None, None, None, false),
+        );
+        assert_eq!(
+            read_count(
+                &disp,
+                4,
+                ident(Some(&full_x), Some("/tmp/a/shop"), None, false)
+            ),
+            3,
+            "stable recall must see own + attached + global"
         );
     }
 }

@@ -13,9 +13,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerNotification, Tool, ToolAnnotations, ToolListChangedNotification,
-    ToolListChangedNotificationMethod,
+    InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ServerCapabilities, ServerNotification, Tool, ToolAnnotations,
+    ToolListChangedNotification, ToolListChangedNotificationMethod,
 };
 use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -23,18 +24,18 @@ use serde_json::{Map, Value};
 
 use ltmrs_compat::lemma::schemas::frozen_tools;
 use ltmrs_compat::lemma::tool_args::{
-    BackupCreateArgs, BackupPreviewArgs, BackupRestoreArgs, ConflictScanArgs, GuideCreateArgs,
-    GuideDistillArgs, GuideForgetArgs, GuideGetArgs, GuideMergeArgs, GuidePracticeArgs,
-    GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs, MemoryFeedbackArgs, MemoryForgetArgs,
-    MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs,
-    MemoryUpdateArgs, ProactiveAnalysisArgs, ProjectAnalyticsArgs, ResponseFormat,
-    SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs, SessionStartArgs, SessionStatsArgs,
-    SuggestionRespondArgs, ToolArgs,
+    BackupCreateArgs, BackupImportLemmaArgs, BackupPreviewArgs, BackupRestoreArgs,
+    ConflictScanArgs, GuideCreateArgs, GuideDistillArgs, GuideForgetArgs, GuideGetArgs,
+    GuideMergeArgs, GuidePracticeArgs, GuideUpdateArgs, MemoryAddArgs, MemoryAuditArgs,
+    MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs,
+    MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs, ProactiveAnalysisArgs,
+    ProjectAnalyticsArgs, ResponseFormat, SemanticSearchArgs, SessionAttemptArgs, SessionEndArgs,
+    SessionStartArgs, SessionStatsArgs, SuggestionRespondArgs, ToolArgs,
 };
 use ltmrs_daemon::client::IpcClient;
 use ltmrs_daemon::envelope::{
-    DomainRequest, HandshakeRequest, IpcEnvelope, IpcError, IpcResponse, IpcResult,
-    PROTOCOL_VERSION,
+    DomainPayload, DomainRequest, EnvelopeIdentity, HandshakeRequest, IpcEnvelope, IpcError,
+    IpcResponse, IpcResult, PROTOCOL_VERSION,
 };
 use ltmrs_domain::command::{DomainErrorCode, Scope};
 use ltmrs_domain::id::{ChannelId, FrontendId, OperationId, StoreGeneration};
@@ -199,11 +200,37 @@ impl LtmrsFrontend {
         *self.snapshot.lock().unwrap() = Some(memories);
     }
 
+    /// Best-effort prefetch for `serve_stdio` (Wave B1): handshake if
+    /// needed, then one `ListMemories` fetch even when already
+    /// handshaken (the managed path arrives with an epoch). Failures
+    /// degrade to the lazy path (the first tool call handshakes +
+    /// prefetches the same way).
+    pub async fn prefetch_snapshot(&self) {
+        let mut client = self.client.lock().await;
+        if self.handshake_if_needed(&mut client).await.is_ok()
+            && let Ok(memories) = self.fetch_snapshot(&mut client).await
+        {
+            self.set_snapshot(memories);
+        }
+    }
+
     /// Ensure the daemon handshake, adopting the live store generation. A
     /// restore bumps the generation; a first-attempt mismatch adopts the
     /// daemon generation and retries once instead of bricking new clients.
     async fn ensure_handshaked(&self) -> Result<(), McpError> {
         let mut client = self.client.lock().await;
+        self.handshake_if_needed(&mut client).await?;
+        // Prefetch the memory snapshot for the dynamic instructions index.
+        // Best-effort: a failure leaves the empty-state instructions.
+        if let Ok(memories) = self.fetch_snapshot(&mut client).await {
+            self.set_snapshot(memories);
+        }
+        Ok(())
+    }
+
+    /// Connect + handshake only when no epoch is held. Already-handshaken
+    /// clients pass through so callers can always follow with a fetch.
+    async fn handshake_if_needed(&self, client: &mut IpcClient) -> Result<(), McpError> {
         if client.retry_epoch().is_some() {
             return Ok(());
         }
@@ -251,11 +278,6 @@ impl LtmrsFrontend {
                 return Err(McpError::internal_error(e.to_string(), None));
             }
         }
-        // Prefetch the memory snapshot for the dynamic instructions index.
-        // Best-effort: a failure leaves the empty-state instructions.
-        if let Ok(memories) = self.fetch_snapshot(&mut client).await {
-            self.set_snapshot(memories);
-        }
         Ok(())
     }
 
@@ -272,6 +294,7 @@ impl LtmrsFrontend {
             retry_epoch: client.retry_epoch().unwrap_or(0),
             deadline_millis: None,
             scope: Scope::default(),
+            identity: ltmrs_daemon::envelope::EnvelopeIdentity::default(),
             body: DomainRequest::ListMemories,
         };
         // Read-only prefetch: must never disturb the handshake (P1-B) — a
@@ -304,7 +327,62 @@ impl LtmrsFrontend {
         retry_epoch: u64,
     ) -> Result<IpcEnvelope, McpError> {
         let body = route_tool(&request.name, &request.arguments)?;
-        Ok(self.envelope_for(body, retry_epoch))
+        let legacy_explicit = request
+            .arguments
+            .as_ref()
+            .is_some_and(|m| m.get("project").is_some_and(|v| !v.is_null()));
+        let identity = self.tool_identity(&body, legacy_explicit)?;
+        Ok(self.envelope_for(body, retry_epoch, identity))
+    }
+
+    /// Project identity for one tool call (Wave A3b): env override, else
+    /// the checkout bind file, plus the frontend-canonicalized root and the
+    /// wire legacy project. Malformed env values fail the call loudly.
+    fn tool_identity(
+        &self,
+        body: &DomainRequest,
+        legacy_explicit: bool,
+    ) -> Result<ltmrs_daemon::envelope::EnvelopeIdentity, McpError> {
+        let (project_id, canonical_root) = Self::base_identity()?;
+        let legacy_project = match body {
+            DomainRequest::ToolCall { tool } => ltmrs_compat::lemma::tool_args::tool_project(tool),
+            _ => None,
+        };
+        Ok(ltmrs_daemon::envelope::EnvelopeIdentity {
+            project_id,
+            canonical_root,
+            legacy_project,
+            legacy_explicit,
+        })
+    }
+
+    /// Shared env/bind/cwd identity resolution (Wave A3b + B4): the
+    /// stable id (if any) plus the canonicalized checkout root. The twin
+    /// `resource_identity` below must stay in sync — resources carry no
+    /// wire project, so they always resolve unattributed legacy.
+    fn base_identity() -> Result<(Option<String>, Option<String>), McpError> {
+        let cwd = std::env::current_dir().ok();
+        let env_raw = std::env::var(crate::project::ENV_PROJECT_ID).ok();
+        let bound = crate::project::resolve_project_id(cwd.as_deref(), env_raw)
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok((
+            bound.map(|b| b.project_id),
+            cwd.as_deref().and_then(crate::project::canonical_root),
+        ))
+    }
+
+    /// Identity for resource reads: same env/bind/cwd resolution as tools,
+    /// never a wire project (resources carry no args, so legacy stays
+    /// unattributed). Reads inherit the tool path's admission + scope, so
+    /// a stable identity sees exactly what the equivalent tool call sees.
+    fn resource_identity(&self) -> Result<EnvelopeIdentity, McpError> {
+        let (project_id, canonical_root) = Self::base_identity()?;
+        Ok(EnvelopeIdentity {
+            project_id,
+            canonical_root,
+            legacy_project: None,
+            legacy_explicit: false,
+        })
     }
 
     /// Envelope construction shared by tool calls and the resilient
@@ -312,7 +390,12 @@ impl LtmrsFrontend {
     /// transport-ambiguous retry resends the same envelope (P1-B), while the
     /// post-restore stale-generation retry still mints a fresh one (certain
     /// no-commit under the retired generation).
-    fn envelope_for(&self, body: DomainRequest, retry_epoch: u64) -> IpcEnvelope {
+    fn envelope_for(
+        &self,
+        body: DomainRequest,
+        retry_epoch: u64,
+        identity: EnvelopeIdentity,
+    ) -> IpcEnvelope {
         let op = OperationId::new(Uuid::now_v7());
         IpcEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -324,8 +407,79 @@ impl LtmrsFrontend {
             retry_epoch,
             deadline_millis: None,
             scope: Scope::default(),
+            identity,
             body,
         }
+    }
+
+    /// Send one IPC request under a pre-resolved identity (resource reads):
+    /// connect + handshake-if-needed + a single send. Read-only: a stale
+    /// generation surfaces as an internal error for the host to retry
+    /// (reads are safe to repeat), mirroring the prefetch path rather than
+    /// the mutation resend machinery.
+    async fn send_with_identity(
+        &self,
+        body: DomainRequest,
+        identity: &EnvelopeIdentity,
+    ) -> Result<IpcResponse, McpError> {
+        let mut client = self.client.lock().await;
+        if !client.is_connected() {
+            client
+                .connect()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
+        if client.retry_epoch().is_none() {
+            drop(client);
+            self.ensure_handshaked().await?;
+            client = self.client.lock().await;
+        }
+        let epoch = client.retry_epoch().unwrap_or(0);
+        let envelope = self.envelope_for(body, epoch, identity.clone());
+        client
+            .roundtrip(&envelope)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// Read one MCP resource. Memory/guide reads reuse the tool-call path
+    /// (same admission, scope and visibility as the equivalent tool call),
+    /// so a stable identity sees exactly what it could recall. The system
+    /// prompt is the static frozen base template — never the dynamic index.
+    async fn read_lemma_resource(
+        &self,
+        uri: &str,
+        identity: &EnvelopeIdentity,
+    ) -> Result<ReadResourceResult, McpError> {
+        if uri == "lemma://system-prompt" {
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(INSTRUCTIONS_TEMPLATE, uri).with_mime_type("text/markdown"),
+            ]));
+        }
+        if let Some(id) = uri.strip_prefix("lemma://memory/") {
+            let body = DomainRequest::ToolCall {
+                tool: ToolArgs::MemoryRead(MemoryReadArgs {
+                    id: Some(id.to_string()),
+                    ..Default::default()
+                }),
+            };
+            let resp = self.send_with_identity(body, identity).await?;
+            return memory_resource_record(uri, &resp);
+        }
+        if let Some(name) = uri.strip_prefix("lemma://guides/") {
+            let body = DomainRequest::ToolCall {
+                tool: ToolArgs::GuideGet(GuideGetArgs {
+                    guide: Some(name.to_string()),
+                    ..Default::default()
+                }),
+            };
+            let resp = self.send_with_identity(body, identity).await?;
+            return guide_resource_record(uri, &resp);
+        }
+        Err(McpError::resource_not_found(
+            format!("Unknown resource: {uri}"),
+            None,
+        ))
     }
 
     /// Round-trip with exactly one re-handshake retry: a restore can bump
@@ -344,6 +498,7 @@ impl LtmrsFrontend {
     async fn roundtrip_with_rehandshake(
         &self,
         body: DomainRequest,
+        legacy_explicit: bool,
     ) -> Result<IpcResponse, McpError> {
         let mut client = self.client.lock().await;
         if !client.is_connected() {
@@ -358,7 +513,8 @@ impl LtmrsFrontend {
             client = self.client.lock().await;
         }
         let epoch = client.retry_epoch().unwrap_or(0);
-        let envelope = self.envelope_for(body.clone(), epoch);
+        let identity = self.tool_identity(&body, legacy_explicit)?;
+        let envelope = self.envelope_for(body.clone(), epoch, identity);
         let resp = match client.roundtrip(&envelope).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -384,7 +540,7 @@ impl LtmrsFrontend {
         client.forget_epoch();
         drop(client);
         self.ensure_handshaked().await?;
-        self.send_fresh_with_resend(body).await
+        self.send_fresh_with_resend(body, legacy_explicit).await
     }
 
     /// Send a freshly built envelope once, resending it (same op id) when
@@ -393,10 +549,15 @@ impl LtmrsFrontend {
     /// post-restore fresh operation keeps receipt identity across
     /// reconnects instead of surfacing a generic error the host would
     /// retry as new work. Bounded: the resend path never resends twice.
-    async fn send_fresh_with_resend(&self, body: DomainRequest) -> Result<IpcResponse, McpError> {
+    async fn send_fresh_with_resend(
+        &self,
+        body: DomainRequest,
+        legacy_explicit: bool,
+    ) -> Result<IpcResponse, McpError> {
         let mut client = self.client.lock().await;
         let fresh_epoch = client.retry_epoch().unwrap_or(0);
-        let fresh = self.envelope_for(body, fresh_epoch);
+        let identity = self.tool_identity(&body, legacy_explicit)?;
+        let fresh = self.envelope_for(body, fresh_epoch, identity);
         match client.roundtrip(&fresh).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
@@ -523,7 +684,7 @@ impl LtmrsFrontend {
 
     /// The tool list advertised to the host: the 26 frozen tools, served
     /// verbatim from the baseline capture (T-MCP-01), plus native ltmrs
-    /// extensions (backup_create/preview/restore). Native tools are marked
+    /// extensions (backup_create/preview/restore/import_lemma). Native tools are marked
     /// in their descriptions.
     pub fn tools() -> Vec<Tool> {
         let mut tools: Vec<Tool> = frozen_tools()
@@ -545,6 +706,7 @@ impl LtmrsFrontend {
         tools.push(native_backup_create_tool());
         tools.push(native_backup_preview_tool());
         tools.push(native_backup_restore_tool());
+        tools.push(native_backup_import_lemma_tool());
         tools
     }
 }
@@ -601,6 +763,7 @@ pub fn route_tool(
         "backup_create" => ToolArgs::BackupCreate(parse_backup_create(&args)?),
         "backup_preview" => ToolArgs::BackupPreview(parse_backup_preview(&args)?),
         "backup_restore" => ToolArgs::BackupRestore(parse_backup_restore(&args)?),
+        "backup_import_lemma" => ToolArgs::BackupImportLemma(parse_backup_import_lemma(&args)?),
         other => {
             return Err(McpError::invalid_params(
                 format!("unknown tool: {other}"),
@@ -632,6 +795,10 @@ static ALLOWED_ARGUMENTS: std::sync::LazyLock<std::collections::HashMap<String, 
         map.insert(
             "backup_restore".to_string(),
             vec!["confirmation_token".to_string(), "confirm".to_string()],
+        );
+        map.insert(
+            "backup_import_lemma".to_string(),
+            vec!["path".to_string(), "confirm".to_string()],
         );
         map
     });
@@ -669,7 +836,18 @@ fn usize_field(args: &Map<String, Value>, key: &str) -> Result<Option<usize>, Mc
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(n)) => match n.as_u64() {
-            Some(v) => Ok(Some(v as usize)),
+            // Gate the `as` cast behind the application window: values above
+            // it are rejected here instead of wrapping into huge usizes.
+            Some(v) if v <= ltmrs_compat::lemma::pagination::MAX_PAGINATION_WINDOW as u64 => {
+                Ok(Some(v as usize))
+            }
+            Some(v) => Err(McpError::invalid_params(
+                format!(
+                    "{key} value {v} exceeds maximum pagination window {}",
+                    ltmrs_compat::lemma::pagination::MAX_PAGINATION_WINDOW
+                ),
+                None,
+            )),
             None => Err(McpError::invalid_params(
                 format!("{key} must be an integer"),
                 None,
@@ -1142,6 +1320,15 @@ fn parse_project_analytics(args: &Map<String, Value>) -> Result<ProjectAnalytics
     })
 }
 
+/// Parse backup_import_lemma args (`path` optional at the wire level,
+/// required at execution; `confirm` acknowledges replacement semantics).
+fn parse_backup_import_lemma(args: &Map<String, Value>) -> Result<BackupImportLemmaArgs, McpError> {
+    Ok(BackupImportLemmaArgs {
+        path: str_field(args, "path")?.map(|s| s.to_string()),
+        confirm: opt_bool_field(args, "confirm")?,
+    })
+}
+
 /// Parse backup_preview args (`path` optional at the wire level, required
 /// at execution).
 fn parse_backup_preview(args: &Map<String, Value>) -> Result<BackupPreviewArgs, McpError> {
@@ -1236,23 +1423,174 @@ fn native_backup_restore_tool() -> Tool {
     )
 }
 
+/// Native backup_import_lemma definition (legacy import via runtime
+/// cdylib; explicit confirmation, replace semantics).
+fn native_backup_import_lemma_tool() -> Tool {
+    native_tool(
+        "backup_import_lemma",
+        "Import a legacy Lemma .lemma-backup file into the canonical store, REPLACING the live store (never merging). NATIVE ltmrs tool (not a verbatim Lemma port): the isolated importer cdylib reads the SQLite payload at runtime (never linked into the daemon). Unconfirmed calls only stage the backup and report loss-accounted preview counts; confirmed calls (confirm=true with the same path) execute the fenced replace with a safety backup first. The report includes quarantined references and counted loss items (folded manuals, dropped caches, unmapped values) for manual repair.",
+        serde_json::json!({
+            "path": {
+                "type": "string",
+                "description": "Absolute path to the .lemma-backup file on this computer.",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true to execute: acknowledges replacement semantics.",
+            },
+        }),
+    )
+}
+
+/// Bound-identity header line for the instructions (Wave A3b): when the
+/// checkout carries a bind file, its bound id is named (the directory name
+/// stays display only). Empty when unbound or unreadable.
+fn bound_identity_line(cwd: Option<&std::path::Path>) -> String {
+    cwd.and_then(|dir| crate::project::read_bind(dir).ok().flatten())
+        .map(|b| {
+            format!(
+                "\nProject identity: {} (bound to this checkout; the directory name is display only).",
+                b.project_id
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Static resource list (Wave B4): exactly the system prompt, mirroring
+/// upstream's single static `resources/list` entry. Per-item memory/guide
+/// URIs are never enumerated — reads address them directly.
+pub fn lemma_resource_list() -> Vec<Resource> {
+    vec![
+        Resource::new("lemma://system-prompt", "Lemma System Prompt")
+            .with_description("System prompt for LLM clients using Lemma memory")
+            .with_mime_type("text/markdown"),
+    ]
+}
+
+/// A tool name is known when it appears in the served schemas (frozen +
+/// native). `route_tool` still rejects unknown names (T-MCP-03 pin); the
+/// caller decides the error shape.
+fn is_known_tool(name: &str) -> bool {
+    ALLOWED_ARGUMENTS.contains_key(name)
+}
+
+/// Unknown tools are MCP `isError` results with human-readable text
+/// (upstream shape), never JSON-RPC errors.
+fn unknown_tool_result(name: &str) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "Error: Unknown tool '{name}'"
+    ))])
+}
+
+/// Serve a memory record as a JSON resource. Visibility is inherited from
+/// the memory_read tool path (the daemon refuses foreign stable rows as
+/// not found); an error payload therefore maps to a not-found resource.
+fn memory_resource_record(uri: &str, resp: &IpcResponse) -> Result<ReadResourceResult, McpError> {
+    match &resp.result {
+        IpcResult::Success {
+            payload:
+                DomainPayload::ToolResult {
+                    text,
+                    structured,
+                    is_error,
+                },
+            ..
+        } => {
+            if *is_error {
+                return Err(McpError::resource_not_found(text.clone(), None));
+            }
+            let record = structured
+                .as_ref()
+                .and_then(|s| s.get("fragments"))
+                .and_then(|f| f.get(0))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(
+                    serde_json::to_string_pretty(&record).unwrap_or_default(),
+                    uri,
+                )
+                .with_mime_type("application/json"),
+            ]))
+        }
+        IpcResult::Error { message, .. } => Err(McpError::internal_error(message.clone(), None)),
+        _ => Err(McpError::internal_error(
+            "unexpected response shape for memory resource",
+            None,
+        )),
+    }
+}
+
+/// Serve a guide record as a JSON resource. Guides are unscoped (global),
+/// matching the guide_get tool path; a null guide maps to not-found.
+fn guide_resource_record(uri: &str, resp: &IpcResponse) -> Result<ReadResourceResult, McpError> {
+    match &resp.result {
+        IpcResult::Success {
+            payload:
+                DomainPayload::ToolResult {
+                    text,
+                    structured,
+                    is_error,
+                },
+            ..
+        } => {
+            if *is_error {
+                return Err(McpError::resource_not_found(text.clone(), None));
+            }
+            let record = structured
+                .as_ref()
+                .and_then(|s| s.get("guide"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if record.is_null() {
+                return Err(McpError::resource_not_found(
+                    format!("Guide not found: {uri}"),
+                    None,
+                ));
+            }
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(
+                    serde_json::to_string_pretty(&record).unwrap_or_default(),
+                    uri,
+                )
+                .with_mime_type("application/json"),
+            ]))
+        }
+        IpcResult::Error { message, .. } => Err(McpError::internal_error(message.clone(), None)),
+        _ => Err(McpError::internal_error(
+            "unexpected response shape for guide resource",
+            None,
+        )),
+    }
+}
+
 impl ServerHandler for LtmrsFrontend {
     fn get_info(&self) -> InitializeResult {
         // Static teaching template always present; the dynamic memory index is
         // appended when a snapshot has been cached (upstream buildInstructions).
         let memories = self.snapshot.lock().unwrap().clone().unwrap_or_default();
-        let project = std::env::current_dir()
-            .ok()
+        let cwd = std::env::current_dir().ok();
+        // The cwd display stays (display only, never identity); when a bind
+        // file exists its bound id rides the instructions header.
+        let project = cwd
+            .as_deref()
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()))
             .filter(|p| !p.is_empty());
+        let bound = bound_identity_line(cwd.as_deref());
         let instructions = format!(
-            "{}{}",
+            "{}{}{}",
             INSTRUCTIONS_TEMPLATE,
-            build_instructions_index(&memories, project.as_deref())
+            build_instructions_index(&memories, project.as_deref()),
+            bound
         );
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("ltmrs", env!("CARGO_PKG_VERSION")))
-            .with_instructions(instructions)
+        InitializeResult::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(Implementation::new("ltmrs", env!("CARGO_PKG_VERSION")))
+        .with_instructions(instructions)
     }
 
     fn list_tools(
@@ -1271,16 +1609,52 @@ impl ServerHandler for LtmrsFrontend {
         }))
     }
 
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(
+            lemma_resource_list(),
+        )))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        let identity = self.resource_identity()?;
+        Ok(ReadResourceResponse::Complete(
+            self.read_lemma_resource(&request.uri, &identity).await?,
+        ))
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // Unknown tools are MCP isError results (upstream shape), not
+        // JSON-RPC errors: route_tool still rejects them (T-MCP-03 pin) and
+        // the mapping happens here, before any dispatch.
+        if !is_known_tool(&request.name) {
+            return Ok(CallToolResponse::Complete(unknown_tool_result(
+                &request.name,
+            )));
+        }
         // The client is shared across calls; the resilient round-trip owns
         // the lock, (re-)handshakes as needed, and recovers once from a
         // post-restore StaleGeneration on an established connection.
         let body = route_tool(&request.name, &request.arguments)?;
-        let resp = self.roundtrip_with_rehandshake(body).await?;
+        let legacy_explicit = request
+            .arguments
+            .as_ref()
+            .is_some_and(|m| m.get("project").is_some_and(|v| !v.is_null()));
+        let resp = self
+            .roundtrip_with_rehandshake(body, legacy_explicit)
+            .await?;
 
         // Memory-mutating tools trigger a tools/list_changed notification
         // (upstream notifyMemoryChange). Best-effort; failures are silent.
@@ -1370,8 +1744,8 @@ mod tests {
         let tools = LtmrsFrontend::tools();
         assert_eq!(
             tools.len(),
-            29,
-            "26 frozen-verbatim + 3 native (backup_create/preview/restore)"
+            30,
+            "26 frozen-verbatim + 4 native (backup_create/preview/restore/import_lemma)"
         );
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert!(names.contains(&"memory_read".to_string()));
@@ -1412,7 +1786,12 @@ mod tests {
             .collect();
         assert_eq!(
             native,
-            vec!["backup_create", "backup_preview", "backup_restore"]
+            vec![
+                "backup_create",
+                "backup_preview",
+                "backup_restore",
+                "backup_import_lemma"
+            ]
         );
         let served = &served[..frozen.len()];
         for (tool, (name, desc, ro, de, id, ow, has_os)) in served.iter().zip(frozen.iter()) {
@@ -1444,6 +1823,7 @@ mod tests {
             description: String::new(),
             fragment_type: ltmrs_domain::memory::FragmentType::Fact,
             project: project.map(|p| p.to_string()),
+            project_id: None,
             source: ltmrs_domain::memory::MemorySource::Ai,
             confidence,
             quality_score: None,
@@ -1653,7 +2033,7 @@ mod tests {
             .set_store_generation(ltmrs_domain::id::StoreGeneration::new(3))
             .unwrap();
         let resp = fe
-            .roundtrip_with_rehandshake(DomainRequest::ListMemories)
+            .roundtrip_with_rehandshake(DomainRequest::ListMemories, false)
             .await
             .unwrap();
         assert!(
@@ -1817,7 +2197,7 @@ mod tests {
         memory.external_alias = None;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fe.roundtrip_with_rehandshake(DomainRequest::AddMemory { memory }),
+            fe.roundtrip_with_rehandshake(DomainRequest::AddMemory { memory }, false),
         )
         .await
         .expect("resend must not hang")
@@ -2071,10 +2451,13 @@ mod tests {
         );
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fe.roundtrip_with_rehandshake(DomainRequest::Feedback {
-                memory_id: target,
-                useful: true,
-            }),
+            fe.roundtrip_with_rehandshake(
+                DomainRequest::Feedback {
+                    memory_id: target,
+                    useful: true,
+                },
+                false,
+            ),
         )
         .await
         .expect("unknown-outcome call must not hang");
@@ -2236,7 +2619,7 @@ mod tests {
         });
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fe.roundtrip_with_rehandshake(DomainRequest::ToolCall { tool }),
+            fe.roundtrip_with_rehandshake(DomainRequest::ToolCall { tool }, false),
         )
         .await
         .expect("resend must not hang")
@@ -2430,7 +2813,7 @@ mod tests {
         memory.external_alias = None;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fe.roundtrip_with_rehandshake(DomainRequest::AddMemory { memory }),
+            fe.roundtrip_with_rehandshake(DomainRequest::AddMemory { memory }, false),
         )
         .await
         .expect("resend must not hang")
@@ -2489,7 +2872,7 @@ mod tests {
         );
         // Establish at generation 1.
         let first = fe
-            .roundtrip_with_rehandshake(DomainRequest::ListMemories)
+            .roundtrip_with_rehandshake(DomainRequest::ListMemories, false)
             .await
             .unwrap();
         assert!(
@@ -2508,7 +2891,7 @@ mod tests {
             .unwrap();
         let recovered = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            fe.roundtrip_with_rehandshake(DomainRequest::ListMemories),
+            fe.roundtrip_with_rehandshake(DomainRequest::ListMemories, false),
         )
         .await
         .expect("post-restore call must complete, never park");
@@ -2623,7 +3006,7 @@ mod tests {
         drop(peer);
         fe.client.lock().await.set_stream(dead);
         assert!(
-            fe.roundtrip_with_rehandshake(DomainRequest::ListMemories)
+            fe.roundtrip_with_rehandshake(DomainRequest::ListMemories, false)
                 .await
                 .is_err()
         );
@@ -2731,6 +3114,29 @@ mod tests {
         let mut m = Map::new();
         m.insert("confirm".into(), json!("yes"));
         assert!(route_tool("backup_restore", &args(m)).is_err());
+    }
+
+    /// backup_import_lemma routes path+confirm through to the typed args.
+    #[test]
+    fn backup_import_lemma_routes_with_path_and_confirm() {
+        let mut m = Map::new();
+        m.insert("path".into(), json!("/tmp/x.lemma-backup"));
+        m.insert("confirm".into(), json!(true));
+        let req = route_tool("backup_import_lemma", &args(m)).unwrap();
+        match req {
+            DomainRequest::ToolCall { tool } => match tool {
+                ToolArgs::BackupImportLemma(call) => {
+                    assert_eq!(call.path.as_deref(), Some("/tmp/x.lemma-backup"));
+                    assert_eq!(call.confirm, Some(true));
+                }
+                other => panic!("wrong tool routed: {:?}", other.tool()),
+            },
+            other => panic!("not a tool call: {other:?}"),
+        }
+        // Unknown keys still fail on the new tool.
+        let mut m = Map::new();
+        m.insert("bogus".into(), json!(true));
+        assert!(route_tool("backup_import_lemma", &args(m)).is_err());
     }
 
     #[test]
@@ -2885,6 +3291,36 @@ mod tests {
         assert!(route_tool("memory_read", &Some(args)).is_ok());
     }
 
+    /// Pagination values beyond the application window are rejected at the
+    /// parse boundary (u64::MAX offsets must never reach the tools as
+    /// wrapped/clamped windows).
+    #[test]
+    fn absurd_pagination_values_rejected_at_parse() {
+        let mut args = serde_json::Map::new();
+        args.insert("limit".to_string(), serde_json::json!(30));
+        args.insert(
+            "offset".to_string(),
+            serde_json::json!(18446744073709551615u64),
+        );
+        let err = route_tool("memory_read", &Some(args)).unwrap_err();
+        assert!(err.to_string().contains("offset"), "got: {err}");
+
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), serde_json::json!("q"));
+        args.insert(
+            "topK".to_string(),
+            serde_json::json!(18446744073709551615u64),
+        );
+        let err = route_tool("semantic_search", &Some(args)).unwrap_err();
+        assert!(err.to_string().contains("topK"), "got: {err}");
+
+        // In-window values still parse.
+        let mut args = serde_json::Map::new();
+        args.insert("limit".to_string(), serde_json::json!(30));
+        args.insert("offset".to_string(), serde_json::json!(0));
+        assert!(route_tool("memory_read", &Some(args)).is_ok());
+    }
+
     /// String arrays reject non-string elements (no silent drops).
     #[test]
     fn string_array_elements_are_strict() {
@@ -2980,5 +3416,522 @@ mod tests {
         );
         let result = shape_result(&resp);
         assert_eq!(result.is_error, Some(true));
+    }
+
+    /// The instructions header names the bound identity when a bind file
+    /// exists, and stays silent otherwise (cwd display is display only).
+    #[test]
+    fn bound_identity_line_names_bind_file() {
+        use crate::project::{Binding, write_bind};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shop");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(bound_identity_line(Some(&root)), "");
+        write_bind(
+            &root,
+            &Binding {
+                project_id: "prj_shop_01ARZ3NDEKTSV4RRFFQ69G5FAV2".into(),
+                name: "shop".into(),
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        let line = bound_identity_line(Some(&root));
+        assert!(
+            line.contains("prj_shop_01ARZ3NDEKTSV4RRFFQ69G5FAV2"),
+            "got: {line}"
+        );
+        assert_eq!(bound_identity_line(None), "");
+    }
+
+    /// Wave B1: non-empty store must surface in the FIRST initialize,
+    /// not just after the first tool call. Prefetch (as `serve_stdio`
+    /// does) then `get_info` must list the stored fragment.
+    #[tokio::test]
+    async fn first_initialize_sees_nonempty_store() {
+        use ltmrs_daemon::runtime::RuntimePaths;
+        use ltmrs_daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        daemon
+            .dispatcher_arc()
+            .repo()
+            .put_memory_direct(&mem(9001, None, 0.9, "Prefetch Fixture"))
+            .unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let _ = handle_connection(server_end, dispatcher, quotas).await;
+        });
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_end);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(1)),
+                ChannelId::new(Uuid::from_u128(2)),
+            ),
+            client,
+        );
+        let instructions = fe.get_info().instructions.unwrap();
+        assert!(
+            instructions.contains("no saved memories yet"),
+            "unprefetched first initialize still shows the empty window, got: {instructions}"
+        );
+        fe.prefetch_snapshot().await;
+        let instructions = fe.get_info().instructions.unwrap();
+        assert!(
+            !instructions.contains("no saved memories yet"),
+            "prefetched first initialize must list the non-empty store, got empty-state window"
+        );
+        assert!(
+            instructions.contains("Prefetch Fixture"),
+            "first initialize must name the stored fragment, got: {instructions}"
+        );
+        drop(daemon);
+    }
+
+    /// Wave B1: prefetch over an empty store keeps the current empty-state
+    /// text (no behavior change for fresh stores).
+    #[tokio::test]
+    async fn prefetch_on_empty_store_keeps_empty_state() {
+        use ltmrs_daemon::runtime::RuntimePaths;
+        use ltmrs_daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let _ = handle_connection(server_end, dispatcher, quotas).await;
+        });
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_end);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(3)),
+                ChannelId::new(Uuid::from_u128(4)),
+            ),
+            client,
+        );
+        fe.prefetch_snapshot().await;
+        let instructions = fe.get_info().instructions.unwrap();
+        assert!(
+            instructions.contains("no saved memories yet"),
+            "empty store must keep the empty-state text, got: {instructions}"
+        );
+        drop(daemon);
+    }
+
+    /// Wave B1 managed path: the default `socket=None` path arrives
+    /// already handshaken (probe handshake sets the retry epoch before
+    /// the frontend is built). Prefetch must fetch regardless of
+    /// handshake state, so `get_info` is populated here too.
+    #[tokio::test]
+    async fn prefetch_fetches_when_already_handshaken() {
+        use ltmrs_daemon::runtime::RuntimePaths;
+        use ltmrs_daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        daemon
+            .dispatcher_arc()
+            .repo()
+            .put_memory_direct(&mem(9002, None, 0.9, "Managed Prefetch Fixture"))
+            .unwrap();
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let _ = handle_connection(server_end, dispatcher, quotas).await;
+        });
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_end);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(5)),
+                ChannelId::new(Uuid::from_u128(6)),
+            ),
+            client,
+        );
+        // Mimic the managed path: probe handshake completes before the
+        // frontend is built, so the epoch is already set while the
+        // snapshot is still None.
+        {
+            let mut guard = fe.client.lock().await;
+            let req = HandshakeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                store_generation: StoreGeneration::FIRST,
+                frontend_id: FrontendId::new(Uuid::from_u128(5)),
+                channel_id: ChannelId::new(Uuid::from_u128(6)),
+                resume_retry_epoch: None,
+            };
+            guard.handshake(&req).await.unwrap();
+            assert!(guard.retry_epoch().is_some());
+        }
+        assert!(
+            fe.get_info()
+                .instructions
+                .unwrap()
+                .contains("no saved memories yet"),
+            "setup: snapshot must start empty while handshaken"
+        );
+        fe.prefetch_snapshot().await;
+        let instructions = fe.get_info().instructions.unwrap();
+        assert!(
+            !instructions.contains("no saved memories yet"),
+            "prefetch on a handshaken client must fetch, got empty-state window"
+        );
+        assert!(
+            instructions.contains("Managed Prefetch Fixture"),
+            "prefetch on a handshaken client must name the stored fragment, got: {instructions}"
+        );
+        drop(daemon);
+    }
+
+    // ---- Wave B4: MCP resources + unknown-tool errors ----
+
+    /// Frontend with no daemon connection (pure read_lemma_resource paths
+    /// that never touch the client still work; IO paths need live_frontend).
+    fn unconnected_frontend() -> LtmrsFrontend {
+        LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(41)),
+                ChannelId::new(Uuid::from_u128(42)),
+            ),
+            IpcClient::new(std::path::PathBuf::from("unused")),
+        )
+    }
+
+    /// Live frontend over a bridged daemon pair.
+    /// Returns the frontend plus guards that must stay alive for IO.
+    async fn live_frontend_with(
+        seeds: &[Memory],
+    ) -> (
+        LtmrsFrontend,
+        tempfile::TempDir,
+        ltmrs_daemon::server::Daemon,
+    ) {
+        use ltmrs_daemon::runtime::RuntimePaths;
+        use ltmrs_daemon::server::{Daemon, DaemonConfig, handle_connection};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let config = DaemonConfig {
+            store_path: dir.path().join("store").to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let daemon = Daemon::start(&paths, config).await.unwrap();
+        for m in seeds {
+            daemon.dispatcher_arc().repo().put_memory_direct(m).unwrap();
+        }
+        let dispatcher = daemon.dispatcher_arc();
+        let quotas = daemon.quotas();
+        let (server_end, client_end) = tokio::net::UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let _ = handle_connection(server_end, dispatcher, quotas).await;
+        });
+        let mut client = IpcClient::new(std::path::PathBuf::from("unused"));
+        client.set_stream(client_end);
+        let fe = LtmrsFrontend::new(
+            FrontendIdentity::new(
+                FrontendId::new(Uuid::from_u128(43)),
+                ChannelId::new(Uuid::from_u128(44)),
+            ),
+            client,
+        );
+        (fe, dir, daemon)
+    }
+
+    /// Unattributed identity: no stable id, no root, no wire project.
+    fn unattributed_identity() -> EnvelopeIdentity {
+        EnvelopeIdentity::default()
+    }
+
+    /// Stable identity for a named checkout that was never bound: a fresh
+    /// id whose root the daemon has never seen.
+    fn stable_identity_named(name: &str, root: &str) -> EnvelopeIdentity {
+        let (full, _) = ltmrs_domain::project_id::generate_project_id(name);
+        EnvelopeIdentity {
+            project_id: Some(full),
+            canonical_root: Some(root.to_string()),
+            legacy_project: None,
+            legacy_explicit: false,
+        }
+    }
+
+    /// Minimal guide record for resource tests.
+    fn sample_guide(name: &str) -> ltmrs_domain::guide::Guide {
+        ltmrs_domain::guide::Guide {
+            name: name.to_string(),
+            category: "dev-tool".to_string(),
+            description: "test guide".to_string(),
+            contexts: vec![],
+            learnings: vec![],
+            usage_count: 0,
+            last_used: None,
+            success_count: 0,
+            failure_count: 0,
+            anti_patterns: vec![],
+            pitfalls: vec![],
+            depends_on: vec![],
+            enables: vec![],
+            source_memories: vec![],
+            validated_by: vec![],
+            superseded_by: None,
+            deprecated: false,
+            entity_revision: ltmrs_domain::id::EntityRevision::new(1),
+            created_at: ltmrs_domain::memory::Instant::new(0),
+            updated_at: ltmrs_domain::memory::Instant::new(0),
+        }
+    }
+
+    /// Extract the text of a single-text resource result in tests.
+    fn resource_text(out: &ReadResourceResult) -> Result<String, String> {
+        out.contents
+            .iter()
+            .filter_map(|c| match c {
+                ResourceContents::TextResourceContents { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .next()
+            .ok_or_else(|| format!("no text content in resource result: {out:?}"))
+    }
+
+    /// Add a memory through the tool path (registers the legacy id, unlike
+    /// direct row writes) and return its legacy id. `project` is the wire
+    /// legacy bucket (None = unattributed global), mirroring a real client.
+    async fn add_via_tool(
+        fe: &LtmrsFrontend,
+        fragment: &str,
+        project: Option<&str>,
+        identity: &EnvelopeIdentity,
+    ) -> String {
+        let body = DomainRequest::ToolCall {
+            tool: ToolArgs::MemoryAdd(MemoryAddArgs {
+                fragment: fragment.to_string(),
+                project: project.map(|p| p.to_string()),
+                ..Default::default()
+            }),
+        };
+        let resp = fe.send_with_identity(body, identity).await.unwrap();
+        match resp.result {
+            IpcResult::Success {
+                payload:
+                    DomainPayload::ToolResult {
+                        structured: Some(s),
+                        ..
+                    },
+                ..
+            } => s
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("add response has no id: {s}"))
+                .to_string(),
+            other => panic!("add failed: {other:?}"),
+        }
+    }
+
+    /// `resources/list` advertises exactly the system-prompt resource
+    /// (upstream serves one static entry; per-item URIs are NOT enumerated).
+    #[test]
+    fn resources_list_advertises_system_prompt_only() {
+        let listed = lemma_resource_list();
+        assert_eq!(listed.len(), 1, "exactly one static entry, got: {listed:?}");
+        assert_eq!(listed[0].uri, "lemma://system-prompt");
+        assert_eq!(listed[0].mime_type.as_deref(), Some("text/markdown"));
+    }
+
+    /// `resources/read lemma://system-prompt` serves the frozen base prompt
+    /// text (static, deterministic — never the dynamic index).
+    #[tokio::test]
+    async fn system_prompt_resource_returns_template() {
+        let fe = unconnected_frontend();
+        let out = fe
+            .read_lemma_resource("lemma://system-prompt", &unattributed_identity())
+            .await
+            .unwrap();
+        let text = resource_text(&out).unwrap();
+        assert!(
+            text.contains("Persistent Memory"),
+            "system prompt must be the frozen base template, got: {text}"
+        );
+        assert!(
+            text.contains("RECALL"),
+            "system prompt must carry the recall contract, got: {text}"
+        );
+        assert!(
+            !text.contains("no saved memories yet"),
+            "resource must not append the dynamic index, got: {text}"
+        );
+    }
+
+    /// `resources/read lemma://memory/{id}` returns the record as JSON.
+    #[tokio::test]
+    async fn memory_resource_returns_record_json() {
+        let (fe, _dir, _daemon) = live_frontend_with(&[]).await;
+        let id = add_via_tool(
+            &fe,
+            "## Resource Fixture\n\n### Context\nResource record body.",
+            None,
+            &unattributed_identity(),
+        )
+        .await;
+        let out = fe
+            .read_lemma_resource(&format!("lemma://memory/{id}"), &unattributed_identity())
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&resource_text(&out).unwrap()).unwrap();
+        assert_eq!(value["id"], json!(id));
+        assert!(
+            value["fragment"]
+                .as_str()
+                .unwrap()
+                .contains("Resource record body")
+        );
+    }
+
+    /// Unknown memory ids are resource errors, not tool errors.
+    #[tokio::test]
+    async fn unknown_memory_resource_errors() {
+        let (fe, _dir, _daemon) = live_frontend_with(&[]).await;
+        let err = fe
+            .read_lemma_resource("lemma://memory/m does-not-exist", &unattributed_identity())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "unknown memory must be a not-found resource error, got: {err}"
+        );
+    }
+
+    /// `resources/read lemma://guides/{name}` is case-insensitive;
+    /// unknown guides are resource errors.
+    #[tokio::test]
+    async fn guide_resource_case_insensitive() {
+        let (fe, _dir, daemon) = live_frontend_with(&[]).await;
+        daemon
+            .dispatcher_arc()
+            .repo()
+            .put_guide(&sample_guide("Rust"))
+            .unwrap();
+        let out = fe
+            .read_lemma_resource("lemma://guides/RUST", &unattributed_identity())
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&resource_text(&out).unwrap()).unwrap();
+        assert_eq!(value["guide"], json!("Rust"));
+        let err = fe
+            .read_lemma_resource("lemma://guides/nope", &unattributed_identity())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "unknown guide must be a not-found resource error, got: {err}"
+        );
+    }
+
+    /// Unknown resource URIs are resource errors.
+    #[tokio::test]
+    async fn unknown_resource_uri_errors() {
+        let fe = unconnected_frontend();
+        let err = fe
+            .read_lemma_resource("lemma://nope/x", &unattributed_identity())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown resource"),
+            "unknown URI must be an unknown-resource error, got: {err}"
+        );
+    }
+
+    /// Unknown tools return an isError tool result, not a JSON-RPC error.
+    #[test]
+    fn unknown_tool_returns_is_error_result() {
+        assert!(!is_known_tool("nope"));
+        assert!(is_known_tool("memory_read"));
+        let result = unknown_tool_result("nope");
+        assert!(
+            result.is_error.unwrap_or(false),
+            "unknown tool must set isError"
+        );
+        let text = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("nope"),
+            "unknown-tool result must name the tool, got: {text}"
+        );
+    }
+
+    /// A stable identity cannot read a foreign project's memory resource,
+    /// but the same record is served without identity.
+    #[tokio::test]
+    async fn memory_resource_stable_scope_refused() {
+        let (fe, _dir, _daemon) = live_frontend_with(&[]).await;
+        // File the fixture under the legacy "other" bucket through the
+        // tool path (registers the legacy id for direct reads). The
+        // identity mirrors what tool_identity would build for a wire
+        // project="other" call: legacy set, explicit, no stable id.
+        let other = EnvelopeIdentity {
+            project_id: None,
+            canonical_root: None,
+            legacy_project: Some("other".to_string()),
+            legacy_explicit: true,
+        };
+        let id = add_via_tool(
+            &fe,
+            "## Foreign Fixture\n\n### Context\nForeign body.",
+            Some("other"),
+            &other,
+        )
+        .await;
+        // A fresh stable identity from an unrelated checkout: the write
+        // registers it on first use, the foreign read must refuse.
+        let foreign = stable_identity_named("shop", "/tmp/a/shop");
+        add_via_tool(
+            &fe,
+            "## Shop Own Fixture\n\n### Context\nShop body.",
+            None,
+            &foreign,
+        )
+        .await;
+        let err = fe
+            .read_lemma_resource(&format!("lemma://memory/{id}"), &foreign)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "foreign resource must be refused to a stable identity, got: {err}"
+        );
+        let out = fe
+            .read_lemma_resource(&format!("lemma://memory/{id}"), &unattributed_identity())
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&resource_text(&out).unwrap()).unwrap();
+        assert!(value["fragment"].as_str().unwrap().contains("Foreign body"));
     }
 }

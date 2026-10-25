@@ -876,6 +876,119 @@ mod tests {
         assert!(E5SmallAdapter::validate_config_file(dir.path(), &recipe).is_ok());
     }
 
+    /// T-SEC-04: stray foreign weight files are ignored by construction.
+    /// Recipe validation only reads the pinned config/tokenizer files, so
+    /// an ONNX/GGUF file sitting next to them changes nothing.
+    #[test]
+    fn extra_weight_files_do_not_change_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "architectures": ["BertModel"],
+                "model_type": "bert"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "tokenizer_class": "XLMRobertaTokenizer"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("model.onnx"), b"fake onnx").unwrap();
+        std::fs::write(dir.path().join("model.gguf"), b"fake gguf").unwrap();
+
+        let recipe = e5_small_recipe();
+        assert!(E5SmallAdapter::validate_config_file(dir.path(), &recipe).is_ok());
+    }
+
+    /// T-SEC-04: a directory holding only foreign weight files never yields
+    /// an adapter. No ONNX/GGUF code path exists, so loading fails closed at
+    /// the pinned safetensors/tokenizer stages instead of substituting.
+    #[test]
+    fn wrong_format_dir_fails_closed_without_safetensors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "architectures": ["BertModel"],
+                "model_type": "bert"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "tokenizer_class": "XLMRobertaTokenizer"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("model.onnx"), b"fake onnx").unwrap();
+
+        match E5SmallAdapter::load_verified(dir.path()) {
+            Ok(_) => panic!("foreign weight files must never yield an adapter"),
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("tokenizer") || err.contains("safetensors"),
+                    "must fail at a pinned stage, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// T-SEC-04 (M1): corrupt weights fail at the SAFETENSORS stage, not the
+    /// tokenizer stage. The fixture carries the real tokenizer.json (gated
+    /// on dev artifacts, like the other weight-gated tests) so tokenization
+    /// succeeds and the pinned `model.safetensors` load is what rejects.
+    #[test]
+    fn corrupt_weights_fail_at_safetensors_stage() {
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/e5-artifacts");
+        if !src.join("tokenizer.json").exists() {
+            eprintln!("SKIP: artifacts not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "architectures": ["BertModel"],
+                "model_type": "bert"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "tokenizer_class": "XLMRobertaTokenizer"
+            }"#,
+        )
+        .unwrap();
+        std::fs::copy(
+            src.join("tokenizer.json"),
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors"),
+            b"not a safetensors file",
+        )
+        .unwrap();
+
+        match E5SmallAdapter::load_verified(dir.path()) {
+            Ok(_) => panic!("corrupt weights must never yield an adapter"),
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("safetensors"),
+                    "must fail at the safetensors stage, got: {err}"
+                );
+            }
+        }
+    }
+
     /// T-EMB-03: long-document chunking preserves recall and parent identity.
     #[test]
     fn t_emb_03_long_document_chunking() {

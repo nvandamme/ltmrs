@@ -260,7 +260,7 @@ see Operations above. Verification gates: `cargo test` (664 lib +
 2 smoke suites), `cargo fmt -- --check`, `cargo clippy
 --all-targets -- -D warnings`.
 
-## Tools (29)
+## Tools (30)
 
 Short MCP names (`memory_read`, `memory_add`, `session_start`);
 hosts may display them namespaced (e.g. `mcp_ltmrs_memory_add`).
@@ -273,7 +273,7 @@ deviations are ledgered (see Compatibility target).
 | Guides (7) | `guide_get`, `guide_practice`, `guide_create`, `guide_distill`, `guide_update`, `guide_forget`, `guide_merge` |
 | Sessions (5) | `session_start`, `session_attempt`, `session_end`, `session_stats`, `suggestion_respond` |
 | Intelligence (4) | `conflict_scan`, `proactive_analysis`, `project_analytics`, `semantic_search` |
-| Backup, native (3) | `backup_create`, `backup_preview`, `backup_restore` |
+| Backup, native (4) | `backup_create`, `backup_preview`, `backup_restore`, `backup_import_lemma` |
 
 Back up by asking: *"Back up my memory to this folder."* The
 assistant creates a verified `.ltmrs-backup`, you move it where it

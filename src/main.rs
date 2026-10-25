@@ -13,7 +13,8 @@ mod visualizer;
 use crate::visualizer::run_visualize;
 use ltmrs_frontend::cli::{
     CliError, Command, help_text, install_shim_command, install_skill_command, parse_args,
-    provision_models_command, run_library, version_text,
+    project_adopt_command, project_bind_command, project_status_command, provision_models_command,
+    run_library, version_text,
 };
 use ltmrs_frontend::frontend::serve::{
     daemon_idle_ms, daemon_socket_path, ensure_daemon_process, resolve_home, run_daemon_foreground,
@@ -109,6 +110,52 @@ async fn main() {
         },
         Ok(Command::ProvisionModels) => {
             match provision_models_command(std::env::var("HOME").ok()).await {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(e) => fail(&e),
+            }
+        }
+        Ok(Command::ProjectBind { here, root, name }) => {
+            match project_bind_command(
+                here,
+                root.as_deref(),
+                name.as_deref(),
+                std::env::var("HOME").ok(),
+            )
+            .await
+            {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(e) => fail(&e),
+            }
+        }
+        Ok(Command::ProjectStatus { root }) => {
+            match project_status_command(
+                root,
+                std::env::var("LTMRS_PROJECT_ID").ok(),
+                std::env::var("HOME").ok(),
+            ) {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(e) => fail(&e),
+            }
+        }
+        Ok(Command::ProjectAdopt { here, root, slug }) => {
+            match project_adopt_command(
+                here,
+                root.as_deref(),
+                &slug,
+                std::env::var("HOME").ok(),
+                std::env::var("LTMRS_PROJECT_ID").ok(),
+            )
+            .await
+            {
                 Ok(text) => {
                     println!("{text}");
                     0

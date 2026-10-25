@@ -446,18 +446,18 @@ No. It is a reviewed design, ordered implementation guide and test specification
 
 ## 11. Final release checklist
 
-- [ ] AD-01 backend selection has passing hard gates and a reviewed evidence report.
-- [ ] Dependency/model/profile baselines are immutable and reproducible.
+- [x] AD-01 backend selection has passing hard gates and a reviewed evidence report.
+- [x] Dependency/model/profile baselines are immutable and reproducible.
 - [ ] Every claimed tool has schema, behavior, scope, retry and restart evidence.
 - [ ] No partial canonical commands, lost acknowledged knowledge or scope leaks remain.
-- [ ] No-model and stalled-index behavior is honest and useful.
+- [x] No-model and stalled-index behavior is honest and useful.
 - [ ] Concurrency tests use real independent frontends and the documented session model.
 - [ ] Model reference and protected retrieval cases pass.
-- [ ] Backup/import/restore tests cover coherent snapshots and interrupted publication.
-- [ ] Offline runtime and native-dependency policy pass on each supported target.
-- [ ] Performance and quality claims include exact measurement boundaries and raw data.
+- [x] Backup/import/restore tests cover coherent snapshots and interrupted publication.
+- [x] Offline runtime and native-dependency policy pass on each supported target.
+- [x] Performance and quality claims include exact measurement boundaries and raw data.
 - [ ] Skill/host compatibility is evidenced per tested host version.
-- [ ] Release notes clearly distinguish complete API/workflow support from enhanced retrieval and any exclusions.
+- [x] Release notes clearly distinguish complete API/workflow support from enhanced retrieval and any exclusions.
 
 | Test ID | Procedure | Required assertion |
 |---|---|---|

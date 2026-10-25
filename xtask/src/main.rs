@@ -38,6 +38,13 @@ enum Command {
         release: String,
         dry_run: bool,
     },
+    DistAudit {
+        full: bool,
+        dry_run: bool,
+    },
+    GateAudit {
+        dry_run: bool,
+    },
     Help {
         verb: Option<String>,
     },
@@ -51,6 +58,8 @@ const VERBS: &[&str] = &[
     "benchmark",
     "quality",
     "evidence",
+    "dist-audit",
+    "gate-audit",
 ];
 
 const BOOL_FLAGS: &[&str] = &["--dry-run", "--help"];
@@ -64,10 +73,12 @@ fn usage() -> &'static str {
        capture-lemma --source <checkout>        capture a Lemma baseline into a sandbox\n\
        capabilities --candidate <name>          run backend-gate suites (only fjall-lance resolves)\n\
        conformance --profile <name>             run compat + differential suites (only lemma-0.21.0 resolves)\n\
-       recovery --suite <name>                  run restore/kill/reopen suites (only durable resolves)\n\
-       benchmark --manifest <file> [--limit N]  run the benchmark harness\n\
-       quality --split <name>                   run calibration corpus + quality wave\n\
-       evidence --release <version>             build the release evidence bundle\n\
+      recovery --suite <name>                  run restore/kill/reopen suites (only durable resolves)\n\
+        benchmark --manifest <file> [--limit N]  run the benchmark harness\n\
+        quality --split <name>                   run calibration corpus + quality wave\n\
+        evidence --release <version>             build the release evidence bundle\n\
+        dist-audit [--mode fast|full]            T-BUILD-01 distribution audit (fast inspection; full adds locked release + offline builds)
+        gate-audit [--dry-run]                 T-GATE-01 requirement/evidence matrix consistency gate (seconds; validates labeling, never executes cells)\n\
      \n\
      Global flags:\n\
        --dry-run   print the would-be command without executing\n\
@@ -114,6 +125,8 @@ fn known_value_flags(verb: &str) -> &'static [&'static str] {
         "benchmark" => &["--manifest", "--limit"],
         "quality" => &["--split"],
         "evidence" => &["--release"],
+        "dist-audit" => &["--mode"],
+        "gate-audit" => &[],
         _ => &[],
     }
 }
@@ -327,6 +340,25 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
             release: take_flag(&mut pairs, "--release", &verb)?,
             dry_run,
         }),
+        "dist-audit" => {
+            let full = match pairs.iter().position(|(k, _)| k == "--mode") {
+                Some(i) => {
+                    let raw = pairs.remove(i).1;
+                    match raw.as_str() {
+                        "full" => true,
+                        "fast" => false,
+                        other => {
+                            return Err(format!(
+                                "invalid value '{other}' for '--mode': expected 'fast' or 'full'"
+                            ));
+                        }
+                    }
+                }
+                None => false,
+            };
+            Ok(Command::DistAudit { full, dry_run })
+        }
+        "gate-audit" => Ok(Command::GateAudit { dry_run }),
         _ => unreachable!("canonical verb '{verb}' has no constructor"),
     }
 }
@@ -371,6 +403,23 @@ fn usage_verb(verb: &str) -> &'static str {
              tools/gen_release_evidence.sh --release --locked \
              --clean-checkout <throwaway-dir>, from a detached HEAD \
              checkout — never the worktree).\n"
+        }
+        "dist-audit" => {
+            "cargo xtask dist-audit [--mode fast|full] [--dry-run]\n\
+             \n\
+             T-BUILD-01 distribution audit: locked-graph deny-list, rusqlite\n\
+             exclusion, reqwest site classification, loader pin and skill\n\
+             egress scan (fast, seconds). --mode full additionally runs\n\
+              the locked release build and the offline build check\n\
+              (minutes; wall time reported).\n"
+        }
+        "gate-audit" => {
+            "cargo xtask gate-audit [--dry-run]\n\
+             \n\
+              T-GATE-01 requirement/evidence matrix consistency gate:\n\
+              parses plans/traceability.json + plans/conformance_matrix.json\n\
+              and fails on mislabeled, evidence-free or dangling references\n\
+              (fast, seconds; --dry-run prints the would-be reads).\n"
         }
         _ => usage(),
     }
@@ -437,6 +486,20 @@ fn main() {
             }
         }
         Ok(Command::Recovery { suite, dry_run }) => match verbs::run_recovery(&suite, dry_run) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Ok(Command::DistAudit { full, dry_run }) => match verbs::run_dist_audit(full, dry_run) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Ok(Command::GateAudit { dry_run }) => match verbs::run_gate_audit(dry_run) {
             Ok(code) => std::process::exit(code),
             Err(err) => {
                 eprintln!("error: {err}");
@@ -617,6 +680,8 @@ mod tests {
             "benchmark",
             "quality",
             "evidence",
+            "dist-audit",
+            "gate-audit",
         ] {
             assert!(usage().contains(verb), "usage missing {verb}");
         }
@@ -713,6 +778,8 @@ mod tests {
             ("recovery", "--suite"),
             ("benchmark", "--manifest"),
             ("quality", "--split"),
+            ("dist-audit", "--mode"),
+            ("gate-audit", "--dry-run"),
         ] {
             let text = usage_verb(verb);
             assert!(
@@ -726,5 +793,29 @@ mod tests {
     fn verb_help_displays_instead_of_generic() {
         let cmd = parse_args(args(&["xtask", "evidence", "--help"])).unwrap();
         assert!(matches!(cmd, Command::Help { verb: Some(v) } if v == "evidence"));
+    }
+
+    #[test]
+    fn parses_gate_audit_verb() {
+        let cmd = parse_args(args(&["xtask", "gate-audit"])).unwrap();
+        assert!(matches!(cmd, Command::GateAudit { dry_run: false }));
+        let cmd = parse_args(args(&["xtask", "gate-audit", "--dry-run"])).unwrap();
+        assert!(matches!(cmd, Command::GateAudit { dry_run: true }));
+    }
+
+    #[test]
+    fn parses_dist_audit_verb() {
+        let cmd = parse_args(args(&["xtask", "dist-audit"])).unwrap();
+        assert!(matches!(cmd, Command::DistAudit { full: false, .. }));
+        let cmd = parse_args(args(&["xtask", "dist-audit", "--mode", "full"])).unwrap();
+        assert!(matches!(cmd, Command::DistAudit { full: true, .. }));
+        let cmd = parse_args(args(&["xtask", "dist-audit", "--mode", "fast"])).unwrap();
+        assert!(matches!(cmd, Command::DistAudit { full: false, .. }));
+    }
+
+    #[test]
+    fn dist_audit_rejects_unknown_mode() {
+        let err = parse_args(args(&["xtask", "dist-audit", "--mode", "bogus"])).unwrap_err();
+        assert!(err.contains("bogus"), "unexpected error: {err}");
     }
 }

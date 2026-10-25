@@ -267,6 +267,8 @@ impl MigrationRunner {
             "namespaces",
             "projections",
             "feedback_events",
+            "projects",
+            "project_roots",
             "meta",
         ] {
             db.keyspace(name, KeyspaceCreateOptions::default)

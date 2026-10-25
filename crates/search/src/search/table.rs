@@ -75,6 +75,12 @@ pub fn search_schema(dim: u32) -> SchemaRef {
         // it enables pre-filtering at the source (RV-13), and tables
         // predating it rebuild from canonical like chunker_version did.
         Field::new("confidence", DataType::Float64, false),
+        // Stable project identity (Wave A3b): UUID string of the canonical
+        // `Memory::project_id`, nullable (None is legacy/global). Appended
+        // last so all pre-wave column positions stay stable; tables
+        // predating it are refused at open with a rebuild directive (the
+        // projection is derived state, rebuilt from canonical).
+        Field::new("project_id", DataType::Utf8, true),
     ]))
 }
 
@@ -542,6 +548,24 @@ fn require_chunker_version(schema: &SchemaRef) -> DomainResult<()> {
             "search table has an incompatible confidence column; rebuild the projection",
         ));
     }
+    let project_id = schema.field_with_name("project_id").map_err(|_| {
+        DomainError::new(
+            DomainErrorCode::Validation,
+            "search table predates stable project identity; rebuild the projection",
+        )
+    })?;
+    let at_slot = schema.index_of("project_id").map_err(|_| {
+        DomainError::new(
+            DomainErrorCode::Validation,
+            "search table predates stable project identity; rebuild the projection",
+        )
+    })?;
+    if at_slot != 15 || project_id.data_type() != &DataType::Utf8 || !project_id.is_nullable() {
+        return Err(DomainError::new(
+            DomainErrorCode::Validation,
+            "search table has an incompatible project_id column; rebuild the projection",
+        ));
+    }
     Ok(())
 }
 
@@ -637,6 +661,11 @@ fn row_batch(
             Arc::new(lancedb::arrow::arrow_array::Float64Array::from_iter_values(
                 rows.iter().map(|r| r.confidence),
             )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.project_id.clone())
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )
     .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))
@@ -681,6 +710,7 @@ fn batches_to_rows(
         let c_embedding = col(0, "embedding")?;
         let c_chunker_version = col(0, "chunker_version")?;
         let c_confidence = col(0, "confidence")?;
+        let c_project_id = col(0, "project_id")?;
         for i in 0..batch.num_rows() {
             let s = |idx: usize, name: &'static str| -> DomainResult<String> {
                 Ok(batch
@@ -735,6 +765,17 @@ fn batches_to_rows(
             } else {
                 Some(s(c_project, "project")?)
             };
+            let project_id = if batch
+                .column(c_project_id)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| corrupt(i, "project_id"))?
+                .is_null(i)
+            {
+                None
+            } else {
+                Some(s(c_project_id, "project_id")?)
+            };
             out.push(SearchRow {
                 store_generation: StoreGeneration::new(u64c(
                     c_store_generation,
@@ -761,6 +802,7 @@ fn batches_to_rows(
                 char_start: u64c(c_char_start, "char_start")?,
                 char_end: u64c(c_char_end, "char_end")?,
                 project,
+                project_id,
                 fragment_type: s(c_fragment_type, "fragment_type")?,
                 created_at_millis: u64c(c_created_at, "created_at_millis")?,
                 updated_at_millis: u64c(c_updated_at, "updated_at_millis")?,
@@ -802,6 +844,7 @@ mod tests {
             char_start: 0,
             char_end: text.len() as u64,
             project: Some("ltmrs".into()),
+            project_id: None,
             fragment_type: "fact".into(),
             created_at_millis: 1000,
             confidence: 0.5,
@@ -937,9 +980,42 @@ mod tests {
     #[test]
     fn schema_appends_chunker_version_last() {
         let schema = search_schema(EMBEDDING_DIM);
-        assert_eq!(schema.fields().len(), 15);
+        assert_eq!(schema.fields().len(), 16);
         assert_eq!(schema.fields()[13].name(), "chunker_version");
         assert_eq!(schema.fields()[14].name(), "confidence");
+        assert_eq!(schema.fields()[15].name(), "project_id");
+        assert!(schema.fields()[15].is_nullable());
+    }
+
+    /// Opening a table that predates stable project identity (has
+    /// confidence, lacks project_id) fails with the project_id rebuild
+    /// directive.
+    #[tokio::test]
+    async fn open_rejects_table_without_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let full = search_schema(EMBEDDING_DIM);
+        let slot = full.index_of("project_id").unwrap();
+        let old = Arc::new(lancedb::arrow::arrow_schema::Schema::new(
+            full.fields()[..slot].to_vec(),
+        ));
+        let db = lancedb::connect(&uri).execute().await.unwrap();
+        db.create_empty_table(SEARCH_TABLE, old)
+            .mode(lancedb::database::CreateTableMode::exist_ok(|req| req))
+            .execute()
+            .await
+            .unwrap();
+        drop(db);
+
+        let err = match SearchTable::open(&uri).await {
+            Ok(_) => panic!("opening a pre-project-id table must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("stable project identity"),
+            "must name the missing project identity, got: {}",
+            err.message
+        );
     }
 
     /// Same-revision policy migration converges: republishing a revision
@@ -1397,6 +1473,7 @@ mod tests {
                 lancedb::arrow::arrow_array::new_null_array(&embedding_type, 1),
                 Arc::new(StringArray::from(vec!["v1"])),
                 Arc::new(Float64Array::from(vec![0.5])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
             ],
         )
         .unwrap();
@@ -1416,8 +1493,9 @@ mod tests {
         use std::sync::Arc;
         let dim = 2;
         let full = search_schema(dim);
-        // All columns except the trailing confidence one.
-        let fields: Vec<_> = full.fields()[..full.fields().len() - 1].to_vec();
+        // All columns except the two trailing appended ones (confidence,
+        // project_id): a table predating confidence lacks both.
+        let fields: Vec<_> = full.fields()[..full.fields().len() - 2].to_vec();
         let schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(fields));
         let embedding_type = lancedb::arrow::arrow_schema::DataType::FixedSizeList(
             Arc::new(lancedb::arrow::arrow_schema::Field::new(
@@ -1547,6 +1625,11 @@ mod tests {
                 lancedb::arrow::arrow_schema::DataType::Float64,
                 false,
             ),
+            lancedb::arrow::arrow_schema::Field::new(
+                "project_id",
+                lancedb::arrow::arrow_schema::DataType::Utf8,
+                true,
+            ),
         ];
         let schema = Arc::new(lancedb::arrow::arrow_schema::Schema::new(fields));
         let id = "12345678-1234-1234-1234-123456789012";
@@ -1578,6 +1661,7 @@ mod tests {
                 ),
                 Arc::new(StringArray::from(vec!["v1"])),
                 Arc::new(lancedb::arrow::arrow_array::Float64Array::from(vec![0.5])),
+                Arc::new(StringArray::from(vec![Some("pid-x")])),
             ],
         )
         .unwrap();
@@ -1587,5 +1671,6 @@ mod tests {
         assert_eq!(rows[0].fragment_type, "fact");
         assert_eq!(rows[0].store_generation.as_u64(), 7);
         assert_eq!(rows[0].created_at_millis, 100);
+        assert_eq!(rows[0].project_id.as_deref(), Some("pid-x"));
     }
 }

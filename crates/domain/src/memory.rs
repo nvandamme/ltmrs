@@ -123,6 +123,12 @@ pub struct Memory {
     pub description: String,
     pub fragment_type: FragmentType,
     pub project: Option<String>,
+    /// Stable project identity (Wave A3b, Part I 01:§6.3): the resolved
+    /// ULID bits. Dual-written with the frozen bare-string `project` above
+    /// (compat display/export); `None` is legacy/global. Serde default keeps
+    /// pre-wave rows loadable.
+    #[serde(default)]
+    pub project_id: Option<EntityId>,
     pub source: MemorySource,
     pub confidence: f64,
     pub quality_score: Option<f64>,
@@ -223,6 +229,59 @@ mod tests {
             }
             .is_recallable()
         );
+    }
+
+    /// Stable-id dual-write (Wave A3b): a memory carries the resolved
+    /// `project_id` (ULID bits) alongside the frozen bare-string `project`
+    /// for compat display/export; pre-wave rows decode as `None`.
+    #[test]
+    fn project_id_dual_writes_with_legacy_project() {
+        use crate::id::EntityId;
+        let pid = EntityId::new(uuid::Uuid::from_u128(0x0123));
+        let m = Memory {
+            id: EntityId::new(uuid::Uuid::from_u128(1)),
+            external_alias: None,
+            title: "t".into(),
+            fragment: "f".into(),
+            description: String::new(),
+            fragment_type: FragmentType::Fact,
+            project: Some("shop".into()),
+            project_id: Some(pid),
+            source: MemorySource::Ai,
+            confidence: 0.5,
+            quality_score: None,
+            lifecycle: MemoryLifecycle::Live,
+            tags: vec![],
+            associated_with: vec![],
+            relations: vec![],
+            parent_id: None,
+            child_ids: vec![],
+            session_id: None,
+            task_type: None,
+            related_guides: vec![],
+            evidence: vec![],
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: EntityRevision::new(1),
+            document_revision: DocumentRevision::new(1),
+            eligibility_revision: EligibilityRevision::new(1),
+            created_at: Instant::new(1000),
+            updated_at: Instant::new(1000),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(m.project_id, Some(pid));
+        assert_eq!(m.project.as_deref(), Some("shop"));
+        let mut v = serde_json::to_value(&m).unwrap();
+        v.as_object_mut().unwrap().remove("project_id");
+        let back: Memory = serde_json::from_value(v).unwrap();
+        assert_eq!(back.project_id, None, "old rows load as None");
+        assert_eq!(back.project.as_deref(), Some("shop"));
     }
 
     /// Provenance vocabulary: disjoint origins (user-typed, model-made,

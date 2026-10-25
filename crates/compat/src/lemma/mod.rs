@@ -5,6 +5,7 @@
 //! shaping, behavior adapters, and DB import from a Lemma store.
 
 pub mod intelligence;
+pub mod pagination;
 pub mod privacy;
 pub mod reference;
 pub mod schemas;

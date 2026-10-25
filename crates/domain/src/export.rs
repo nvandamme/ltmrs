@@ -140,6 +140,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Lesson,
             project: None,
+            project_id: None,
             source: MemorySource::Ai,
             confidence: 0.42,
             quality_score: None,

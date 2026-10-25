@@ -268,6 +268,179 @@ pub struct ConfirmRequest<'a> {
     pub live_op_seq: u64,
 }
 
+/// Import lease failure (mirrors `RestoreError` without the bearer token:
+/// the lease is bound to the previewing channel plus the source path).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ImportError {
+    #[error("no import preview for this channel and path (preview again for a fresh lease)")]
+    NeedsPreview,
+    #[error("import lease expired (preview again for a fresh lease)")]
+    Expired,
+    #[error("import lease already used (single-use; preview again)")]
+    AlreadyUsed,
+    #[error("backup file changed since preview (digest {actual} != {expected}); preview again")]
+    StaleSource { expected: String, actual: String },
+    #[error("store changed since preview (generation {actual} != {expected}); preview again")]
+    GenerationChanged { expected: u64, actual: u64 },
+    #[error("import blocked: {0}")]
+    Blocked(String),
+}
+
+/// Lease readiness for a legacy import preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportPreview {
+    /// Whether confirm may proceed.
+    pub ready: bool,
+    /// Human-readable readiness state.
+    pub message: String,
+    /// Loss items the staging carries (counted; the caller reports them).
+    pub unknown_top_level: usize,
+}
+
+/// Preview inputs for a legacy import lease (the staging already carries
+/// its loss report; the coordinator only binds identity and freshness).
+pub struct ImportPreviewRequest<'a> {
+    pub backup: &'a crate::backup::VerifiedBackup,
+    pub source_path: &'a Path,
+    pub channel: &'a str,
+    pub live_counts: &'a BTreeMap<String, u64>,
+    pub live_generation: u64,
+    pub active_channels: usize,
+    pub now_millis: u64,
+    /// Live mutation watermark at preview time (bound into the lease).
+    pub live_op_seq: u64,
+}
+
+/// Confirm inputs for a legacy import lease (no bearer token: the lease is
+/// keyed by the previewing channel plus the source path).
+pub struct ImportConfirmRequest<'a> {
+    pub channel: &'a str,
+    pub source_path: &'a Path,
+    pub digest: &'a str,
+    pub live_generation: u64,
+    pub active_channels: usize,
+    pub now_millis: u64,
+    /// Live mutation watermark at confirm time (compared to the preview's).
+    pub live_op_seq: u64,
+}
+
+/// Daemon-lifetime import leases (single-use, TTL-bound, keyed by channel
+/// plus source path). Same safety shape as `RestoreCoordinator` without a
+/// bearer token: the tool carries no token argument, so the channel+path
+/// binding is the lease identity.
+#[derive(Debug, Default)]
+pub struct ImportCoordinator {
+    pending: HashMap<(String, PathBuf), LeaseRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct LeaseRecord {
+    digest: String,
+    generation: u64,
+    created_at: u64,
+    used: bool,
+    live_op_seq: u64,
+}
+
+impl ImportCoordinator {
+    /// Preview a verified staging against the live store. More than one
+    /// cooperating connection blocks (same rule as restore: the replace
+    /// drains acknowledged writes).
+    pub fn preview(&mut self, req: ImportPreviewRequest<'_>) -> ImportPreview {
+        self.evict_expired(req.now_millis);
+        let key = (req.channel.to_string(), req.source_path.to_path_buf());
+        if req.active_channels > 1 {
+            return ImportPreview {
+                ready: false,
+                message: format!(
+                    "{} other connections are open; close them and preview again (import replaces, never merges)",
+                    req.active_channels - 1
+                ),
+                unknown_top_level: req.backup.unknown_top_level,
+            };
+        }
+        let live_total: u64 = req.live_counts.values().sum();
+        let backup_total: u64 = req.backup.counts.values().sum();
+        self.pending.insert(
+            key,
+            LeaseRecord {
+                digest: req.backup.digest.clone(),
+                generation: req.live_generation,
+                created_at: req.now_millis,
+                used: false,
+                live_op_seq: req.live_op_seq,
+            },
+        );
+        ImportPreview {
+            ready: true,
+            message: format!(
+                "Import holds {backup_total} records (digest {}) vs live {live_total}; confirm replaces the live store (never merges).{}",
+                &req.backup.digest[..req.backup.digest.len().min(12)],
+                if req.backup.unknown_top_level == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " {} loss item(s) counted in staging (reported, not restored silently).",
+                        req.backup.unknown_top_level
+                    )
+                }
+            ),
+            unknown_top_level: req.backup.unknown_top_level,
+        }
+    }
+
+    /// Drop expired or consumed leases (idempotent housekeeping).
+    fn evict_expired(&mut self, now_millis: u64) {
+        self.pending.retain(|_, rec| {
+            !rec.used && now_millis <= rec.created_at + RESTORE_PREVIEW_TTL_MILLIS
+        });
+    }
+
+    /// Confirm a previewed import. Returns the bound digest plus the live
+    /// writes that landed between preview and confirm (acknowledged by the
+    /// caller, recoverable from the safety backup). Lease failures do NOT
+    /// consume the lease except stale/expired ones — except `AlreadyUsed`.
+    pub fn confirm(&mut self, req: ImportConfirmRequest<'_>) -> Result<(String, u64), ImportError> {
+        let key = (req.channel.to_string(), req.source_path.to_path_buf());
+        let rec = self
+            .pending
+            .get(&key)
+            .cloned()
+            .ok_or(ImportError::NeedsPreview)?;
+        if req.now_millis > rec.created_at + RESTORE_PREVIEW_TTL_MILLIS {
+            self.pending.remove(&key);
+            return Err(ImportError::Expired);
+        }
+        if rec.used {
+            return Err(ImportError::AlreadyUsed);
+        }
+        if req.digest != rec.digest {
+            self.pending.remove(&key);
+            return Err(ImportError::StaleSource {
+                expected: rec.digest,
+                actual: req.digest.to_string(),
+            });
+        }
+        if req.live_generation != rec.generation {
+            self.pending.remove(&key);
+            return Err(ImportError::GenerationChanged {
+                expected: rec.generation,
+                actual: req.live_generation,
+            });
+        }
+        if req.active_channels > 1 {
+            return Err(ImportError::Blocked(format!(
+                "{} other connections are open; close them and confirm again (the lease stays valid)",
+                req.active_channels - 1
+            )));
+        }
+        if let Some(stored) = self.pending.get_mut(&key) {
+            stored.used = true;
+        }
+        Ok((rec.digest, req.live_op_seq.saturating_sub(rec.live_op_seq)))
+    }
+}
+
 /// Atomically replace the store's domain records with the backup snapshot:
 /// dangling relations are quarantined (listed, skipped); the store flips in
 /// ONE durable transaction covering data, canonical sessions, both
@@ -351,10 +524,13 @@ pub fn restore_verified_guarded(
     restored.insert("relations".to_string(), count(kept.len()));
     restored.insert("guides".to_string(), count(backup.snapshot.guides.len()));
     // Replace semantics write exactly these six categories. Sessions
-    // restore from the backup (continuity/analytics knowledge); projects,
-    // archives and history have no storage keyspace. Reporting intake
-    // counts for the latter would claim restores that never happened, so
-    // these report 0 with the reason documented, not the snapshot lengths.
+    // restore from the backup (continuity/analytics knowledge); the
+    // project registry drains as machine-local operational state (like
+    // retry namespaces — absolute checkout roots don't port, and
+    // checkouts re-register on first write), and archives and history
+    // have no storage keyspace. Reporting intake counts for the latter
+    // would claim restores that never happened, so these report 0 with
+    // the reason documented, not the snapshot lengths.
     restored.insert(
         "sessions".to_string(),
         count(backup.snapshot.sessions.len()),
@@ -411,6 +587,7 @@ mod tests {
             description: String::new(),
             fragment_type: FragmentType::Fact,
             project: None,
+            project_id: None,
             source: MemorySource::Ai,
             confidence: 1.0,
             quality_score: None,
@@ -1468,7 +1645,7 @@ mod tests {
                 None,
                 &[],
                 &["learn it".to_string()],
-                &[],
+                None,
                 Some(true),
                 1000,
             )
@@ -1559,7 +1736,7 @@ mod tests {
                 None,
                 &[],
                 &["learn it".to_string()],
-                &[],
+                None,
                 Some(true),
                 1000,
             )
@@ -1638,5 +1815,221 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Import preview issues a channel+path lease; a first confirm consumes
+    /// it and the second is reuse.
+    #[test]
+    fn import_preview_then_confirm_single_use() {
+        use crate::backup::VerifiedBackup;
+        let backup = VerifiedBackup {
+            digest: "abc".to_string(),
+            store_generation: 0,
+            counts: BTreeMap::from([("memories".to_string(), 2)]),
+            snapshot: CanonicalExport::default(),
+            unknown_top_level: 1,
+        };
+        let live = BTreeMap::from([("memories".to_string(), 1)]);
+        let mut coord = ImportCoordinator::default();
+        let ready = coord.preview(ImportPreviewRequest {
+            backup: &backup,
+            source_path: Path::new("/tmp/x.lemma-backup"),
+            channel: "ch-1",
+            live_counts: &live,
+            live_generation: 1,
+            active_channels: 1,
+            now_millis: 1000,
+            live_op_seq: 0,
+        });
+        assert!(ready.ready);
+        assert_eq!(ready.unknown_top_level, 1);
+        let ok = coord
+            .confirm(ImportConfirmRequest {
+                channel: "ch-1",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "abc",
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            })
+            .unwrap();
+        assert_eq!(ok, ("abc".to_string(), 0));
+        assert_eq!(
+            coord.confirm(ImportConfirmRequest {
+                channel: "ch-1",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "abc",
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
+            Err(ImportError::AlreadyUsed)
+        );
+    }
+
+    /// Confirming without a preview (or on another channel) has no lease.
+    #[test]
+    fn import_confirm_without_preview_is_invalid() {
+        let mut coord = ImportCoordinator::default();
+        assert_eq!(
+            coord.confirm(ImportConfirmRequest {
+                channel: "ch-9",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "abc",
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
+            Err(ImportError::NeedsPreview)
+        );
+    }
+
+    /// Changed file, moved generation or dead TTL all invalidate the lease.
+    #[test]
+    fn import_confirm_rejects_stale_source_generation_and_expiry() {
+        use crate::backup::VerifiedBackup;
+        let backup = VerifiedBackup {
+            digest: "abc".to_string(),
+            store_generation: 0,
+            counts: BTreeMap::new(),
+            snapshot: CanonicalExport::default(),
+            unknown_top_level: 0,
+        };
+        let mut coord = ImportCoordinator::default();
+        let preview = |coord: &mut ImportCoordinator| {
+            coord.preview(ImportPreviewRequest {
+                backup: &backup,
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                channel: "ch-1",
+                live_counts: &BTreeMap::new(),
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            })
+        };
+        preview(&mut coord);
+        assert_eq!(
+            coord.confirm(ImportConfirmRequest {
+                channel: "ch-1",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "CHANGED",
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
+            Err(ImportError::StaleSource {
+                expected: "abc".to_string(),
+                actual: "CHANGED".to_string(),
+            })
+        );
+        // A stale source drops the lease outright.
+        assert_eq!(
+            coord.confirm(ImportConfirmRequest {
+                channel: "ch-1",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "abc",
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
+            Err(ImportError::NeedsPreview)
+        );
+        preview(&mut coord);
+        assert_eq!(
+            coord.confirm(ImportConfirmRequest {
+                channel: "ch-1",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "abc",
+                live_generation: 2,
+                active_channels: 1,
+                now_millis: 1000,
+                live_op_seq: 0,
+            }),
+            Err(ImportError::GenerationChanged {
+                expected: 1,
+                actual: 2,
+            })
+        );
+        preview(&mut coord);
+        assert_eq!(
+            coord.confirm(ImportConfirmRequest {
+                channel: "ch-1",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "abc",
+                live_generation: 1,
+                active_channels: 1,
+                now_millis: 1000 + RESTORE_PREVIEW_TTL_MILLIS + 1,
+                live_op_seq: 0,
+            }),
+            Err(ImportError::Expired)
+        );
+    }
+
+    /// A connection that arrived after the preview blocks the confirm but
+    /// keeps the lease for a retry after closing the other connection.
+    #[test]
+    fn import_confirm_rechecks_lease_when_busy() {
+        use crate::backup::VerifiedBackup;
+        let backup = VerifiedBackup {
+            digest: "abc".to_string(),
+            store_generation: 0,
+            counts: BTreeMap::new(),
+            snapshot: CanonicalExport::default(),
+            unknown_top_level: 0,
+        };
+        let mut coord = ImportCoordinator::default();
+        let ready = coord.preview(ImportPreviewRequest {
+            backup: &backup,
+            source_path: Path::new("/tmp/x.lemma-backup"),
+            channel: "ch-1",
+            live_counts: &BTreeMap::new(),
+            live_generation: 1,
+            active_channels: 3,
+            now_millis: 1000,
+            live_op_seq: 0,
+        });
+        assert!(!ready.ready);
+        let ready = coord.preview(ImportPreviewRequest {
+            backup: &backup,
+            source_path: Path::new("/tmp/x.lemma-backup"),
+            channel: "ch-1",
+            live_counts: &BTreeMap::new(),
+            live_generation: 1,
+            active_channels: 1,
+            now_millis: 1000,
+            live_op_seq: 0,
+        });
+        assert!(ready.ready);
+        let err = coord
+            .confirm(ImportConfirmRequest {
+                channel: "ch-1",
+                source_path: Path::new("/tmp/x.lemma-backup"),
+                digest: "abc",
+                live_generation: 1,
+                active_channels: 3,
+                now_millis: 1000,
+                live_op_seq: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ImportError::Blocked(_)), "got: {err:?}");
+        assert!(
+            coord
+                .confirm(ImportConfirmRequest {
+                    channel: "ch-1",
+                    source_path: Path::new("/tmp/x.lemma-backup"),
+                    digest: "abc",
+                    live_generation: 1,
+                    active_channels: 1,
+                    now_millis: 1000,
+                    live_op_seq: 0,
+                })
+                .is_ok()
+        );
     }
 }

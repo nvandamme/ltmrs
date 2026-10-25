@@ -25,6 +25,10 @@ pub struct SearchRow {
     pub char_start: u64,
     pub char_end: u64,
     pub project: Option<String>,
+    /// Stable project identity (Wave A3b): UUID string of the canonical
+    /// `Memory::project_id`. Nullable; `None` is legacy/global. Appended
+    /// after `project` so pre-wave column positions stay stable.
+    pub project_id: Option<String>,
     pub fragment_type: String,
     pub created_at_millis: u64,
     pub updated_at_millis: u64,
@@ -45,6 +49,37 @@ mod tests {
         EntityId::new(Uuid::from_u128(n as u128))
     }
 
+    /// Stable-id projection (Wave A3b): the row carries the nullable
+    /// `project_id` (UUID string of the canonical [`EntityId`]); legacy
+    /// rows carry `None`.
+    #[test]
+    fn row_carries_nullable_project_id() {
+        let mut row = SearchRow {
+            store_generation: StoreGeneration::new(7),
+            memory_id: eid(42),
+            document_revision: DocumentRevision::new(3),
+            model_fingerprint: ModelFingerprint::new(99),
+            chunk_id: ChunkId::new(1),
+            chunker_version: "e5-chunks-v1".to_string(),
+            lexical_text: "hello world".into(),
+            char_start: 0,
+            char_end: 11,
+            project: Some("ltmrs".into()),
+            project_id: Some(eid(7).as_uuid().to_string()),
+            fragment_type: "fact".into(),
+            created_at_millis: 1000,
+            confidence: 0.5,
+            updated_at_millis: 2000,
+            embedding: None,
+        };
+        assert_eq!(
+            row.project_id.as_deref(),
+            Some(eid(7).as_uuid().to_string()).as_deref()
+        );
+        row.project_id = None;
+        assert!(row.project_id.is_none());
+    }
+
     #[test]
     fn row_carries_chunker_version() {
         let row = SearchRow {
@@ -58,6 +93,7 @@ mod tests {
             char_start: 0,
             char_end: 11,
             project: Some("ltmrs".into()),
+            project_id: None,
             fragment_type: "fact".into(),
             created_at_millis: 1000,
             confidence: 0.5,
@@ -81,6 +117,7 @@ mod tests {
             char_start: 0,
             char_end: 11,
             project: Some("ltmrs".into()),
+            project_id: None,
             fragment_type: "fact".into(),
             created_at_millis: 1000,
             confidence: 0.5,
@@ -112,6 +149,7 @@ mod tests {
             char_start: 0,
             char_end: 4,
             project: None,
+            project_id: None,
             fragment_type: "fact".into(),
             created_at_millis: 0,
             confidence: 0.5,

@@ -113,6 +113,15 @@ pub enum DomainRequest {
     ToolCall {
         tool: ToolArgs,
     },
+    /// Explicit legacy-bucket adoption (Wave A3c `project adopt`). Internal
+    /// IPC only: the CLI resolves the bound identity and the daemon executes
+    /// it on its own store handle, so concurrent writers never dual-open the
+    /// store. Never on the MCP wire (frozen tool args/schemas untouched).
+    AdoptLegacySlug {
+        project_id: String,
+        canonical_root: Option<String>,
+        slug: String,
+    },
 }
 
 impl DomainRequest {
@@ -169,13 +178,14 @@ impl DomainRequest {
                 final_approach: final_approach.clone(),
                 lessons: lessons.clone(),
             }),
-            // Reads and session bookkeeping are handled by the dispatcher, not
-            // the canonical command gateway.
+            // Reads, session bookkeeping and the adopt request are handled by
+            // the dispatcher, not the canonical command gateway.
             DomainRequest::SessionAttempt { .. }
             | DomainRequest::GetMemories { .. }
             | DomainRequest::ListMemories
             | DomainRequest::Neighbors { .. }
-            | DomainRequest::ToolCall { .. } => None,
+            | DomainRequest::ToolCall { .. }
+            | DomainRequest::AdoptLegacySlug { .. } => None,
         }
     }
 }
@@ -192,6 +202,14 @@ pub enum DomainPayload {
         text: String,
         structured: Option<Value>,
         is_error: bool,
+    },
+    /// Adoption report for `AdoptLegacySlug` (internal IPC only).
+    Adopted {
+        attached: usize,
+        already_attached: bool,
+        created: bool,
+        warning: Option<String>,
+        record_name: String,
     },
     None,
 }
@@ -243,6 +261,26 @@ impl IpcResponse {
     }
 }
 
+/// Project identity carried with every request (Wave A3b, Part I 01:§6.3).
+/// All fields are optional with serde defaults so pre-wave envelopes keep
+/// parsing: the frozen MCP wire never carries these (internal IPC only).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnvelopeIdentity {
+    /// Winning stable id (env / bind file / flag): `prj_<name>_<ulid>`.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Frontend-canonicalized checkout root (realpath, case preserved).
+    #[serde(default)]
+    pub canonical_root: Option<String>,
+    /// Wire legacy project (already normalized at the parse boundary).
+    #[serde(default)]
+    pub legacy_project: Option<String>,
+    /// True when the raw tool args carried a `project` key (even "global"):
+    /// without it the daemon falls back to the cwd clue.
+    #[serde(default)]
+    pub legacy_explicit: bool,
+}
+
 /// The IPC envelope: the full header + typed body of one request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcEnvelope {
@@ -256,6 +294,9 @@ pub struct IpcEnvelope {
     pub deadline_millis: Option<u64>,
     pub scope: Scope,
     pub body: DomainRequest,
+    /// Project identity for resolution (defaults to unattributed).
+    #[serde(default)]
+    pub identity: EnvelopeIdentity,
 }
 
 impl IpcEnvelope {
@@ -515,6 +556,7 @@ mod tests {
             retry_epoch: 1,
             deadline_millis: None,
             scope: Scope::default(),
+            identity: EnvelopeIdentity::default(),
             body: DomainRequest::GetMemories {
                 ids: vec![EntityId::new(Uuid::from_u128(4))],
             },

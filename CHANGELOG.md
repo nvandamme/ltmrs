@@ -5,7 +5,282 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-08 — Build speed: profiles, auto-detected fast linker, hygiene rules
+
+## COLLAPSED (2026-10-26) — External review remediation, waves A–C
+
+Collapses the 19-commit arc `2f7d961..8ca4618` (all local-only, unpushed) into one
+reviewed unit: Wave A correctness fixes (atomicity, secrets, pagination, project
+identity, adopt), Wave B compatibility surface (prefetch, provenance, conflict
+advisory + refusal, MCP resources, graph bounds, TF-IDF reference profile, legacy
+import, score truthfulness), and Wave C qualification evidence (import conformance,
+audit checks, gate + release bundle, test pins). Each entry below keeps its reviewed
+body verbatim (per-commit headings demoted to subsections; original SHAs recoverable
+from branch `backup/pre-collapse-waves-abc` and the reflog). No product-plan, wire,
+receipt or durability semantic change beyond what each entry records; the committed
+tree is byte-identical to gated HEAD `8ca4618` except this file.
+
+### Wave C0: deferred test hardening (order-pinning, query-summary, virtual assert)
+- `expand` / `expand_ranked`: traversal-order pins (EntityId order under scrambled adjacency + fanout cap; rank-desc selection with id tiebreak). Pass on current code (coverage gaps, not bugs).
+- `memory_read` query summary: post-boost values asserted (mirrors batch detail test); virtual session routing carries the read ids.
+- Gate: daemon lib 286/286, search lib 188/188 (+4 ignored); fmt + workspace clippy clean.
+
+`.
+
+---
+
+### Wave C3: T-GATE-01 executable check + T-RELEASE-01 bundle
+- NEW `cargo xtask gate-audit` verb (9 consistency checks over traceability/conformance ledgers; passed rows need verifiable artifacts, gapless partials fail, dangling T-IDs fail; T-IDs must resolve to runnable verbs/tests). 19 fixture tests incl. RED-first + UTF-8 scanner fix.
+- T-RELEASE-01 executed: release bundle at reports/release-3c536b48500c-full-Ct5MSH (~1024s wall; full suite 1008 passed / 0 failed / 7 ignored over 15 crates); 12-item checklist walked (7 pass / 5 fail unwaived / 0 waived); 15-claim scope audit (9 evidenced, 1 as-worded, 5 exclusions).
+- Fix round (reviewer): T-ID runnability + grandfather warnings + cited runs; deferred items named in one committed place.
+- Ledger: RQ-27 + RQ-28 → executed_partial (gate green + 5 named unwaived failures); 6 Part III boxes checked (proven items only).
+- Gate: xtask 98/98; gate-audit GREEN on real tree; release bundle 1008 passed / 0 failed / 7 ignored (15 suites); fmt + clippy clean; review SPEC ❌ → fix round → scoped re-review ADDRESSED×6.
+
+`.
+
+---
+
+### Wave C2: T-BUILD-01/T-SEC-04 runnable checks + RQ-21
+- NEW `cargo xtask dist-audit` verb (fast/full): deny-graph over the full host tree (component/prefix rule, winapi-util safe), rusqlite exclusion proof, reqwest provision-only sites, lance-remote zero-usage API scan, loader pin, skills egress, manifest-backed model-dir check. Full mode: locked release build + offline build (local cache, fresh-machine install explicitly unproven). Fast 0.5s; full ~6min.
+- T-SEC-04 tests: explanations carry no unredacted secret (needle live, items locked); digest tampering incl. netns cut; forbidden formats fail at the right stage; provision-then-run-local.
+- Fix round (reviewer): vacuous model-dir literal → real manifest parse; deny/token/offline wording fixed; remote-API scan added.
+- Ledger: RQ-21 specified_not_executed → executed_partial (gaps named: log-site pin; serving-E2E-under-cut; GPU/Windows deferred). Controller fixed model-dir PASS wording to presence-only + re-ran gate.
+- Gate: xtask 66/66, embeddings 28/28, daemon 284/284, compat 46/46; verb fast green on real tree; fmt + clippy clean; review SPEC ❌ → fix round → scoped re-review ADDRESSED×4.
+
+`.
+
+---
+
+### Wave C1: T-IMPORT-01/02 conformance fixtures + RQ-26
+- Coverage mapping dimension→test for all 12 T-IMPORT-01/02 dimensions: null quality (NULL→None vs 0.7), evidence blobs (symbol/snippet/hash), archives+fragment_history content, guide deps (depends_on/enables asserted), faithful 1:1 reverse edges, suggestions (accepted+resolved_at), schema-v1 tolerant path, live-WAL coherent import without source mutation (writer open, -wal present, un-checkpointed frames, coherent cut verified, triple-hash identity), offline copy (db-bytes assert), malformed/unsupported rejection, envelope byte-identical post-import.
+- Deferred-with-reason: raw WAL image unsupported (no faithful artifact can exist — upstream normalizes its private copy; refused by design with an actionable error); v2–v7 interpolation noted (tolerant path version-generic; extremes pinned).
+- Fix round: serialize feature removed from leaf [dependencies] (dev-deps only); RQ-26 v2–v7 rationale sentence.
+- Ledger: RQ-26 specified_not_executed → executed_passed (all green; sole deferral refused-by-design).
+- Gate: leaf crate 7+10 tests; daemon lib 283/283; fmt + clippy clean (both workspaces); review SPEC ✅ (2 minor paperwork); fix round → scoped re-review ADDRESSED×4.
+
+`.
+
+---
+
+### Wave B5d: truthful scores + labels on memory_read recall (score_kind fix)
+- `recall_browse` now returns scored pairs; `exec_memory_read` serves per-path scores equal to the ranking criterion (engine max, hit-count, confidence; explicit ID stays scoreless). Sort comparators byte-identical (scores served, never re-sorted on).
+- Method split by actual serving path: `engine_rrf` / `substring_relevance` / `confidence_browse`; kinds truthful (`engine_relevance_higher_is_better`, `hit_count_higher_is_better`); `hybrid_rrf_mmr` reason fixed to dense+lexical fusion. Old `fts5_bm25` memory_read assert updated (ours, documented).
+- No ranking-algorithm changes; orderings verified identical path by path.
+- Ledger: RQ-15 evidence appended (surgical edits). No DEV entry (native labels, not an upstream deviation).
+- Gate: daemon lib 283/283, search lib 186/186 (+4 ignored), compat lib 46/46; fmt + workspace clippy clean; review SPEC ✅, no Critical/Important (M1 dead semantic branch noted for follow-up; M2/M3 noted).
+
+`.
+
+---
+
+### Wave B5c: legacy Lemma import via runtime cdylib (#12)
+- NEW excluded crate `crates/lemma-import` (own workspace/lockfile, never a workspace member): envelope magic/SHA/base64 checks, read-only temp copy, CanonicalExport-shaped staging JSON with loss accounting (dangling relations quarantined-enumerated, every skip named and counted). C ABI with catch_unwind + safety docs; rusqlite =0.37.0 bundled (exact pin).
+- Daemon loads it at runtime via direct libc dlopen (zero new deps): env override → build dirs; missing lib → actionable error. Native tool `backup_import_lemma` (preview with loss + unrestored rows, confirm with lease/stale/generation/single-use, fenced execute, safety backup, generation bump, full restore parity). Frozen 26 untouched.
+- Fix round (reviewer-found genuine bug): link-table source rows silently dropped (opt_text on INTEGER guide_id) → get_i64 + fixture source row; M3 fence comment corrected.
+- Ledger: WP-11 corrected (import implemented, export marked out-of-scope per the task's own `or` clause + import-only owner order); DEV-010 rewritten + owner-approved (import ordered; content-verified post-commit). RQ-21 evidence extended; AGENTS.md rule 5 updated.
+- Gate: daemon lib 278/278, interchange lib 31/31, compat lib 46/46, frontend lib 128/128, leaf crate 8/8; fmt + clippy both workspaces clean; review SPEC ✅ → fix round → scoped re-review ADDRESSED×3.
+
+`.
+
+---
+
+### Wave B5b: Lemma-faithful TF-IDF profile + explain honesty (#7)
+- NEW `retrieval::tfidf`: corpus-wide TF-IDF cosine + explicit 0.15 threshold ported verbatim from upstream `semantic.ts` (lowercase tokenizer, len>2, stoplist, augmented TF, smoothed IDF — smoothing is faithfulness: pure ln(N/df) zeroes single-doc corpora). Wired as the `hybrid: false` path (engine + fallback skipped); default hybrid unchanged.
+- `semantic_search` `explain:true` supplements the native `explanation` with the upstream-shaped `recall_explanation` (same constructor as memory_read) on all legs; native object untouched.
+- Controller fixed 2 reviewer minors directly (wording + fixture retarget; zero behavior change, suites re-run green).
+- Ledger: DEV-011/DEV-012 corrected (approvals untouched); RQ-15 extended. No Part I change.
+- Gate: daemon lib 267/267, search lib 186/186 (+4 ignored), compat lib 45/45; fmt clean; workspace clippy -D warnings clean; review SPEC ✅, no Critical/Important.
+
+`.
+
+---
+
+### Wave B5a: bounded tool-level graph expansion (#11)
+- `expand_graph` rewritten on the shared engine BFS core (`expand_ranked`): fanout 5, total-node budget with truncation flag, confidence-ordered selection, `tool_score = confidence × 0.6^depth` (upstream reference formula). One indexed relation snapshot replaces the per-node full scan.
+- `graph_truncated` additive top-level key when expand_graph requested (non-expand path byte-identical); text suffix only on truncated path.
+- Tests: hub stress (bounded + deterministic), cross-project exclusion under stable id (gate proven load-bearing), depth-penalty concrete scores, ineligible exclusion.
+- Ledger: RQ-12 evidence appended (surgical edits). No Part I change.
+- Gate: daemon lib 263/263, search lib 180/180 (+4 ignored); fmt + workspace clippy clean; review SPEC ✅, no Critical/Important.
+- Deferred: order-pinning test for shared core; tool-level budget e2e; fanout over-signal; per-candidate re-resolution.
+
+`.
+
+---
+
+### Wave B3b: conflicting adds refused with advice (no silent path)
+- Conflicting `memory_add` refused pre-commit with Validation (no memory, no receipt, no relations, no boosts). The error names conflicting ids/titles with resolution advice (update-then-add, relate-once-both-exist). No override flag.
+- Detection-error path unchanged (commits with visible notice); non-conflicting adds byte-identical; no confidence changes; no auto-created relations.
+- Fix round (reviewer-found Critical): merge inputs + relate endpoints gated with `stable_visible` (foreign → not found); I1 stats scoped by id to match recall; I2 wire-name mismatch → Validation; bare bind errors.
+- Ledger: DEV-015 rewritten (refusal, no decay, heuristic deferred; owner-approved 2026-10-26, content-verified post-commit). RQ-12 evidence extended. No Part I change.
+- Gate: daemon lib 259/259 (incl. refusal + update-old-then-add tests), compat lib 45/45; fmt + clippy clean; review SPEC ✅, no Critical/Important (2 accepted minors).
+
+`.
+
+---
+
+### Wave B4: MCP resources + unknown-tool errors (#14)
+- `resources/list` advertises exactly `lemma://system-prompt` (static, no per-item enumeration); `resources/read` serves the static base template, memory records by legacy id, and guides case-insensitively (unknown → resource_not_found; unknown URIs → unknown-resource error).
+- Memory/guide reads reuse the tool-call path (same admission, scope, visibility as the equivalent tool call): foreign stable rows refused as not found; unknown tools return an isError tool result with human text instead of JSON-RPC invalid_params (route_tool still rejects — T-MCP-03 pin intact).
+- Capabilities: `enable_resources()` (list_changed correctly absent — the static list never changes). No frozen tool/schema changes.
+- Direct controller implementation (2 cancelled dispatches verified clean both times): TDD with compile-fail + runtime REDs (alias registration, template text, guide case, scope setup); formal + functional review in place of a separate task reviewer.
+- Ledger: RQ-15 evidence appended (surgical edit, JSON valid).
+- Gate: frontend lib 127/127; fmt + workspace clippy clean.
+
+`.
+
+---
+
+### Wave B3-perf: cache conflict signatures (kill per-add recomputation)
+- NEW `SignatureCache` (compat): per-memory (signature + negation) keyed on `(EntityId, EntityRevision)`; validated invalidation (all fragment mutations bump entity_revision; updated_at rejected as unsound key since nothing writes it). Daemon holds the cache behind a poisoning-recovering Mutex; add path extracts exactly one signature per add; forget prunes; merge-archive prunes; whole-store restore clears (verbatim row swap can reuse an (id, rev)).
+- No behavior change: parity test cached-vs-uncached incl. updated + archived memories.
+- Measured: n=500 tool-path seed 16.71s → 14.05s (−16%); suite 21.77s → 20.79s; per-scan n=500: 212ms → 168ms warm. Remainder is Fjall tx + SyncAll + FTS/Lance fixed per-op cost (non-negotiable durability).
+- Gate: daemon lib 258/258, compat lib 45/45; fmt + clippy clean; review SPEC ✅, no Critical/Important (fix round for restore-swap staleness + merge-archive prune).
+- Deferred: WAL-without-sidecars staleness; Feb-30 date fold.
+
+`.
+
+---
+
+### Wave B3: conflict advisory on memory_add (#6) + auto-link scope gate
+- `memory_add` runs automatic conflict detection (target-anchored `scan_conflicts_for_target` sharing the exact predicate/thresholds with `scan_for_conflicts`, parity-pinned) and fills frozen `conflicts:[{id,title}]` + advisory text suggesting `memory_relate`/`contradicts`. Response shapes unchanged.
+- No confidence changes on either side (advisory-only reporting; no auto-created contradicts relations); candidates stable-visibility gated (cross-boundary pairs excluded); detection errors degrade visibly via `Note:` (never silent), without failing the add.
+- Fix round (reviewer-found Important): pre-existing `planned_link` auto-link was ungated — persisted cross-boundary RelatedTo edges + foreign titles. Gated with `stable_visible` (fail-loud pre-commit; overlaps list degrades to invisible with the failure surfaced by the advisory notice). Same-project auto-link preserved.
+- Ledger: DEV-015 (advisory-only conflict reporting, no confidence decay; proposed here, owner-approved 2026-10-26) + RQ-12 evidence extended. No Part I change.
+- Gate: daemon lib 255/255, compat lib 41/41; fmt + workspace clippy clean; review SPEC ✅ → fix round → scoped re-review ADDRESSED×3.
+
+`.
+
+---
+
+### Wave B2: read/provenance side effects (#3 + #9)
+- `memory_read` single/batch/query paths attribute read IDs into the channel session (fail-loud; virtual in-memory-only; no-session canonical no-op). Admission already covers the call via mutates_store (verified, no admit-structure change).
+- Co-read: `associatedWith` both directions + up to 3 `related_to` relations (confidence-sorted star) via `plan_coread` + `apply_coread_links`; every pair gated by stable visibility (no cross-boundary edges even under all=true).
+- Detail mode post-access on all paths (batch/query re-fetch; shapes/keys unchanged; explain keys stay pre-boost by construction).
+- `practice_guide_idempotent` patches the memory's `related_guides` in the same tx (reciprocal of validated_by; same-tx verified).
+- Differential workflow test adapted (fixture predates read tracking): exact equality minus the read line + positive asserts; fixture refresh from own behavior would be circular (reviewer-accepted).
+- Ledger: RQ-17 + RQ-16 evidence appended (surgical edits). No Part I change.
+- Gate: daemon lib 250/250, service lib 110/110; fmt clean; workspace clippy clean; review SPEC ✅, no Critical/Important (deferred: query-summary post-boost test, virtual-branch assertion, redundant inner gate comment — all closed in Wave C0).
+
+`.
+
+---
+
+### Wave B1: prefetch snapshot before initialize + push-vs-pull ledger
+- `serve_stdio` calls `prefetch_snapshot()` after attach, before serving: handshake-if-needed + fetch-ALWAYS (one `ListMemories`), errors swallowed → failed prefetch degrades to the lazy first-call path, never fails startup.
+- Fix round (reviewer-found Critical: managed-path no-op; Important: untested primary path): extracted `handshake_if_needed` (verbatim move; lazy path bit-identical) + managed-path test with real handshake.
+- No `get_info`/`tools()`/wire changes. Existing empty-store tests unchanged.
+- Ledger: DEV-014 (static schemas + response-side context instead of per-request injected descriptions; proposed here, owner-approved 2026-10-26).
+- Gate: frontend lib 119/119; fmt + workspace clippy clean; review SPEC ❌ → fix round → scoped re-review ADDRESSED×3.
+
+`.
+
+---
+
+### Wave A3c: adopt CLI + cross-name legacy buckets via daemon IPC
+- `ltmrs project adopt --slug <slug>`: attaches a legacy bucket to the bound identity (bind file/env required; unknown slug → Validation + known buckets; cross-id → warn + shared visibility, never refuse); idempotent re-attach; no row rewriting. Bare `adopt` errors with usage.
+- Fix round (reviewer-found Important): adopt opened the store directly (new dual-writer path) → routed through daemon IPC (internal `AdoptLegacySlug`, never canonical gateway; frozen wire untouched); status keeps read-only direct open.
+- Stable-recall assertion added (passed immediately — coverage gap, not bug).
+- Ledger: RQ-13 evidence extended; DEV-006 +1 sentence on adopt.
+- Gate: daemon lib 242/242, service 110/110, frontend 116/116, domain 55, search 177+4, compat 40, interchange 27, root bin 34+3; fmt + workspace clippy clean; review SPEC ✅ → fix round → scoped re-review ADDRESSED×2.
+
+`.
+
+---
+
+### Wave A3b: stable project identity (prj_<name>_<ulid>)
+- ID `prj_<name>_<ulid>`: name = explicit or cwd basename (sanitized,
+  max 32); ULID = 48-bit ms + 80-bit CSPRNG, local Crockford encoder, no
+  new deps; shape/uniqueness unit tests.
+- Binding: `<checkout>/.ltmrs/project.json` (0600) via `ltmrs project bind
+  (--here|--root, bare bind errors with guidance); `project status`;
+  `LTMRS_PROJECT_ID` env override. Daemon `projects`/`project_roots`
+  keyspaces: insert-if-absent, moved-root append + report, root-conflict
+  refusal. Daemon never uses its own cwd.
+- Resolution env > bind file > cwd clue > None; shadow matrix (a–d):
+  writes refuse with candidates + remediation, ambiguous reads refuse
+  without explicit id/all, proceed + warning with it.
+- `Memory/Session.project_id` dual-written with legacy string; recall
+  eligibility keyed on id via EffectiveScope in Lance pushdown + canonical
+  paths (no post-hoc truncation). `SearchRow`/table `project_id` column
+  with rebuild-gate + backfill. Bind attaches same-slug legacy bucket with
+  reported count; otherwise disjoint. No cross-name adopt (deferred).
+- Fix round (reviewer-found Critical): merge inputs + relate endpoints gated
+  with `stable_visible` (foreign → not found); I1 stats scoped by id to
+  match recall; I2 wire-name mismatch → Validation; bare bind errors.
+- Ledger: DEV-006 amended (approved by owner 2026-10-23); RQ-13 evidence
+  extended + T-SCOPE-02; no Part I change (cites 01:§6.3). DEV-013 approval
+  flipped to owner-approved per ruling.
+- Gate: daemon lib 236/236, domain 55, service 109, search 177+4, compat 40,
+  interchange 27, frontend 110, root bin 34+3; fmt + workspace clippy clean;
+  review SPEC ✅ → fix round → scoped re-review ADDRESSED×4, no breakage.
+  Deferred: unasserted stable-recall test half; adopt CLI; per-user ACLs.
+
+`.
+
+---
+
+### Wave A3a: honest pagination + overflow hardening
+- One pagination contract (`ltmrs-compat::lemma::pagination`): `MAX_PAGINATION_WINDOW = 1000`, `validate_window` (checked `offset + limit`, window cap, typed `Validation` errors), `page_flags` (truncated pool forces continuation), `paginate_vec` (page slice with independently known total). Both tools page through this choke point; wire shapes unchanged.
+- Engine (`ltmrs-search::retrieval::engine`): `RetrievalResult` gains `total` (eligible pool size) + `pool_truncated` (a leg hit its fetch cap; total is a lower bound) on ranked/list/direct/no-answer paths. Daemon requests full-window legs (`candidate_limit` 1000, `result_limit`/`mmr.max_items` = window end).
+- Overflow: `usize_field` (frontend `mcp.rs`) caps the parse boundary at the same window (`u64::MAX` offset/topK now `invalid_params`); out-of-range `limit`/`top_k` and absurd `offset` are `Validation` errors (replaces silent clamps); `memory_library` arithmetic saturating (panic-only drive-by, semantics unchanged).
+- RED-first tests: 31/51/100/500 matches x 6 offsets on lexical-only AND hybrid paths for both tools (hybrid RED was `total = 10` via the MMR-10 choke; overflow RED was `attempt to add with overflow` at tools.rs:604); `u64::MAX` → `Validation`. Seeding 500 memories ≈ 6 s per set (no BLOCKED case).
+- Fix round (reviewer): filtered-engine total overcount fixed (date/confidence filters into `req.scope`; regression test `memory_read_filtered_engine_total_counts_only_passing_set`); Clamp→Validation recorded as DEV-013 (proposed here; approved 2026-10-23).
+- `traceability.json` RQ-08 evidence appended (status kept `executed_partial`).
+- Gate: daemon lib 229/229, search lib 169/169 (+4 ignored), compat lib 39/39, frontend lib 97/97; `cargo fmt` clean; workspace `clippy -D warnings` clean; review SPEC ❌ → fix round → scoped re-review ADDRESSED×2.
+- Deferred: deep pages near the 1000-window with 1000+ matches pay full-window MMR rerank cost; dense leg contributes no hits in tests (zero-embedder, lexical rows) — dual-leg fusion at scale untested; `memory_library` still clamps rather than validates (out of scope).
+
+`.
+
+---
+
+### Wave A2: tool-level atomicity — one canonical transaction per tool + audit
+- `session_start_full_tx`: create/replace + abandon-previous + memories_read
+  links + preload boosts + receipt in ONE tx; preload planned pre-tx via
+  `recall_browse` (pure-read, no divergence); continuity boosts keep the
+  P2-B receipt-claimed exactly-once continuation.
+- `apply_with_session_link`: AddMemory + auto-link + MemoryCreated session
+  link + receipt in one tx; replay path untouched (no session re-resolution).
+- `practice_guide_idempotent`: `validated_by` resolved from session reads
+  in-tx with errors propagated; GuideUsed link + idempotency log same tx;
+  signature now takes the session handle (callers updated).
+- Audit: all 3 `let _ =` on repo results removed in-tx; `.ok()`/`unwrap_or`
+  on repo results either propagate (`?`: continuity reads, memory_add
+  session lookup) or are named presentational adapters (audit assoc-check,
+  related-ref, recorded-link/session-stats renders).
+- Barrier tests (RED-first): tail-fault → error with nothing persisted,
+  no receipt, healed retry exactly-once with links intact (3 tests).
+- `traceability.json` RQ-17: evidence appended (kept `executed_passed`,
+  presentational/auxiliary-only fallbacks documented).
+- Pre-existing `FaultInjector` pattern extended with `tail_effect_failures`
+  (pre-commit, production-unreachable; zero production callers).
+- Gate: daemon lib 223/223, service lib 99/99, interchange lib 27/27,
+  clippy `-D warnings` clean, fmt clean; task review SPEC ✅ + scoped
+  re-review clean; 4 deferred minors parked (unnamed None-fallback,
+  RQ-17 wording, preload pre-tx TOCTOU note, seam visibility).
+
+`.
+
+---
+
+### Wave A1: secrets P1 — critical-secret override + taxonomy parity
+- `privacy.rs`: 7 new detector families (GitHub `ghp_`/`gho_`/`github_pat_`,
+  PEM private-key blocks, Google `AIza`, Slack `xox[bpas]-`, Discord/Slack
+  webhook URLs, DB connection strings with credentials) + per-category
+  positive/negative unit tests + `critical ⇒ secret` pinning test.
+- `exec_memory_add`: `should_redact = has_critical || (has_secrets && !confirm)` —
+  critical secrets (PEM/GitHub/AKIA) always redacted even with `confirm:true`;
+  drift-safe against future list edits.
+- `finish_add_response`: critical notice branch checked first; the
+  "Use confirm:true to store as-is" hint no longer fires for critical content
+  on either confirm path (reviewer-caught notice lie, fix round 1).
+- `deviations.json` DEV-002 wording updated to actual behavior.
+- Gate: compat lib 33/33, daemon lib 220/220, clippy `-D warnings` clean,
+  fmt clean; task review + scoped re-review clean, 1 deferred-minor list parked.
+
+`.
+
+---
+
+## 99c546e (2026-10-08) — Build speed: profiles, auto-detected fast linker, hygiene rules
 
 ### Build speed: profiles, auto-detected fast linker, hygiene rules
 - `[profile.dev]`: `lto = false` (was thin — re-optimized the whole
