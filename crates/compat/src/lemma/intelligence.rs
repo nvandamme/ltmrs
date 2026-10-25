@@ -240,11 +240,10 @@ pub fn scan_conflicts_for_target(
 /// touch the fragment, so their revision-stable rows stay valid.
 /// Merge/forget only flip lifecycle (+eligibility), never the fragment, and
 /// non-recallable rows never reach the scan; the forget path
-/// (crates/daemon/src/tools.rs:2337) and the merge path
-/// (crates/daemon/src/tools.rs:2485) still prune for hygiene, and
-/// whole-store restore clears the cache outright
-/// (crates/daemon/src/tools.rs:5852) because a verbatim row swap can
-/// reuse an (id, revision) with a different fragment.
+/// (`tools::memory_forget`) and the merge path (`tools::memory_merge`)
+/// still prune for hygiene, and whole-store restore clears the cache
+/// outright (`tools::backup` restore confirm) because a verbatim row swap
+/// can reuse an (id, revision) with a different fragment.
 pub struct SignatureCache {
     entries: HashMap<EntityId, (EntityRevision, HashSet<String>, bool)>,
 }
@@ -329,6 +328,42 @@ pub fn scan_conflicts_for_target_cached(
     }
     sort_conflicts(&mut conflicts);
     conflicts
+}
+
+/// Score one candidate pair with the contradiction rules (None below the
+/// emit threshold). Candidate generation lives with the caller — Lance
+/// nearest neighbors through the similarity service — so only sufficiently
+/// similar pairs reach these rules; the rules themselves are unchanged.
+pub fn score_conflict_pair(
+    a: &Memory,
+    b: &Memory,
+    legacy_a_id: String,
+    legacy_b_id: String,
+) -> Option<ConflictPair> {
+    let overlap = topic_overlap(
+        &extract_topic_signature(&a.fragment),
+        &extract_topic_signature(&b.fragment),
+    );
+    if overlap < CONFLICT_MIN_OVERLAP {
+        return None;
+    }
+    let neg_differs = has_negation(&a.fragment) != has_negation(&b.fragment);
+    let conflict_score = score_conflict(&a.fragment, &b.fragment, overlap, neg_differs);
+    if conflict_score < CONFLICT_EMIT_THRESHOLD {
+        return None;
+    }
+    Some(ConflictPair {
+        memory_a_id: legacy_a_id,
+        memory_a_title: a.title.clone(),
+        memory_b_id: legacy_b_id,
+        memory_b_title: b.title.clone(),
+        reason: if neg_differs {
+            "Opposing sentiment on same topic".to_string()
+        } else {
+            "Contradiction signals detected".to_string()
+        },
+        overlap_score: (conflict_score * 100.0).round() / 100.0,
+    })
 }
 
 pub fn format_conflict_results(conflicts: &[ConflictPair]) -> String {

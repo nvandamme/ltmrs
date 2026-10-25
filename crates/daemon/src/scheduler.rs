@@ -87,7 +87,7 @@ impl EmbeddingScheduler {
                 let text = job.text.clone();
                 let adapter = std::sync::Arc::clone(&adapter);
                 let vec = tokio::task::spawn_blocking(move || {
-                    let mut guard = adapter.lock().unwrap();
+                    let mut guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
                     guard.embed(&text)
                 })
                 .await

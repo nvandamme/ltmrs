@@ -96,8 +96,18 @@ pub struct MeasuredOp {
 /// gateway (no receipts, aliases, revision checks or projection jobs).
 /// Point them at throwaway benchmark stores only — never at a live store,
 /// where blind overwrites at fixed revisions would clobber real state.
+///
+/// The runner is a caller of the storage layer, so it honors the plan's
+/// retry contract (Part I: storage conflicts retry from a fresh snapshot
+/// with bounded backoff): `put_memory_direct` exhaustion is typed
+/// `Contention` (transient, safe to retry), and shared-watermark SSI
+/// contention between closed-loop workers is expected under concurrency.
+/// The runner retries exhaustion up to `RUNNER_RETRY_LIMIT` times; latency
+/// is measured from the first attempt (retry time is real service time),
+/// and true exhaustion stays a recorded failure.
 pub fn execute_storage_op(repo: &CanonicalRepository, op: &WorkloadOp) -> (u64, bool, String) {
     use crate::bench::experiment::workload_memory;
+    use ltmrs_domain::command::DomainErrorCode;
     use ltmrs_domain::id::EntityId;
     enum Prepared {
         Put(Box<ltmrs_domain::memory::Memory>),
@@ -116,13 +126,32 @@ pub fn execute_storage_op(repo: &CanonicalRepository, op: &WorkloadOp) -> (u64, 
             );
         }
     };
+    const RUNNER_RETRY_LIMIT: u32 = 20;
     let start = Instant::now();
     let elapsed = || start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     match prepared {
-        Prepared::Put(memory) => match repo.put_memory_direct(&memory) {
-            Ok(()) => (elapsed(), true, "written".to_string()),
-            Err(e) => (elapsed(), false, e.message.clone()),
-        },
+        Prepared::Put(memory) => {
+            let mut last = None;
+            for attempt in 0..RUNNER_RETRY_LIMIT {
+                match repo.put_memory_direct(&memory) {
+                    Ok(()) => return (elapsed(), true, "written".to_string()),
+                    Err(e) => {
+                        if e.code != DomainErrorCode::Contention {
+                            return (elapsed(), false, e.message.clone());
+                        }
+                        last = Some(e.message.clone());
+                        if attempt + 1 < RUNNER_RETRY_LIMIT {
+                            std::thread::sleep(Duration::from_micros(50));
+                        }
+                    }
+                }
+            }
+            (
+                elapsed(),
+                false,
+                format!("runner retry exhausted: {}", last.unwrap_or_default()),
+            )
+        }
         Prepared::Get(id) => match repo.get_memories(&[id]) {
             Ok(found) => (elapsed(), true, format!("found={}", found.len())),
             Err(e) => (elapsed(), false, e.message.clone()),

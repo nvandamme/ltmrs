@@ -242,7 +242,7 @@ Do not claim all hosts use the same directory or inject MCP instructions in the 
 
 | Test ID | Procedure | Required assertion |
 |---|---|---|
-| T-SEC-01 | Wrong UID/permissions, stale socket, simultaneous daemon starts, symlinked runtime paths and mismatched store generation. | Unauthorized/wrong-store connection rejected; one safe owner; no unsafe unlink or takeover. |
+| T-SEC-01 | Wrong UID/permissions, stale socket, simultaneous daemon starts, symlinked runtime paths and mismatched store generation. Windows execution (2026-10-08, all green): wrong UID → per-user DACL with exactly user SID + SYSTEM ACEs (`dacl_grants_only_user_and_system`); stale socket → LockFileEx one-owner exclusivity + shared probe (`second_acquire_rejects_while_first_holds_lock`, `lock_probe_distinguishes_held_free_and_missing`); simultaneous starts → race loser exits AlreadyRunning, both frontends served (`simultaneous_cold_start_serves_both_frontends`); symlinked paths → junction refusal via `symlink_metadata` (`junction_runtime_dir_refused`); generation mismatch → typed handshake refusal + same-connection retry (`handshake_generation_mismatch_is_typed`, `mismatched_handshake_retry_on_same_connection`). | Unauthorized/wrong-store connection rejected; one safe owner; no unsafe unlink or takeover. |
 | T-SEC-02 | Fuzz IPC frames/JSON, query strings, evidence paths and size/depth limits; test cancellation at every stage. | Bounded parsing and memory; no injection/path escape or arbitrary filesystem reads. |
 | T-SEC-03 | Store malicious memory/skill content that asks to run commands, leak secrets or change restore approval; exercise visualizer rendering. | Content remains data; no privileged instruction promotion, auto-execution or unsafe HTML/script injection. |
 | T-SEC-04 | Known-secret fixtures, false positives, logs/explanations, model digest tampering, offline mode and forbidden remote code/model formats. | Supported secret patterns are handled before downstream use; artifacts are verified; no unapproved egress or code execution. |
@@ -355,17 +355,20 @@ Use exact search as ground truth for ANN recall, distinct from human semantic re
 | T-QUALITY-01 | Frozen labeled development/held-out corpus with full ranking ablations and fixed budgets. | Protected cases pass; non-regression/benefit claims are supported by labels and uncertainty. |
 | T-QUALITY-02 | ANN versus exact on the same vectors, filter distribution and index freshness state. | Declared recall and freshness envelope holds; optimization has a measured purpose. |
 
-## 9. CI, nightly and release execution
+## 9. Local change gate, extended qualification and release qualification
 
-| Schedule | Required work |
+Project policy is explicitly no CI: qualification runs locally (a missing
+environment is `blocked`, never borrowed from another host).
+
+| Gate | Required work |
 |---|---|
 | Every change | Formatting/lint/build, L0/domain tests, targeted storage tests, schema/compatibility fixtures, score/scope regressions |
-| Pull request changing persistence | Real database atomicity, receipt/revision, projection races and selected deterministic process-crash cases |
-| Pull request changing inference | Tokenization/reference-vector, mixed-batch and truncation tests on the affected profile |
-| Nightly | Multi-process sessions, randomized state histories, broader crash/I/O suites, maintenance/soak and representative benchmarks |
-| Release candidate | Full claimed host/OS/model matrix, offline packaging, supported power-loss model, complete import/restore, all tool conformance and frozen quality evaluation |
+| Change touching persistence | Real database atomicity, receipt/revision, projection races and selected deterministic process-crash cases |
+| Change touching inference | Tokenization/reference-vector, mixed-batch and truncation tests on the affected profile |
+| Extended (soak) | Multi-process sessions, randomized state histories, broader crash/I/O suites, maintenance/soak and representative benchmarks |
+| Release qualification | Full claimed host/OS/model matrix, offline packaging, supported power-loss model, complete import/restore, all tool conformance and frozen quality evaluation |
 
-Cache model artifacts in CI through a verified manifest. A network outage should mark a missing artifact prerequisite, not silently skip model tests and produce a green semantic-support badge.
+Cache model artifacts locally through a verified manifest. A network outage should mark a missing artifact prerequisite, not silently skip model tests and produce a green semantic-support badge.
 
 ### 9.1 Evidence bundle
 

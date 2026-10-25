@@ -206,18 +206,13 @@ pub fn install_skill(
 }
 
 /// Body text without a leading marker line (for hashing user content).
-/// Round-trips exactly with `render_asset`: trailing newline preserved,
-/// with empty content normalizing to empty on both sides.
+/// Round-trips exactly with `render_asset` byte-wise: the marker line and
+/// its `\n` separator are cut, preserving any CRLF body (Windows checkouts
+/// hash identically to LF ones).
 fn strip_marker(text: &str) -> String {
     let mut lines = text.lines();
     match lines.next() {
-        Some(first) if parse_marker(first).is_some() => {
-            let mut body = lines.collect::<Vec<_>>().join("\n");
-            if !body.is_empty() && text.ends_with('\n') {
-                body.push('\n');
-            }
-            body
-        }
+        Some(first) if parse_marker(first).is_some() => text[first.len() + 1..].to_string(),
         _ => text.to_string(),
     }
 }

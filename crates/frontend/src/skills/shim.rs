@@ -1,9 +1,10 @@
 //! Opt-in legacy executable shim (WP-10 task 4; T-SKILL-01 adjacent).
 //!
 //! Hosts still configured with the legacy `lemma` command can opt in to a
-//! `<home>/.local/bin/lemma` symlink pointing at the running ltmrs binary.
+//! shim under `<home>/.local/bin` pointing at the running ltmrs binary: a
+//! symlink named `lemma` on unix, a `lemma.cmd` batch file on Windows.
 //! Nothing is ever replaced silently: an existing file that is not our
-//! symlink refuses with the path; other `lemma` executables found on PATH
+//! shim refuses with the path; other `lemma` executables found on PATH
 //! are reported loudly (collision list) but do not block the install.
 
 use std::path::{Path, PathBuf};
@@ -13,12 +14,25 @@ pub const SHIM_DIR: &str = ".local/bin";
 /// Legacy executable name the shim provides.
 pub const SHIM_NAME: &str = "lemma";
 
+/// The shim file name per platform: `lemma` on unix, `lemma.cmd` on
+/// Windows (a `.cmd` is directly executable from PATH without extensions).
+pub const fn shim_name() -> &'static str {
+    #[cfg(unix)]
+    {
+        SHIM_NAME
+    }
+    #[cfg(windows)]
+    {
+        "lemma.cmd"
+    }
+}
+
 /// Outcome of a shim install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShimOutcome {
-    /// Symlink created.
+    /// Shim created.
     Installed,
-    /// Symlink already points at this binary.
+    /// Shim already points at this binary.
     AlreadyCurrent,
 }
 
@@ -43,7 +57,17 @@ pub enum ShimError {
 
 /// Shim path under `home`.
 pub fn shim_path(home: &Path) -> PathBuf {
-    home.join(SHIM_DIR).join(SHIM_NAME)
+    home.join(SHIM_DIR).join(shim_name())
+}
+
+/// The `.cmd` batch content routing the shim to `exe` (Windows): quoted
+/// path (spaces safe), all arguments, exit code propagated.
+#[cfg(windows)]
+pub fn shim_content(exe: &Path) -> String {
+    format!(
+        "@echo off\r\n\"{}\" %*\r\nexit /b %ERRORLEVEL%\r\n",
+        exe.display()
+    )
 }
 
 /// Install the legacy shim pointing at `exe` (normally `current_exe`).
@@ -63,23 +87,10 @@ pub fn install_shim(
                     message: e.to_string(),
                 })?;
             }
-            match std::os::unix::fs::symlink(exe, &shim) {
-                Ok(()) => ShimOutcome::Installed,
-                // A concurrent installer won the race: re-read instead of
-                // failing (our symlink => current, anything else => refuse).
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    check_current(&shim, exe).map(|_| ShimOutcome::AlreadyCurrent)?
-                }
-                Err(e) => {
-                    return Err(ShimError::Io {
-                        path: shim.to_string_lossy().into_owned(),
-                        message: e.to_string(),
-                    });
-                }
-            }
+            create_shim(&shim, exe)?
         }
         Ok(_) => {
-            // Anything already at the shim path must be our own symlink;
+            // Anything already at the shim path must be our own shim;
             // foreign files AND foreign symlinks refuse (never replace).
             check_current(&shim, exe).map(|_| ShimOutcome::AlreadyCurrent)?
         }
@@ -96,9 +107,36 @@ pub fn install_shim(
     })
 }
 
+/// Create the shim at a fresh path.
+#[cfg(unix)]
+fn create_shim(shim: &Path, exe: &Path) -> Result<ShimOutcome, ShimError> {
+    match std::os::unix::fs::symlink(exe, shim) {
+        Ok(()) => Ok(ShimOutcome::Installed),
+        // A concurrent installer won the race: re-read instead of
+        // failing (our symlink => current, anything else => refuse).
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            check_current(shim, exe).map(|_| ShimOutcome::AlreadyCurrent)
+        }
+        Err(e) => Err(ShimError::Io {
+            path: shim.to_string_lossy().into_owned(),
+            message: e.to_string(),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn create_shim(shim: &Path, exe: &Path) -> Result<ShimOutcome, ShimError> {
+    std::fs::write(shim, shim_content(exe)).map_err(|e| ShimError::Io {
+        path: shim.to_string_lossy().into_owned(),
+        message: e.to_string(),
+    })?;
+    Ok(ShimOutcome::Installed)
+}
+
 /// The shim is ours when it links straight at `exe` (textual match) or at
 /// the same file through another spelling (`./`, symlinked dirs). Anything
 /// else — including a broken or foreign link — refuses.
+#[cfg(unix)]
 fn check_current(shim: &Path, exe: &Path) -> Result<(), ShimError> {
     let current = std::fs::read_link(shim).ok();
     if current.as_deref() == Some(exe) {
@@ -113,10 +151,34 @@ fn check_current(shim: &Path, exe: &Path) -> Result<(), ShimError> {
     Err(ShimError::RefusedForeign(shim.to_path_buf()))
 }
 
+/// Windows: the shim is ours byte-for-byte for this `exe`, or its quoted
+/// target canonicalizes to the same file as `exe`. Any other content
+/// refuses (never replaced).
+#[cfg(windows)]
+fn check_current(shim: &Path, exe: &Path) -> Result<(), ShimError> {
+    let Ok(bytes) = std::fs::read(shim) else {
+        return Err(ShimError::RefusedForeign(shim.to_path_buf()));
+    };
+    if bytes == shim_content(exe).as_bytes() {
+        return Ok(());
+    }
+    // The quoted target on the second line (`"<exe>" %*`).
+    let second = bytes.split(|b| *b == b'\n').nth(1).unwrap_or(&[]);
+    let target = String::from_utf8_lossy(second)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if let (Ok(have), Ok(want)) = (std::fs::canonicalize(&target), exe.canonicalize())
+        && have == want
+    {
+        return Ok(());
+    }
+    Err(ShimError::RefusedForeign(shim.to_path_buf()))
+}
+
 /// Scan PATH (or `path_env`) for executable `lemma` files other than
 /// `shim`: PATH order, deduplicated.
 fn find_collisions(shim: &Path, path_env: Option<&str>) -> Vec<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
     let path_env = path_env
         .map(str::to_string)
         .or_else(|| std::env::var("PATH").ok());
@@ -127,22 +189,56 @@ fn find_collisions(shim: &Path, path_env: Option<&str>) -> Vec<PathBuf> {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = dir.join(SHIM_NAME);
-        if candidate == shim {
-            continue;
+        for candidate in collision_candidates(&dir) {
+            if candidate == shim {
+                continue;
+            }
+            if out.contains(&candidate) {
+                continue;
+            }
+            if is_collision(&candidate) {
+                out.push(candidate);
+            }
         }
-        if out.contains(&candidate) {
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
-            continue;
-        }
-        out.push(candidate);
     }
     out
+}
+
+/// The `lemma` file names PATH can resolve on this platform.
+#[cfg(unix)]
+fn collision_candidates(dir: &Path) -> Vec<PathBuf> {
+    vec![dir.join(SHIM_NAME)]
+}
+
+/// Windows PATH resolution: a bare `lemma` runs as `lemma.com`, `lemma.exe`,
+/// `lemma.cmd` or `lemma.bat` — all are collisions.
+#[cfg(windows)]
+fn collision_candidates(dir: &Path) -> Vec<PathBuf> {
+    ["", ".exe", ".cmd", ".bat", ".com"]
+        .iter()
+        .map(|ext| dir.join(format!("{SHIM_NAME}{ext}")))
+        .collect()
+}
+
+/// A candidate is a collision when it is an executable file: unix mode
+/// bits, Windows extension resolution (the candidate names already carry
+/// the executable extensions).
+#[cfg(unix)]
+fn is_collision(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = std::fs::metadata(candidate) else {
+        return false;
+    };
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(windows)]
+fn is_collision(candidate: &Path) -> bool {
+    let ext = candidate
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "exe" | "cmd" | "bat" | "com") && candidate.is_file()
 }
 
 #[cfg(test)]
@@ -152,14 +248,18 @@ mod tests {
     fn fake_exe(dir: &Path) -> PathBuf {
         let exe = dir.join("ltmrs-test-bin");
         std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
-        let mut perms = std::fs::metadata(&exe).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&exe, perms).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&exe, perms).unwrap();
+        }
         exe
     }
 
     /// Fresh install creates the symlink; rerun is a no-op.
+    #[cfg(unix)]
     #[test]
     fn installs_symlink_idempotently() {
         let dir = tempfile::tempdir().unwrap();
@@ -169,6 +269,22 @@ mod tests {
         assert!(report.collisions.is_empty());
         let link = shim_path(dir.path());
         assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+        let again = install_shim(dir.path(), &exe, Some("")).unwrap();
+        assert_eq!(again.outcome, ShimOutcome::AlreadyCurrent);
+    }
+
+    /// Windows: fresh install writes the .cmd routing to the exe; rerun is
+    /// a no-op (byte identity = ours).
+    #[cfg(windows)]
+    #[test]
+    fn installs_cmd_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_exe(dir.path());
+        let report = install_shim(dir.path(), &exe, Some("")).unwrap();
+        assert_eq!(report.outcome, ShimOutcome::Installed);
+        assert!(report.collisions.is_empty());
+        let shim = shim_path(dir.path());
+        assert_eq!(std::fs::read(&shim).unwrap(), shim_content(&exe).as_bytes());
         let again = install_shim(dir.path(), &exe, Some("")).unwrap();
         assert_eq!(again.outcome, ShimOutcome::AlreadyCurrent);
     }
@@ -188,6 +304,7 @@ mod tests {
     }
 
     /// A foreign symlink (pointing elsewhere) also refuses.
+    #[cfg(unix)]
     #[test]
     fn foreign_symlink_refuses() {
         let dir = tempfile::tempdir().unwrap();
@@ -206,6 +323,7 @@ mod tests {
 
     /// A `lemma` executable elsewhere on PATH is reported (PATH order) but
     /// does not block the install; the shim itself is never listed.
+    #[cfg(unix)]
     #[test]
     fn path_collisions_reported_not_blocking() {
         let dir = tempfile::tempdir().unwrap();
@@ -229,8 +347,31 @@ mod tests {
         assert_eq!(report.collisions, vec![shadow_lemma]);
     }
 
+    /// Windows PATH resolution: a `lemma.cmd` elsewhere is reported; a
+    /// non-executable `lemma` (no executable extension) is not.
+    #[cfg(windows)]
+    #[test]
+    fn path_collisions_reported_not_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_exe(dir.path());
+        let shadow = dir.path().join("shadowbin");
+        std::fs::create_dir_all(&shadow).unwrap();
+        let shadow_lemma = shadow.join("lemma.cmd");
+        std::fs::write(&shadow_lemma, b"@echo off\r\n").unwrap();
+        // A no-extension `lemma` is not executable from PATH: no collision.
+        let dead = dir.path().join("deadbin");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("lemma"), b"not executable").unwrap();
+
+        let path_env = format!("{};{}", shadow.display(), dead.display());
+        let report = install_shim(dir.path(), &exe, Some(&path_env)).unwrap();
+        assert_eq!(report.outcome, ShimOutcome::Installed);
+        assert_eq!(report.collisions, vec![shadow_lemma]);
+    }
+
     /// Reinstalling with a differently-spelled path to the same binary
     /// (`./` component) still recognizes our own shim (no refusal).
+    #[cfg(unix)]
     #[test]
     fn same_binary_other_spelling_stays_current() {
         let dir = tempfile::tempdir().unwrap();

@@ -11,19 +11,27 @@ use crate::artifacts::{ArtifactCache, ArtifactError};
 use crate::e5_small::{E5SmallAdapter, EmbedInput, EmbeddedSequence};
 use crate::worker::{EmbeddingWorkerConfig, EmbeddingWorkerHandle, ServiceError, SyncEmbedder};
 
+/// Joint worker ownership: the service handle plus the worker thread's
+/// `JoinHandle`. Last-ownership is determined atomically by `Arc` itself —
+/// a check-then-act `strong_count` test here would race when two final
+/// clones drop concurrently (both can observe 2 and both skip shutdown).
+/// `Inner::drop` signals shutdown; the detached thread exits on its own
+/// (dropping a `JoinHandle` detaches — no `mem::forget` leak).
+struct ServiceInner {
+    handle: EmbeddingWorkerHandle,
+    _worker: std::thread::JoinHandle<()>,
+}
+
+impl Drop for ServiceInner {
+    fn drop(&mut self) {
+        self.handle.shutdown();
+    }
+}
+
 /// The async embedding service. Cloneable — all handles share the same worker.
 #[derive(Clone)]
 pub struct EmbeddingService {
-    handle: Arc<EmbeddingWorkerHandle>,
-}
-
-impl Drop for EmbeddingService {
-    fn drop(&mut self) {
-        // When the last service handle is dropped, shut down the worker thread.
-        if Arc::strong_count(&self.handle) == 1 {
-            self.handle.shutdown();
-        }
-    }
+    inner: Arc<ServiceInner>,
 }
 
 impl EmbeddingService {
@@ -31,20 +39,29 @@ impl EmbeddingService {
     /// given adapter (synchronous, `&mut self`). The adapter is moved into the
     /// worker — no cross-thread sharing.
     pub fn spawn(adapter: impl SyncEmbedder + 'static, config: EmbeddingWorkerConfig) -> Self {
-        let (handle, _worker) = crate::worker::spawn_worker(adapter, config);
-        // The JoinHandle is intentionally dropped; the worker thread runs for the
-        // lifetime of all service handles. Shutdown goes through `shutdown()` or Drop.
-        std::mem::forget(_worker);
+        let (handle, worker) = crate::worker::spawn_worker(adapter, config);
         Self {
-            handle: Arc::new(handle),
+            inner: Arc::new(ServiceInner {
+                handle,
+                _worker: worker,
+            }),
         }
     }
 
-    /// Create a service from an existing worker handle (for testing or shared workers).
-    pub fn from_handle(handle: EmbeddingWorkerHandle) -> Self {
+    /// Create a service that jointly owns an existing worker thread (for
+    /// testing or shared workers): the passed `JoinHandle` is kept until
+    /// the last clone drops, which shuts the worker down.
+    pub fn from_handle(handle: EmbeddingWorkerHandle, worker: std::thread::JoinHandle<()>) -> Self {
         Self {
-            handle: Arc::new(handle),
+            inner: Arc::new(ServiceInner {
+                handle,
+                _worker: worker,
+            }),
         }
+    }
+
+    fn handle(&self) -> &EmbeddingWorkerHandle {
+        &self.inner.handle
     }
 
     /// Embed a single text with the given role. Returns the normalized vector.
@@ -65,7 +82,7 @@ impl EmbeddingService {
         &self,
         inputs: Vec<EmbedInput>,
     ) -> Result<Vec<EmbeddedSequence>, ServiceError> {
-        let (rx, _gen) = self.handle.submit(inputs)?;
+        let (rx, _gen) = self.handle().submit(inputs)?;
 
         // Awaiting `rx` on a tokio runtime is non-blocking for I/O workers.
         // Dropping this future (cancellation) drops `rx`, which the worker
@@ -76,24 +93,24 @@ impl EmbeddingService {
 
     /// Cancel all queued and in-flight requests on this service.
     pub fn cancel_all(&self) {
-        self.handle.cancel_all();
+        self.handle().cancel_all();
     }
 
     /// Batch accounting stats (RQ-22 health output).
     pub fn stats(&self) -> crate::worker::WorkerStats {
-        self.handle.stats()
+        self.handle().stats()
     }
 
     /// Shut down the worker thread. Subsequent requests return `Closed`.
     pub fn shutdown(&self) {
-        self.handle.shutdown();
+        self.handle().shutdown();
     }
 
     /// Whether the service is still accepting work (for health checks).
     /// Observes worker state only: never submits, never perturbs stats.
     #[allow(dead_code)] // used by daemon diagnostics in later WPs
     pub fn is_available(&self) -> bool {
-        self.handle.is_open()
+        self.handle().is_open()
     }
 
     /// Load the E5-small adapter from cache and spawn a service.
@@ -137,7 +154,7 @@ mod tests {
             EmbeddingService::spawn(FastEmbedder { dim: 16 }, EmbeddingWorkerConfig::default());
         assert!(svc.is_available());
         assert!(svc.is_available());
-        let stats = svc.handle.stats();
+        let stats = svc.handle().stats();
         assert_eq!(stats.processed_batches, 0, "health checks must not embed");
         assert_eq!(stats.in_flight, 0, "health checks must not occupy slots");
         svc.shutdown();
@@ -197,36 +214,74 @@ mod tests {
 
     #[tokio::test]
     async fn service_cancellation_via_drop() {
-        struct SlowEmbedder;
-        impl SyncEmbedder for SlowEmbedder {
+        // Gated adapter: the entry signal proves the worker picked up the
+        // request before the abort (no 20ms hope); the completion signal
+        // proves the worker finished the attempt and accounted it (no
+        // 150ms hope). The inference window itself stays a bounded sleep
+        // (fixture duration, not a race).
+        struct GatedSlowEmbedder {
+            entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            done: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        }
+        impl SyncEmbedder for GatedSlowEmbedder {
             fn embed_batch(
                 &mut self,
                 inputs: &[EmbedInput],
             ) -> crate::artifacts::ArtifactResult<Vec<EmbeddedSequence>> {
+                if let Some(tx) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                Ok(inputs
+                let result = Ok(inputs
                     .iter()
                     .map(|_| EmbeddedSequence {
                         vector: vec![1.0],
                         input_ids: vec![],
                         attention_mask: vec![],
                     })
-                    .collect())
+                    .collect());
+                if let Some(tx) = self.done.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = tx.send(());
+                }
+                result
             }
         }
 
-        let svc = EmbeddingService::spawn(SlowEmbedder, EmbeddingWorkerConfig::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let svc = EmbeddingService::spawn(
+            GatedSlowEmbedder {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                done: std::sync::Mutex::new(Some(done_tx)),
+            },
+            EmbeddingWorkerConfig::default(),
+        );
 
         // Start an embed but cancel it by dropping the future.
         let inner_svc = svc.clone();
         let handle = tokio::spawn(async move { inner_svc.embed("long text", Role::Query).await });
 
-        // Give the worker time to pick up the request, then abort.
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        // Abort only after the worker provably picked up the request.
+        let entered = tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        entered.expect("worker must pick up the request");
         handle.abort();
 
-        // Wait for the worker to notice the cancellation.
-        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        // Wait for the worker to finish the attempt and account it.
+        let done = tokio::task::spawn_blocking(move || {
+            done_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
+        done.expect("worker must finish the attempt");
 
         let stats = svc.stats();
         assert!(
@@ -234,6 +289,51 @@ mod tests {
             "aborted request must count as cancelled"
         );
         svc.shutdown();
+    }
+
+    /// Dropping the last service clone closes the worker (no explicit
+    /// shutdown call needed).
+    #[test]
+    fn last_drop_shuts_down_worker() {
+        let svc =
+            EmbeddingService::spawn(FastEmbedder { dim: 16 }, EmbeddingWorkerConfig::default());
+        // Bare-handle observer: shares state, owns no worker lifetime.
+        let raw = svc.handle().clone();
+        let again = svc.clone();
+        drop(svc);
+        assert!(raw.is_open(), "worker stays open while clones live");
+        drop(again);
+        assert!(!raw.is_open(), "last drop must close the worker");
+    }
+
+    /// Concurrent last drops must still close the worker: exactly one of
+    /// the two final clones owns the last reference — never neither
+    /// (strong_count check-then-drop races when both observe 2).
+    #[test]
+    fn concurrent_last_drops_shut_down_worker() {
+        for _ in 0..300 {
+            let svc =
+                EmbeddingService::spawn(FastEmbedder { dim: 16 }, EmbeddingWorkerConfig::default());
+            let raw = svc.handle().clone();
+            let a = svc.clone();
+            let b = svc.clone();
+            drop(svc);
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    barrier.wait();
+                    drop(a);
+                });
+                s.spawn(|| {
+                    barrier.wait();
+                    drop(b);
+                });
+            });
+            assert!(
+                !raw.is_open(),
+                "worker must close after all clones dropped concurrently"
+            );
+        }
     }
 
     #[tokio::test]

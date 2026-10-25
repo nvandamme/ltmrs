@@ -16,10 +16,10 @@ use ltmrs_frontend::cli::{
     project_adopt_command, project_bind_command, project_status_command, provision_models_command,
     run_library, version_text,
 };
-use ltmrs_frontend::frontend::serve::{
-    daemon_idle_ms, daemon_socket_path, ensure_daemon_process, resolve_home, run_daemon_foreground,
-    serve_stdio, stdio_layout,
+use ltmrs_frontend::frontend::serve::daemon::{
+    daemon_idle_ms, daemon_socket_path, ensure_daemon_process, run_daemon_foreground, serve_stdio,
 };
+use ltmrs_frontend::frontend::serve::{home_dir, resolve_home, stdio_layout};
 
 #[tokio::main]
 async fn main() {
@@ -40,17 +40,15 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::Stdio { socket }) => {
-            match serve_stdio(socket, std::env::var("HOME").ok()).await {
-                Ok(()) => 0,
-                Err(e) => fail(&e),
-            }
-        }
+        Ok(Command::Stdio { socket }) => match serve_stdio(socket, home_dir()).await {
+            Ok(()) => 0,
+            Err(e) => fail(&e),
+        },
         Ok(Command::Daemon {
             foreground,
             idle_ms,
         }) => {
-            let home = std::env::var("HOME").ok();
+            let home = home_dir();
             let idle = daemon_idle_ms(idle_ms, std::env::var("LTMRS_DAEMON_IDLE_MS").ok());
             match resolve_home(home).map(|base| stdio_layout(&base)) {
                 Err(e) => fail(&e),
@@ -86,7 +84,7 @@ async fn main() {
             }
         }
         Ok(Command::Visualize { foreground, port }) => {
-            match run_visualize(foreground, port, std::env::var("HOME").ok()).await {
+            match run_visualize(foreground, port, home_dir()).await {
                 Ok(text) => {
                     println!("{text}");
                     0
@@ -94,29 +92,27 @@ async fn main() {
                 Err(e) => fail(&e),
             }
         }
-        Ok(Command::InstallSkill) => match install_skill_command(std::env::var("HOME").ok()) {
+        Ok(Command::InstallSkill) => match install_skill_command(home_dir()) {
             Ok(text) => {
                 println!("{text}");
                 0
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::InstallShim) => match install_shim_command(std::env::var("HOME").ok()) {
+        Ok(Command::InstallShim) => match install_shim_command(home_dir()) {
             Ok(text) => {
                 println!("{text}");
                 0
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::ProvisionModels) => {
-            match provision_models_command(std::env::var("HOME").ok()).await {
-                Ok(text) => {
-                    println!("{text}");
-                    0
-                }
-                Err(e) => fail(&e),
+        Ok(Command::ProvisionModels) => match provision_models_command(home_dir()).await {
+            Ok(text) => {
+                println!("{text}");
+                0
             }
-        }
+            Err(e) => fail(&e),
+        },
         Ok(Command::ProjectBind { here, root, name }) => {
             match project_bind_command(
                 here,

@@ -56,6 +56,12 @@ pub struct Dispatcher {
     /// recovered like the restore coordinator below (entries are
     /// recomputable, never authoritative).
     conflict_sigs: Mutex<ltmrs_compat::lemma::intelligence::SignatureCache>,
+    /// Mutation-time similarity gate: serializes duplicate-check + commit
+    /// across concurrent memory_add/update/merge so two racing neardup
+    /// writes cannot both miss each other. Held for milliseconds (one
+    /// Lance query + one commit); different scopes still share it because
+    /// unprojected writes are globally visible to every scope's scan.
+    similarity_gate: std::sync::Mutex<()>,
 }
 
 impl Dispatcher {
@@ -73,6 +79,7 @@ impl Dispatcher {
             lemma_import: Mutex::new(ltmrs_interchange::restore::ImportCoordinator::default()),
             sessions_path: Mutex::new(None),
             conflict_sigs: Mutex::new(ltmrs_compat::lemma::intelligence::SignatureCache::new()),
+            similarity_gate: std::sync::Mutex::new(()),
         }
     }
 
@@ -85,7 +92,7 @@ impl Dispatcher {
     /// Set the sessions snapshot path for eager durability (P1). Called by
     /// `Daemon::start` when sessions are enabled.
     pub fn set_sessions_path(&self, path: Option<std::path::PathBuf>) {
-        *self.sessions_path.lock().unwrap() = path;
+        *self.sessions_path.lock().unwrap_or_else(|e| e.into_inner()) = path;
     }
 
     /// Persist registry sessions now, before an acknowledgement returns (P1
@@ -94,9 +101,17 @@ impl Dispatcher {
     /// (re-review R1). Loud either way (previous file intact via
     /// tmp+rename); the loss on error is bounded to a failed disk write.
     pub fn persist_sessions(&self) -> Result<(), String> {
-        let path = self.sessions_path.lock().unwrap().clone();
+        let path = self
+            .sessions_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(p) = path
-            && let Err(e) = self.registry.lock().unwrap().persist(&p)
+            && let Err(e) = self
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .persist(&p)
         {
             let msg = format!("failed to persist session history: {e:?}");
             eprintln!("ltmrs: {msg}");
@@ -179,10 +194,10 @@ impl Dispatcher {
     }
 
     /// The store generation this daemon serves (for health/handshake).
-    pub fn store_generation(&self) -> ltmrs_domain::id::StoreGeneration {
-        self.repo
-            .store_generation()
-            .unwrap_or(ltmrs_domain::id::StoreGeneration::FIRST)
+    /// Fail-closed: an unreadable generation is a server fault, never a
+    /// default — callers refuse rather than admit under generation 1.
+    pub fn store_generation(&self) -> DomainResult<ltmrs_domain::id::StoreGeneration> {
+        self.repo.store_generation()
     }
 
     /// Handle one IPC envelope, returning the typed response.
@@ -206,8 +221,14 @@ impl Dispatcher {
         // Generation gate: a restore replaces the store under a new
         // generation. Envelopes naming a retired generation are refused so
         // stale writers re-handshake instead of polluting the new store
-        // (or minting receipts under a dead generation).
-        let live = self.store_generation();
+        // (or minting receipts under a dead generation). An unreadable live
+        // generation fails closed as a server fault, not a default.
+        let live = self.store_generation().map_err(|e| {
+            DomainError::new(
+                DomainErrorCode::Validation,
+                format!("cannot read live store generation: {}", e.message),
+            )
+        })?;
         if envelope.store_generation != live {
             return Err(DomainError::new(
                 DomainErrorCode::StaleGeneration,
@@ -433,6 +454,13 @@ impl Dispatcher {
         self.search.as_deref()
     }
 
+    /// Hold across a mutation preflight (similarity check) plus its commit:
+    /// concurrent memory_add/update/merge serialize here so racing
+    /// near-duplicates cannot both miss. Leaf lock, milliseconds held.
+    pub fn similarity_gate(&self) -> &std::sync::Mutex<()> {
+        &self.similarity_gate
+    }
+
     /// Access the restore preview registry (lock briefly; never hold across IO).
     pub fn restore_coordinator(
         &self,
@@ -463,7 +491,7 @@ impl Dispatcher {
 
     /// Lock the registry (for lease management, health, session ops).
     pub fn registry(&self) -> std::sync::MutexGuard<'_, FrontendRegistry> {
-        self.registry.lock().unwrap()
+        self.registry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Resolve the channel's ACTIVE traced session: the registry binding

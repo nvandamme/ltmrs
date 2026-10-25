@@ -2,6 +2,42 @@
   "plan_version": "2.0-review",
   "date": "2026-09-27",
   "status": "implementation_in_progress",
+  "windows_certification_2026_10_08": {
+    "host": "Windows 11 Pro x86_64, NTFS, MSVC toolchain 1.99.0, protoc 36.0, no mold/wild",
+    "gate": "cargo fmt --all -- --check clean; cargo clippy --workspace --all-targets -- -D warnings clean; cargo test --workspace 768 passed / 0 failed (15 ignored with reason); cargo build --release clean; live-binary smokes: daemon foreground idle exit 0, two stdio frontends share one daemon, -vis URL+pid with /api/library 200, --install-shim writes byte-exact lemma.cmd",
+    "deviations": [
+      {
+        "area": "runtime dir protection (spec 2.4)",
+        "upstream_or_plan": "0700/0600 permission bits",
+        "ltmrs": "NTFS ACL inheritance from the per-user profile dir",
+        "status": "executed_passed"
+      },
+      {
+        "area": "shutdown testability (spec 2.5)",
+        "upstream_or_plan": "programmatic Ctrl-Break delivery under cargo test",
+        "ltmrs": "test kept as #[ignore] with reason; handler registration pinned by serve::tests::shutdown_handlers_register; foreground Ctrl-C path proven by probe; visualizer child stopped via TerminateProcess",
+        "status": "executed_passed"
+      },
+      {
+        "area": "shim location (spec 2.7)",
+        "upstream_or_plan": "upstream shim dir convention",
+        "ltmrs": "<home>/.local/bin/lemma.cmd, PATH hint only (Windows PATH is not user-owned)",
+        "status": "executed_passed"
+      },
+      {
+        "area": "accept data gate (spec 2.1)",
+        "upstream_or_plan": "plain connect() accept loop",
+        "ltmrs": "accept gated on PeekNamedPipe bytes-available > 0 on the same instance, bounded 1000ms to WouldBlock (byte-mode ERROR_NO_DATA is indistinguishable from success); connect stays inside tokio/mio",
+        "status": "executed_passed"
+      },
+      {
+        "area": "peer auth + home (spec 2.3, 2.6)",
+        "upstream_or_plan": "as designed",
+        "ltmrs": "per-user DACL (user SID + SYSTEM) in place of peer credentials; literal HOME wins over USERPROFILE when set",
+        "status": "executed_passed"
+      }
+    ]
+  },
   "review_findings": [
     {
       "id": "RV-01",
@@ -433,7 +469,7 @@
         "T-MCP-04"
       ],
       "status": "executed_passed",
-      "evidence": "RQ-17 read side effects persisted via canonical gateway before success: memory_read applies Access (confidence +0.015, access_count+1, last_accessed_at, context tag) in repository_internal.rs apply_access / interpreter.rs; semantic_search does not boost (upstream). Feedback: positive +0.015 + access_count + positive_feedback++, negative -0.02 + negative_hits++ + negative_feedback++. Tests: tools.rs memory_read_records_access_side_effect, memory_feedback_positive_boosts_confidence, memory_feedback_negative_reduces_confidence. Wave A2 tool atomicity (one canonical transaction per tool, no swallowed follow-up): session_start preload boosts + memories_read links + receipt in session_start_full_tx (continuity boosts keep the P2-B receipt-claimed continuation), memory_add MemoryCreated link + receipt in apply_with_session_link (replay path untouched), guide_practice GuideUsed link + validated_by in practice_guide_idempotent with session-lookup errors propagated; audit closed every `let _ =` / `.ok()` / `unwrap_or_default()` on repository results in the daemon tool layer (remaining fallbacks are named presentational adapters only). Barrier tests: tools.rs session_start_tail_failure_errors_with_nothing_frozen, memory_add_link_failure_errors_with_no_receipt, guide_practice_link_failure_errors_atomically. Wave B2 read side effects complete (#3 + #9): memory_read single/batch/query tracks read IDs into the channel active session via attribute_read_to_session (traced MemoryRead links fail-loud with preload dedup, virtual in-memory only, no session canonical no-op; admission already covers the call via mutates_store); co-read linking via plan_coread (stable visibility gate, no cross-boundary even under all=true) + apply_coread_links (associated_with both ways, up to 3 related_to star-anchored highest-confidence-first, best-effort skips); batch detail and query summary re-fetch post-access so values are post-boost (shapes/keys unchanged, explain stays pre-boost). Tests: memory_read_single_tracks_session, memory_read_batch_tracks_session, memory_read_query_tracks_session, memory_read_without_session_is_canonical_noop, memory_read_batch_coread_links, memory_read_coread_cross_project_not_linked, memory_read_batch_detail_is_post_boost; differential_workflow_replay_matches_upstream updated to expect the Memories read review line."
+      "evidence": "RQ-17 read side effects persisted via canonical gateway before success: memory_read applies Access (confidence +0.015, access_count+1, last-accessed_at, context tag) in repository_internal.rs apply_access / interpreter.rs; semantic_search does not boost (upstream). Feedback: positive +0.015 + access_count + positive_feedback++, negative -0.02 + negative_hits++ + negative_feedback++. Tests: tools.rs memory_read_records_access_side_effect, memory_feedback_positive_boosts_confidence, memory_feedback_negative_reduces_confidence. Tool atomicity - single-transaction core layered with staged completion (merge reconciliation of the local single-tx wave and origin staged-completion wave): session_start abandon/create/read-links/receipt commit in session_start_full_tx with tail-effect fault barrier; preload boost as a staged sub-command (receipted, exactly-once across crash-retry); memory_add MemoryCreated link + receipt in apply_with_session_link with staged ensure on unfrozen replay; guide_practice GuideUsed link in-tx with staged completion on unfrozen replay; audit closed every let-underscore / .ok() / unwrap_or_default() on repository results in the daemon tool layer (remaining fallbacks are named presentational adapters only). Barrier tests: tools.rs session_start_tail_failure_errors_with_nothing_frozen, session_start_boost_conflict_fails_loudly, session_start_unfrozen_receipt_completes_stages_and_freezes, memory_add_link_failure_errors_with_no_receipt, add_unfrozen_receipt_completes_session_link_and_freezes, guide_practice_link_failure_errors_atomically, guide_practice_link_failure_fails_loudly, guide_practice_unfrozen_receipt_completes_session_link, sessions_tests session_link_barrier_failure_errors. Wave B2 read side effects complete: memory_read single/batch/query tracks read IDs into the channel active session via attribute_read_to_session (traced MemoryRead links fail-loud with preload dedup, virtual in-memory only, no session canonical no-op; admission already covers the call via mutates_store); co-read linking via plan_coread (stable visibility gate, no cross-boundary even under all=true) + apply_coread_links (associated_with both ways, up to 3 related_to star-anchored highest-confidence-first, best-effort skips); batch detail and query summary re-fetch post-access so values are post-boost (shapes/keys unchanged, explain stays pre-boost)."
     },
     {
       "id": "RQ-18",
@@ -472,7 +508,7 @@
         "T-SEC-03"
       ],
       "status": "executed_partial",
-      "evidence": "Same-UID peer-credential check before any frame (pair-tested), past-deadline refusal, handshake validation, bounded frames, per-frame frontend binding (frontend_mismatch rejection), WireReply shape fix (rejections parseable). Full adversarial suites (fuzzing, 32-startup arbitration, malicious-archive/visualizer vectors) deferred."
+      "evidence": "Same-UID peer-credential check before any frame (pair-tested), past-deadline refusal, handshake validation, bounded frames, per-frame frontend binding (frontend_mismatch rejection), WireReply shape fix (rejections parseable). Windows execution 2026-10-08 (all green): per-user DACL with exactly user SID + SYSTEM ACEs (dacl_grants_only_user_and_system); LockFileEx one-owner exclusivity plus shared held/free/missing probe (second_acquire_rejects_while_first_holds_lock, lock_probe_distinguishes_held_free_and_missing); simultaneous-start race loser exits AlreadyRunning with both frontends served (simultaneous_cold_start_serves_both_frontends); junction refusal via symlink_metadata (junction_runtime_dir_refused); typed generation-mismatch refusal with same-connection retry (handshake_generation_mismatch_is_typed, mismatched_handshake_retry_on_same_connection). Full adversarial suites (fuzzing, 32-startup arbitration, malicious-archive/visualizer vectors) deferred."
     },
     {
       "id": "RQ-21",

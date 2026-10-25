@@ -252,6 +252,16 @@ On Linux use a user-owned 0700 runtime directory, a 0600 socket and peer-credent
 
 Persistent data is separate from runtime sockets and rebuildable cache. Resolve the lock/socket by store identity so an explicit portable store does not collide with the default store.
 
+On Windows the same model holds with platform mappings (certified 2026-10-08): a per-user
+`%USERPROFILE%\.ltmrs` runtime dir (NTFS ACL inheritance stands in for 0700/0600 bits), a
+named-pipe endpoint `\\.\pipe\ltmrs-<identity>-<12-hex SHA-256(SID ‖ dir) token>` instead
+of the socket, `LockFileEx` singleton semantics identical to flock, a per-user DACL (user
+SID + SYSTEM only) in place of peer-credential checks, and accept gated on client-written
+bytes (byte-mode `ERROR_NO_DATA` is indistinguishable from success at the syscall layer,
+so `PeekNamedPipe` availability proves the peer). Literal `HOME`, when set, wins over
+`USERPROFILE`. Detached children use `CREATE_NEW_PROCESS_GROUP`; shutdown is Ctrl-C /
+Ctrl-Break; the legacy shim is `lemma.cmd` with byte-exact content.
+
 ### 7.2 Session binding
 
 Distinguish OS user, MCP frontend instance, frontend channel, logical agent session, tool request and durable operation. None is an alias for the others.
@@ -473,7 +483,7 @@ Import into staging. Preserve all supported fields/IDs, record every unsupported
 | AD-04 Default Candle recipe | E5-small candidate | Reference equivalence and retrieval quality suite |
 | AD-05 Score/abstention thresholds | Initial normalized design only | Development tuning plus frozen held-out evaluation |
 | AD-06 FTS freshness/null-vector behavior | OPEN for pinned Lance build | Local create/update/delete/search capability probes |
-| AD-07 Host/platform support | Linux-first target; no runtime certification yet | Versioned host/OS matrix |
+| AD-07 Host/platform support | Linux-first target; Windows 11 Pro x86_64 certified 2026-10-08 alongside Linux (MSVC toolchain 1.99.0, protoc 36.0, NTFS, no mold/wild) | Versioned host/OS matrix |
 
 No runtime code should depend on an unclosed decision without a failing test and explicit experimental label.
 

@@ -9,6 +9,3 @@ pub mod projects;
 pub mod repository;
 
 mod repository_internal;
-
-pub use migrations::{MigrationOutcome, MigrationPlan, MigrationRunner, MigrationSafetyRules};
-pub use repository::CanonicalRepository;

@@ -510,7 +510,7 @@ mod tests {
             dir.path().join("store").to_str().unwrap(),
         )
         .unwrap();
-        let out = ltmrs_interchange::restore::restore_verified(
+        let out = ltmrs_interchange::restore::verify::restore_verified(
             &repo,
             &parsed.verified,
             StoreGeneration::new(2),

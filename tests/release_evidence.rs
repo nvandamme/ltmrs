@@ -22,6 +22,13 @@ fn head_sha() -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+/// Windows: the evidence script is a bash program (`#!/usr/bin/env bash`)
+/// with no `bash` on a bare Windows host PATH — run it under Git Bash or
+/// unix CI. Compile coverage is kept; execution is unix-only.
+#[cfg_attr(
+    windows,
+    ignore = "evidence script needs bash; run under Git Bash or unix CI"
+)]
 #[test]
 fn quick_evidence_manifest_ties_to_head() {
     let script = Command::new("bash")
@@ -68,6 +75,10 @@ fn quick_evidence_manifest_ties_to_head() {
 
 /// Re-review P2-2: two runs in the same timestamp second must not share
 /// (and must not overwrite) a run directory — mktemp exclusivity.
+#[cfg_attr(
+    windows,
+    ignore = "evidence script needs bash; run under Git Bash or unix CI"
+)]
 #[test]
 fn same_second_runs_never_share_a_directory() {
     let run_once = || {
@@ -119,6 +130,10 @@ fn clean_checkout_runs_the_checkout_script_copy() {
 /// quick+locked over a clean tree leaves Cargo.lock byte-identical,
 /// proving metadata/tree obeyed --locked (the script additionally
 /// re-hashes the lockfile and fails a locked run that drifted).
+#[cfg_attr(
+    windows,
+    ignore = "evidence script needs bash; run under Git Bash or unix CI"
+)]
 #[test]
 fn locked_discovery_leaves_cargo_lock_untouched() {
     let before = std::fs::read("Cargo.lock").expect("Cargo.lock must be readable");
@@ -170,6 +185,10 @@ fn clean_checkout_never_passes_mode_as_flag() {
 /// P2-3: `--quick --clean-checkout` produces a bundle moved back into
 /// `reports/` with a HEAD-tied manifest (exercises the wrapper end to
 /// end without the minutes-long full suite).
+#[cfg_attr(
+    windows,
+    ignore = "evidence script needs bash; run under Git Bash or unix CI"
+)]
 #[test]
 fn clean_checkout_quick_produces_bundle() {
     let checkout = tempfile::tempdir().expect("tempdir for clean checkout");

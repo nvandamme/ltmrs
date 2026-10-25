@@ -388,11 +388,7 @@ mod tests {
         }
         let edges: BTreeMap<EntityId, Vec<Relation>> = BTreeMap::from([(eid(1), hub_edges)]);
         let rank = |id: EntityId| {
-            if id == eid(20) {
-                0.5
-            } else {
-                0.9
-            }
+            if id == eid(20) { 0.5 } else { 0.9 }
         };
         let policy = GraphPolicy {
             max_fan_out: 2,

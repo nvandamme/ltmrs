@@ -431,6 +431,7 @@ fn apply_update_memory(
         // The document revision stays put (nothing to re-project).
         memory.entity_revision = memory.entity_revision.next();
     }
+    memory.updated_at = Instant::new(state.now_millis);
 
     state.put_memory(&memory)?;
     // Content mutations enqueue a newer desired-state job so the worker
@@ -503,7 +504,7 @@ fn apply_feedback(
         id: EntityId::new(uuid::Uuid::from_bytes(event_uuid_bytes)),
         memory_id,
         useful,
-        timestamp: Instant::new(0),
+        timestamp: Instant::new(state.now_millis),
     };
     let key = format!("feedback:{}", ctx.operation_id.as_uuid());
     let raw = encode(&event)?;
@@ -667,7 +668,7 @@ fn apply_merge(
         ));
     }
 
-    let now = Instant::new(0);
+    let now = state.now_millis;
     let mut affected = Vec::new();
 
     let mut result = result.clone();
@@ -678,42 +679,43 @@ fn apply_merge(
     }
     affected.push(result.id);
 
-    // Consolidated supersession belongs to this transaction, ordered
-    // before archival: the result is live and the sources are not yet
-    // archived, so edge validation sees live endpoints on both sides.
-    // Creating them afterwards (as a post-commit tail) would reject on
-    // the archived sources.
     if consolidate {
+        // Frozen contract (consolidate=true): sources are KEPT live,
+        // marked superseded via edges, and down-weighted — never archived.
+        // Edges record first so validation sees live endpoints on both
+        // sides; creating them after a lifecycle change would reject.
         for source_id in source_ids {
             let edge = ltmrs_domain::relation::Relation::consolidation_edge(
                 result.id,
                 *source_id,
-                Instant::new(state.now_millis),
+                Instant::new(now),
             );
             apply_relate(state, &edge)?;
         }
-    }
-
-    for source_id in source_ids {
-        if let Some(mut source) = state.get_memory(*source_id)? {
-            source.lifecycle = MemoryLifecycle::Archived { at: now };
-            source.advance_eligibility();
-            state.put_memory(&source)?;
+        for source_id in source_ids {
+            if let Some(mut source) = state.get_memory(*source_id)? {
+                source.confidence = ltmrs_domain::memory::CONSOLIDATED_CONFIDENCE;
+                source.entity_revision = source.entity_revision.next();
+                state.put_memory(&source)?;
+                // Confidence is a filter-relevant projection column: the
+                // down-weight must re-publish like any absolute write.
+                state.record_pending_projection(*source_id, now)?;
+                affected.push(*source_id);
+            }
+        }
+    } else {
+        // Frozen contract (consolidate=false): sources are hard-deleted —
+        // rows gone, edges severed, projection tombstoned.
+        for source_id in source_ids {
+            apply_forget(state, *source_id, ltmrs_domain::command::ForgetMode::Delete)?;
             affected.push(*source_id);
         }
     }
 
-    // Merge write set, pending-work half (design §5.3 Merge row also lists
-    // required edges/references, which remain unimplemented here and in the
-    // reference interpreter): the result is new recallable content (pending
-    // job) and archived sources lose recallability (tombstone jobs so
-    // workers remove their rows). The projected set changed, so any open
-    // build must be refreshed.
-    let now = state.now_millis;
+    // Merge write set: the result is new recallable content (pending job).
+    // Deleted sources were tombstoned above; the projected set changed, so
+    // any open build must be refreshed.
     state.record_pending_projection(result.id, now)?;
-    for source_id in source_ids {
-        state.invalidate_projection(*source_id)?;
-    }
     state.mark_build_dirty()?;
 
     Ok(ReceiptOutcome::Success { affected })
@@ -728,7 +730,7 @@ fn apply_forget(
         .get_memory(id)?
         .ok_or_else(|| DomainError::new(DomainErrorCode::NotFound, "memory not found"))?;
 
-    let now = Instant::new(0);
+    let now = Instant::new(state.now_millis);
     memory.lifecycle = match mode {
         ltmrs_domain::command::ForgetMode::Delete => MemoryLifecycle::Deleted { at: now },
         ltmrs_domain::command::ForgetMode::Invalidate => MemoryLifecycle::Invalidated { at: now },

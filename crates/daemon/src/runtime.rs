@@ -1,15 +1,32 @@
-//! Private runtime directories, OS singleton lock, secure socket creation and
-//! safe stale-socket recovery (design §7.1, RQ-20, T-SEC-01).
+//! Private runtime directories, OS singleton lock, secure endpoint creation
+//! and safe stale-endpoint recovery (design §7.1, RQ-20, T-SEC-01).
 //!
-//! On Linux the daemon uses a user-owned 0700 runtime directory, a 0600
-//! socket, and an OS lock (flock) held for the daemon's lifetime — not just a
-//! PID file. The lock is the source of truth for ownership: if we hold it, any
-//! existing socket is stale and may be removed. A concurrent startup either
-//! wins the lock (becomes the owner) or observes a live daemon (rejects).
+//! Linux: a user-owned 0700 runtime directory, a 0600 socket, and an OS lock
+//! (flock) held for the daemon's lifetime. Windows: a per-user runtime
+//! directory under the managed home, a `LockFileEx` singleton lock, and a
+//! DACL-protected named pipe `\\.\pipe\ltmrs-<identity>-<user-token>` — the
+//! per-user DACL is the same-user boundary (the OS rejects foreign users at
+//! connect, so no frame is ever read from them). The lock is the source of
+//! truth for ownership in both platforms: if we hold it, any existing
+//! endpoint is stale and may be recovered.
 
 use std::path::{Path, PathBuf};
 
 use ltmrs_domain::id::StoreGeneration;
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+/// A duplex IPC byte stream: the platform accept path hands over the
+/// concrete connection (Unix socket, named pipe, duplex pair) as one
+/// boxed transport so the wire protocol stays platform-neutral. A combined
+/// trait is required: `dyn` cannot merge two non-auto traits directly.
+pub trait IpcDuplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> IpcDuplex for T {}
+
+pub type IpcStream = Box<dyn IpcDuplex>;
 
 /// Error type for runtime setup.
 #[derive(Debug, thiserror::Error)]
@@ -26,12 +43,12 @@ pub enum RuntimeError {
 /// store does not collide with the default store.
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
-    /// The 0700 runtime directory (sockets, lock).
+    /// The runtime directory (sockets, lock).
     pub runtime_dir: PathBuf,
     /// The lock file path.
     pub lock_path: PathBuf,
-    /// The socket path.
-    pub socket_path: PathBuf,
+    /// The IPC endpoint: Unix socket path, or Windows named-pipe name.
+    pub endpoint: PathBuf,
 }
 
 impl RuntimePaths {
@@ -40,7 +57,7 @@ impl RuntimePaths {
         let runtime_dir = base_dir.join("ltmrs").join(store_identity);
         Self {
             lock_path: runtime_dir.join("daemon.lock"),
-            socket_path: runtime_dir.join("daemon.sock"),
+            endpoint: platform_endpoint(&runtime_dir, store_identity),
             runtime_dir,
         }
     }
@@ -49,29 +66,53 @@ impl RuntimePaths {
 /// The OS singleton lock, held for the daemon's lifetime. Dropping it (or the
 /// process exiting) releases the lock.
 pub struct DaemonLock {
-    /// Keep the file open so the flock is held; released on drop.
+    /// Keep the file open so the lock is held; released on drop.
     #[allow(dead_code)]
     file: std::fs::File,
 }
 
-/// The acquired runtime: the singleton lock and the bound 0600 socket
-/// listener. Both must be kept alive for the daemon's lifetime; the lock
-/// guards ownership and the listener serves connections. The listener is
-/// reference-counted so the stdio path can spawn a background accept loop
-/// that outlives any single borrow of the daemon.
-pub struct DaemonRuntime {
-    pub lock: DaemonLock,
-    pub listener: std::sync::Arc<tokio::net::UnixListener>,
+/// The accepted connection listener. Unix: a persistent bound socket
+/// listener; Windows: the pipe endpoint, one instance created per accept.
+pub struct DaemonListener {
+    #[cfg(unix)]
+    listener: std::sync::Arc<tokio::net::UnixListener>,
+    #[cfg(windows)]
+    endpoint: PathBuf,
 }
 
-/// Acquire the singleton lock and bind a secure 0600 socket, recovering a
-/// stale socket if the previous daemon died. Returns the lock and the bound
-/// listener (both must be kept alive).
+/// The acquired runtime: the singleton lock and the endpoint listener. Both
+/// must be kept alive for the daemon's lifetime; the lock guards ownership
+/// and the listener serves connections. The listener is reference-counted so
+/// the stdio path can spawn a background accept loop that outlives any
+/// single borrow of the daemon.
+pub struct DaemonRuntime {
+    pub lock: DaemonLock,
+    pub listener: std::sync::Arc<DaemonListener>,
+}
+
+#[cfg(unix)]
+use unix::{
+    acquire_lock, build_listener, create_runtime_dir, lock_held_platform, platform_endpoint,
+    recover_stale_endpoint,
+};
+#[cfg(windows)]
+use windows::{
+    acquire_lock, build_listener, create_runtime_dir, lock_held_platform, platform_endpoint,
+    recover_stale_endpoint,
+};
+
+/// Bind the endpoint listener without acquiring the singleton lock. Used by
+/// frontend tests that drive the wire protocol with a custom server task.
+pub fn bind_listener(paths: &RuntimePaths) -> Result<DaemonListener, RuntimeError> {
+    build_listener(paths)
+}
+
+/// Acquire the singleton lock and secure the endpoint, recovering a stale
+/// endpoint if the previous daemon died. Returns the lock and the listener
+/// (both must be kept alive).
 pub fn acquire_singleton(paths: &RuntimePaths) -> Result<DaemonRuntime, RuntimeError> {
-    // Create the 0700 runtime directory.
     create_runtime_dir(&paths.runtime_dir)?;
 
-    // Open/create the lock file.
     let lock_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -79,29 +120,13 @@ pub fn acquire_singleton(paths: &RuntimePaths) -> Result<DaemonRuntime, RuntimeE
         .truncate(false)
         .open(&paths.lock_path)?;
 
-    // Try to acquire an exclusive, non-blocking flock.
-    use std::os::unix::io::AsRawFd;
-    let fd = lock_file.as_raw_fd();
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::AlreadyExists
-            || err.kind() == std::io::ErrorKind::WouldBlock
-        {
-            // Another daemon holds the lock: a live daemon exists.
-            return Err(RuntimeError::AlreadyRunning(paths.lock_path.clone()));
-        }
-        return Err(RuntimeError::Io(err));
-    }
+    acquire_lock(&lock_file, &paths.lock_path)?;
 
-    // We own the lock. Any existing socket is stale (previous daemon died
-    // without cleanup). Remove it safely.
-    recover_stale_socket(&paths.socket_path)?;
+    // We own the lock: any existing endpoint is stale (previous daemon died
+    // without cleanup). Recover it safely.
+    recover_stale_endpoint(&paths.endpoint)?;
 
-    // Bind the 0600 socket listener (kept alive to serve connections).
-    let listener = tokio::net::UnixListener::bind(&paths.socket_path)?;
-    set_mode(&paths.socket_path, 0o600)?;
-
+    let listener = build_listener(paths)?;
     Ok(DaemonRuntime {
         lock: DaemonLock { file: lock_file },
         listener: std::sync::Arc::new(listener),
@@ -109,70 +134,13 @@ pub fn acquire_singleton(paths: &RuntimePaths) -> Result<DaemonRuntime, RuntimeE
 }
 
 /// Whether another process currently holds the singleton lock, probed
-/// without side effects (shared non-blocking flock: succeeds only when
+/// without side effects (shared non-blocking lock: succeeds only when
 /// nobody owns it). Used by spawners to tell "our child died and nobody
 /// serves" (fail fast) apart from "our child lost the race to a live
 /// owner" (keep waiting). Returns `None` when the lock file cannot be
 /// inspected at all (treat as unknown: keep waiting, never fail on it).
 pub fn lock_held(paths: &RuntimePaths) -> Option<bool> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(&paths.lock_path)
-        .ok()?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
-    if rc == 0 {
-        // We got a shared lock: no exclusive owner. Release immediately.
-        unsafe {
-            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-        }
-        return Some(false);
-    }
-    let err = std::io::Error::last_os_error();
-    if err.kind() == std::io::ErrorKind::AlreadyExists
-        || err.kind() == std::io::ErrorKind::WouldBlock
-    {
-        return Some(true);
-    }
-    None
-}
-
-/// Create the 0700 runtime directory, refusing symlinked paths.
-fn create_runtime_dir(dir: &Path) -> Result<(), RuntimeError> {
-    if dir.exists() {
-        // Refuse if it is a symlink (a symlinked runtime path is unsafe).
-        let meta = std::fs::symlink_metadata(dir)?;
-        if meta.file_type().is_symlink() {
-            return Err(RuntimeError::UnsafePath(dir.to_path_buf()));
-        }
-        return Ok(());
-    }
-    std::fs::create_dir_all(dir)?;
-    // Set 0700.
-    set_mode(dir, 0o700)?;
-    Ok(())
-}
-
-/// Remove a stale socket if present. Safe because we hold the lock: no live
-/// daemon can be listening on it.
-fn recover_stale_socket(socket_path: &Path) -> Result<(), RuntimeError> {
-    if socket_path.exists() {
-        // Refuse to remove a symlink (unsafe takeover).
-        let meta = std::fs::symlink_metadata(socket_path)?;
-        if meta.file_type().is_symlink() {
-            return Err(RuntimeError::UnsafePath(socket_path.to_path_buf()));
-        }
-        std::fs::remove_file(socket_path)?;
-    }
-    Ok(())
-}
-
-/// Set a file's permission mode (Unix).
-fn set_mode(path: &Path, mode: u32) -> Result<(), RuntimeError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    Ok(())
+    lock_held_platform(paths)
 }
 
 /// The store generation the daemon is serving (used in the handshake).
@@ -190,80 +158,8 @@ mod tests {
     fn paths_resolve_per_store_identity() {
         let a = RuntimePaths::resolve(Path::new("/tmp"), "store-a");
         let b = RuntimePaths::resolve(Path::new("/tmp"), "store-b");
-        assert_ne!(a.socket_path, b.socket_path);
-        assert!(a.socket_path.starts_with(&a.runtime_dir));
-    }
-
-    #[tokio::test]
-    async fn acquire_singleton_succeeds_on_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = RuntimePaths::resolve(dir.path(), "test-store");
-        let runtime = acquire_singleton(&paths).unwrap();
-        // Lock held; socket bound.
-        assert!(paths.socket_path.exists());
-        drop(runtime);
-    }
-
-    #[tokio::test]
-    async fn second_acquire_rejects_while_first_holds_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = RuntimePaths::resolve(dir.path(), "test-store");
-        let runtime_a = acquire_singleton(&paths).unwrap();
-
-        // A second attempt on the same paths must fail (live daemon).
-        let result = acquire_singleton(&paths);
-        assert!(matches!(result, Err(RuntimeError::AlreadyRunning(_))));
-
-        drop(runtime_a);
-    }
-
-    #[tokio::test]
-    async fn stale_socket_recovered_after_lock_released() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = RuntimePaths::resolve(dir.path(), "test-store");
-
-        // First daemon acquires, binds socket, then dies (drops lock + listener).
-        let runtime = acquire_singleton(&paths).unwrap();
-        assert!(paths.socket_path.exists());
-        drop(runtime);
-
-        // A new daemon acquires the now-free lock and recovers the stale socket.
-        let runtime2 = acquire_singleton(&paths).unwrap();
-        assert!(
-            paths.socket_path.exists(),
-            "socket recreated after recovery"
-        );
-        drop(runtime2);
-    }
-
-    #[test]
-    fn symlinked_runtime_dir_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = RuntimePaths::resolve(dir.path(), "test-store");
-        // Create the parent so the symlink location is valid, then symlink the
-        // runtime dir itself to a real directory.
-        let parent = paths.runtime_dir.parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&parent).unwrap();
-        let target = dir.path().join("real-dir");
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&target, &paths.runtime_dir).unwrap();
-
-        let result = acquire_singleton(&paths);
-        assert!(matches!(result, Err(RuntimeError::UnsafePath(_))));
-    }
-
-    /// The side-effect-free lock probe reports held while an owner lives,
-    /// free after it drops, and unknown when nothing exists to inspect.
-    #[tokio::test]
-    async fn lock_probe_distinguishes_held_free_and_missing() {
-        // Nothing on disk yet: unknown, never a bare false that could
-        // mislead a spawner into failing fast.
-        let dir = tempfile::tempdir().unwrap();
-        let paths = RuntimePaths::resolve(dir.path(), "test-store");
-        assert_eq!(lock_held(&paths), None);
-        let runtime = acquire_singleton(&paths).unwrap();
-        assert_eq!(lock_held(&paths), Some(true));
-        drop(runtime);
-        assert_eq!(lock_held(&paths), Some(false));
+        assert_ne!(a.endpoint, b.endpoint);
+        #[cfg(unix)]
+        assert!(a.endpoint.starts_with(&a.runtime_dir));
     }
 }

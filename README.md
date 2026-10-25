@@ -26,8 +26,9 @@ open items) lives in [`docs/RELEASE.md`](docs/RELEASE.md); history in
 - the repository governance files.
 
 The wire capture and tool inventory are real captures with provenance, not
-hand-written goldens. All conformance matrix cells still start at `not_run` —
-capturing the baseline is not passing conformance.
+hand-written goldens. All BASELINE conformance cells start at `not_run` —
+capturing the baseline is not passing conformance (ltmrs's own matrix in
+`plans/conformance_matrix.json` tracks executed cells separately).
 
 ## Compatibility target
 
@@ -212,7 +213,7 @@ assumption.
 ## Install
 
 Prerequisites: a Rust stable toolchain. `rust-toolchain.toml` pins it
-(currently 1.96.0 with rustfmt + clippy); rustup picks it up
+(currently 1.99.0 with rustfmt + clippy); rustup picks it up
 automatically. No Node, Python, or system database engine is needed —
 inference is CPU Candle, storage is Fjall + LanceDB.
 

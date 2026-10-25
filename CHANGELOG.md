@@ -5,7 +5,6 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-
 ## COLLAPSED (2026-10-26) — External review remediation, waves A–C
 
 Collapses the 19-commit arc `2f7d961..8ca4618` (all local-only, unpushed) into one
@@ -16,8 +15,9 @@ import, score truthfulness), and Wave C qualification evidence (import conforman
 audit checks, gate + release bundle, test pins). Each entry below keeps its reviewed
 body verbatim (per-commit headings demoted to subsections; original SHAs recoverable
 from branch `backup/pre-collapse-waves-abc` and the reflog). No product-plan, wire,
-receipt or durability semantic change beyond what each entry records; the committed
-tree is byte-identical to gated HEAD `8ca4618` except this file.
+receipt or durability semantic change beyond what each entry records. Merged with
+origin/main `ba5a861` (6-entry audit/file-split/Windows arc, recorded below); the
+merged tree unites both lines — see the merge commit for the reconciliation record.
 
 ### Wave C0: deferred test hardening (order-pinning, query-summary, virtual assert)
 - `expand` / `expand_ranked`: traversal-order pins (EntityId order under scrambled adjacency + fanout cap; rank-desc selection with id tiebreak). Pass on current code (coverage gaps, not bugs).
@@ -280,7 +280,198 @@ tree is byte-identical to gated HEAD `8ca4618` except this file.
 
 ---
 
-## 99c546e (2026-10-08) — Build speed: profiles, auto-detected fast linker, hygiene rules
+## 2026-10-10 — Companion rule-hygiene + deterministic tests
+
+- Companion rule-hygiene + deterministic tests (user WIP): AGENTS.md module-hygiene rules text (1500 LOC ceiling / 800 preferred, shared-first, no shims/re-exports); `crates/service/src/lib.rs` re-export facade removal per rule 6; gated (signal-based, no sleep-hopes) cancellation/worker tests in `crates/embeddings/src/service.rs` + `worker.rs`.
+
+## db3371f (2026-10-10) — Whole-tree file-split wave (1500/800 LOC rule)
+
+- Whole-tree file-split wave (AGENTS.md rule 2, 1500 LOC ceiling / 800 preferred): `crates/daemon/src/tools.rs` 5800+ -> 236 lib-only lines (25 domain modules + 15 test modules); `crates/service/src/repository.rs` 9400 -> ~760 lib lines (11 domain modules + 13 test modules). All moves verbatim (git-HEAD-verified where repaired); gates: fmt clean, clippy clean (daemon+service), daemon lib 231/231, service lib 108/108.
+- Split incident repairs (all verified): 5 brace/import off-by-ones recovered byte-identical from HEAD; one +2 shift junction repaired; E0252 dupes removed; cross-sibling privates upgraded to pub(crate) with compiler-enumerated precision; empty mod shells deleted.
+- `crates/daemon/src/server.rs` 2316 -> ~350 lib lines (workers/connection/guards + lifecycle/projection/test_support); `handle_connection` stays `pub` via `pub mod connection` with call-site path updates (client.rs, frontend, visualizer; no shim). Gates: daemon lib 231/231 green, check clean.
+- `crates/frontend/src/frontend/mcp.rs` 3160 -> lib core (4 parse modules + handler + connection/resume/route/test_support); `handle_connection` publicity restored via `pub mod connection` with call-site path updates (no shim). Gates: frontend lib 96/96 green, check clean.
+- `crates/search/src/retrieval/engine.rs` 2886 -> lib core (legs/shaping submodules + 5 test modules); `include_str!` fixture path adjusted for new depth. Gates: search lib 178/178 green, check clean.
+- `crates/search/src/search/projector.rs` 1985 -> lib core (worker submodule + 4 test modules). Notable: tokio-vs-std Mutex caught by compiler; glob-import lint lesson (test files need explicit imports). Gates: search lib 178/178 green, check clean.
+- `crates/search/src/search/table.rs` 1591 -> lib core (reads/writes/maintenance submodules + 3 test modules). Lesson: cross-crate APIs must stay `pub` (pub(crate) broke daemon callers); glob-import lint gap confirmed again. Gates: search lib 178/178 green, check clean.
+- `crates/domain/src/interpreter.rs` 1572 -> struct+ctor core (4 domain modules + 6 test modules). Gates: domain lib 48/48 green, check clean.
+- `crates/interchange/src/restore.rs` 1658 -> types core (coordinator/verify submodules + 4 test modules). Cross-crate API preserved (`pub mod verify`, ConfirmRequest stays parent, daemon paths updated). Gates: interchange lib 30/30 green, check clean.
+- `crates/search/src/search/backend.rs` 1075 -> core + embedders/e5 submodules + backend_tests. Cross-crate embedder paths updated in daemon (no shim). Gates: search lib 178/178 green, check clean.
+- `crates/frontend/src/frontend/serve.rs` 1113 -> layout core (daemon submodule (pub) + 2 test modules); binary import paths updated. Gates: frontend lib 96/96 green, check clean.
+- `crates/embeddings/src/e5_small.rs` 1125 -> types core (adapter submodule + e5_tests; impl move never moves the type, paths unchanged). Gates: embeddings lib 25/25 green, check clean.
+- `src/bench/quality.rs` 1207 -> harness core (quality_tests + quality_fixture_tests). Full workspace gate: 810 passed / 0 failed, fmt clean, clippy clean.
+- Review: formal pass (exact fn+type parity HEAD-vs-worktree on all 13 splits) + functional pass (810/810 green, byte-identical recoveries). 221 files census: zero over 800 LOC.
+
+## 02deede (2026-10-09) — Tool-atomicity wave: staged completion, FTS honesty, evidence
+
+### Tool-atomicity wave (staged completion)
+- Staged tool completion (`crates/daemon/src/tools.rs`,
+  `crates/service/src/repository.rs`): multi-effect tools freeze success
+  only after every stage completes; retries re-run idempotent stages
+  (sub-command receipts for boosts, dedup merges for session links) before
+  freezing. `session_start` boost `let _` → `?` (replay already flows
+  through all stages); `memory_add` gains `resolve_add_session` +
+  `ensure_memory_created_link` with `?` on fresh and ensure on Unfrozen
+  rebuild; `guide_practice` link + validated-read `?` (practice has no
+  tool-level recorded replay — every call flows through link + primitive).
+  New tests: `session_start_boost_conflict_fails_loudly`,
+  `session_start_unfrozen_receipt_completes_stages_and_freezes`,
+  `add_unfrozen_receipt_completes_session_link_and_freezes`,
+  `guide_practice_unfrozen_receipt_completes_session_link`,
+  `guide_practice_link_failure_fails_loudly`,
+  `session_link_barrier_failure_errors` (all RED→GREEN or guard-verified).
+- Sweep: add `task_type` read + continuity recall propagate storage errors
+  (`build_continuity_recall` → `DomainResult`); rest triaged
+  presentation/best-effort/read-only.
+
+### FTS honesty, poison policy, evidence reconciliation
+- `fts_ready` propagates Lance errors (destroyed-index table reports
+  `Unavailable`, was `Partial`; RED→GREEN
+  `search_state_unavailable_when_table_unreadable`); `fts_usable` keeps
+  canonical-scan degrade with a loud anomaly line.
+- Poison policy: plain locks recover via `into_inner` (dispatcher, limits,
+  scheduler, server, similarity gate, queue, hooks); restore fence keeps
+  fail-daemon unwrap + policy comment.
+- Formal: RQ-17 → `executed_partial` with staged-completion evidence;
+  RELEASE.md date/numbers refreshed; README toolchain 1.99.0 + baseline
+  scoping; TODO delivery boxes flipped with WP-12/13 honestly open.
+- Evidence: `cargo test --workspace` 811 passed / 0 failed (15 ignored with
+  reason), `cargo fmt --all -- --check` + `cargo clippy --workspace
+  --all-targets -- -D warnings` clean. Rulings: boost-list recompute on
+  replay may drift targets (never loses/doubles effects); link-first order
+  kept (1-fault test isolates the link barrier); failure-only `?` changes
+  without corruption seams use existing success-path coverage.
+
+## 3c78557 (2026-10-09) — Audit review wave 2: admission-once, replay purity, migration, embedding
+
+### Audit review wave 2: session replay, TTL renewal, housekeeping
+- Session-operation replay before mutable routing (`crates/daemon/src/tools.rs`,
+  `crates/service/src/repository.rs`): `exec_session_attempt` consults
+  `session_attempt_receipt` before `resolve_session`, so a retried envelope
+  replays from its durable receipt even after its session went terminal;
+  shared `render_attempt_response` (recorded handle, frozen after render).
+  `apply()` looks up the durable receipt before namespace validation
+  (dead epoch never hides a committed outcome). Regression:
+  `session_attempt_replays_after_session_end` + expiry replay tests.
+- Frontend TTL renewal (`crates/frontend/src/frontend/mcp.rs`): healthy-stream
+  `StaleReplay` forgets the dead epoch, re-handshakes (no resume) and executes
+  once with a fresh operation id; `resend_after_reconnect` stays conservative.
+  Scripted wire test `stale_replay_renews_epoch_and_executes_once`.
+- GC scheduling (`crates/daemon/src/server.rs`): hourly `start_housekeeping`
+  worker runs `gc_expired` independent of search maintenance (lexical-only
+  collects too), first pass immediate, aborted on shutdown + test.
+
+### Audit review wave 2: admission-once, replay purity, migration, embedding
+- Admission-once throughout (`repository.rs`, `tools.rs`): guide/distill/
+  suggestion primitives and all mutating exec adapters take `&AdmittedScope`
+  (TTL checked once at tool entry); reads admit once at the gateway.
+  `check_tool_replay`/sub-scopes verified TTL-free. Expiry test asserts gate
+  rejection. Debug derives on `AdmittedScope`/`NamespacePin`.
+- Crash-window replay purity (`tools.rs`): add/update/feedback Unfrozen
+  rebuilds are pure functions of request + receipt (no live reads); three
+  RED→GREEN exec-level tests prove later mutations can't rewrite reported
+  results. Forget/merge/relate were already pure; MemoryRead intentionally
+  unfrozen (reads re-render; access side-effect receipted).
+- Migration repair (`migrations.rs`, `repository.rs`): `REQUIRED_KEYSPACES`
+  (16) shared by open + validation with coverage test; accurate v1
+  description; `backup_before` author contract; atomicity locked by existing
+  fault test. Fail-closed publish lock test (`backup.rs`).
+- Embedding ownership (`embeddings/service.rs`, `worker.rs`):
+  `Arc<ServiceInner>` owns handle + JoinHandle; race-free last-drop shutdown;
+  `mem::forget` gone; bare-handle Clone is observe-only. Barrier-synced 300x
+  stress test failed pre-fix, green post.
+- Evidence/API hygiene: manifest `direct_dependencies` are `{name, version}`
+  records; `put_guide`/`delete_guide`/`put_suggestion` doc-marked
+  seeding/repair-only.
+- Evidence: `cargo test --workspace` 803 passed / 0 failed (15 ignored with
+  reason), `cargo fmt --all -- --check` + `cargo clippy --workspace
+  --all-targets -- -D warnings` clean. Rulings: no receipt-schema surgery
+  (reduced-but-honest window text, frozen after); no version bump or dir-copy
+  backup (stamp-only path; migration #2 author snapshots); mutators stay pub
+  (cross-crate test + bench callers).
+
+## 8017237 (2026-10-09) — Serve-forever accept-loop WouldBlock fix
+
+### Serve-forever accept-loop WouldBlock fix
+- Serve-forever accept loop `WouldBlock` fix (`crates/daemon/src/server.rs`,
+  `tests/daemon_lifecycle.rs`): the idle-budget-0 branch returned
+  `WouldBlock` as a fatal error, so a serve-forever daemon on Windows
+  exited ~1s after its first quiet window (all other loops already
+  continued/ticked on it; no test exercised idle 0). Added the `continue`
+  arm + `foreground_daemon_without_idle_budget_serves_across_quiet_windows`
+  (RED→GREEN: failed in 2.5s pre-fix; boots, survives a 1500ms quiet
+  window, serves a frontend attach, explicit kill with a KillGuard against
+  strays on failure paths). Evidence: `daemon_lifecycle` 6 passed +
+  1 ignored, fmt + clippy `-D warnings` clean. Design §2.1 wording
+  extended to the serve-forever loop.
+
+## 3fbf00d (2026-10-09) — Whole-tree audit fix wave + Windows compat certification
+
+### Whole-tree audit fix wave (Lance similarity authority, fencing, durability)
+- Whole-tree audit fix wave (22 findings, P1→P3): single Lance-backed
+  `SimilarityService` in `ltmrs-search` (Jaccard recipe, indexed candidates +
+  pending overlay + degraded snapshot; `word_overlap` removed from compat);
+  SearchBackend always attached (lexical without E5) + always-on lexical
+  projection worker + NULL-row backfill on E5 start; `SearchState`
+  Complete/Partial/Unavailable with empty-complete answers standing;
+  mutation-time admission gate with barrier + overlay regression tests;
+  `memory_merge` DeleteSources vs Consolidate per frozen contract (both
+  levels + interpreter parity, 0.05 const); generation fencing fail-closed
+  (dispatcher + txn check + corrupt-meta rejection + degraded health);
+  backup durable publication + 0600 + configurable bound (`_with_limit`
+  + `LTMRS_MAX_BACKUP_BYTES`); replay-first in update/relate/distill (new
+  distill receipt reader); first-freeze-wins; real timestamps +
+  `updated_at`; update claim removed; truthful provenance + engine-side
+  dates/pagination; Lance-neighbor conflict candidates; bounded streaming
+  artifact download; linker provenance in release evidence (executed);
+  deviations.json + CI-section + stale-comment drift fixed. Evidence:
+  `cargo test --workspace` 790 passed / 0 failed (15 ignored with reason),
+  fmt + clippy `-D warnings` clean. Deferred with path: streaming backup
+  encode (bound is now a parameter), partial-nonempty recall surfacing.
+  Rulings: shell-dependent tests get `cfg_attr(windows, ignore)`; dense
+  stays out of dup rejection (unfrozen thresholds must not block writes);
+  ltmrs hard-delete is tombstoned (merge-delete matches Forget{Delete}).
+
+### Windows daemon accept data gate + compat plan Tasks 1-7
+- Windows daemon accept data gate (`crates/daemon/src/runtime/windows.rs`,
+  `crates/daemon/src/server.rs`): byte-mode `ConnectNamedPipe` `ERROR_NO_DATA`
+  is mistaken for success by tokio/mio, spinning fake EOF accepts and starving
+  idle-exit. `accept()` now gates on `PeekNamedPipe` bytes-available `> 0` on the
+  same instance (bounded 1000ms → `WouldBlock`); serve idle loop treats
+  `WouldBlock` as a timeout tick, `spawn_socket_server` continues. Evidence:
+  `cargo test --test daemon_lifecycle` 5 passed + 1 ignored (simultaneous ×3
+  stable), `cargo test -p ltmrs-daemon --lib` 215 passed,
+  `cargo test -p ltmrs-frontend --lib` 94 passed, `cargo test -p ltmrs --bin ltmrs`
+  34 passed, `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets
+  -- -D warnings` clean (also fixed two pre-existing clippy hits: redundant cast
+  in `create_pipe`, no-op `.into()` in `resolve_home`). Design recorded in
+  `plans/2026-10-08-windows-compat-design.md` §2.1. Rejected: future-stack
+  `OVERLAPPED` with direct `ConnectNamedPipe` (kernel pointer dangles across
+  awaits → `0xc0000005`); `PeekNamedPipe` success as connectedness proof (succeeds
+  on unconnected instances); `HasOverlappedIoCompleted` import (WinBase macro).
+- Windows compat plan Tasks 1–7 complete (2026-10-09 session). T3: `home_dir()`
+  now prefers non-empty `HOME`, falls back to `USERPROFILE` on Windows
+  (`home_dir_prefers_home_over_userprofile` RED→GREEN; frontend lib 95/95).
+  Rulings: shipped `detach_child(&mut Command)` stands in for the plan's
+  `spawn_detached` constructor (shared by daemon spawn + visualizer); the
+  spawn smoke test lives in `tests/daemon_lifecycle.rs` (`CARGO_BIN_EXE_ltmrs`
+  unavailable in frontend unit tests). T5: `vis_smoke` 1/1 (shared helper
+  already wired). T6 gate: `cargo fmt --all -- --check` clean,
+  `cargo clippy --workspace --all-targets -- -D warnings` clean,
+  `cargo test --workspace` 768 passed / 0 failed (15 ignored with reason),
+  `cargo build --release` clean; release-binary smokes: daemon foreground
+  idle exit 0, two stdio frontends share one daemon, `-vis` URL+pid with
+  `/api/library?token` 200, `--install-shim` writes byte-exact `lemma.cmd`;
+  no strays. Rulings: `tests/release_evidence.rs` 4 bash-executing tests +
+  `xtask/src/run.rs` 3 `sh`-dependent tests get `#[cfg_attr(windows, ignore)]`
+  with reason (no bash/sh on bare Windows host; static guards still run;
+  full runs on unix CI). T7: §7.1 Windows paragraph + AD-07
+  (Windows 11 Pro x86_64, NTFS, MSVC 1.99.0, protoc 36.0 — all verified),
+  T-SEC-01 Windows execution row, RQ-20 evidence, `windows_certification`
+  ledger entries in `traceability.json` / `conformance_matrix.json` (visualizer
+  table verbatim); design cross-check fixes (`detach_child` shape, shim
+  `exit /b` line).
+
+## 2026-10-08 — Build speed: profiles, auto-detected fast linker, hygiene rules
 
 ### Build speed: profiles, auto-detected fast linker, hygiene rules
 - `[profile.dev]`: `lto = false` (was thin — re-optimized the whole

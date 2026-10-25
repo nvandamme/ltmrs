@@ -128,7 +128,7 @@ pub async fn daemon_unattached_count(name: &str, home: Option<String>) -> Option
         return None;
     }
     let layout = crate::frontend::serve::stdio_layout(&base);
-    let socket = crate::frontend::serve::daemon_socket_path(&layout);
+    let socket = crate::frontend::serve::daemon::daemon_socket_path(&layout);
     let mut client = IpcClient::new(socket);
     tokio::time::timeout(std::time::Duration::from_secs(2), client.connect())
         .await
@@ -202,7 +202,7 @@ pub async fn daemon_adopt_slug(
         .ok_or_else(|| "HOME is not set".to_string())?;
     let base = std::path::Path::new(&home).join(crate::frontend::serve::MANAGED_HOME_DIR);
     let layout = crate::frontend::serve::stdio_layout(&base);
-    let socket = crate::frontend::serve::daemon_socket_path(&layout);
+    let socket = crate::frontend::serve::daemon::daemon_socket_path(&layout);
     let sock_display = socket.display().to_string();
     let unreachable = move || {
         format!(
