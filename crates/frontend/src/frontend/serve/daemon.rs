@@ -398,6 +398,11 @@ async fn probe_handshake_inner(
 /// store, sessions, search, embedding detection), serves the bound socket
 /// with maintenance and projection, persists on every shutdown path.
 pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result<(), CliError> {
+    // Arm the shutdown watchers BEFORE any slow startup work (socket bind
+    // included): a SIGTERM arriving mid-startup must be caught, never
+    // default-kill the process before the serve loop exists.
+    let shutdown = ShutdownWatch::arm()
+        .map_err(|e| CliError::Runtime(format!("cannot watch for shutdown signal: {e}")))?;
     let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
     let embedding = resolve_daemon_embedding(layout);
     let config = DaemonConfig {
@@ -420,7 +425,7 @@ pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result
 
     let result = tokio::select! {
         r = daemon.serve() => r,
-        _ = shutdown_signal() => {
+        _ = shutdown.wait() => {
             eprintln!("ltmrs: daemon received shutdown signal, shutting down");
             Ok(())
         }
@@ -436,22 +441,73 @@ pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result
 /// and Ctrl-Break on Windows (a detached daemon is Ctrl-C-protected by its
 /// new process group; Ctrl-Break reaches it via GenerateConsoleCtrlEvent).
 #[cfg(unix)]
+pub struct ShutdownWatch {
+    term: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownWatch {
+    /// Arm the OS signal watchers BEFORE slow startup work. A supervisor
+    /// sends SIGTERM as soon as the socket file is visible, which happens
+    /// inside `Daemon::start` — long before the serve loop exists. Arming
+    /// here (instead of at the first `select!`) closes that window: a
+    /// SIGTERM arriving mid-startup is caught and shuts down gracefully
+    /// instead of default-killing the process.
+    pub fn arm() -> std::io::Result<Self> {
+        Ok(Self {
+            term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    pub async fn wait(mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+}
+
+#[cfg(unix)]
 pub async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("cannot watch for SIGTERM");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
+    ShutdownWatch::arm()
+        .expect("cannot watch for SIGTERM")
+        .wait()
+        .await
+}
+
+#[cfg(windows)]
+pub struct ShutdownWatch {
+    brk: tokio::signal::windows::CtrlBreak,
+}
+
+#[cfg(windows)]
+impl ShutdownWatch {
+    /// Arm the OS signal watchers BEFORE slow startup work (same contract
+    /// as the unix arm above: no unhandled window while the endpoint is
+    /// visible but the serve loop does not exist yet).
+    /// NOTE: not compile-verified on this host (no Windows target
+    /// installed); body mirrors the previously reviewed handler line for
+    /// line, only the watcher's creation moved earlier.
+    pub fn arm() -> std::io::Result<Self> {
+        Ok(Self {
+            brk: tokio::signal::windows::ctrl_break()?,
+        })
+    }
+
+    pub async fn wait(mut self) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = self.brk.recv() => {}
+        }
     }
 }
 
 #[cfg(windows)]
 pub async fn shutdown_signal() {
-    let mut brk = tokio::signal::windows::ctrl_break().expect("cannot watch for Ctrl-Break");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = brk.recv() => {}
-    }
+    ShutdownWatch::arm()
+        .expect("cannot watch for Ctrl-Break")
+        .wait()
+        .await
 }
 
 /// Serve MCP over stdio: `socket=None` ensures the managed-home daemon

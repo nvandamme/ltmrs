@@ -51,7 +51,7 @@
       }
     ]
   },
-  "expected_tool_count": 29,
+  "expected_tool_count": 30,
   "tools": [
     {
       "name": "memory_read",
@@ -77,7 +77,7 @@
         "defaults_and_validation": "executed_passed",
         "output_and_errors": "executed_passed",
         "state_transitions": "executed_passed",
-        "scope_and_concurrency": "not_run",
+        "scope_and_concurrency": "executed_passed",
         "retry_and_restart": "not_run",
         "legacy_oracle": "not_run",
         "enhancement_ledger": "not_run"
@@ -87,7 +87,8 @@
         "confirm=false default redaction policy",
         "confirm=true verbatim-storage override or explicit documented policy rejection",
         "evidence provenance and snippet privacy policy"
-      ]
+      ],
+      "notes": "Scope: cross_project_conflict_not_surfaced (stable id adds with 0 conflicts, no foreign render). Concurrency: concurrent_near_duplicate_adds_admit_exactly_one (barrier-synced duplicates admit exactly one, admission-once)."
     },
     {
       "name": "memory_update",
@@ -157,12 +158,13 @@
         "defaults_and_validation": "executed_passed",
         "output_and_errors": "executed_passed",
         "state_transitions": "executed_passed",
-        "scope_and_concurrency": "not_run",
+        "scope_and_concurrency": "executed_passed",
         "retry_and_restart": "not_run",
         "legacy_oracle": "not_run",
         "enhancement_ledger": "not_run"
       },
-      "owner_workpackage": "WP-08"
+      "owner_workpackage": "WP-08",
+      "notes": "Scope: cross_project_relate_refused (foreign endpoint refused as not-found under stable id, same-project control passes). Concurrency: same_envelope_replays_success (receipt idempotency, no duplicate edge)."
     },
     {
       "name": "memory_stats",
@@ -322,12 +324,13 @@
         "defaults_and_validation": "executed_passed",
         "output_and_errors": "executed_passed",
         "state_transitions": "executed_passed",
-        "scope_and_concurrency": "not_run",
-        "retry_and_restart": "not_run",
+        "scope_and_concurrency": "executed_passed",
+        "retry_and_restart": "executed_passed",
         "legacy_oracle": "not_run",
         "enhancement_ledger": "not_run"
       },
-      "owner_workpackage": "WP-09"
+      "owner_workpackage": "WP-09",
+      "notes": "Retry: session_start_replay_returns_recorded_session + session_start_retry_returns_frozen_response (verbatim frozen replay, changed-args rejects). Restart: restart_preserves_session_record_without_resurrecting_binding (kill+reopen keeps the record and its attempt; fresh op opens a new session, old binding never resurrected)."
     },
     {
       "name": "session_attempt",
@@ -352,12 +355,13 @@
         "defaults_and_validation": "executed_passed",
         "output_and_errors": "executed_passed",
         "state_transitions": "executed_passed",
-        "scope_and_concurrency": "not_run",
-        "retry_and_restart": "not_run",
+        "scope_and_concurrency": "executed_passed",
+        "retry_and_restart": "executed_passed",
         "legacy_oracle": "not_run",
         "enhancement_ledger": "not_run"
       },
-      "owner_workpackage": "WP-09"
+      "owner_workpackage": "WP-09",
+      "notes": "Retry: session_end_replay_returns_recorded_outcome (identical text, counted once). Restart: session_end_ack_survives_store_reopen (outcome/lessons/final_approach survive kill+reopen)."
     },
     {
       "name": "session_stats",
@@ -463,6 +467,22 @@
         "enhancement_ledger": "not_run"
       },
       "owner_workpackage": "WP-11"
+    },
+    {
+      "name": "backup_import_lemma",
+      "family": "backup",
+      "checks": {
+        "name_and_schema": "executed_passed",
+        "defaults_and_validation": "executed_passed",
+        "output_and_errors": "executed_passed",
+        "state_transitions": "executed_passed",
+        "scope_and_concurrency": "executed_passed",
+        "retry_and_restart": "executed_passed",
+        "legacy_oracle": "specified_not_executed",
+        "enhancement_ledger": "not_run"
+      },
+      "owner_workpackage": "WP-11",
+      "notes": "Native cdylib importer (Wave B5c, C1 T-IMPORT-01/02): route + parse (backup_import_lemma_routes_with_path_and_confirm), validation (requires_path, confirm/token checks), preview loss report, preview-then-confirm single-use replace (execute_replaces_store). Concurrency fenced (restore_write_guard + channel+path single-use TTL lease + generation/op-seq recheck: rechecks_lease_when_busy, rejects_stale_source_generation_and_expiry, without_preview_is_invalid). Retry of confirm refused AlreadyUsed (single_use), never double-applied. No upstream oracle (greenfield tool)."
     },
     {
       "name": "backup_preview",

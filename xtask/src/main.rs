@@ -45,6 +45,11 @@ enum Command {
     GateAudit {
         dry_run: bool,
     },
+    Test {
+        tier: String,
+        package: Option<String>,
+        dry_run: bool,
+    },
     Help {
         verb: Option<String>,
     },
@@ -60,6 +65,7 @@ const VERBS: &[&str] = &[
     "evidence",
     "dist-audit",
     "gate-audit",
+    "test",
 ];
 
 const BOOL_FLAGS: &[&str] = &["--dry-run", "--help"];
@@ -78,7 +84,8 @@ fn usage() -> &'static str {
         quality --split <name>                   run calibration corpus + quality wave\n\
         evidence --release <version>             build the release evidence bundle\n\
         dist-audit [--mode fast|full]            T-BUILD-01 distribution audit (fast inspection; full adds locked release + offline builds)
-        gate-audit [--dry-run]                 T-GATE-01 requirement/evidence matrix consistency gate (seconds; validates labeling, never executes cells)\n\
+        gate-audit [--dry-run]                 T-GATE-01 requirement/evidence matrix consistency gate (seconds; validates labeling, never executes cells)
+        test [--tier quick|full] [--package N] tiered test runner (default quick: light-crate lib suites; full runs the workspace gate; package runs one crate)\n\
      \n\
      Global flags:\n\
        --dry-run   print the would-be command without executing\n\
@@ -127,6 +134,7 @@ fn known_value_flags(verb: &str) -> &'static [&'static str] {
         "evidence" => &["--release"],
         "dist-audit" => &["--mode"],
         "gate-audit" => &[],
+        "test" => &["--tier", "--package"],
         _ => &[],
     }
 }
@@ -359,6 +367,31 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
             Ok(Command::DistAudit { full, dry_run })
         }
         "gate-audit" => Ok(Command::GateAudit { dry_run }),
+        "test" => {
+            let tier = match pairs.iter().position(|(k, _)| k == "--tier") {
+                Some(i) => {
+                    let raw = pairs.remove(i).1;
+                    match raw.as_str() {
+                        "quick" | "full" => raw,
+                        other => {
+                            return Err(format!(
+                                "invalid value '{other}' for '--tier': expected 'quick' or 'full'"
+                            ));
+                        }
+                    }
+                }
+                None => "quick".to_string(),
+            };
+            let package = pairs
+                .iter()
+                .position(|(k, _)| k == "--package")
+                .map(|i| pairs.remove(i).1);
+            Ok(Command::Test {
+                tier,
+                package,
+                dry_run,
+            })
+        }
         _ => unreachable!("canonical verb '{verb}' has no constructor"),
     }
 }
@@ -420,6 +453,20 @@ fn usage_verb(verb: &str) -> &'static str {
               parses plans/traceability.json + plans/conformance_matrix.json\n\
               and fails on mislabeled, evidence-free or dangling references\n\
               (fast, seconds; --dry-run prints the would-be reads).\n"
+        }
+        "test" => {
+            "cargo xtask test [--tier quick|full] [--package <name>] [--dry-run]\n\
+             \n\
+              Tiered test runner (iteration speed):\n\
+              default quick runs the four light-crate lib suites only\n\
+              (domain, service, compat, interchange — no candle/lance/\n\
+              arrow/rmcp in the closure, seconds);\n\
+              --tier full runs the workspace gate (cargo test --workspace);\n\
+              --package <name> runs one workspace member's full test target\n\
+              (name must be a workspace member: ltmrs, ltmrs-domain,\n\
+              ltmrs-service, ltmrs-compat, ltmrs-embeddings, ltmrs-search,\n\
+              ltmrs-interchange, ltmrs-daemon, ltmrs-frontend, xtask).\n\
+              --package and --tier full conflict (full already covers all).\n"
         }
         _ => usage(),
     }
@@ -493,6 +540,17 @@ fn main() {
             }
         },
         Ok(Command::DistAudit { full, dry_run }) => match verbs::run_dist_audit(full, dry_run) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Ok(Command::Test {
+            tier,
+            package,
+            dry_run,
+        }) => match verbs::run_test(&tier, package.as_deref(), dry_run) {
             Ok(code) => std::process::exit(code),
             Err(err) => {
                 eprintln!("error: {err}");
@@ -816,6 +874,29 @@ mod tests {
     #[test]
     fn dist_audit_rejects_unknown_mode() {
         let err = parse_args(args(&["xtask", "dist-audit", "--mode", "bogus"])).unwrap_err();
+        assert!(err.contains("bogus"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parses_test_verb() {
+        let cmd = parse_args(args(&["xtask", "test"])).unwrap();
+        assert!(
+            matches!(cmd, Command::Test { tier, package, dry_run: false }
+                if tier == "quick" && package.is_none())
+        );
+        let cmd = parse_args(args(&["xtask", "test", "--tier", "full"])).unwrap();
+        assert!(matches!(cmd, Command::Test { tier, package, .. }
+                if tier == "full" && package.is_none()));
+        let cmd = parse_args(args(&["xtask", "test", "--package", "ltmrs-daemon"])).unwrap();
+        assert!(matches!(cmd, Command::Test { tier, package, .. }
+                if tier == "quick" && package.as_deref() == Some("ltmrs-daemon")));
+        let cmd = parse_args(args(&["xtask", "test", "--dry-run"])).unwrap();
+        assert!(matches!(cmd, Command::Test { dry_run: true, .. }));
+    }
+
+    #[test]
+    fn test_rejects_unknown_tier() {
+        let err = parse_args(args(&["xtask", "test", "--tier", "bogus"])).unwrap_err();
         assert!(err.contains("bogus"), "unexpected error: {err}");
     }
 }

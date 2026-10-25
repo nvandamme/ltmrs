@@ -779,7 +779,7 @@ fn wal_live_snapshot_imports_coherently_without_touching_source() {
     // Upstream-equivalent snapshot: serialize the live view, normalize the
     // PRIVATE copy to (1,1) (upstream backup.js snapshot(); the live db is
     // untouched by construction — serialize copies).
-    let reader = rusqlite::Connection::open(&live_path).unwrap();
+    let mut reader = rusqlite::Connection::open(&live_path).unwrap();
     let data = reader.serialize(rusqlite::MAIN_DB).unwrap();
     let mut image: Vec<u8> = data.iter().copied().collect();
     drop(data);

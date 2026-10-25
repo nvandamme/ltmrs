@@ -5,3 +5,10 @@ xtask = "run --quiet -p xtask --"
 # probe at tools/detect_linker.rs), not here: cargo has no conditional
 # config, and a hardcoded -fuse-ld breaks checkouts without that linker.
 # Override per-build with LTMRS_LINKER=mold|wild|system.
+
+# rustc-wrapper routes every rustc invocation through
+# tools/sccache-wrap.sh, which uses sccache when installed and falls back
+# to plain rustc otherwise (fresh checkouts keep building). Bypass per
+# invocation with LTMRS_NO_SCCACHE=1 (see the script header).
+[build]
+rustc-wrapper = "tools/sccache-wrap.sh"

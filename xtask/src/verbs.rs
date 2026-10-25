@@ -472,6 +472,93 @@ pub fn run_recovery(suite: &str, dry_run: bool) -> Result<i32, String> {
     run_children("recovery", &commands, RECOVERY_NAMES, dry_run)
 }
 
+/// Light crates for the quick test tier: no candle/lance/arrow/rmcp in
+/// their closures, so the tier builds and runs in seconds even cold.
+const TEST_QUICK_CRATES: &[&str] = &[
+    "ltmrs-domain",
+    "ltmrs-service",
+    "ltmrs-compat",
+    "ltmrs-interchange",
+];
+
+/// Workspace members selectable via `test --package` (cargo package names).
+const TEST_MEMBERS: &[&str] = &[
+    "ltmrs",
+    "ltmrs-domain",
+    "ltmrs-service",
+    "ltmrs-compat",
+    "ltmrs-embeddings",
+    "ltmrs-search",
+    "ltmrs-interchange",
+    "ltmrs-daemon",
+    "ltmrs-frontend",
+    "xtask",
+];
+
+/// Validate the `test` tier/package selection and build its child commands
+/// (each entry is a full argv). Quick tier: light-crate lib suites only.
+/// Full tier: the workspace gate. Package: that member's full test target.
+fn test_commands(
+    tier: &str,
+    package: Option<&str>,
+) -> Result<(Vec<Vec<String>>, Vec<String>), String> {
+    if let Some(pkg) = package {
+        if tier == "full" {
+            return Err(
+                "--package selects a single crate; omit --tier (or drop --package) for the full workspace gate"
+                    .to_string(),
+            );
+        }
+        if !TEST_MEMBERS.contains(&pkg) {
+            return Err(format!(
+                "unknown package '{pkg}' (expected one of: {})",
+                TEST_MEMBERS.join(", ")
+            ));
+        }
+        return Ok((
+            vec![argv(&["cargo", "test", "-p", pkg])],
+            vec![pkg.to_string()],
+        ));
+    }
+    match tier {
+        "quick" => Ok((
+            TEST_QUICK_CRATES
+                .iter()
+                .map(|c| argv(&["cargo", "test", "-p", c, "--lib"]))
+                .collect(),
+            TEST_QUICK_CRATES
+                .iter()
+                .map(|c| c.strip_prefix("ltmrs-").unwrap_or(c).to_string())
+                .collect(),
+        )),
+        "full" => Ok((
+            vec![argv(&["cargo", "test", "--workspace"])],
+            vec!["workspace".to_string()],
+        )),
+        other => Err(format!(
+            "invalid tier '{other}' (expected 'quick' or 'full')"
+        )),
+    }
+}
+
+/// Tiered test runner (iteration speed): quick lib suites, the full
+/// workspace gate, or one member's tests. Prints the tier banner on real
+/// runs so a quick run is never mistaken for the gate.
+pub fn run_test(tier: &str, package: Option<&str>, dry_run: bool) -> Result<i32, String> {
+    let (commands, names) = test_commands(tier, package)?;
+    if !dry_run {
+        if package.is_some() {
+            println!("test tier: single package (explicit scope, not the gate)");
+        } else if tier == "full" {
+            println!("test tier: full workspace gate");
+        } else {
+            println!("test tier: quick (light-crate lib suites; --tier full for the gate)");
+        }
+    }
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    run_children("test", &commands, &name_refs, dry_run)
+}
+
 /// T-BUILD-01 (RQ-21) deny tokens matched against workspace tree package
 /// names. Families: Python (`python|pyo3`), Node (`napi|node`),
 /// ONNX/foreign runtimes (`onnx|onnxruntime|ort|tract`), GGUF (`gguf`),
@@ -2543,7 +2630,7 @@ mod tests {
     use super::{
         CAPABILITY_NAMES, CONFORMANCE_NAMES, RECOVERY_NAMES, benchmark_argv, benchmark_out_file,
         capability_commands, capture_argv, conformance_commands, evidence_argv,
-        quality_wave_command, recovery_commands, run_quality_parts,
+        quality_wave_command, recovery_commands, run_quality_parts, test_commands,
     };
 
     #[test]
@@ -2592,6 +2679,45 @@ mod tests {
         assert_eq!(super::run_capabilities("fjall-lance", true).unwrap(), 0);
         assert_eq!(super::run_conformance("lemma-0.21.0", true).unwrap(), 0);
         assert_eq!(super::run_recovery("durable", true).unwrap(), 0);
+        assert_eq!(super::run_test("quick", None, true).unwrap(), 0);
+        assert_eq!(super::run_test("full", None, true).unwrap(), 0);
+        assert_eq!(
+            super::run_test("quick", Some("ltmrs-daemon"), true).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_commands_tiers_and_package() {
+        let (cmds, names) = test_commands("quick", None).unwrap();
+        assert_eq!(cmds.len(), 4);
+        assert!(cmds[0].iter().any(|a| a == "ltmrs-domain"));
+        assert!(cmds.iter().all(|c| c.contains(&"--lib".to_string())));
+        assert_eq!(names, vec!["domain", "service", "compat", "interchange"]);
+        let (cmds, names) = test_commands("full", None).unwrap();
+        assert_eq!(
+            cmds,
+            vec![vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "--workspace".to_string()
+            ]]
+        );
+        assert_eq!(names, vec!["workspace".to_string()]);
+        let (cmds, names) = test_commands("quick", Some("ltmrs-daemon")).unwrap();
+        assert_eq!(
+            cmds,
+            vec![vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "ltmrs-daemon".to_string()
+            ]]
+        );
+        assert_eq!(names, vec!["ltmrs-daemon".to_string()]);
+        assert!(test_commands("fast", None).is_err());
+        assert!(test_commands("quick", Some("nope")).is_err());
+        assert!(test_commands("full", Some("ltmrs-daemon")).is_err());
     }
 
     #[test]

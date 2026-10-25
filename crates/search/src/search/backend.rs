@@ -77,7 +77,25 @@ impl SearchBackend {
     /// Unavailable (table unreadable). A usable backend returning zero
     /// hits is Complete-empty, never a reason to substitute other results.
     pub fn search_state(&self) -> SearchState {
-        let fts = match self.fts_ready() {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(e) => {
+                return SearchState::Unavailable {
+                    reason: format!("table unreadable: no tokio runtime for search: {e}"),
+                };
+            }
+        };
+        // Refresh the handle first: index listings can be served from
+        // cached metadata, but readiness must describe on-storage state.
+        // A destroyed table fails the reopen (Unavailable below); a merely
+        // unindexed one proceeds to the Partial branch.
+        let mut table = self.table.clone();
+        if let Err(e) = handle.block_on(table.refresh()) {
+            return SearchState::Unavailable {
+                reason: format!("table unreadable: {}", e.message),
+            };
+        }
+        let fts = match handle.block_on(table.fts_index_ready()) {
             Err(e) => {
                 return SearchState::Unavailable {
                     reason: format!("table unreadable: {}", e.message),

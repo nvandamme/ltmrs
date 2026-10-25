@@ -50,6 +50,12 @@ Project instructions for coding agents working in this repository.
   safety argument and a test.
 - Keep database crates and Arrow types behind the `search/` module.
   Expose domain types to the rest of ltmrs.
+- Pin dependencies as `X.Y` (caret default: Z floats with
+  `cargo update`). Never pin exact versions (`=A.B.C`) or bare majors.
+  Foundation crates (`fjall`, `lancedb`, `tokio`, `rmcp`) always track
+  latest; leaf upgrades must not introduce duplicate major versions
+  (`cargo tree --duplicates` stays clean of new dups) — hold with a
+  documented reason instead.
 - No comments unless they explain non-obvious invariants, contracts or protocol
   details. No backward-compatibility shims.
 - **Deterministic async tests (STRICT)**: for time-based behavior (intervals,
@@ -70,16 +76,28 @@ cargo build --release   # for release-claim work
 ```
 
 Include the exact validation commands used in the report or `DONE.md`.
+For light-crate-only edits, `cargo xtask test` (quick tier) is an
+acceptable iteration gate; the full `cargo test --workspace` remains
+mandatory before any commit or qualification claim.
 
 ### Fast iteration (STRICT — build time is expensive here)
 
-The daemon test binary links candle/lance/arrow; unoptimized builds
-take minutes per touch rebuild. Iterate cheaply, qualify fully:
+The daemon test binary links candle/lance/arrow. Measured iteration
+costs (32-core, mold, incremental codegen): single-crate touch
+rebuild ~4s, full-workspace rebuild after a bottom-crate edit ~15s.
+The full suite (`cargo test --workspace`, ~2m) is dominated by test
+execution (daemon ~50s, search ~20s, integration suites), not compile.
+Cold builds (fresh checkout: datafusion/lance/candle/arrow) remain
+expensive — see sccache below. Iterate cheaply, qualify fully:
 
-- During development, scope to the crate under test and lib targets
-  only: `cargo test -p <crate> --lib`. Never run bare `cargo test`
-  (builds the root binary incl. `src/bench/quality.rs`) or
-  `--workspace` (builds every member) for iteration.
+- Quick tier (seconds): `cargo xtask test` runs the light-crate lib
+  suites only (domain, service, compat, interchange — no
+  candle/lance/arrow/rmcp in their closures).
+- Full gate: `cargo xtask test --tier full` (== `cargo test --workspace`).
+  Never run bare `cargo test` (builds the root binary incl.
+  `src/bench/quality.rs`) or `--workspace` for iteration.
+- Scoped: `cargo xtask test --package <name>` or
+  `cargo test -p <crate> --lib` for direct iteration.
 - Run `cargo check -p <crate> --all-targets` before `cargo test`
   when iterating on compile errors (no codegen, no link).
 - Do not run `cargo clean`, wipe `target/`, or reinstall the
@@ -93,6 +111,18 @@ take minutes per touch rebuild. Iterate cheaply, qualify fully:
   `cargo binstall`, never `cargo install` — prebuilt binaries,
   no toolchain compile time. Library dependencies always compile
   from source; that is not what binstall is for.
+- `cargo-nextest` runs the same suites faster with per-test timing
+  (`cargo nextest run -p <crate>`); use it for iteration and slow-test
+  hunting. Gates stay on `cargo test` (evidence scripts parse it).
+- Cold-checkout builds are slow (datafusion/lance/candle/arrow from
+  source). Every rustc invocation routes through
+  `tools/sccache-wrap.sh` (tracked in `.cargo/config.toml`): sccache
+  when installed (`cargo binstall sccache`), plain rustc otherwise —
+  fresh checkouts keep building either way. sccache only engages on
+  non-incremental builds (`CARGO_INCREMENTAL=0`: cold checkouts, clean
+  trees, fresh worktrees sharing `~/.cache/sccache`); warm incremental
+  builds bypass it untouched and stay fast. Escape hatch:
+  `LTMRS_NO_SCCACHE=1`.
 - Linker selection is automatic per member (`build.rs` + shared probe
   in `tools/detect_linker.rs`): mold if present, else wild, else the
   system default — no setup needed, and checkouts without either

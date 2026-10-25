@@ -7,14 +7,20 @@ edition = "2024"
 ltmrs-domain = { path = "../domain" }
 ltmrs-service = { path = "../service" }
 ltmrs-embeddings = { path = "../embeddings" }
-lancedb = { version = "0.39.0", default-features = false, features = ["remote"] }
-lance-index = { version = "12", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "sync", "time"] }
-serde = { version = "1", features = ["derive"] }
-uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+# `remote` is mandatory, not used: lancedb <=0.40 fails to compile
+# without it (unconditional Error::Http use in job.rs — upstream bug,
+# verified on 0.39 and 0.40). The tonic/arrow-flight/reqwest-gzip subtree
+# it drags in is therefore unavoidable until a lancedb upgrade; the
+# serving code itself never calls remote APIs (dist-audit remote-apis
+# check enforces this).
+lancedb = { version = "0.40", default-features = false, features = ["remote"] }
+lance-index = { version = "13.0", default-features = false }
+tokio = { version = "1.0", features = ["rt-multi-thread", "rt", "macros", "sync", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 futures-util = "0.3"
 
 [dev-dependencies]
-tempfile = "3"
-serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["test-util"] }
+tempfile = "3.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tokio = { version = "1.0", features = ["test-util"] }

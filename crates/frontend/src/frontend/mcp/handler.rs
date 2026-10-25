@@ -3,8 +3,8 @@
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
-    ServerNotification, ToolListChangedNotification, ToolListChangedNotificationMethod,
+    ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerNotification,
+    ToolListChangedNotification, ToolListChangedNotificationMethod,
 };
 use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};

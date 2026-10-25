@@ -5,7 +5,33 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## COLLAPSED (2026-10-26) — External review remediation, waves A–C
+## 2026-10-25 — Dependency upgrade pass (X.Y pins, lancedb 0.40) + RQ-04/05/06 race matrices + test tooling
+
+### Deps: X.Y pins + latest-compatible upgrade, lancedb 0.40
+- Pinned every dependency req as `X.Y` across all 11 Cargo.tomls (78 reqs; AGENTS.md rule added: foundations fjall/lancedb/tokio/rmcp track latest, no duplicate majors).
+- `cargo update`: fjall 3.1.11→3.1.12, tokio 1.53.1→1.54.1, rmcp 3.5.0→3.7.0, lancedb 0.39→0.40, lance-index 12→13.0, uuid 1.29.0, regex/sha2/tempfile/base64 patch bumps; rusqlite 0.37→0.41 in lemma-import (own lockfile).
+- HELD with documented reasons: reqwest 0.12 (0.13 drops bundled webpki roots for platform verifier; provisioning needs re-qual), tokenizers 0.22 (candle-core 0.11 requires ^0.22; 0.23 would fork a dup), windows-sys 0.59 (unverifiable from Linux; needs a Windows runner).
+- lancedb 0.40 regression caught by tests: destroyed table reported Complete (cached index listings); fixed with refresh-then-list in `search_state` (matches the engine's freshness discipline).
+- lancedb `remote` feature STILL mandatory: identical unconditional `Error::Http` use in job.rs on both versions (upstream bug, verified).
+- lemma-import: clean build on 0.41, one test-only borrow fix (`serialize` takes `&mut` now), 7+10 green.
+- Dup families 34 → 31; remaining are third-party-pinned (hashbrown, rand, getrandom, base64, sha2, object_store), unactionable from our manifests; axum 0.7/0.8 dup gone as a side effect.
+
+### RQ-04/05/06 race matrices closed, three RQs passed
+- RQ-04: 6 barrier-synced pins (disjoint/same-field revision races, endpoint-delete vs edge-create, duplicate-edge uniqueness, concurrent boosts; 30/30 deterministic). RQ-04 → executed_passed.
+- RQ-05: T-SESS-01 32-channel interleave with colliding op numbers + 4 T-SESS-02 harnesses (siblings, kill+reopen without resurrection, virtual-lease sweep, native bindings). RQ-05 → executed_passed.
+- RQ-06: 6 replay/restart race pins (post-expiry refusal, cut-generation frozen replay + fresh-write fence, post-restore refusal, post-migration replay, projection-state replay). RQ-06 → executed_passed.
+- Matrix: backup_import_lemma row added (30 tools, count bumped), 5 scope/retry cells + session_start retry cell → executed_passed with test-name evidence. Item 3 remainder mapped to the closed waves.
+- Traceability evidence updated for RQ-04/05/06/12; gate-audit green throughout.
+
+### Tooling, determinism, and hygiene
+- `cargo xtask test` tiers: default quick (4 light-crate lib suites, ~5s), `--tier full` (workspace gate), `--package <name>`; 6 new xtask tests.
+- sccache engaged by default via tracked `tools/sccache-wrap.sh` (falls back to plain rustc; `LTMRS_NO_SCCACHE=1` bypasses); no-op on warm incremental builds.
+- AGENTS.md: quick/full tier rule, nextest for iteration, sccache + dev-tool binstall notes, X.Y pin rule.
+- Graceful-shutdown race fixed: `ShutdownWatch` armed before `Daemon::start` (socket never visible with no handler); daemon_lifecycle 5/5 full-binary green (was flaky). Windows arm mirrors the reviewed handler; compile-unverified on this host.
+- Projection drain test tuned 62s→10s (reseed 100 jobs, limit 40; same 3-batch drain property, no plans citations).
+- Unused-import cleanup in frontend MCP handler (clippy-driven).
+
+## 53f9c7c (2026-10-26) — External review remediation, waves A–C
 
 Collapses the 19-commit arc `2f7d961..8ca4618` (all local-only, unpushed) into one
 reviewed unit: Wave A correctness fixes (atomicity, secrets, pagination, project

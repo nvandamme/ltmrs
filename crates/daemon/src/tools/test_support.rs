@@ -61,6 +61,26 @@ pub(crate) fn tool_call(op: u64, tool: ToolArgs) -> IpcEnvelope {
     envelope(op, DomainRequest::ToolCall { tool })
 }
 
+/// Same as `tool_call` for an explicit (frontend, channel) identity with a
+/// caller-chosen operation number. Op numbers may repeat across channels:
+/// receipt keys and session bindings are per (frontend, channel), so a
+/// reused numeric op must never collide globally (T-SESS-01).
+pub(crate) fn channel_tool_call(fe_n: u64, ch_n: u64, op: u64, tool: ToolArgs) -> IpcEnvelope {
+    IpcEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        store_generation: StoreGeneration::FIRST,
+        frontend_id: fe(fe_n),
+        channel_id: ch(ch_n),
+        operation_id: OperationId::new(Uuid::from_u128(op as u128)),
+        session: None,
+        retry_epoch: 1,
+        deadline_millis: None,
+        scope: Scope::default(),
+        body: DomainRequest::ToolCall { tool },
+        identity: Default::default(),
+    }
+}
+
 pub(crate) fn run(disp: &Dispatcher, env: &IpcEnvelope, tool: &ToolArgs) -> DomainPayload {
     execute_tool(disp, env, tool).unwrap()
 }

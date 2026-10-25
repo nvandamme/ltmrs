@@ -21,12 +21,12 @@ license = "MIT OR Apache-2.0"
 libc = "0.2"
 
 # Core async runtime + utilities.
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "io-std", "net", "signal", "time", "sync"] }
-serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "rt", "macros", "io-util", "io-std", "net", "signal", "time", "sync"] }
+serde = { version = "1.0", features = ["derive"] }
 # preserve_order: legacy wire objects (e.g. memory_stats by_source/by_project)
 # must serialize in upstream insertion order, not BTreeMap-alphabetical.
-serde_json = { version = "1", features = ["preserve_order"] }
-uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 sha2 = "0.11"
 
 ltmrs-domain = { path = "crates/domain" }
@@ -39,10 +39,10 @@ ltmrs-daemon = { path = "crates/daemon" }
 ltmrs-frontend = { path = "crates/frontend" }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.0"
 # Test-only tokio features: `test-util` enables #[tokio::test(start_paused)] for
 # deterministic, fast interval/scheduling tests (no real-time sleeps).
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1.0", features = ["test-util"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Test-only: TerminateProcess by pid (visualizer smoke stop) and the

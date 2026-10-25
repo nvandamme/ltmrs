@@ -7,7 +7,7 @@ use ltmrs_compat::lemma::tool_args::{
     GuideCreateArgs, GuideGetArgs, GuidePracticeArgs, MemoryReadArgs, SessionAttemptArgs,
     SessionEndArgs, SessionStartArgs, SessionStatsArgs, ToolArgs,
 };
-use ltmrs_domain::id::{OperationId, StoreGeneration};
+use ltmrs_domain::id::{OperationId, SessionHandle, StoreGeneration};
 use uuid::Uuid;
 
 /// A retried attempt replays from its durable receipt even after its
@@ -660,4 +660,285 @@ fn session_end_retry_returns_frozen_response() {
         result_text(&first),
         "retry must return the frozen original response"
     );
+}
+
+/// T-SESS-01: interleave legacy start/attempt/end calls from 32 separately
+/// identified frontend channels reusing the same numeric op numbers.
+/// Attempts and outcomes must belong to the intended channel's session;
+/// request ids must never collide globally.
+#[test]
+fn thirty_two_channel_interleave_with_colliding_op_numbers() {
+    let (disp, _dir) = test_dispatcher();
+    for c in 1u64..=32 {
+        disp.repo().issue_namespace(fe(c), ch(c), 1000).unwrap();
+    }
+    // Phase-interleaved across channels: every start, then every attempt,
+    // then every end. Op numbers 1/2/3 repeat on every channel.
+    let mut handles = std::collections::BTreeMap::new();
+    for c in 1u64..=32 {
+        let tool = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: format!("work-{c}"),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let result = run(&disp, &channel_tool_call(c, c, 1, tool.clone()), &tool);
+        assert!(!result_is_error(&result), "channel {c} start failed");
+        let sid = result_structured(&result).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        handles.insert(c, sid);
+    }
+    let uniq: std::collections::HashSet<_> = handles.values().collect();
+    assert_eq!(uniq.len(), 32, "each channel must own its session");
+    for c in 1u64..=32 {
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: format!("try-{c}"),
+            outcome: "rejected".to_string(),
+            critique: Some("nope".to_string()),
+            rationale: None,
+            related_memory_id: None,
+        });
+        let result = run(
+            &disp,
+            &channel_tool_call(c, c, 2, attempt.clone()),
+            &attempt,
+        );
+        assert!(!result_is_error(&result), "channel {c} attempt failed");
+    }
+    for c in 1u64..=32 {
+        let end = ToolArgs::SessionEnd(SessionEndArgs {
+            outcome: "success".to_string(),
+            final_approach: None,
+            lessons: vec![],
+        });
+        let result = run(&disp, &channel_tool_call(c, c, 3, end.clone()), &end);
+        assert!(!result_is_error(&result), "channel {c} end failed");
+    }
+    // Attribution: each session holds exactly its own channel's attempt
+    // and is terminally ended; no cross-channel leakage.
+    for c in 1u64..=32 {
+        let h = SessionHandle::new(uuid::Uuid::parse_str(&handles[&c]).unwrap());
+        let s = disp
+            .repo()
+            .get_session(h)
+            .unwrap()
+            .expect("session must exist");
+        assert_eq!(
+            s.attempts.len(),
+            1,
+            "channel {c} session must hold exactly one attempt"
+        );
+        assert_eq!(s.attempts[0].approach, format!("try-{c}"));
+        assert!(s.status.is_terminal(), "channel {c} session must be ended");
+    }
+}
+
+/// T-SESS-02 sibling subagents: two frontends sharing one channel stay
+/// fully isolated — distinct sessions, attempts never cross.
+#[test]
+fn sibling_frontends_sharing_channel_stay_isolated() {
+    let (disp, _dir) = test_dispatcher();
+    disp.repo().issue_namespace(fe(1), ch(1), 1000).unwrap();
+    disp.repo().issue_namespace(fe(2), ch(1), 1000).unwrap();
+    let mut handles = Vec::new();
+    for f in [1u64, 2] {
+        let tool = ToolArgs::SessionStart(SessionStartArgs {
+            task_type: format!("sibling-{f}"),
+            technologies: vec![],
+            initial_approach: None,
+        });
+        let result = run(&disp, &channel_tool_call(f, 1, 1, tool.clone()), &tool);
+        assert!(!result_is_error(&result), "frontend {f} start failed");
+        handles.push(
+            result_structured(&result).unwrap()["session_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+            approach: format!("sibling-try-{f}"),
+            outcome: "rejected".to_string(),
+            critique: None,
+            rationale: None,
+            related_memory_id: None,
+        });
+        let result = run(
+            &disp,
+            &channel_tool_call(f, 1, 2, attempt.clone()),
+            &attempt,
+        );
+        assert!(!result_is_error(&result), "frontend {f} attempt failed");
+    }
+    assert_ne!(
+        handles[0], handles[1],
+        "siblings must own distinct sessions"
+    );
+    for (i, f) in [1u64, 2].iter().enumerate() {
+        let h = SessionHandle::new(uuid::Uuid::parse_str(&handles[i]).unwrap());
+        let s = disp
+            .repo()
+            .get_session(h)
+            .unwrap()
+            .expect("session must exist");
+        assert_eq!(s.attempts.len(), 1);
+        assert_eq!(s.attempts[0].approach, format!("sibling-try-{f}"));
+    }
+}
+
+/// T-SESS-02 restart: kill the dispatcher without shutdown, reopen the
+/// same store, and confirm the session record (with its attempt) survived
+/// recovery. The channel binding itself is registry-side and does not
+/// resurrect: a fresh start on the channel opens a new session instead of
+/// guessing the old one.
+#[test]
+fn restart_preserves_session_record_without_resurrecting_binding() {
+    use ltmrs_domain::clock::FrozenClock;
+
+    let (disp, dir) = test_dispatcher();
+    let start = ToolArgs::SessionStart(SessionStartArgs {
+        task_type: "restartable".to_string(),
+        technologies: vec![],
+        initial_approach: None,
+    });
+    let result = run(&disp, &tool_call(1, start.clone()), &start);
+    assert!(!result_is_error(&result));
+    let sid = result_structured(&result).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+        approach: "try-before-kill".to_string(),
+        outcome: "rejected".to_string(),
+        critique: None,
+        rationale: None,
+        related_memory_id: None,
+    });
+    let result = run(&disp, &tool_call(2, attempt.clone()), &attempt);
+    assert!(!result_is_error(&result));
+    // Kill: drop the dispatcher without shutdown, reopen the same store.
+    let handle = SessionHandle::new(uuid::Uuid::parse_str(&sid).unwrap());
+    drop(disp);
+    let clock2: std::sync::Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+        std::sync::Arc::new(FrozenClock::new(2000));
+    let repo2 = std::sync::Arc::new(
+        ltmrs_service::repository::CanonicalRepository::open_with_clock(
+            dir.path().to_str().unwrap(),
+            clock2,
+        )
+        .unwrap(),
+    );
+    let s = repo2
+        .get_session(handle)
+        .unwrap()
+        .expect("session record must survive kill+reopen");
+    assert_eq!(s.attempts.len(), 1);
+    assert_eq!(s.attempts[0].approach, "try-before-kill");
+    assert!(!s.status.is_terminal(), "unended session stays open");
+    // The binding died with the registry: a fresh operation on the
+    // channel opens a new session instead of guessing the old one.
+    // (Op 3: ops 1-2 already have receipts in the reopened store, and a
+    // changed body under a reused op must reject, never resurrect.)
+    let disp2 = Dispatcher::new(
+        repo2,
+        crate::registry::FrontendRegistry::new(),
+        std::sync::Arc::new(FrozenClock::new(2000)),
+    );
+    let start2 = ToolArgs::SessionStart(SessionStartArgs {
+        task_type: "after-restart".to_string(),
+        technologies: vec![],
+        initial_approach: None,
+    });
+    let result = run(&disp2, &tool_call(3, start2.clone()), &start2);
+    assert!(!result_is_error(&result));
+    let sid2 = result_structured(&result).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(sid, sid2, "restart must not resurrect the old binding");
+}
+
+/// T-SESS-02 lease expiry: an idle virtual session is finalized by the
+/// sweep and its channel unbound; a touched lease survives. Virtual
+/// routing lives beside (never inside) the traced channel binding.
+#[test]
+fn virtual_idle_expiry_finalizes_and_unbinds() {
+    let (disp, _dir) = test_dispatcher();
+    let vhandle = disp.registry().ensure_virtual_session(fe(9), ch(9), 1000);
+    // The traced binding stays empty: virtual routing is separate.
+    assert_eq!(disp.registry().channel_session(fe(9), ch(9)), None);
+    assert!(disp.registry().virtual_record(vhandle).is_some());
+    // Sweep before the 120s idle timeout: nothing finalized.
+    let quiet = disp.registry().sweep_virtual_sessions(1000 + 119_999);
+    assert!(
+        quiet.is_empty(),
+        "sweep before expiry must finalize nothing"
+    );
+    assert!(disp.registry().virtual_record(vhandle).is_some());
+    // Past the timeout: finalized with Abandoned outcome; the record
+    // stays as abandoned history and a re-sweep is a no-op.
+    let done = disp.registry().sweep_virtual_sessions(1000 + 120_001);
+    assert_eq!(done, vec![vhandle]);
+    // Scope the guard: the registry mutex is not reentrant, so the
+    // borrow must end before the re-sweep below locks again.
+    {
+        let reg = disp.registry();
+        let rec = reg
+            .virtual_record(vhandle)
+            .expect("finalized virtual session stays as history");
+        assert!(rec.status.is_terminal());
+        assert_eq!(
+            rec.outcome,
+            Some(ltmrs_domain::session::TaskOutcome::Abandoned)
+        );
+    }
+    assert!(
+        disp.registry()
+            .sweep_virtual_sessions(1000 + 120_002)
+            .is_empty()
+    );
+}
+
+/// T-SESS-02 native bindings: an explicitly bound handle routes the
+/// channel's attempts, reports explicit, and never guesses.
+#[test]
+fn explicit_native_binding_routes_channel_attempts() {
+    let (disp, _dir) = test_dispatcher();
+    disp.repo().issue_namespace(fe(2), ch(7), 1000).unwrap();
+    let start = ToolArgs::SessionStart(SessionStartArgs {
+        task_type: "native-host".to_string(),
+        technologies: vec![],
+        initial_approach: None,
+    });
+    let result = run(&disp, &tool_call(1, start.clone()), &start);
+    assert!(!result_is_error(&result));
+    let sid = result_structured(&result).unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let native = SessionHandle::new(uuid::Uuid::parse_str(&sid).unwrap());
+    // A second channel explicitly bound to the same store session.
+    disp.registry().bind_native_session(fe(2), ch(7), native);
+    assert!(disp.registry().is_explicit(fe(2), ch(7)));
+    assert!(!disp.registry().is_explicit(fe(1), ch(1)));
+    let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+        approach: "native-try".to_string(),
+        outcome: "rejected".to_string(),
+        critique: None,
+        rationale: None,
+        related_memory_id: None,
+    });
+    let result = run(
+        &disp,
+        &channel_tool_call(2, 7, 2, attempt.clone()),
+        &attempt,
+    );
+    assert!(!result_is_error(&result));
+    let s = disp
+        .repo()
+        .get_session(native)
+        .unwrap()
+        .expect("native session must exist");
+    assert_eq!(s.attempts.len(), 1);
+    assert_eq!(s.attempts[0].approach, "native-try");
 }

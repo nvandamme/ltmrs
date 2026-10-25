@@ -72,8 +72,12 @@ async fn projection_drains_past_one_batch_without_sleep() {
     let table = SearchTable::open(table_dir.to_str().unwrap())
         .await
         .unwrap();
-    // Seed 250 pending jobs (2.5 batch limits at MAX=100).
-    for n in 1..=250u64 {
+    // Seed 100 pending jobs (2.5 batch limits at MAX=40). The property
+    // under test is multi-batch draining without sleeps, not the absolute
+    // batch width: three consecutive bounded batches prove the worker
+    // keeps draining runnable backlog instead of sleeping after the
+    // first batch.
+    for n in 1..=100u64 {
         let ctx = ltmrs_domain::command::CommandContext {
             store_generation: StoreGeneration::FIRST,
             frontend_id: fe(1),
@@ -95,37 +99,37 @@ async fn projection_drains_past_one_batch_without_sleep() {
         )
         .unwrap();
     }
-    assert_eq!(repo.projection_lag().unwrap(), 250);
+    assert_eq!(repo.projection_lag().unwrap(), 100);
     // Three consecutive bounded batches, no writes and no clock advance
-    // between them: 100 + 100 + 50 proves the worker drains runnable
+    // between them: 40 + 40 + 20 proves the worker drains runnable
     // backlog instead of sleeping after the first batch.
     let (first, _) = Daemon::drive_projection_batch(
         &repo,
         &table,
         Box::new(FixedEmbedder { dim: 384 }),
-        100,
+        40,
         false,
     )
     .await;
-    assert_eq!(first.unwrap(), 100);
+    assert_eq!(first.unwrap(), 40);
     let (second, _) = Daemon::drive_projection_batch(
         &repo,
         &table,
         Box::new(FixedEmbedder { dim: 384 }),
-        100,
+        40,
         false,
     )
     .await;
-    assert_eq!(second.unwrap(), 100);
+    assert_eq!(second.unwrap(), 40);
     let (third, _) = Daemon::drive_projection_batch(
         &repo,
         &table,
         Box::new(FixedEmbedder { dim: 384 }),
-        100,
+        40,
         false,
     )
     .await;
-    assert_eq!(third.unwrap(), 50);
+    assert_eq!(third.unwrap(), 20);
     assert_eq!(repo.projection_lag().unwrap(), 0);
 }
 

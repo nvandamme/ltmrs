@@ -1,9 +1,12 @@
 //! Apply / receipt / replay tests (moved verbatim from `repository.rs`).
 
+use super::CanonicalRepository;
 use super::FaultInjector;
 use super::test_support::*;
 use fjall::OptimisticTxDatabase;
-use ltmrs_domain::command::{DomainCommand, DomainErrorCode, ForgetMode, ReceiptOutcome};
+use ltmrs_domain::command::{
+    DomainCommand, DomainErrorCode, ForgetMode, MemoryPatch, ReceiptOutcome,
+};
 use ltmrs_domain::id::{EntityId, StoreGeneration};
 use ltmrs_domain::relation::RelationType;
 use uuid::Uuid;
@@ -466,5 +469,441 @@ fn commit_hook_fires_once_per_commit_not_replay() {
         fired.load(Ordering::SeqCst),
         1,
         "replay must not wake the projection worker"
+    );
+}
+
+#[test]
+fn disjoint_field_edits_at_same_revision_conflict_then_merge_without_loss() {
+    // T-CONC-01 disjoint-field race: two writers hold the same expected
+    // revision and patch different fields. Exactly one commits; the loser
+    // must see RevisionConflict (never a silent last-writer-win), and a
+    // re-read + re-patch lands both fields with no lost update.
+    let (repo, _dir) = repo_with_ns();
+    repo.apply(
+        &ctx(1, "d1"),
+        &DomainCommand::AddMemory {
+            memory: memory(eid(1), "base"),
+            session: None,
+            auto_link: None,
+        },
+    )
+    .unwrap();
+    let rev = repo
+        .get_memories(&[eid(1)])
+        .unwrap()
+        .pop()
+        .unwrap()
+        .entity_revision;
+    let repo = std::sync::Arc::new(repo);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let title_patch = MemoryPatch {
+        title: Some("retitled".to_string()),
+        ..Default::default()
+    };
+    let conf_patch = MemoryPatch {
+        confidence: Some(0.9),
+        ..Default::default()
+    };
+    let mut handles = Vec::new();
+    for (i, patch) in [title_patch, conf_patch].into_iter().enumerate() {
+        let repo = std::sync::Arc::clone(&repo);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            repo.apply(
+                &ctx(i as u64 + 10, &format!("race{i}")),
+                &DomainCommand::UpdateMemory {
+                    id: eid(1),
+                    expected_revision: Some(rev),
+                    patch,
+                },
+            )
+        }));
+    }
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.join().unwrap());
+    }
+    let winners = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(
+        winners, 1,
+        "exactly one disjoint-field writer must commit, got {results:?}"
+    );
+    for r in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(r.code, DomainErrorCode::RevisionConflict);
+    }
+    // Loser re-reads and re-patches: both fields land, nothing lost.
+    let fresh = repo.get_memories(&[eid(1)]).unwrap().pop().unwrap();
+    let missing_title = fresh.title != "retitled";
+    let missing_conf = (fresh.confidence - 0.9).abs() > 1e-12;
+    assert!(
+        missing_title ^ missing_conf,
+        "exactly one field applied, got title={} confidence={}",
+        fresh.title,
+        fresh.confidence
+    );
+    let repair = MemoryPatch {
+        title: if missing_title {
+            Some("retitled".to_string())
+        } else {
+            None
+        },
+        confidence: if missing_conf { Some(0.9) } else { None },
+        ..Default::default()
+    };
+    repo.apply(
+        &ctx(12, "repair"),
+        &DomainCommand::UpdateMemory {
+            id: eid(1),
+            expected_revision: Some(fresh.entity_revision),
+            patch: repair,
+        },
+    )
+    .unwrap();
+    let final_mem = repo.get_memories(&[eid(1)]).unwrap().pop().unwrap();
+    assert_eq!(final_mem.title, "retitled");
+    assert!((final_mem.confidence - 0.9).abs() < 1e-12);
+    assert_ne!(final_mem.entity_revision, rev);
+}
+
+#[test]
+fn same_field_edits_at_same_revision_exactly_one_wins() {
+    // T-CONC-01 same-field race: two writers patch the same field at the
+    // same expected revision. Exactly one commits (no silent
+    // last-writer-win); the loser retries on the fresh revision.
+    let (repo, _dir) = repo_with_ns();
+    repo.apply(
+        &ctx(1, "d1"),
+        &DomainCommand::AddMemory {
+            memory: memory(eid(1), "base"),
+            session: None,
+            auto_link: None,
+        },
+    )
+    .unwrap();
+    let rev = repo
+        .get_memories(&[eid(1)])
+        .unwrap()
+        .pop()
+        .unwrap()
+        .entity_revision;
+    let repo = std::sync::Arc::new(repo);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for (i, title) in ["first-writer", "second-writer"].into_iter().enumerate() {
+        let repo = std::sync::Arc::clone(&repo);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            repo.apply(
+                &ctx(i as u64 + 10, &format!("race{i}")),
+                &DomainCommand::UpdateMemory {
+                    id: eid(1),
+                    expected_revision: Some(rev),
+                    patch: MemoryPatch {
+                        title: Some(title.to_string()),
+                        ..Default::default()
+                    },
+                },
+            )
+        }));
+    }
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.join().unwrap());
+    }
+    let winners = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(
+        winners, 1,
+        "exactly one same-field writer must commit, got {results:?}"
+    );
+    for r in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(r.code, DomainErrorCode::RevisionConflict);
+    }
+    let mid = repo.get_memories(&[eid(1)]).unwrap().pop().unwrap();
+    assert!(mid.title == "first-writer" || mid.title == "second-writer");
+    // Loser retries on the fresh revision: commits cleanly.
+    let loser_title = if mid.title == "first-writer" {
+        "second-writer"
+    } else {
+        "first-writer"
+    };
+    repo.apply(
+        &ctx(12, "retry"),
+        &DomainCommand::UpdateMemory {
+            id: eid(1),
+            expected_revision: Some(mid.entity_revision),
+            patch: MemoryPatch {
+                title: Some(loser_title.to_string()),
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap();
+    let final_mem = repo.get_memories(&[eid(1)]).unwrap().pop().unwrap();
+    assert_eq!(final_mem.title, loser_title);
+    assert_ne!(final_mem.entity_revision, rev);
+}
+
+#[test]
+fn endpoint_delete_vs_edge_create_leaves_no_dangling_edge() {
+    // T-GRAPH-01 race: endpoint deletion vs edge creation on the same
+    // barrier. Whichever order commits, the final store must hold no edge
+    // referencing the deleted endpoint and the endpoint must stay deleted
+    // (delete severs; a late relate against a dead endpoint is refused).
+    let (repo, _dir) = repo_with_ns();
+    for n in [1u64, 2] {
+        repo.apply(
+            &ctx(n, &format!("m{n}")),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(n), &format!("m{n}")),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+    }
+    let repo = std::sync::Arc::new(repo);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let repo_relate = std::sync::Arc::clone(&repo);
+    let barrier_relate = std::sync::Arc::clone(&barrier);
+    let relate_handle = std::thread::spawn(move || {
+        barrier_relate.wait();
+        repo_relate.apply(
+            &ctx(100, "relate"),
+            &DomainCommand::Relate {
+                relation: rel(eid(100), eid(1), eid(2), RelationType::RelatedTo),
+            },
+        )
+    });
+    let repo_forget = std::sync::Arc::clone(&repo);
+    let barrier_forget = std::sync::Arc::clone(&barrier);
+    let forget_handle = std::thread::spawn(move || {
+        barrier_forget.wait();
+        repo_forget.apply(
+            &ctx(101, "forget"),
+            &DomainCommand::Forget {
+                id: eid(1),
+                mode: ForgetMode::Delete,
+            },
+        )
+    });
+    let relate_result = relate_handle.join().unwrap();
+    let forget_result = forget_handle.join().unwrap();
+    assert!(
+        forget_result.is_ok(),
+        "delete must always commit, got {forget_result:?}"
+    );
+    if let Err(e) = relate_result.as_ref() {
+        // Delete-first order: the relate replays against the tombstone and
+        // the domain validator rejects the dead endpoint as not found.
+        assert_eq!(e.code, DomainErrorCode::NotFound);
+    }
+    // Invariants hold under either commit order: endpoint stays deleted,
+    // no edge references it, forward/reverse views agree (empty here).
+    let a = repo
+        .get_memories(&[eid(1)])
+        .unwrap()
+        .pop()
+        .expect("tombstone row must remain");
+    assert!(!a.lifecycle.is_recallable(), "endpoint must stay deleted");
+    let dangling: Vec<_> = repo
+        .all_relations()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.source == eid(1) || r.target == eid(1))
+        .collect();
+    assert!(
+        dangling.is_empty(),
+        "no edge may reference the deleted endpoint, got {dangling:?}"
+    );
+    assert!(repo.neighbors(eid(1)).unwrap().is_empty());
+}
+
+#[test]
+fn concurrent_duplicate_edge_creation_keeps_uniqueness() {
+    // T-GRAPH-01 concurrent duplicates: two operations create the same
+    // logical edge under one barrier. Uniqueness must hold in the final
+    // store: at most one commit may survive, and any loser must fail
+    // loudly (DuplicateEdge), never silently double-record.
+    let (repo, _dir) = repo_with_ns();
+    for n in [1u64, 2] {
+        repo.apply(
+            &ctx(n, &format!("m{n}")),
+            &DomainCommand::AddMemory {
+                memory: memory(eid(n), &format!("m{n}")),
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+    }
+    let repo = std::sync::Arc::new(repo);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for (i, rid) in [eid(100), eid(101)].into_iter().enumerate() {
+        let repo = std::sync::Arc::clone(&repo);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            repo.apply(
+                &ctx(i as u64 + 200, &format!("dup{i}")),
+                &DomainCommand::Relate {
+                    relation: rel(rid, eid(1), eid(2), RelationType::RelatedTo),
+                },
+            )
+        }));
+    }
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.join().unwrap());
+    }
+    for r in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(r.code, DomainErrorCode::DuplicateEdge);
+    }
+    let surviving: Vec<_> = repo
+        .all_relations()
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.source == eid(1) && r.target == eid(2) && r.relation_type == RelationType::RelatedTo
+        })
+        .collect();
+    assert_eq!(
+        surviving.len(),
+        1,
+        "uniqueness must hold: exactly one duplicate edge survives, got {surviving:?} ({results:?})"
+    );
+}
+
+#[test]
+fn concurrent_boosts_on_same_memory_both_apply() {
+    // T-CONC-01 concurrent increments: two barrier-synced +0.02 boosts on
+    // the same memory must both land (no lost increment) via the
+    // transaction retry, with access counted twice.
+    let (repo, _dir) = repo_with_ns();
+    repo.apply(
+        &ctx(1, "d1"),
+        &DomainCommand::AddMemory {
+            memory: memory(eid(1), "boost-target"),
+            session: None,
+            auto_link: None,
+        },
+    )
+    .unwrap();
+    let before = repo.get_memories(&[eid(1)]).unwrap().pop().unwrap();
+    let repo = std::sync::Arc::new(repo);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for i in 0..2 {
+        let repo = std::sync::Arc::clone(&repo);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            repo.apply(
+                &ctx(10 + i, &format!("boost{i}")),
+                &DomainCommand::BoostConfidence {
+                    memory_ids: vec![eid(1)],
+                },
+            )
+        }));
+    }
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.join().unwrap());
+    }
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "both boosts must commit, got {results:?}"
+    );
+    let after = repo.get_memories(&[eid(1)]).unwrap().pop().unwrap();
+    assert!(
+        (after.confidence - (before.confidence + 0.04)).abs() < 1e-9,
+        "both +0.02 increments must land, got {} from {}",
+        after.confidence,
+        before.confidence
+    );
+    assert_eq!(
+        after.access_count,
+        before.access_count + 2,
+        "each boost records one access"
+    );
+}
+
+#[test]
+fn receipt_survives_migration_cycle_without_duplicate_effect() {
+    // T-REC-02 retry across migration: a receipt recorded before a schema
+    // migration replays after it with no duplicated canonical effect.
+    use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
+    use ltmrs_domain::clock::FrozenClock;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+    let repo = CanonicalRepository::open_with_clock(path, Arc::clone(&clock)).unwrap();
+    repo.issue_namespace(
+        ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+        ch(2),
+        1000,
+    )
+    .unwrap();
+    let m = memory(eid(1), "migration-replay");
+    let c = ctx(1, "mig1");
+    let r1 = repo
+        .apply(
+            &c,
+            &DomainCommand::AddMemory {
+                memory: m,
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+    drop(repo);
+    // Downgrade the schema marker so reopening runs a real migration.
+    {
+        let db = OptimisticTxDatabase::builder(path).open().unwrap();
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default).unwrap();
+        let mut tx = db.write_tx().unwrap();
+        tx.insert(&meta, "schema_version", 0u64.to_le_bytes());
+        tx.commit().unwrap().unwrap();
+    }
+    let clock2: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+        Arc::new(FrozenClock::new(1000));
+    let repo2 = CanonicalRepository::open_with_clock(path, clock2).unwrap();
+    // The recorded receipt survived the migration ...
+    let stored = repo2
+        .lookup_receipt(
+            StoreGeneration::FIRST,
+            ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1)),
+            1,
+            r1.operation_id,
+        )
+        .unwrap()
+        .expect("receipt must survive migration");
+    assert_eq!(stored.request_digest, "mig1");
+    // ... and replaying the same operation replays it with no new effect.
+    let m2 = memory(eid(1), "migration-replay");
+    let r2 = repo2
+        .apply(
+            &c,
+            &DomainCommand::AddMemory {
+                memory: m2,
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(r1.operation_id, r2.operation_id);
+    assert_eq!(
+        repo2
+            .export_snapshot()
+            .unwrap()
+            .memories
+            .iter()
+            .filter(|m| m.title == "migration-replay")
+            .count(),
+        1,
+        "replay after migration must not duplicate"
     );
 }

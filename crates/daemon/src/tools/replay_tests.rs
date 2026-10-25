@@ -4,9 +4,10 @@ use super::execute_tool;
 use super::ids::new_legacy_id;
 use super::replay::sub_command_ctx;
 use super::test_support::*;
+use crate::dispatcher::Dispatcher;
 use ltmrs_compat::lemma::tool_args::{
-    MemoryAddArgs, MemoryFeedbackArgs, MemoryForgetArgs, MemoryRelateArgs, MemoryUpdateArgs,
-    SessionStartArgs, ToolArgs,
+    BackupCreateArgs, BackupPreviewArgs, BackupRestoreArgs, MemoryAddArgs, MemoryFeedbackArgs,
+    MemoryForgetArgs, MemoryRelateArgs, MemoryUpdateArgs, SessionStartArgs, ToolArgs,
 };
 use ltmrs_domain::command::DomainCommand;
 use ltmrs_domain::id::EntityId;
@@ -471,4 +472,224 @@ fn error_envelope_unknown_ids_and_bad_values() {
     });
     let result = run(&disp, &tool_call(5, upd.clone()), &upd);
     assert!(result_is_error(&result));
+}
+
+/// T-CONC-03 lose-then-replay after expiry: commit, cross the namespace
+/// TTL, then replay the same envelope. Admission must refuse the expired
+/// epoch (StaleReplay) — never replay into it, never re-execute as new.
+#[test]
+fn replay_after_namespace_expiry_is_refused_not_reexecuted() {
+    use std::sync::{Arc, Mutex};
+    struct AdvancingClock(Mutex<u64>);
+    impl ltmrs_domain::clock::Clock for AdvancingClock {
+        fn now_millis(&self) -> u64 {
+            *self.0.lock().unwrap()
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clock: Arc<AdvancingClock> = Arc::new(AdvancingClock(Mutex::new(1000)));
+    let repo = Arc::new(
+        ltmrs_service::repository::CanonicalRepository::open_with_clock(
+            dir.path().to_str().unwrap(),
+            Arc::clone(&clock) as Arc<dyn ltmrs_domain::clock::Clock + Send + Sync>,
+        )
+        .unwrap(),
+    );
+    repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+    let disp = Dispatcher::new(
+        Arc::clone(&repo),
+        crate::registry::FrontendRegistry::new(),
+        Arc::clone(&clock) as Arc<dyn ltmrs_domain::clock::Clock + Send + Sync>,
+    );
+    let add = ToolArgs::MemoryAdd(MemoryAddArgs {
+        fragment: "## Expiry Replay\n\n### Context\nCommitted before the TTL crossed.".to_string(),
+        ..Default::default()
+    });
+    let env = tool_call(1, add.clone());
+    let first = run(&disp, &env, &add);
+    assert!(!result_is_error(&first));
+    // Cross the 24h TTL: the recording epoch is now expired.
+    *clock.0.lock().unwrap() += ltmrs_service::repository::DEFAULT_NAMESPACE_TTL_MILLIS + 1;
+    let err = execute_tool(&disp, &env, &add).unwrap_err();
+    assert_eq!(
+        err.code,
+        ltmrs_domain::command::DomainErrorCode::StaleReplay,
+        "expired replay must be refused, got: {}",
+        err.message
+    );
+    let count = repo
+        .export_snapshot()
+        .unwrap()
+        .memories
+        .iter()
+        .filter(|m| m.fragment.contains("Expiry Replay"))
+        .count();
+    assert_eq!(count, 1, "expired replay must not execute as new");
+}
+
+/// T-CONC-03 + T-REC-02 generation cut, frozen receipt: the recorded
+/// response replays verbatim. No new effect is recorded under the cut
+/// generation — a frozen replay returns bytes, it does not write.
+#[test]
+fn replay_after_generation_cut_returns_frozen_without_new_write() {
+    let (disp, _dir) = test_dispatcher();
+    let add = ToolArgs::MemoryAdd(MemoryAddArgs {
+        fragment: "## Generation Cut\n\n### Context\nCommitted before the cut.".to_string(),
+        ..Default::default()
+    });
+    let env = tool_call(1, add.clone());
+    let first = run(&disp, &env, &add);
+    assert!(!result_is_error(&first));
+    let first_text = result_text(&first);
+    disp.repo()
+        .set_store_generation(ltmrs_domain::id::StoreGeneration::new(2))
+        .unwrap();
+    let replayed = run(&disp, &env, &add);
+    assert!(
+        !result_is_error(&replayed),
+        "frozen replay must stay servable, got: {}",
+        result_text(&replayed)
+    );
+    assert_eq!(
+        result_text(&replayed),
+        first_text,
+        "cut-generation replay must return the recorded bytes"
+    );
+    let count = disp
+        .repo()
+        .export_snapshot()
+        .unwrap()
+        .memories
+        .iter()
+        .filter(|m| m.fragment.contains("Generation Cut"))
+        .count();
+    assert_eq!(count, 1, "cut-generation replay must not write");
+}
+
+/// T-CONC-03 fresh write under a cut generation: the durability fence
+/// refuses loudly (StaleGeneration) instead of recording the write
+/// outside the live generation.
+#[test]
+fn fresh_write_under_cut_generation_is_refused() {
+    let (disp, _dir) = test_dispatcher();
+    disp.repo()
+        .set_store_generation(ltmrs_domain::id::StoreGeneration::new(2))
+        .unwrap();
+    let add = ToolArgs::MemoryAdd(MemoryAddArgs {
+        fragment: "## Cut Write\n\n### Context\nFresh op under a stale envelope.".to_string(),
+        ..Default::default()
+    });
+    // Fresh operation id, but the envelope still names generation FIRST.
+    let env = tool_call(1, add.clone());
+    let err = execute_tool(&disp, &env, &add).unwrap_err();
+    assert_eq!(
+        err.code,
+        ltmrs_domain::command::DomainErrorCode::StaleGeneration,
+        "fresh write under a cut generation must be refused, got: {}",
+        err.message
+    );
+    let count = disp
+        .repo()
+        .export_snapshot()
+        .unwrap()
+        .memories
+        .iter()
+        .filter(|m| m.fragment.contains("Cut Write"))
+        .count();
+    assert_eq!(count, 0, "refused write must not land");
+}
+
+/// T-REC-02 replay after a real restore: the replace drains receipts
+/// and namespaces, so the pre-restore envelope is refused at admission
+/// (unknown namespace) — never replayed, never re-executed.
+#[test]
+fn replay_after_restore_is_refused_not_replayed() {
+    let (disp, _dir) = test_dispatcher();
+    let add = ToolArgs::MemoryAdd(MemoryAddArgs {
+        fragment: "## Restore Replay\n\n### Context\nCommitted before restore.".to_string(),
+        ..Default::default()
+    });
+    let env = tool_call(1, add.clone());
+    let first = run(&disp, &env, &add);
+    assert!(!result_is_error(&first));
+    // Back up, then restore: the generation cuts and receipts drain.
+    let out = tempfile::tempdir().unwrap();
+    let create = ToolArgs::BackupCreate(BackupCreateArgs {
+        directory: Some(out.path().to_str().unwrap().to_string()),
+    });
+    let result = run(&disp, &tool_call(2, create.clone()), &create);
+    let backup_path = result_structured(&result).unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+        path: Some(backup_path.clone()),
+    });
+    let result = run(&disp, &tool_call(3, preview.clone()), &preview);
+    let token = result_structured(&result).unwrap()["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+        confirmation_token: Some(token),
+        confirm: Some(true),
+    });
+    let result = run(&disp, &tool_call(4, restore.clone()), &restore);
+    assert!(!result_is_error(&result), "restore must succeed");
+    // The pre-restore envelope is now admission-unknown: refused loudly.
+    let err = execute_tool(&disp, &env, &add).unwrap_err();
+    assert_eq!(
+        err.code,
+        ltmrs_domain::command::DomainErrorCode::StaleReplay,
+        "post-restore replay must be refused, got: {}",
+        err.message
+    );
+    let count = disp
+        .repo()
+        .export_snapshot()
+        .unwrap()
+        .memories
+        .iter()
+        .filter(|m| m.fragment.contains("Restore Replay"))
+        .count();
+    assert_eq!(count, 1, "post-restore replay must not re-execute");
+}
+
+/// T-REC-02 retry with projection state: replaying a committed add
+/// records nothing new — no duplicate memory, no fresh projection job.
+#[test]
+fn retry_after_projection_state_replays_without_new_effects() {
+    let (disp, _dir) = test_dispatcher();
+    let add = ToolArgs::MemoryAdd(MemoryAddArgs {
+        fragment: "## Projection Replay\n\n### Context\nCommitted with a projection job pending."
+            .to_string(),
+        ..Default::default()
+    });
+    let env = tool_call(1, add.clone());
+    let first = run(&disp, &env, &add);
+    assert!(!result_is_error(&first));
+    let eid = disp
+        .repo()
+        .resolve_id(result_structured(&first).unwrap()["id"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        disp.repo().projection_job(eid).is_ok(),
+        "committed add must enqueue a projection job"
+    );
+    let replayed = run(&disp, &env, &add);
+    assert!(!result_is_error(&replayed));
+    assert_eq!(
+        result_text(&replayed),
+        result_text(&first),
+        "replay must return the recorded response"
+    );
+    let count = disp
+        .repo()
+        .export_snapshot()
+        .unwrap()
+        .memories
+        .iter()
+        .filter(|m| m.fragment.contains("Projection Replay"))
+        .count();
+    assert_eq!(count, 1, "replay must not duplicate the memory");
 }
