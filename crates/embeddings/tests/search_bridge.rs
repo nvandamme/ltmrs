@@ -96,7 +96,7 @@ fn query_bridge_uses_query_role() {
         eprintln!("SKIP: artifacts not present");
         return;
     }
-    let mut adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
+    let adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
     let text = "how to configure fjall persistence";
     let expected_q = adapter.embed(text, Role::Query).unwrap().vector;
     let expected_p = adapter.embed(text, Role::Passage).unwrap().vector;

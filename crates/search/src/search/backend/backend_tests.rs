@@ -15,6 +15,83 @@ fn e5_chunk_version_differs_from_default() {
     assert_ne!(E5_CHUNK_VERSION, SINGLE_CHUNK_VERSION);
 }
 
+/// Parallel chunk mapping preserves order and per-item errors on a
+/// fake workload (pool mechanics, not model math).
+#[test]
+fn par_map_preserves_order_and_errors() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let out: Vec<Result<usize, String>> = pool.install(|| {
+        use rayon::prelude::*;
+        ["a", "bad", "ccc"]
+            .par_iter()
+            .map(|t| {
+                if *t == "bad" {
+                    return Err("stalled".to_string());
+                }
+                Ok(t.len())
+            })
+            .collect()
+    });
+    assert_eq!(out, [Ok(1), Err("stalled".to_string()), Ok(3)]);
+}
+
+/// Parallel chunk embedding matches sequential embedding within float
+/// tolerance (per-chunk batch-of-one forwards are mathematically
+/// identical to one batch forward; pool scheduling must neither reorder
+/// nor drop units). Ignored: needs pinned artifacts via LTMRS_PROBE_MODELS.
+#[tokio::test]
+#[ignore]
+async fn e5_parallel_matches_sequential_within_tolerance() {
+    use super::e5::ParallelE5Embedder;
+    use crate::search::projector::Embedder as _;
+    use ltmrs_embeddings::artifacts::ArtifactCache;
+    use ltmrs_embeddings::e5_small::E5SmallAdapter;
+
+    let models = std::env::var("LTMRS_PROBE_MODELS").unwrap_or_default();
+    if models.is_empty() || !std::path::Path::new(&models).exists() {
+        eprintln!("SKIP: set LTMRS_PROBE_MODELS to a provisioned models dir");
+        return;
+    }
+    let cache = ArtifactCache::new(&models);
+    let texts = vec![
+        "the quick brown fox jumps over the lazy dog".to_string(),
+        "quantum entanglement enables instantaneous correlation".to_string(),
+    ];
+    let pool = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap(),
+    );
+    let mut parallel = ParallelE5Embedder::new(
+        std::sync::Arc::new(
+            E5SmallAdapter::load_from_cache(&cache).expect("provisioned cache loads"),
+        ),
+        pool,
+    );
+    let par = parallel
+        .embed_texts(&texts)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut sequential = E5SmallAdapter::load_from_cache(&cache).expect("provisioned cache loads");
+    let seq = sequential
+        .embed_texts(&texts)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(par.len(), seq.len(), "parallel must answer per chunk");
+    for (p, s) in par.iter().zip(seq.iter()) {
+        assert_eq!(p.len(), s.len());
+        for (x, y) in p.iter().zip(s.iter()) {
+            assert!((x - y).abs() < 1e-5, "parallel diverged: {x} vs {y}");
+        }
+    }
+}
+
 /// Service-routed queries embed with the Query role through the bounded
 /// worker (design §7.3), awaiting normally — never blocking the caller.
 #[tokio::test]

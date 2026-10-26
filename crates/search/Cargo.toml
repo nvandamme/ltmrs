@@ -19,6 +19,7 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "rt", "macros", "sync"
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 futures-util = "0.3"
+rayon = "1.12"
 
 [dev-dependencies]
 tempfile = "3.0"

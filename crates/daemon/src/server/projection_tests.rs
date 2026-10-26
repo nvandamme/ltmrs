@@ -265,3 +265,25 @@ async fn health_reports_live_generation_not_first() {
     assert_eq!(report.store_generation.as_u64(), 2);
     assert!(report.ready);
 }
+
+/// RQ-22 inference budget: the chunk-embedding pool reserves cores for
+/// serving with a floor, so a bulk backfill never starves interactive
+/// recall. Deterministic: pure function of `available_parallelism`.
+#[test]
+fn inference_pool_threads_reserves_cores_with_floor() {
+    let threads = Daemon::inference_pool_threads();
+    assert!(threads >= 2, "pool floors at 2 threads, got {threads}");
+    if let Some(n) = std::thread::available_parallelism().ok().map(|n| n.get()) {
+        assert!(
+            threads <= n.max(2),
+            "pool never exceeds the machine width ({n}), got {threads}"
+        );
+        if n > 4 {
+            assert_eq!(
+                threads,
+                n - 2,
+                "wide machines reserve exactly 2 cores for serving"
+            );
+        }
+    }
+}

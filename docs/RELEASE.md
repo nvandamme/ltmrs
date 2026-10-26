@@ -41,7 +41,7 @@ in `plans/`; history in `CHANGELOG.md`; evidence bundle in
 | Storage re-run on release tree | done | 1614 ops 0 failures (putget) + 386 ops 0 failures (search); summaries in bundle |
 | Upstream 100-op sample | done | fresh transcript in bundle (26 ok / 74 read-miss-expected); full differential unchanged (no contract delta) |
 | BEIR SciFact harness | done | ignored test + UKP corpus (5183 docs / 300 queries); proven through 709 indexed docs |
-| BEIR SciFact full run | open | **~5h CPU bulk indexing** (measured 4s/job: multi-chunk forwards + per-job commits); needs GPU or unattended box |
+| BEIR SciFact full run | open | **~5h CPU bulk indexing** (measured 4s/job: multi-chunk forwards + per-job commits); embed-path probe 2026-10-25 (Ryzen 9 7950X, debug, 30t pool): 11-chunk job ~1.1s fan-out vs ~2.3s single batch (evidence only, no gate); needs GPU or unattended box |
 
 ## Standing not_run (environmental)
 

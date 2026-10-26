@@ -58,8 +58,9 @@ pub struct Chunk {
     pub token_count: usize,
 }
 
-/// The E5-small adapter. Synchronous and `&mut self` — owned by the bounded
-/// worker, never called from Tokio I/O threads directly (design §9).
+/// The E5-small adapter. Synchronous CPU inference over `&self` (reads
+/// weights, mutates nothing), so one adapter fans out across threads —
+/// never called from Tokio I/O threads directly (design §9).
 pub struct E5SmallAdapter {
     recipe: ModelRecipe,
     tokenizer: Arc<Tokenizer>,

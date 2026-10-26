@@ -134,7 +134,7 @@ fn t_emb_02_embeddings_match_reference() {
         eprintln!("SKIP: artifacts not present");
         return;
     }
-    let mut adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
+    let adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
     let fixture = load_fixture();
 
     // Tolerance rationale (see manifest): CPU F32 Candle vs PyTorch F32.
@@ -483,7 +483,7 @@ fn t_emb_03_long_document_chunking() {
         eprintln!("SKIP: artifacts not present");
         return;
     }
-    let mut adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
+    let adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
     let fixture = load_fixture();
 
     const COSINE_TOL: f32 = 0.999;
@@ -606,7 +606,7 @@ fn t_emb_03_chunking_offsets_and_bounds() {
         eprintln!("SKIP: artifacts not present");
         return;
     }
-    let mut adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
+    let adapter = E5SmallAdapter::load_from_cache(&cache).unwrap();
 
     // A title whose prefix alone overflows the window must disclose,
     // never underflow the token budget (usize panic in debug).
@@ -721,4 +721,13 @@ fn t_emb_03_chunking_offsets_and_bounds() {
     // Over-limit input is rejected with an actionable error (no silent truncation).
     let too_long = format!("{near_text} extra word here to push it over the window");
     assert!(adapter.embed(&too_long, Role::Passage).is_err());
+}
+
+/// Phase 2 gate (Step 2): the adapter must be shareable by `&` across a
+/// rayon pool. Fails to COMPILE if any field (recipe, tokenizer, model)
+/// is !Send or !Sync — that blocks the pool and stops Phase 2.
+#[test]
+fn e5_adapter_is_shareable() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<E5SmallAdapter>();
 }

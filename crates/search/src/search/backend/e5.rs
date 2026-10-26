@@ -34,12 +34,12 @@ fn poisoned_lock() -> DomainError {
     DomainError::new(DomainErrorCode::Validation, "embedder lock poisoned")
 }
 
-/// Document-side bridge: the projector's `Embedder` seam over the pinned
-/// E5-small adapter (Passage role). Oversized input errors instead of
-/// truncating; the projector treats that as pending semantic work.
-impl Embedder for E5SmallAdapter {
-    fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
-        self.embed_batch(&[EmbedInput {
+/// One Passage-role vector through a shared adapter handle: the batch-of-one
+/// mapping both the sequential `Embedder` impl and the parallel fan-out use,
+/// so per-chunk math stays identical across paths.
+fn passage_vector(adapter: &E5SmallAdapter, text: &str) -> Result<Vec<f32>, String> {
+    adapter
+        .embed_batch(&[EmbedInput {
             text: text.to_string(),
             role: Role::Passage,
         }])
@@ -47,6 +47,14 @@ impl Embedder for E5SmallAdapter {
         .pop()
         .map(|s| s.vector)
         .ok_or_else(|| "embedding returned no sequences".to_string())
+}
+
+/// Document-side bridge: the projector's `Embedder` seam over the pinned
+/// E5-small adapter (Passage role). Oversized input errors instead of
+/// truncating; the projector treats that as pending semantic work.
+impl Embedder for E5SmallAdapter {
+    fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        passage_vector(self, text)
     }
 
     fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
@@ -97,7 +105,7 @@ impl Embedder for E5SmallAdapter {
 /// batch accounting and shutdown semantics (RQ-22).
 impl QueryEmbedderProvider for Mutex<E5SmallAdapter> {
     fn embed_query(&self, query: &str) -> DomainResult<Vec<f32>> {
-        let mut guard = self.lock().map_err(|_| poisoned_lock())?;
+        let guard = self.lock().map_err(|_| poisoned_lock())?;
         guard
             .embed_batch(&[EmbedInput {
                 text: query.to_string(),
@@ -223,6 +231,75 @@ impl Embedder for Arc<Mutex<E5SmallAdapter>> {
             // default single unit rather than dropping the memory.
             Err(_) => vec![crate::search::projector::single_chunk_unit(title, fragment)],
         }
+    }
+
+    fn chunker_version(&self) -> String {
+        E5_CHUNK_VERSION.to_string()
+    }
+}
+
+/// Document-side bridge over a SHARED adapter handle plus a dedicated capped
+/// rayon pool (bulk-drive Phase 2): chunk forwards within one tick fan out
+/// across the pool while revision guards, pending/retry, publish and FTS
+/// steps stay sequential in the projector. Results are order-preserving
+/// (rayon's indexed `collect` keeps input order) with per-chunk error
+/// mapping — one oversized chunk fails alone instead of poisoning its
+/// siblings, and every chunk still lands a lexical row through the
+/// projector's `r.ok()` mapping. Empty input answers empty, never dropped
+/// or padded.
+pub struct ParallelE5Embedder {
+    adapter: Arc<E5SmallAdapter>,
+    pool: Arc<rayon::ThreadPool>,
+}
+
+impl ParallelE5Embedder {
+    pub fn new(adapter: Arc<E5SmallAdapter>, pool: Arc<rayon::ThreadPool>) -> Self {
+        Self { adapter, pool }
+    }
+}
+
+impl Embedder for ParallelE5Embedder {
+    fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        passage_vector(&self.adapter, text)
+    }
+
+    fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        self.pool.install(|| {
+            use rayon::prelude::*;
+            texts
+                .par_iter()
+                .map(|text| passage_vector(&self.adapter, text))
+                .collect()
+        })
+    }
+
+    fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
+        e5_chunks_to_text_chunks(title, &self.adapter.chunk_passage(title, fragment))
+    }
+
+    fn chunker_version(&self) -> String {
+        E5_CHUNK_VERSION.to_string()
+    }
+}
+
+/// Sequential lock-free bridge over a shared adapter handle: the same chunk
+/// policy and version as the parallel path, used when the pool is
+/// unavailable (a pool build failure falls back here instead of parking
+/// the tick).
+impl Embedder for Arc<E5SmallAdapter> {
+    fn embed(&mut self, text: &str) -> Result<Vec<f32>, String> {
+        passage_vector(self, text)
+    }
+
+    fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
+        texts.iter().map(|t| passage_vector(self, t)).collect()
+    }
+
+    fn chunk_text(&self, title: &str, fragment: &str) -> Vec<TextChunk> {
+        e5_chunks_to_text_chunks(title, &self.chunk_passage(title, fragment))
     }
 
     fn chunker_version(&self) -> String {

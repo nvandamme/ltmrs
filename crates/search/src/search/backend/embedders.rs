@@ -71,8 +71,8 @@ impl QueryEmbedderProvider for ClosureEmbedder {
     }
 }
 
-/// A Mutex-guarded synchronous embedder (for the Candle adapter, which is
-/// `&mut self`).
+/// A Mutex-guarded synchronous embedder (the `Embedder` seam is
+/// `&mut self`; adapter inference itself is `&`-shareable).
 pub struct MutexEmbedder {
     inner: Mutex<Box<dyn crate::search::projector::Embedder + Send>>,
 }

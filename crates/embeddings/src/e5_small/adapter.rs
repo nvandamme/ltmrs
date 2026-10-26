@@ -337,8 +337,9 @@ impl E5SmallAdapter {
 
     /// Embed a batch of inputs. Pads rows to the max length in the batch with
     /// pad_token_id and attention_mask=0 (T-EMB-02). Returns one vector per input,
-    /// each L2-normalized and finite-checked.
-    pub fn embed_batch(&mut self, inputs: &[EmbedInput]) -> ArtifactResult<Vec<EmbeddedSequence>> {
+    /// each L2-normalized and finite-checked. Takes `&self`: inference reads
+    /// weights but mutates nothing, so one adapter fans out across threads.
+    pub fn embed_batch(&self, inputs: &[EmbedInput]) -> ArtifactResult<Vec<EmbeddedSequence>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -454,7 +455,7 @@ impl E5SmallAdapter {
     }
 
     /// Convenience single-input embed (batch of one).
-    pub fn embed(&mut self, text: &str, role: Role) -> ArtifactResult<EmbeddedSequence> {
+    pub fn embed(&self, text: &str, role: Role) -> ArtifactResult<EmbeddedSequence> {
         let inputs = vec![EmbedInput {
             text: text.to_string(),
             role,

@@ -5,7 +5,23 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-26 — docs: plan ledger reconciliations (stale boxes, oracle, 29/30 drift, bulk-drive boxes, header repairs)
+## 2026-10-26 — feat: parallel bulk-drive Phase 2 (bounded pool + throughput evidence)
+
+### Task 4: dedicated parallel chunk pool (TDD, reviewed)
+- `&mut`-to-`&` audit: `E5SmallAdapter::embed_batch`/`embed` are pure functions of inputs + weights (tokenizer `encode(&self)`, `BertModel::forward(&self)`, plain field reads; no mutation in the inference path). Changed one word each (`&mut self` → `&self`); all callers still compile. `SyncEmbedder` worker-thread seam keeps `&mut self` (single-owner, untouched).
+- `e5_adapter_is_shareable` compiles: `Send + Sync` proven (was the Phase-2 go/no-go gate).
+- New `ParallelE5Embedder { adapter: Arc<E5SmallAdapter>, pool: Arc<rayon::ThreadPool> }`: order-preserving indexed collect, per-chunk error mapping, empty→empty; `Arc<E5SmallAdapter>` sequential fallback on pool-build failure (loud log, tick never parks).
+- Pool built in `Daemon::start_projection` with the plan formula verbatim (`available_parallelism - 2`, floor 2; 30 threads on this 32-core box) + RQ-22 bound/fairness rationale on `Daemon::inference_pool_threads()`; 100-job tick cap, revision guards, pending/retry, publish and FTS sequencing untouched.
+- `rayon = "1.12"` direct dep in `crates/search` + `crates/daemon` (both name it); `Cargo.lock` +2 edge lines only, zero new packages/versions (plan's "empty diff" expectation was imprecise — recording the edge is necessary mechanics).
+- Live-weights parity (provisioned `tmp/probe-models` scratch cache, gitignored): `e5_parallel_matches_sequential_within_tolerance` REAL PASS (1e-5); pre-existing batch parity still green after the `&self` refactor.
+
+### Task 5: throughput evidence (report-only, no perf gate)
+- Same box (Ryzen 9 7950X, 32t → pool 30; debug profile; model load ~12.7s excluded; n=1 per leg x 2 runs; reconstructed 11-chunk texts): loop 3.68/3.69s → single batch 2.32/2.31s → 4-thread fan-out 5.44/5.63s → 30-thread fan-out 1.13/1.15s.
+- Reading: production-sized fan-out is the fastest embed path for multi-chunk jobs (~2x batch, ~3.3x old loop); 4-thread fan-out reproduces the slower-than-batch finding (singleton forwards re-read weights). Single-chunk jobs still carry pool overhead only. `plans/02` has no fairness line — left untouched (no invented requirement text; needs owner decision on where fairness numbers live).
+- `docs/RELEASE.md` throughput note updated; probe source verbatim in `.superpowers/sdd/.../task-5-report.md` (temp test deleted after measurement).
+- Gate: fmt clean, clippy `-D warnings` clean, search 198 + daemon 313 green, full workspace green, `dist-audit` fast 7/7 (full mode not re-run), Task 4 + Task 5 reviews spec ✅ / Approved.
+
+## a26d4ce (2026-10-26) — docs: plan ledger reconciliations (stale boxes, oracle, 29/30 drift, bulk-drive boxes, header repairs)
 
 ### No behavior change, no statuses changed
 - Bulk-drive plan: 25 task boxes `[x]` (Tasks 1–3 pre-split, Tasks 4–5 in the bulk-drive feature commit above) with reconciliation note.

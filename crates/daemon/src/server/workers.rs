@@ -245,10 +245,16 @@ impl Daemon {
                 return;
             }
         };
-        /// What each worker tick embeds with: loaded E5 weights, or nothing
-        /// (lexical rows only, jobs resolve instead of retrying vectors).
+        /// What each worker tick embeds with: loaded E5 weights shared by
+        /// `&` (inference mutates nothing), or nothing (lexical rows only,
+        /// jobs resolve instead of retrying vectors). The pool fans chunk
+        /// forwards out within one tick; `None` (pool build failure) falls
+        /// back to sequential chunk embedding, never a parked tick.
         enum EmbedderSource {
-            E5(std::sync::Arc<std::sync::Mutex<ltmrs_embeddings::e5_small::E5SmallAdapter>>),
+            E5 {
+                adapter: std::sync::Arc<ltmrs_embeddings::e5_small::E5SmallAdapter>,
+                pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+            },
             Lexical,
         }
         let source = match self.models_dir.clone() {
@@ -262,7 +268,7 @@ impl Daemon {
                 })
                 .await
                 {
-                    Ok(Ok(adapter)) => std::sync::Arc::new(std::sync::Mutex::new(adapter)),
+                    Ok(Ok(adapter)) => std::sync::Arc::new(adapter),
                     Ok(Err(e)) => {
                         eprintln!(
                             "ltmrs: projection adapter failed ({e}); dense indexing parked; \
@@ -275,10 +281,26 @@ impl Daemon {
                         return;
                     }
                 };
+                // Dedicated capped pool for chunk forwards (RQ-22 inference
+                // budget): a bulk backfill must not starve serving, and an
+                // unbounded pool must not oversubscribe the machine.
+                let pool = match rayon::ThreadPoolBuilder::new()
+                    .num_threads(Self::inference_pool_threads())
+                    .build()
+                {
+                    Ok(pool) => Some(std::sync::Arc::new(pool)),
+                    Err(e) => {
+                        eprintln!(
+                            "ltmrs: embed pool build failed ({e}); \
+                             falling back to sequential chunk embedding"
+                        );
+                        None
+                    }
+                };
                 // Upgrade backfill: rows projected while lexical-only carry
                 // NULL vectors; requeue them for dense embedding now.
                 Self::backfill_null_vectors(&repo, &table).await;
-                EmbedderSource::E5(adapter)
+                EmbedderSource::E5 { adapter, pool }
             }
             None => {
                 eprintln!("ltmrs: no embedding models; lexical-only projection");
@@ -292,7 +314,15 @@ impl Daemon {
             loop {
                 let embedder: Box<dyn ltmrs_search::search::projector::Embedder + Send> =
                     match &source {
-                        EmbedderSource::E5(adapter) => Box::new(std::sync::Arc::clone(adapter)),
+                        EmbedderSource::E5 { adapter, pool } => match pool {
+                            Some(pool) => Box::new(
+                                ltmrs_search::search::backend::e5::ParallelE5Embedder::new(
+                                    std::sync::Arc::clone(adapter),
+                                    std::sync::Arc::clone(pool),
+                                ),
+                            ),
+                            None => Box::new(std::sync::Arc::clone(adapter)),
+                        },
                         EmbedderSource::Lexical => {
                             Box::new(ltmrs_search::search::projector::StalledEmbedder)
                         }
@@ -451,6 +481,17 @@ impl Daemon {
     /// converges over successive ticks instead of one unbounded pass
     /// starving interactive recall. Steady-state write rates never bind.
     const MAX_PROJECTION_JOBS_PER_TICK: usize = 100;
+
+    /// RQ-22 inference budget: threads for the per-tick chunk-embedding
+    /// pool. Reserves 2 cores for serving (Tokio I/O + retrieval) so a bulk
+    /// backfill never starves interactive recall, with a floor of 2 so even
+    /// small machines fan out. Paired with `MAX_PROJECTION_JOBS_PER_TICK`:
+    /// the tick cap bounds JOBS per pass, this bounds THREADS per forward.
+    pub(crate) fn inference_pool_threads() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(2))
+            .unwrap_or(2)
+    }
 
     /// Run the accept loop until the socket is closed, an error occurs, or
     /// the idle timeout elapses with no connections (design §7.2).
