@@ -1151,9 +1151,9 @@ fn dist_audit_skills_pipeline() -> String {
 /// the locked CPU release build and the offline-capable build proof.
 /// Offline scope, stated honestly: `cargo build --locked --offline` proves
 /// the locked workspace compiles with NO network from the local cargo
-/// cache. It does NOT prove a fresh-machine install (no prefetch, no
-/// vendor dir) — that remains unproven and is labeled as such wherever
-/// this check is reported.
+/// cache. It does NOT by itself prove a fresh-machine install (no prefetch, no
+/// vendor dir) — that leg is proven separately by the 2026-10-26 clean-container
+/// build (see traceability RQ-21), not by this check.
 fn dist_audit_release_argv() -> Vec<String> {
     argv(&["cargo", "build", "--locked", "--release", "--workspace"])
 }
@@ -1169,7 +1169,7 @@ fn dist_audit_offline_argv() -> Vec<String> {
 /// tree file, rusqlite inverse, reqwest site classification,
 /// lance-remote API usage scan, loader pin, manifest-backed model-dir
 /// check, skills egress scan. Full mode adds the locked release build and
-/// the offline build (local cache only — fresh-machine install unproven)
+/// the offline build (local cache only — fresh-machine proven separately, see RQ-21)
 /// with measured wall times. `dry_run` prints every would-be
 /// command and executes nothing.
 pub fn run_dist_audit(full: bool, dry_run: bool) -> Result<i32, String> {
@@ -1377,7 +1377,7 @@ pub fn run_dist_audit(full: bool, dry_run: bool) -> Result<i32, String> {
         let wall = t0.elapsed().as_secs();
         if offline.exit_code == 0 {
             report.push(format!(
-                "offline-build: PASS (wall {wall}s; `cargo build --locked --offline`, local cache only — fresh-machine install remains unproven)"
+                "offline-build: PASS (wall {wall}s; `cargo build --locked --offline`, local cache only — fresh-machine proven separately, see RQ-21)"
             ));
         } else {
             failed = true;

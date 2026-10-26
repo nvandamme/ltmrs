@@ -5,7 +5,21 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-26 — test: WP-12 qualification evidence round (live tails, saturation, ANN, soak, adversarial)
+## 2026-10-26 — fix: sccache-wrap.sh fallback + fresh-machine offline-install proof
+
+### Clean ubuntu:24.04, pure-HEAD archive, `--network=none` serving proofs
+- Release build green (515s, 519 units, 328MB binary); daemon idle-exit 0; stdio recall roundtrip exit 0; 6/6 digests OK. Prior BLOCKED reports superseded, not rewritten.
+- Closed: sccache-wrap fallback (fixed above in this commit) + `libprotobuf-dev` prerequisite (same protoc; doc line added).
+- RQ-21 fresh-machine clause → executed/passed (status stays `executed_partial`). Follow-ups: verb wording refresh, Windows runner.
+- Review spec ✅ / Approved. Gate green.
+
+
+### One file, two lines; sccache branches untouched
+- Wrapper forwarded cargo's compiler path as an input file in both non-sccache branches — no sccache-less machine could build, and the `LTMRS_NO_SCCACHE=1` hatch was broken identically. Fix saves `$1` first (`_cc="$1"; shift; exec "$_cc" "$@"`), preserving the rustup pin.
+- Verified: host repro flips red→green; blinded-direct invocation prints version; sccache path green; in-container cargo compiled hundreds of crates. Surfaced by the fresh-machine leg.
+
+- dist-audit offline-build wording: fresh-machine now points at the proven RQ-21 leg. xtask 101/101 green.
+## a411114 (2026-10-26) — test: WP-12 qualification evidence round (live tails, saturation, ANN, soak, adversarial)
 
 ### No product changes; RQ-20 stays `executed_partial`
 - 90-case seeded frame fuzz: all typed-or-valid, never panics (pinned seed/corpus).

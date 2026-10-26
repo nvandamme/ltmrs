@@ -87,6 +87,11 @@ object-store or cloud credentials are pulled in. Verified: no `object-store`,
 
 - C compiler (cc/gcc) — required by zstd-sys, onig_sys, ring.
 - protoc on PATH (or `PROTOC` env) — required by lance build.rs.
+  - Plus `libprotobuf-dev` alongside `protobuf-compiler` — provides the
+    well-known-type protos (`google/protobuf/*.proto`) lance codegen imports;
+    it is Recommends-only and missing under `--no-install-recommends`
+    (proven by the 2026-10-26 fresh-machine leg: stock 3.21.12 fails codegen
+    without it, passes with it — same protoc version).
   - Alternative: enable lance's `protoc` feature (builds protobuf-src C++),
     more self-contained but slower. Chosen: system protoc for dev.
 
