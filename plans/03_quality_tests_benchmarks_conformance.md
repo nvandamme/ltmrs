@@ -216,7 +216,7 @@ Each row receives all of: schema/default validation; text/JSON/error comparison;
 | backup_preview | Readiness/leases, digest/state binding, expiry and clear replacement preview | WP-11 |
 | backup_restore | Explicit approval, single-use token, verified safety backup and usable connection after restore | WP-11 |
 
-The number 29 is an expected baseline inventory, not a substitute for the source/wire capture. The captured count and schemas are authoritative after WP-00.
+The number 29 is an expected baseline inventory, not a substitute for the source/wire capture. The captured count and schemas are authoritative after WP-00. (29 pinned Lemma tools + the greenfield `backup_import_lemma` = 30 matrix rows; `legacy_oracle` for the greenfield row is honestly `specified_not_executed`, not deferred.)
 
 ### 5.4 Conformance classes and truthful claims
 

@@ -8,6 +8,19 @@
 
 **Tech Stack:** Rust edition 2024, Cargo workspace with shared root `Cargo.lock`, path dependencies, existing pinned toolchain (`rust-toolchain.toml`).
 
+## Global Constraints — reconciliation (2026-10-25, boxes checked post-hoc)
+
+All task boxes below were verified landed against the tree before checking:
+crates `domain/service/compat/embeddings/search/interchange/daemon/frontend`
+exist with green suites; `src/storage/` deleted (Task 5, zero-ref proof
+re-verified); no `arrow` paths outside `ltmrs-search` (Task 7); before/after
+timing table in `CHANGELOG.md` (Tasks 0/12); AGENTS.md rule 5 carries the crate
+DAG + acyclicity + arrow + pin-drop rules (Task 12). Task 11: thin-LTO keep
+measured at split time (CHANGELOG note); the later faster-builds wave
+(`99c546e`) moved dev to `lto = false` — current profile is authoritative.
+Code landed via the file-split wave (`db3371f`) and the `53f9c7c` merge; boxes
+record end-state, not per-task SHAs.
+
 ## Global Constraints
 
 - `cargo fmt -- --check` clean after every task.
@@ -73,7 +86,7 @@ ltmrs-domain ──┬──► ltmrs-service ──┬──► ltmrs-search �
 - Consumes: clean tree at current HEAD
 - Produces: timing table every later task compares against
 
-- [ ] **Step 1: Record a clean-checkout build time**
+- [x] **Step 1: Record a clean-checkout build time**
 
 ```bash
 git --no-pager status --short
@@ -82,7 +95,7 @@ cargo clean -p ltmrs 2>/dev/null; /usr/bin/time -v cargo check --tests 2>&1 | ta
 
 Expected: wall time noted into `reports/crate-split-baseline.txt` (expect several minutes; dependency artifacts in `~/.cargo` stay cached, only `ltmrs` itself rebuilds).
 
-- [ ] **Step 2: Record incremental leaf-touch and hub-touch times**
+- [x] **Step 2: Record incremental leaf-touch and hub-touch times**
 
 ```bash
 touch src/domain/memory.rs && /usr/bin/time -f "%es" cargo check --lib 2>&1 | tail -n 1
@@ -91,7 +104,7 @@ touch src/daemon/tools.rs && /usr/bin/time -f "%es" cargo check --lib 2>&1 | tai
 
 Expected: both numbers nearly identical (single crate — this equality IS the problem statement); append both to the baseline file.
 
-- [ ] **Step 3: Record test-link cost**
+- [x] **Step 3: Record test-link cost**
 
 ```bash
 touch src/daemon/tools.rs && /usr/bin/time -f "%es" cargo test --lib --no-run 2>&1 | tail -n 1
@@ -99,7 +112,7 @@ touch src/daemon/tools.rs && /usr/bin/time -f "%es" cargo test --lib --no-run 2>
 
 Expected: noted; this is the per-edit tax the split must shrink for subsystem work.
 
-- [ ] **Step 4: Commit nothing (measurements only)**
+- [x] **Step 4: Commit nothing (measurements only)**
 
 No commit. Report the three numbers in the task handoff.
 
@@ -115,7 +128,7 @@ No commit. Report the three numbers in the task handoff.
 - Consumes: baseline from Task 0
 - Produces: `cargo check --workspace` green with byte-identical build plan (`cargo tree` diff empty)
 
-- [ ] **Step 1: Add the workspace table to the root manifest**
+- [x] **Step 1: Add the workspace table to the root manifest**
 
 Add exactly this (resolver pinned so the lockfile stays valid):
 
@@ -127,7 +140,7 @@ members = ["."]
 
 Keep `[package]`, all `[dependencies]`, all profiles untouched.
 
-- [ ] **Step 2: Verify the build plan is unchanged**
+- [x] **Step 2: Verify the build plan is unchanged**
 
 ```bash
 cargo tree --depth 1 --prefix none > /tmp/tree-before.txt
@@ -138,7 +151,7 @@ diff /tmp/tree-before.txt /tmp/tree-after.txt && echo "PLAN-IDENTICAL"
 
 Expected: `PLAN-IDENTICAL`, check clean.
 
-- [ ] **Step 3: Run the fast gate**
+- [x] **Step 3: Run the fast gate**
 
 ```bash
 cargo fmt -- --check && echo FMT-OK
@@ -148,7 +161,7 @@ cargo test --lib -- service::repository::tests::export_full_covers_canonical_ses
 
 Expected: fmt clean, clippy clean, 1 test green (proves the harness still runs; the full suite runs from Task 2 on).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add Cargo.toml
@@ -168,7 +181,7 @@ git commit -m "chore: declare cargo workspace (single member, plan-identical)"
 - Consumes: workspace from Task 1
 - Produces: `ltmrs-domain` compiling alone; rest of tree resolving `domain` through it
 
-- [ ] **Step 1: Create the crate manifest (deps: serde, serde_json, uuid, thiserror — versions copied verbatim from root)**
+- [x] **Step 1: Create the crate manifest (deps: serde, serde_json, uuid, thiserror — versions copied verbatim from root)**
 
 ```toml
 [package]
@@ -183,7 +196,7 @@ uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 thiserror = "2"
 ```
 
-- [ ] **Step 2: Move the sources and rewire paths**
+- [x] **Step 2: Move the sources and rewire paths**
 
 ```bash
 mkdir -p crates/domain/src
@@ -192,7 +205,7 @@ git mv src/domain/clock.rs src/domain/command.rs src/domain/export.rs src/domain
 
 Then `crates/domain/src/lib.rs` contains the old `mod.rs` body (module list). In the root crate, replace every `crate::domain::` with `ltmrs_domain::` (verify count first: `grep -rn "crate::domain" src/ --include="*.rs" | wc -l`) and add `ltmrs-domain = { path = "crates/domain" }` to root `[dependencies]`. Fold `src/error.rs` (doc-only stub) out: delete the file and its `pub mod error;` line.
 
-- [ ] **Step 3: Verify alone, then together**
+- [x] **Step 3: Verify alone, then together**
 
 ```bash
 cargo check -p ltmrs-domain 2>&1 | tail -n 2
@@ -202,7 +215,7 @@ cargo test -p ltmrs-domain 2>&1 | tail -n 3
 
 Expected: domain crate checks alone in seconds; workspace green; domain unit tests pass in place (they moved with the code).
 
-- [ ] **Step 4: Time the win and commit**
+- [x] **Step 4: Time the win and commit**
 
 ```bash
 touch crates/domain/src/memory.rs && /usr/bin/time -f "%es" cargo check -p ltmrs-domain 2>&1 | tail -n 1
@@ -224,7 +237,7 @@ Expected: domain-only check is seconds vs minutes for the old full crate. Note b
 - Consumes: `ltmrs-domain` from Task 2
 - Produces: service crate (repository + migrations + faithful fault injector) compiling with only domain + fjall + light deps
 
-- [ ] **Step 1: Create the manifest**
+- [x] **Step 1: Create the manifest**
 
 ```toml
 [package]
@@ -243,7 +256,7 @@ thiserror = "2"
 
 Copy the `fjall` version verbatim from the root manifest; afterwards remove `fjall` from root deps ONLY if no remaining root module names it (verify: `grep -rn "fjall::" src/ --include="*.rs" | grep -v "^src/service"` must be empty — `src/storage/` still does, but Task 5 deletes it; until then root keeps the dep).
 
-- [ ] **Step 2: Move, rewire, verify**
+- [x] **Step 2: Move, rewire, verify**
 
 ```bash
 mkdir -p crates/service/src
@@ -260,7 +273,7 @@ cargo check --workspace 2>&1 | tail -n 2
 
 Expected: all green; service tests (repository suite incl. restore/receipt/namespace tests) pass inside their own crate binary.
 
-- [ ] **Step 3: Time and commit**
+- [x] **Step 3: Time and commit**
 
 ```bash
 touch crates/service/src/repository.rs && /usr/bin/time -f "%es" cargo check -p ltmrs-service 2>&1 | tail -n 1
@@ -280,9 +293,9 @@ git add -A && git commit -m "refactor: extract ltmrs-service crate (repository, 
 - Consumes: `ltmrs-domain`
 - Produces: frozen Lemma wire/tools crate with no heavy deps (verify with `cargo tree -p ltmrs-compat --depth 1`)
 
-- [ ] **Step 1: Create the manifest (domain + serde + serde_json + uuid, versions verbatim)**
+- [x] **Step 1: Create the manifest (domain + serde + serde_json + uuid, versions verbatim)**
 
-- [ ] **Step 2: Move, rewire, verify no heavy deps leak in**
+- [x] **Step 2: Move, rewire, verify no heavy deps leak in**
 
 ```bash
 mkdir -p crates/compat/src && git mv src/compatibility/* crates/compat/src/
@@ -293,7 +306,7 @@ cargo check --workspace 2>&1 | tail -n 2
 
 Expected: `cargo tree` shows only domain + serde-family + uuid; suite green.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add -A && git commit -m "refactor: extract ltmrs-compat crate (frozen wire, zero behavior change)"
@@ -311,7 +324,7 @@ git add -A && git commit -m "refactor: extract ltmrs-compat crate (frozen wire, 
 - Consumes: service extraction (proves the canonical store does not need it)
 - Produces: smaller tree, fewer compiled lines per workspace check
 
-- [ ] **Step 1: Re-prove zero references on the current tree**
+- [x] **Step 1: Re-prove zero references on the current tree**
 
 ```bash
 grep -rn "crate::storage\|storage::lance\|storage::fjall\|storage::schema\|mod storage" src/ tests/ --include="*.rs" | grep -v "^src/storage/"
@@ -319,7 +332,7 @@ grep -rn "crate::storage\|storage::lance\|storage::fjall\|storage::schema\|mod s
 
 Expected: exactly one line — `src/lib.rs:pub mod storage;`. If anything else appears, STOP and re-scope (the module gained a user).
 
-- [ ] **Step 2: Delete and drop now-unused pins**
+- [x] **Step 2: Delete and drop now-unused pins**
 
 ```bash
 git rm -r src/storage
@@ -327,7 +340,7 @@ git rm -r src/storage
 
 Edit `src/lib.rs` to remove the `pub mod storage;` line. Then check each heavy pin: `grep -rn "lance_index\|lancedb::" src/ crates/ --include="*.rs"` — if `lance-index` has no remaining user, remove it from root deps; same for any dep that was storage-only.
 
-- [ ] **Step 3: Verify and commit**
+- [x] **Step 3: Verify and commit**
 
 ```bash
 cargo check --workspace 2>&1 | tail -n 2
@@ -348,9 +361,9 @@ git add -A && git commit -m "chore: delete unreferenced storage module (backend-
 - Consumes: `ltmrs-domain`; dev-only bridge to `ltmrs-search` (see Step 2)
 - Produces: candle/tokenizers isolated — touching daemon code no longer recompiles them
 
-- [ ] **Step 1: Create the manifest (domain + candle-core + candle-nn + tokenizers + reqwest-rustls + tokio + tracing + serde, versions verbatim)**
+- [x] **Step 1: Create the manifest (domain + candle-core + candle-nn + tokenizers + reqwest-rustls + tokio + tracing + serde, versions verbatim)**
 
-- [ ] **Step 2: Move, rewire, add the test-only bridge dev-dependency**
+- [x] **Step 2: Move, rewire, add the test-only bridge dev-dependency**
 
 ```bash
 mkdir -p crates/embeddings/src && git mv src/embeddings/* crates/embeddings/src/
@@ -358,7 +371,7 @@ mkdir -p crates/embeddings/src && git mv src/embeddings/* crates/embeddings/src/
 
 The two `crate::search::` uses in `e5_small.rs` tests become `ltmrs_search::` under a `[dev-dependencies] ltmrs-search = { path = "../search" }` entry (create the `crates/search/` shell with manifest + lib.rs in the SAME commit so the path resolves; its modules arrive in Task 7 — an empty lib with `pub mod placeholder` removed in Task 7 is acceptable scaffolding ONLY here because Task 7 is the immediate next commit; call this out in the commit message).
 
-- [ ] **Step 3: Verify, time, commit**
+- [x] **Step 3: Verify, time, commit**
 
 ```bash
 cargo check -p ltmrs-embeddings 2>&1 | tail -n 2
@@ -382,7 +395,7 @@ Expected: daemon touch no longer rebuilds candle/transformer codegen (compare wi
 - Consumes: domain, service, embeddings crates
 - Produces: Lance-backed retrieval crate owning the `lancedb::arrow` discipline (no other crate may name arrow types — verify with grep)
 
-- [ ] **Step 1: Move both modules under one crate root**
+- [x] **Step 1: Move both modules under one crate root**
 
 ```bash
 mkdir -p crates/search/src
@@ -392,7 +405,7 @@ git mv src/retrieval crates/search/src/retrieval
 
 `crates/search/src/lib.rs` declares `pub mod search; pub mod retrieval;`. Internal `crate::search::` / `crate::retrieval::` become `crate::search::` / `crate::retrieval::` (unchanged — they are intra-crate now); only EXTERNAL users rewire to `ltmrs_search::`.
 
-- [ ] **Step 2: Manifest (domain, service, embeddings, lancedb, lance-index if still pinned, tokio, serde) and arrow check**
+- [x] **Step 2: Manifest (domain, service, embeddings, lancedb, lance-index if still pinned, tokio, serde) and arrow check**
 
 ```bash
 grep -rn "arrow" crates/ --include="*.rs" | grep -v "ltmrs-search\|lancedb::arrow" | head
@@ -402,7 +415,7 @@ cargo check --workspace 2>&1 | tail -n 2
 
 Expected: no arrow path outside `ltmrs-search`; suite green.
 
-- [ ] **Step 3: Time and commit**
+- [x] **Step 3: Time and commit**
 
 ```bash
 touch crates/search/src/retrieval/engine.rs && /usr/bin/time -f "%es" cargo check -p ltmrs-search 2>&1 | tail -n 1
@@ -422,11 +435,11 @@ git add -A && git commit -m "refactor: extract ltmrs-search crate (search+retrie
 - Consumes: domain, service, compat
 - Produces: backup/restore crate with NO daemon edge at all (not even dev) — verify with `grep -rn "daemon" crates/interchange/`
 
-- [ ] **Step 1: Re-home the dispatcher test fixtures to repo-only**
+- [x] **Step 1: Re-home the dispatcher test fixtures to repo-only**
 
 In `crates/interchange/src/backup.rs` tests, replace the `Dispatcher`-based `setup()` with direct `CanonicalRepository::open_with_clock` + `issue_namespace` (pattern: `service::repository::tests::repo_with_ns`), seeding memories via `repo.apply` with `AddMemory` commands instead of `add_fragment`/`tool_call`. Keep every assertion identical (manifest counts, digest stability, session cargo = 1 traced session created via `session_start_tx`).
 
-- [ ] **Step 2: Move, manifest (domain, service, compat + tempfile dev-dep), verify the cut**
+- [x] **Step 2: Move, manifest (domain, service, compat + tempfile dev-dep), verify the cut**
 
 ```bash
 mkdir -p crates/interchange/src && git mv src/interchange/* crates/interchange/src/
@@ -437,7 +450,7 @@ cargo check --workspace 2>&1 | tail -n 2
 
 Expected: grep empty; suite green.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add -A && git commit -m "refactor: extract ltmrs-interchange crate (daemon-free, fixtures re-homed)"
@@ -456,9 +469,9 @@ git add -A && git commit -m "refactor: extract ltmrs-interchange crate (daemon-f
 - Consumes: domain, service, compat, embeddings, search, interchange
 - Produces: the 16k-LOC hub as one crate (inner file splits explicitly out of scope)
 
-- [ ] **Step 1: Manifest (all six lib deps + tokio + libc + tracing + serde + serde_json + uuid + sha2, versions verbatim)**
+- [x] **Step 1: Manifest (all six lib deps + tokio + libc + tracing + serde + serde_json + uuid + sha2, versions verbatim)**
 
-- [ ] **Step 2: Move, rewire, run the daemon-heavy suites in place**
+- [x] **Step 2: Move, rewire, run the daemon-heavy suites in place**
 
 ```bash
 mkdir -p crates/daemon/src && git mv src/daemon/* crates/daemon/src/
@@ -468,7 +481,7 @@ cargo check --workspace 2>&1 | tail -n 2
 
 Expected: dispatcher/server/tools/registry tests green inside the crate.
 
-- [ ] **Step 3: Time the flagship win and commit**
+- [x] **Step 3: Time the flagship win and commit**
 
 ```bash
 touch crates/domain/src/memory.rs && /usr/bin/time -f "%es" cargo check --lib 2>&1 | tail -n 1
@@ -491,13 +504,13 @@ Expected: a domain touch now rebuilds domain+dependents but the daemon crate its
 - Consumes: all lib crates
 - Produces: `cargo run -p ltmrs -- --help` works; `tests/` integration suites (daemon_lifecycle, release_evidence, stdio_smoke, vis_smoke) pass unchanged against the binary
 
-- [ ] **Step 1: Move frontend + CLI surface, manifest (domain, service, compat, daemon, embeddings, rmcp, tokio + light deps, versions verbatim)**
+- [x] **Step 1: Move frontend + CLI surface, manifest (domain, service, compat, daemon, embeddings, rmcp, tokio + light deps, versions verbatim)**
 
-- [ ] **Step 2: Re-home binary-only modules**
+- [x] **Step 2: Re-home binary-only modules**
 
 Move `src/skills/`, `src/visualizer/`, `src/bench/` into `src/` submodules of the root binary crate (they are never imported by lib code — verify: `grep -rn "crate::skills\|crate::visualizer\|crate::bench" crates/ | head` must be empty; `visualizer` uses `crate::cli` — update to the frontend crate path or move `cli.rs` access accordingly).
 
-- [ ] **Step 3: Verify binary + integration suites**
+- [x] **Step 3: Verify binary + integration suites**
 
 ```bash
 cargo run -p ltmrs -- --help 2>&1 | head -n 5
@@ -507,7 +520,7 @@ cargo test --test daemon_lifecycle 2>&1 | grep -E "test result"
 
 Expected: help prints; all three suites green.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add -A && git commit -m "refactor: extract ltmrs-frontend crate, assemble binary crate (zero behavior change)"
@@ -525,13 +538,13 @@ git add -A && git commit -m "refactor: extract ltmrs-frontend crate, assemble bi
 - Consumes: full workspace from Task 10
 - Produces: measured link-time delta + a keep-or-revert recommendation (no code change if kept)
 
-- [ ] **Step 1: Measure with thin LTO (current)**
+- [x] **Step 1: Measure with thin LTO (current)**
 
 ```bash
 touch crates/daemon/src/tools.rs && /usr/bin/time -f "%es" cargo check --tests 2>&1 | tail -n 1
 ```
 
-- [ ] **Step 2: Measure without LTO and compare**
+- [x] **Step 2: Measure without LTO and compare**
 
 ```bash
 # temporarily comment out lto = "thin" under [profile.dev]
@@ -556,7 +569,7 @@ git add Cargo.toml && git commit -m "chore: dev-profile LTO decision (measured X
 - Consumes: all previous tasks
 - Produces: committed final state + before/after timing table in the changelog entry
 
-- [ ] **Step 1: Full release evidence on the workspace**
+- [x] **Step 1: Full release evidence on the workspace**
 
 ```bash
 bash tools/gen_release_evidence.sh --release --locked 2>&1 | tail -n 2
@@ -564,15 +577,15 @@ bash tools/gen_release_evidence.sh --release --locked 2>&1 | tail -n 2
 
 Expected: exit 0 with a fresh bundle dir; manifest shows the new HEAD.
 
-- [ ] **Step 2: Before/after timing table**
+- [x] **Step 2: Before/after timing table**
 
 Re-run the three Task 0 measurements and tabulate against baseline in the CHANGELOG entry body (per-crate checks replace the old full-crate numbers).
 
-- [ ] **Step 3: Update the repo hygiene rule**
+- [x] **Step 3: Update the repo hygiene rule**
 
 In `AGENTS.md`, under Module Organization, append the crate DAG and the rule: new code lives in the owning crate; cross-crate prod deps must keep the DAG acyclic (test-only upward edges via dev-dependencies are allowed but must be called out); `lancedb::arrow` stays inside `ltmrs-search`.
 
-- [ ] **Step 4: Commit per workflow (DONE → CHANGELOG → verify → commit → hash → bake → stop)**
+- [x] **Step 4: Commit per workflow (DONE → CHANGELOG → verify → commit → hash → bake → stop)**
 
 ---
 

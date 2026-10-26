@@ -8,6 +8,15 @@
 
 **Tech Stack:** Rust edition 2024 (pinned toolchain), `serde_json` workspace edge only (no new Cargo.lock crates), existing `tools/` scripts, existing test suites as the execution mechanism.
 
+## Global Constraints — reconciliation (2026-10-25, boxes checked post-hoc)
+
+All seven §20 verbs verified implemented in `xtask/src/main.rs` +
+`xtask/src/verbs.rs` with `--dry-run` on every verb, both refusal rules, and
+run-records under `reports/`; §20 delivery note in
+`plans/02_implementation_guide.md` records per-verb backing + refusal rules +
+`--dry-run`. Later extensions (`test` tiers, `dist-audit`, `gate-audit`) are
+recorded in `CHANGELOG.md`. Boxes record end-state, not per-task SHAs.
+
 ## Global Constraints
 
 - Rust edition 2024; pinned toolchain in `rust-toolchain.toml` unchanged.
@@ -32,7 +41,7 @@
 - Consumes: nothing (first task)
 - Produces: `parse_args(Vec<String>) -> Result<Command, String>` where `Command` is the verb enum below (later tasks match on its variants — exact names: `CaptureLemma { source: String }`, `Capabilities { candidate: String }`, `Conformance { profile: String }`, `Recovery { suite: String }`, `Benchmark { manifest: String, limit: Option<u64> }`, `Quality { split: String }`, `Evidence { release: String }`, plus global `dry_run: bool` carried alongside, and `Help { verb: Option<String> }`); `fn usage() -> &'static str` (full help text).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -42,12 +51,12 @@ fn parses_evidence_verb() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p xtask parses_evidence_verb`
 Expected: FAIL with "cannot find function `parse_args`" (nothing implemented yet)
 
-- [ ] **Step 3: Write `.cargo/config.toml`, `xtask/Cargo.toml`, minimal `main.rs`**
+- [x] **Step 3: Write `.cargo/config.toml`, `xtask/Cargo.toml`, minimal `main.rs`**
 
 ```toml
 # .cargo/config.toml
@@ -69,7 +78,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 
 `main.rs` implements `Command`, `parse_args` (hand-rolled prefix matching; unknown verb/flag → `Err` naming the token; `--dry-run` sets the flag), `usage()`, and `fn main()` printing usage on empty/`--help` (exit 0) and errors to stderr (exit 2).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 ```bash
 cargo test -p xtask 2>&1 | tail -n 3
@@ -78,7 +87,7 @@ cargo xtask --help 2>&1 | head -n 5
 
 Expected: all unit tests PASS (parsing for all 7 verbs + `--dry-run` + unknown-verb error); `--help` prints usage.
 
-- [ ] **Step 5: Verify no lockfile drift and commit**
+- [x] **Step 5: Verify no lockfile drift and commit**
 
 ```bash
 git diff --stat Cargo.lock | head -n 3
@@ -102,7 +111,7 @@ Expected: lockfile shows no new package versions (serde_json edge only); tree sh
 - Consumes: `Command` from Task 1 (unchanged)
 - Produces: `fn execute(program: &str, args: &[String], workdir: &std::path::Path) -> RunOutcome` with `struct RunOutcome { exit_code: i32, stdout_tail: String, stderr_tail: String, started_ms: u64, finished_ms: u64 }`; `fn write_record(dir: &std::path::Path, verb: &str, argv: &[String], outcome: &RunOutcome) -> std::io::Result<std::path::PathBuf>` writing `record.json` with fields `verb, argv, started_ms, finished_ms, exit_code` and returning its path. Later tasks call exactly these two functions and propagate `exit_code` as the process exit.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -124,21 +133,21 @@ fn record_shape_has_required_fields() {
 
 (`tempfile_dir()` and `fake_outcome()` are test-only helpers in the same test module — write them as part of this step. `tempfile` is a root dev-dependency; add it under `[dev-dependencies]` of `xtask/Cargo.toml` verbatim `tempfile = "3"`.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p xtask`
 Expected: FAIL — `execute`/`write_record` do not exist.
 
-- [ ] **Step 3: Implement `run.rs` with `std::process::Command`**
+- [x] **Step 3: Implement `run.rs` with `std::process::Command`**
 
 Capture both streams fully (pipes, not inheritance), tail to last 4 KiB each for the outcome struct, full status preserved. `write_record` creates the dir (all parents) and writes pretty JSON. No truncation of the exit code path: signal-kill maps to exit code 128+SIGKILL semantics documented in a comment (Rust `ExitStatus::code()` returns `None` on signal — record `exit_code: -1` plus `signal: true` field in that case).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p xtask 2>&1 | tail -n 3`
 Expected: PASS, including the two new tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add xtask/ Cargo.toml Cargo.lock
@@ -157,7 +166,7 @@ git commit -m "feat: add xtask run-record and dispatch core"
 - Consumes: `Command::{Evidence, CaptureLemma, Benchmark}` + `execute`/`write_record` from Task 2
 - Produces: three `pub fn` runners returning the child exit code; `--dry-run` prints the exact argv and returns 0 without executing (used by tests; later tasks reuse the flag)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -173,16 +182,16 @@ fn capture_argv_provisions_sandbox_paths() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p xtask`
 Expected: FAIL — `evidence_argv`/`capture_argv` do not exist.
 
-- [ ] **Step 3: Implement the three runners**
+- [x] **Step 3: Implement the three runners**
 
 `run_evidence`: `execute("bash", ["tools/gen_release_evidence.sh", "--release", "--locked"])`, record under `reports/xtask-evidence-<timestamp>/`. `run_capture`: provision two tempdirs (sandbox home + out), `execute("node", ["tools/capture_lemma.mjs", "--repo", source, "--home", home, "--out", out])`. `run_benchmark`: `execute("python3", ["tools/bench_against_ltmrs.py", "--ops", manifest, "--out", <reports dir>, plus "--limit" when given])` with `HOME` set to a sandbox tempdir (do not use the developer's real HOME). `--dry-run` short-circuits before `execute`, printing `would run: <program> <args...>` and returning 0.
 
-- [ ] **Step 4: Run tests + one live cheap execution**
+- [x] **Step 4: Run tests + one live cheap execution**
 
 ```bash
 cargo test -p xtask 2>&1 | tail -n 3
@@ -191,7 +200,7 @@ cargo xtask evidence --dry-run --release v0.1
 
 Expected: unit tests PASS; dry-run prints the exact argv and exits 0 without creating any bundle.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add xtask/
@@ -210,7 +219,7 @@ git commit -m "feat: add xtask evidence, capture-lemma and benchmark verbs"
 - Consumes: `Command::Quality`, `execute`/`write_record` from Task 2
 - Produces: `pub fn run_quality(split: &str) -> Result<i32, String>` (only `"heldout"` and `"dev"` resolve; anything else is a hard error naming the token)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -227,16 +236,16 @@ fn quality_wave_env_uses_sandbox_probe_home() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p xtask`
 Expected: FAIL — `run_quality_parts`/`quality_wave_command` do not exist.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `run_quality`: reject unknown splits; run `python3 tools/gen_calibration_corpus.py` (zero-arg, per its `__main__`), then `python3 tools/agent_quality_wave.py` with `PROBE_HOME` set to a fresh sandbox tempdir (never the developer's real HOME; `RATER_MODEL` passes through from the environment untouched). Either child failing stops the verb and propagates its exit code. Document in a comment that model inference requires pre-provisioned artifacts/rater access (same precondition as running the scripts by hand).
 
-- [ ] **Step 4: Run tests + dry-run**
+- [x] **Step 4: Run tests + dry-run**
 
 ```bash
 cargo test -p xtask 2>&1 | tail -n 3
@@ -245,7 +254,7 @@ cargo xtask quality --dry-run --split heldout
 
 Expected: PASS; dry-run prints both commands, executes nothing.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add xtask/
@@ -267,7 +276,7 @@ git commit -m "feat: add xtask quality verb (corpus + wave pipeline)"
   - `conformance lemma-0.21.0`: `cargo test -p ltmrs-compat` then `cargo test -p ltmrs-daemon -- differential`. Anything else errors naming the supported profile.
   - `recovery durable`: `cargo test -p ltmrs-service -- restore replay kill soak fragmented` then `cargo test -p ltmrs-interchange -- restore` then `cargo test --test daemon_lifecycle`. Anything else errors naming the supported suite.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -285,14 +294,14 @@ fn conformance_argv_pins_compat_and_differential() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p xtask`
 Expected: FAIL — `capability_commands`/`conformance_commands` do not exist.
 
-- [ ] **Step 3: Implement the three runners** (each stops at the first failing child and returns its code; each child gets its own run-record entry under one `reports/xtask-<verb>-<timestamp>/` dir)
+- [x] **Step 3: Implement the three runners** (each stops at the first failing child and returns its code; each child gets its own run-record entry under one `reports/xtask-<verb>-<timestamp>/` dir)
 
-- [ ] **Step 4: Run unit tests, dry-runs, and one live execution**
+- [x] **Step 4: Run unit tests, dry-runs, and one live execution**
 
 ```bash
 cargo test -p xtask 2>&1 | tail -n 3
@@ -304,7 +313,7 @@ cargo test -p ltmrs-compat 2>&1 | tail -n 2
 
 Expected: unit PASS; all three dry-runs print exact argv, exit 0, execute nothing; live compat suite green (9 passed — proves the conformance path resolves to a real suite).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add xtask/
@@ -323,7 +332,7 @@ git commit -m "feat: add xtask capabilities, conformance and recovery verbs"
 - Consumes: all verbs from Tasks 1–5
 - Produces: committed close-out; §20 no longer claims an unimplemented interface
 
-- [ ] **Step 1: Run the full gate**
+- [x] **Step 1: Run the full gate**
 
 ```bash
 cargo fmt -- --check && echo FMT-OK
@@ -336,11 +345,11 @@ for v in "capabilities --candidate fjall-lance" "conformance --profile lemma-0.2
 
 Expected: everything green; every dry-run exits 0.
 
-- [ ] **Step 2: Amend §20 with delivery notes**
+- [x] **Step 2: Amend §20 with delivery notes**
 
 Append to the §20 block: per-verb backing (script path or suite selectors), the two refusal rules (unknown candidate/profile/suite errors; `lance` removed post-AD-01), and the `--dry-run` flag. Keep the original target-interface text intact above the note (historical record).
 
-- [ ] **Step 3: Commit per workflow (DONE → CHANGELOG → verify → commit → hash → bake → stop)**
+- [x] **Step 3: Commit per workflow (DONE → CHANGELOG → verify → commit → hash → bake → stop)**
 
 Follow `AGENTS.md` commit workflow exactly. Stage ONLY: `xtask/`, `.cargo/config.toml`, root `Cargo.toml`/`Cargo.lock` (if changed by member addition), `plans/02_implementation_guide.md`, `DONE.md`, `CHANGELOG.md`. Verify `grep -c` on the date heading before committing.
 

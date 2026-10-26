@@ -5,7 +5,25 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-25 — Dependency upgrade pass (X.Y pins, lancedb 0.40) + RQ-04/05/06 race matrices + test tooling
+## 2026-10-26 — docs: plan ledger reconciliations (stale boxes, oracle, 29/30 drift, bulk-drive boxes, header repairs)
+
+### No behavior change, no statuses changed
+- Bulk-drive plan: 25 task boxes `[x]` (Tasks 1–3 pre-split, Tasks 4–5 in the bulk-drive feature commit above) with reconciliation note.
+- Task 5 Step 2 pointer corrected: the "`plans/02` fairness parenthetical" does not exist (grep: fairness only in bulk-drive goal/Task-4 wording, RV-22, T-BENCH-02, RQ-22). Rationale in `Daemon::inference_pool_threads()` RQ-22 comment; numbers in `docs/RELEASE.md` + Task 5 report.
+- Repaired two instructional headers damaged by the earlier blanket flip.
+
+
+### Stale plan boxes checked (verified landed, no behavior change)
+- Workspace split plan: 44 boxes `[x]` (9 crates, storage deleted, arrow discipline, timing table, AGENTS.md rule 5). LTO note: split-time keep measured, `99c546e` moved dev to `lto = false` (authoritative).
+- xtask runner plan: 29 boxes `[x]` (7 verbs + `--dry-run` + refusal rules in tree; §20 note present).
+- Windows compat plan: 26 commit boxes `[x]` (impl + ledger entries verified; landed via `3fbf00d`/`8017237` through `53f9c7c`).
+
+### Ledger decisions (statuses unchanged, gate green)
+- `backup_import_lemma.legacy_oracle` stays `specified_not_executed` (greenfield, no upstream counterpart at `d30a816`; gate vocabulary has no waived cell state — a waiver label would fail the gate). Rationale in matrix notes.
+- Part III §5.3: 29 pinned tools + 1 greenfield row = 30 matrix rows.
+- Gate: 28 rows, 240 cells, 129 passed / 111 openly not-executed, exit 0.
+
+## f10b61a (2026-10-25) — Dependency upgrade pass (X.Y pins, lancedb 0.40) + RQ-04/05/06 race matrices + test tooling
 
 ### Deps: X.Y pins + latest-compatible upgrade, lancedb 0.40
 - Pinned every dependency req as `X.Y` across all 11 Cargo.tomls (78 reqs; AGENTS.md rule added: foundations fjall/lancedb/tokio/rmcp track latest, no duplicate majors).

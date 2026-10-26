@@ -20,6 +20,17 @@
 - Deterministic async tests via `#[tokio::test(start_paused = true)]` where time is involved.
 - Every plan/ledger statement distinguishes planned vs executed; never claim unrun evidence.
 
+## Review Focus — reconciliation (2026-10-25, commit boxes checked post-hoc)
+
+Tasks 1–6 implementation steps were verified landed (runtime/unix.rs +
+windows.rs platform core, boxed `IpcStream` transport, `spawn_detached` +
+HOME-wins serve, `lemma.cmd` shim writer, visualizer via shared helper,
+`daemon_lifecycle` + full Windows gate 2026-10-08); ledger entries verified in
+`plans/traceability.json` (`windows_certification_2026_10_08`), the
+conformance visualizer table, Part I §7.1 + AD-07 row, and Part III T-SEC-01.
+Code landed via `3fbf00d` + `8017237` through the `53f9c7c` merge; commit boxes
+record end-state, not per-task SHAs.
+
 ## Review Focus
 
 - Two Windows users with the same store identity must not collide on the pipe name → user-SID token in the endpoint (Task 1 test).
@@ -51,7 +62,7 @@
 - [x] **Step 1:** Failing tests in `runtime/windows.rs` (cfg(windows)) + shared: `endpoint_is_unique_per_store_identity` (two identities → distinct endpoints); `endpoint_carries_user_sid_token` (endpoint contains the 12-hex SID token, deterministic from `user_sid_string()`); `dacl_grants_only_user_and_system` (create pipe via `accept`-path builder, `GetSecurityInfo` on the handle, assert exactly 2 ACEs: user SID + `S-1-5-18`, no `GR` for Everyone); `junction_runtime_dir_refused` (`std::os::windows::fs::symlink_dir` — dev-mode may refuse; fallback `mklink /J` via `Command::new("cmd").args(["/C","mklink","/J",…])`); `second_acquire_rejects_while_first_holds_lock` (LockFileEx exclusivity); `lock_probe_distinguishes_held_free_and_missing` (shared probe). Run scoped: `cargo test -p ltmrs-daemon --lib` → FAIL.
 - [x] **Step 2:** Implement `runtime/unix.rs` (move current flock/UnixListener/PermissionsExt/symlink-refusal code verbatim), `runtime/windows.rs` (`LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on `File::as_raw_handle`; shared probe = `LockFileEx(LOCKFILE_FAIL_IMMEDIATELY)` then `UnlockFile`; endpoint build with `sha2::Sha256` over SID string; SDDL DACL; `ServerOptions::create` per accept; reparse refusal via `symlink_metadata`), `runtime.rs` `#[cfg(unix)]/#[cfg(windows)]` re-exports + `RuntimePaths::resolve` platform endpoint. Safety comments on each unsafe block.
 - [x] **Step 3:** `cargo test -p ltmrs-daemon --lib` → PASS (unix tests keep passing on Linux side by keeping them cfg(unix)).
-- [ ] **Step 4:** Commit (AGENTS workflow).
+- [x] **Step 4:** Commit (AGENTS workflow).
 
 ### Task 2: Transport abstraction (`ltmrs-daemon`)
 
@@ -70,7 +81,7 @@
 - [x] **Step 1:** Failing tests: `client.rs` — `duplex_roundtrip` (`tokio::io::duplex(65536)`, `set_stream(Box::new(a))`, handshake + `ListMemories` roundtrip against `handle_connection(Box::new(b), …)`); `server.rs` — `peer_cred_same_uid_passes` stays cfg(unix) on the pair; `accept_loop_checks_peer_before_frame` (cfg(unix): accept on a `UnixListener::pair`-based listener rejects foreign-cred path is not constructible in-process — pin that `check_peer_cred` runs in the accept loop by refactoring the call site and keeping the pair test green). Run scoped → FAIL.
 - [x] **Step 2:** Implement generic `handle_connection`, boxed `IpcStream` in `IpcClient`, platform `connect()`, accept-loop boxing. All frame read/write helpers already take `&mut S` — widen signatures minimally.
 - [x] **Step 3:** `cargo test -p ltmrs-daemon --lib` → PASS.
-- [ ] **Step 4:** Commit.
+- [x] **Step 4:** Commit.
 
 ### Task 3: Frontend serve, spawn, signals, home (`ltmrs-frontend`)
 
@@ -90,7 +101,7 @@
 - [x] **Step 1:** Failing tests: `resolve_home_prefers_home_over_userprofile` (both env set → HOME wins; cfg(windows): USERPROFILE-only resolves); `spawn_detached_child_exits_and_survives_group_signal` (spawn `daemon --foreground --daemon-idle-ms 0`… no — spawn a child running `daemon --foreground --daemon-idle-ms 10`, `try_wait` within bounded timeout exits success); `start_local_daemon` duplex bridge roundtrip (existing `local_daemon_bridge_roundtrips_memory_add` must pass via duplex). Scoped run → FAIL.
 - [x] **Step 2:** Implement the interfaces above. `spawn_daemon_child` becomes a thin wrapper over `spawn_detached` (log-file Stdio preserved).
 - [x] **Step 3:** `cargo test -p ltmrs-frontend --lib` → PASS.
-- [ ] **Step 4:** Commit.
+- [x] **Step 4:** Commit.
 
 ### Task 4: `.cmd` shim (`ltmrs-frontend` skills)
 
@@ -105,7 +116,7 @@
 - [x] **Step 1:** Failing tests: `cmd_shim_accepts_our_exact_bytes` (pre-write expected content, re-install → accepted, file unchanged); `cmd_shim_refuses_foreign_content` (write `@echo off\r\nother.exe %*\r\n` → refuse); symlink tests stay cfg(unix). Scoped run → FAIL.
 - [x] **Step 2:** Implement cfg(windows) shim writer + byte-identity check.
 - [x] **Step 3:** `cargo test -p ltmrs-frontend --lib` → PASS.
-- [ ] **Step 4:** Commit.
+- [x] **Step 4:** Commit.
 
 ### Task 5: Visualizer background via shared helper (root binary)
 
@@ -119,7 +130,7 @@
 
 - [x] **Step 1:** Replace `pre_exec`+`setsid` with `spawn_detached(exe, ["-vis","--fg","-p",port], [("LTMRS_VIS_TOKEN", token)], Stdio::null(), Stdio::inherit())`; keep the `owns_port` probe logic verbatim.
 - [x] **Step 2:** `cargo test -p ltmrs --test vis_smoke` (root binary, scoped to that target) → PASS on Windows.
-- [ ] **Step 3:** Commit.
+- [x] **Step 3:** Commit.
 
 ### Task 6: Root tests + full Windows gate
 
@@ -138,7 +149,7 @@
   `cargo build --release`
   Expected: all clean. Fix everything found; no claims without executed output.
 - [x] **Step 3:** Live smokes against the release binary: `ltmrs daemon --foreground --daemon-idle-ms 2000` (idle exit 0), two stdio frontends attach to one managed daemon (second handshake), `-vis` background prints URL+pid and `/api/library?token` serves 200, `--install-skill` writes the `.cmd` shim. Record outputs.
-- [ ] **Step 4:** Commit.
+- [x] **Step 4:** Commit.
 
 ### Task 7: Plan, ledger and changelog updates (one review)
 
@@ -150,7 +161,7 @@
 
 - [x] **Step 1:** Re-read spec §2.8 + §4; enter every deviation with exact upstream facts (port 3456, `x-lemma-token`, browser auto-open, CORS, write routes) and ltmrs behavior; mark executed evidence ONLY where Task 6 output exists.
 - [x] **Step 2:** Cross-check §7.1 wording matches the shipped interfaces (endpoint, DACL, LockFileEx, Ctrl-break, USERPROFILE, `.cmd`).
-- [ ] **Step 3:** Commit with the CHANGELOG date heading (verify via grep per AGENTS step 2).
+- [x] **Step 3:** Commit with the CHANGELOG date heading (verify via grep per AGENTS step 2).
 
 ---
 

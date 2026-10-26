@@ -8,6 +8,22 @@
 
 **Tech Stack:** Rust 2024, candle-core 0.11 (already rayon-linked internally), rayon 1.12 (already in Cargo.lock as transitive — add as direct dependency, no new crate), tokio spawn_blocking drive (unchanged).
 
+## Global Constraints — reconciliation (2026-10-25, boxes checked post-hoc)
+
+All task boxes below were verified landed before checking. Tasks 1–3 (batch
+`embed_texts` API, single-batch `render_chunk_rows`, E5 one-forward override +
+parity guards) landed pre-split; Tasks 4–5 landed as `093b8ea` (bounded
+`ParallelE5Embedder` pool, `&mut`→`&` audit, live-weights parity REAL PASS;
+throughput evidence in `docs/RELEASE.md` + `DONE.md`/commit body + Task 5
+report in `.superpowers/sdd/2026-09-28-parallel-bulk-drive/`).
+Correction to Task 5 Step 2: the "`plans/02` fairness parenthetical" it names
+does not exist — `plans/02` carries no bulk-drive per-tick/pool line
+(verified by grep; the only fairness lines are the goal + Task 4 output
+wording in this plan, RV-22/T-BENCH-02/RQ-22 elsewhere). The fairness
+rationale lives in code (`Daemon::inference_pool_threads()` RQ-22 comment)
+and the measured numbers in `docs/RELEASE.md` + the Task 5 report. Do not
+re-add a `plans/02` pointer without an owner-reviewed plan change.
+
 ## Global Constraints
 
 - Rust edition 2024; `cargo fmt -- --check` clean.
@@ -48,7 +64,7 @@
 - Consumes: existing `fn embed(&mut self, text: &str) -> Result<Vec<f32>, String>`.
 - Produces: `fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>>` with a default body mapping `embed` 1:1 in order (length-preserving, error-preserving).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 /// Batch default maps per-text results 1:1 in order, preserving errors.
@@ -78,12 +94,12 @@ fn embed_texts_default_preserves_order_and_errors() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --lib -- embed_texts_default_preserves_order_and_errors`
 Expected: FAIL with "no method named `embed_texts` found"
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```rust
 fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
@@ -91,12 +107,12 @@ fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test --lib -- embed_texts_default_preserves_order_and_errors`
 Expected: PASS. Then: `cargo test --lib -- projector` — all existing projector tests green (they exercise the default path through `render_chunk_rows` unchanged behavior).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/search/projector.rs
@@ -112,12 +128,12 @@ git commit -m "feat: batch embed API with order-preserving default"
 - Consumes: `embed_texts` from Task 1.
 - Produces: identical `Vec<SearchRow>` shape; per-chunk `Ok` → vector, `Err` → `None` (lexical-only row, unchanged).
 
-- [ ] **Step 1: Verify existing tests already pin this behavior**
+- [x] **Step 1: Verify existing tests already pin this behavior**
 
 Run: `cargo test --lib -- projector`
 Expected: PASS (baseline: `project_pending_publishes_dense_rows`, `project_pending_leaves_semantic_retry_on_embed_failure`, `VecFake` failure paths).
 
-- [ ] **Step 2: Replace the per-chunk loop body**
+- [x] **Step 2: Replace the per-chunk loop body**
 
 ```rust
 let vectors: Vec<Option<Vec<f32>>> = self
@@ -138,17 +154,17 @@ assert_eq!(
 );
 ```
 
-- [ ] **Step 3: Run tests to verify behavior is unchanged**
+- [x] **Step 3: Run tests to verify behavior is unchanged**
 
 Run: `cargo test --lib -- projector`
 Expected: PASS, zero test changes required (default `embed_texts` delegates to `embed`, so fakes behave identically).
 
-- [ ] **Step 4: Run clippy + fmt**
+- [x] **Step 4: Run clippy + fmt**
 
 Run: `cargo fmt -- --check && cargo clippy --all-targets -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/search/projector.rs
@@ -164,7 +180,7 @@ git commit -m "refactor: single batch embed per memory in projection"
 - Consumes: `E5SmallAdapter::embed_batch(&mut self, &[EmbedInput]) -> ArtifactResult<Vec<EmbeddedSequence>>`, `Role::Passage`, `e5_chunks_to_text_chunks` mapping (unchanged).
 - Produces: `fn embed_texts` override returning one entry per input text, in order; whole-batch failure maps to all-`Err` (same outcome as N identical per-chunk failures today).
 
-- [ ] **Step 1: Write the failing test (weight-gated, ignored)**
+- [x] **Step 1: Write the failing test (weight-gated, ignored)**
 
 ```rust
 /// Batched E5 embedding matches sequential embedding within float
@@ -205,12 +221,12 @@ async fn e5_batch_matches_sequential_within_tolerance() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --lib -- e5_batch_matches_sequential_within_tolerance`
 Expected: FAIL — `embed_texts` resolves to the default (per-chunk) path... NOTE: this test PASSES on the default too (same values, slower). To observe RED, temporarily assert identical call counts is impossible without hooks — instead verify RED by checking the override is absent: the test passes trivially pre-override, so treat the *benchmark delta* (Task 5) as the override's proof and this test as the parity guard. Document this explicitly in the test comment if the runner demands strict RED.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```rust
 fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
@@ -245,14 +261,14 @@ fn embed_texts(&mut self, texts: &[String]) -> Vec<Result<Vec<f32>, String>> {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --lib -- projector backend` then full `cargo test --lib`
 Expected: PASS. Then run the ignored parity test with weights:
 `LTMRS_PROBE_MODELS=/tmp/e5proof/.ltmrs/models cargo test --lib -- --ignored e5_batch_matches_sequential_within_tolerance`
 Expected: PASS (values within 1e-5).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/search/backend.rs
@@ -269,12 +285,12 @@ git commit -m "feat: single-forward batch embedding per memory"
 - Consumes: `E5SmallAdapter` shared inference (audit first).
 - Produces: bounded data-parallel chunk embedding with order-preserving results and per-chunk error mapping; pool size const with fairness rationale.
 
-- [ ] **Step 1: Audit `&mut` vs `&` (do not change code yet)**
+- [x] **Step 1: Audit `&mut` vs `&` (do not change code yet)**
 
 Verify by reading: `E5SmallAdapter::embed_batch` body, `BertModel::forward` (`&self` — confirmed at `bert_impl.rs:309`), `Tokenizer::encode` (`&self`), `chunk_passage` (`&self`). List every `&mut self` use inside `embed_batch`; if any field is actually mutated, STOP and report (shared inference is unsound — fall back to per-thread adapter clones, which the 470MB cost rules out, killing Phase 2).
 Expected: no mutation (pure function of inputs + model weights).
 
-- [ ] **Step 2: Verify `E5SmallAdapter: Send + Sync` compiles**
+- [x] **Step 2: Verify `E5SmallAdapter: Send + Sync` compiles**
 
 ```rust
 #[test]
@@ -287,7 +303,7 @@ fn e5_adapter_is_shareable() {
 Run: `cargo test --lib -- e5_adapter_is_shareable`
 Expected: FAIL (if any field is !Sync) or PASS. If FAIL, Phase 2 is blocked — report, do not proceed.
 
-- [ ] **Step 3 (only if Steps 1–2 pass): Write the failing pool test**
+- [x] **Step 3 (only if Steps 1–2 pass): Write the failing pool test**
 
 ```rust
 /// Parallel chunk mapping preserves order and per-item errors on a
@@ -314,12 +330,12 @@ fn par_map_preserves_order_and_errors() {
 Run: `cargo test --lib -- par_map_preserves_order_and_errors`
 Expected: FAIL with "unresolved import `rayon`" (rayon is transitive-only today).
 
-- [ ] **Step 4: Add rayon as a direct dependency**
+- [x] **Step 4: Add rayon as a direct dependency**
 
 In `Cargo.toml` dependencies section, add `rayon = "1.12"` (exact pinned version already in Cargo.lock — verify with `grep -A2 'name = "rayon"' Cargo.lock` — no lock change expected).
 Expected: `cargo build` succeeds with zero lock diff (`git diff --stat Cargo.lock` empty).
 
-- [ ] **Step 5: Implement the bounded pool + wire the tick drive**
+- [x] **Step 5: Implement the bounded pool + wire the tick drive**
 
 Pool construction in `Daemon::start_projection` (next to the adapter load):
 ```rust
@@ -329,12 +345,12 @@ let pool_threads = std::thread::available_parallelism()
 ```
 Reserve 2 cores for serving; floor 2. Document as the RQ-22 inference budget next to `MAX_PROJECTION_JOBS_PER_TICK`. Thread the pool handle into the per-tick drive so chunk forwards within one tick fan out; revision guards, pending/retry, publish and FTS steps stay exactly sequential.
 
-- [ ] **Step 6: Validate (correctness first, speed second)**
+- [x] **Step 6: Validate (correctness first, speed second)**
 
 Run: full `cargo test --workspace --all-targets` (includes the ignored-gated parity test with weights).
 Expected: green. Then measure: re-run the 11-chunk probe pattern and record wall time vs the 47s baseline in DONE.md — report only, no perf gate (correctness gates; speed is evidence).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml src/daemon/server.rs src/search/backend.rs
@@ -343,16 +359,16 @@ git commit -m "feat: bounded parallel chunk embedding for bulk drive"
 
 ### Task 5: Benchmark + record (evidence, not gates)
 
-- [ ] **Step 1: Re-run the bulk rate probe**
+- [x] **Step 1: Re-run the bulk rate probe**
 
 Run the BEIR slice probe pattern (or 300-doc calibration index) before/after on the same box; record per-job wall time in DONE.md.
 Expected: numbers only. Do NOT gate the release on a fixed speedup.
 
-- [ ] **Step 2: Update `docs/RELEASE.md` throughput note + `plans/02` fairness parenthetical**
+- [x] **Step 2: Update `docs/RELEASE.md` throughput note + `plans/02` fairness parenthetical**
 
 Record measured bulk rate and pool size. No requirement text changes.
 
-- [ ] **Step 3: Commit docs**
+- [x] **Step 3: Commit docs**
 
 ```bash
 git add docs/RELEASE.md plans/02_implementation_guide.md DONE.md CHANGELOG.md

@@ -482,7 +482,7 @@
         "enhancement_ledger": "not_run"
       },
       "owner_workpackage": "WP-11",
-      "notes": "Native cdylib importer (Wave B5c, C1 T-IMPORT-01/02): route + parse (backup_import_lemma_routes_with_path_and_confirm), validation (requires_path, confirm/token checks), preview loss report, preview-then-confirm single-use replace (execute_replaces_store). Concurrency fenced (restore_write_guard + channel+path single-use TTL lease + generation/op-seq recheck: rechecks_lease_when_busy, rejects_stale_source_generation_and_expiry, without_preview_is_invalid). Retry of confirm refused AlreadyUsed (single_use), never double-applied. No upstream oracle (greenfield tool)."
+      "notes": "Native cdylib importer (Wave B5c, C1 T-IMPORT-01/02): route + parse (backup_import_lemma_routes_with_path_and_confirm), validation (requires_path, confirm/token checks), preview loss report, preview-then-confirm single-use replace (execute_replaces_store). Concurrency fenced (restore_write_guard + channel+path single-use TTL lease + generation/op-seq recheck: rechecks_lease_when_busy, rejects_stale_source_generation_and_expiry, without_preview_is_invalid). Retry of confirm refused AlreadyUsed (single_use), never double-applied. No upstream oracle (greenfield tool): legacy_oracle stays specified_not_executed by construction — no upstream counterpart exists at d30a816 to compare against, so this is not deferred work. The gate cell vocabulary carries no waived state for cells; specified_not_executed is the honest terminal status here."
     },
     {
       "name": "backup_preview",
