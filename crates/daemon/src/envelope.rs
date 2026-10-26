@@ -646,6 +646,238 @@ mod tests {
         ));
     }
 
+    /// RQ-20 bounded adversarial round (seeded, deterministic — not a
+    /// libFuzzer campaign): a fixed corpus of evil inputs through the pure
+    /// `decode_frame` + `parse_envelope` functions. Every input must yield a
+    /// value or a typed `IpcError`, never a panic (each case runs under
+    /// `catch_unwind`; a panic fails the test with the case index).
+    /// Seed and corpus size are pinned in-test.
+    #[test]
+    fn seeded_frame_fuzz_never_panics_and_stays_typed() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        /// Deterministic seed for the generated mutation tail.
+        const SEED: u64 = 0x9E3779B97F4A7C15;
+        /// Hand-built boundary classes (26) + seeded mutations (64).
+        const CORPUS_CASES: usize = 90;
+        /// Seeded mutation tail size (xorshift64* from SEED).
+        const MUTATIONS: usize = 64;
+
+        fn xorshift64star(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *state = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+
+        fn frame_of(payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(4 + payload.len());
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+
+        // Case: raw bytes fed to `decode_frame`, then (on success) to
+        // `parse_envelope`. `must_err` pins hand-built evil inputs to
+        // rejection; seeded mutations only pin no-panic (a byte swap inside
+        // a JSON string can stay a valid envelope).
+        struct Case {
+            name: &'static str,
+            bytes: Vec<u8>,
+            must_err: bool,
+        }
+
+        let valid_json = serde_json::to_vec(&sample_envelope()).unwrap();
+        let valid_frame = encode_frame(&valid_json).unwrap();
+        let mut cases: Vec<Case> = Vec::with_capacity(CORPUS_CASES);
+
+        // Control: the valid frame decodes and parses.
+        cases.push(Case {
+            name: "valid control",
+            bytes: valid_frame.clone(),
+            must_err: false,
+        });
+
+        // Truncation at every framing boundary class.
+        for (name, len) in [
+            ("empty", 0usize),
+            ("one byte", 1),
+            ("three bytes", 3),
+            ("prefix only", 4),
+            ("prefix plus three", 7),
+            ("prefix plus four", 8),
+        ] {
+            cases.push(Case {
+                name,
+                bytes: valid_frame[..len.min(valid_frame.len())].to_vec(),
+                must_err: true,
+            });
+        }
+        cases.push(Case {
+            name: "payload minus one",
+            bytes: valid_frame[..valid_frame.len() - 1].to_vec(),
+            must_err: true,
+        });
+
+        // Huge length prefixes (8 zero body bytes; decode fails first).
+        for (name, len) in [
+            ("u32::MAX prefix", u32::MAX),
+            ("MAX+1 prefix", MAX_FRAME_BYTES as u32 + 1),
+            ("MAX exactly, short body", MAX_FRAME_BYTES as u32),
+        ] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(&[0u8; 8]);
+            cases.push(Case {
+                name,
+                bytes,
+                must_err: true,
+            });
+        }
+
+        // Empty payload frame decodes (zero bytes) but never parses.
+        cases.push(Case {
+            name: "zero-length payload",
+            bytes: vec![0, 0, 0, 0],
+            must_err: true,
+        });
+
+        // Bad JSON payloads (framed so the full pipeline runs).
+        for (name, payload) in [
+            ("not json", b"not json".as_slice()),
+            ("lone brace", b"{".as_slice()),
+            ("truncated array", b"[1,2".as_slice()),
+            ("bare null", b"null".as_slice()),
+            ("bare number", b"123".as_slice()),
+            ("wrong shape", b"{\"kind\":\"nope\"}".as_slice()),
+        ] {
+            cases.push(Case {
+                name,
+                bytes: frame_of(payload),
+                must_err: true,
+            });
+        }
+        cases.push(Case {
+            name: "valid json cut in half",
+            bytes: frame_of(&valid_json[..valid_json.len() / 2]),
+            must_err: true,
+        });
+
+        // Deep nesting past serde's recursion limit (256-deep).
+        cases.push(Case {
+            name: "256-deep arrays",
+            bytes: frame_of(format!("{}{}", "[".repeat(256), "]".repeat(256)).as_bytes()),
+            must_err: true,
+        });
+        cases.push(Case {
+            name: "256-deep objects",
+            bytes: frame_of(
+                format!("{}{}{}", "{\"a\":".repeat(256), "1", "}".repeat(256)).as_bytes(),
+            ),
+            must_err: true,
+        });
+
+        // Invalid UTF-8 payloads (framed; decode is byte-blind, parse rejects).
+        for (name, payload) in [
+            ("ff fe", &[0xffu8, 0xfe][..]),
+            ("lone continuations", &[0x80, 0x81, 0xbf, 0xc0][..]),
+            ("overlong", &[0xf0, 0x28, 0x8c, 0xbc][..]),
+        ] {
+            cases.push(Case {
+                name,
+                bytes: frame_of(payload),
+                must_err: true,
+            });
+        }
+
+        // Large but under the cap: 64KiB of junk parses as nothing, and a
+        // MAX-exact frame of junk decodes (boundary pinned, no false cap).
+        cases.push(Case {
+            name: "64KiB junk",
+            bytes: frame_of(&vec![b'x'; 65536]),
+            must_err: true,
+        });
+        {
+            let mut maxed = Vec::with_capacity(4 + MAX_FRAME_BYTES);
+            maxed.extend_from_slice(&(MAX_FRAME_BYTES as u32).to_be_bytes());
+            maxed.extend_from_slice(&vec![b'x'; MAX_FRAME_BYTES]);
+            cases.push(Case {
+                name: "MAX-exact junk",
+                bytes: maxed,
+                must_err: true,
+            });
+        }
+
+        // Seeded mutation tail: byte swaps + truncations of the valid frame.
+        let mut rng = SEED;
+        for _ in 0..MUTATIONS {
+            let mut bytes = valid_frame.clone();
+            let swaps = 1 + (xorshift64star(&mut rng) % 4) as usize;
+            for _ in 0..swaps {
+                let at = (xorshift64star(&mut rng) % bytes.len() as u64) as usize;
+                let val = (xorshift64star(&mut rng) % 256) as u8;
+                bytes[at] = val;
+            }
+            if xorshift64star(&mut rng).is_multiple_of(2) {
+                let cut = (xorshift64star(&mut rng) % bytes.len() as u64) as usize;
+                bytes.truncate(cut);
+            }
+            cases.push(Case {
+                name: "seeded mutation",
+                bytes,
+                must_err: false,
+            });
+        }
+
+        assert_eq!(
+            cases.len(),
+            CORPUS_CASES,
+            "seed 0x{SEED:016X}: corpus size pinned at {CORPUS_CASES}"
+        );
+
+        let mut rejected = 0usize;
+        for (index, case) in cases.iter().enumerate() {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let mut buf: &[u8] = &case.bytes;
+                match decode_frame(&mut buf) {
+                    Ok(payload) => parse_envelope(&payload).map(|_| ()),
+                    Err(err) => Err(err),
+                }
+            }));
+            let result = match outcome {
+                Ok(result) => result,
+                Err(_) => panic!(
+                    "seed 0x{SEED:016X}: case {index} ({}) panicked — a panic is a harness failure",
+                    case.name
+                ),
+            };
+            if case.must_err {
+                assert!(
+                    result.is_err(),
+                    "seed 0x{SEED:016X}: case {index} ({}) decoded evil input as valid",
+                    case.name
+                );
+                rejected += 1;
+            }
+        }
+
+        // The valid control must stay valid (exactly one non-evil case plus
+        // mutations that may stay valid); everything hand-built evil rejects.
+        let control = {
+            let mut buf: &[u8] = &valid_frame;
+            let payload = decode_frame(&mut buf).expect("control frame decodes");
+            parse_envelope(&payload).expect("control payload parses")
+        };
+        assert_eq!(control.operation_id, sample_envelope().operation_id);
+        assert_eq!(
+            rejected,
+            CORPUS_CASES - 1 - MUTATIONS,
+            "seed 0x{SEED:016X}: every hand-built evil input rejects"
+        );
+    }
+
     #[test]
     fn request_digest_is_stable_and_input_sensitive() {
         let a = sample_envelope();

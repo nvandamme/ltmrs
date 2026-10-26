@@ -5,7 +5,41 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-26 — feat: parallel bulk-drive Phase 2 (bounded pool + throughput evidence)
+## 2026-10-26 — test: WP-12 qualification evidence round (live tails, saturation, ANN, soak, adversarial)
+
+### No product changes; RQ-20 stays `executed_partial`
+- 90-case seeded frame fuzz: all typed-or-valid, never panics (pinned seed/corpus).
+- N=8 arbitration: 1 owner + 7 typed rejections, 10/10 stable; in-process scope stated; Windows mirror compile-unverified.
+- Render audit: already covered, nothing added.
+- Remains: cargo-fuzz harness, 32x multi-process arbitration incl. Windows leg. Review spec ✅ / Approved. Gate green.
+
+
+### No product changes; RQ-23 stays `executed_partial`
+- NEW 5000-op deterministic soak with maintenance interleaved + kill/reopen at 3500 + generation rotation/reaper proof; steady-state growth +1.8KiB/op; full state match, 0 errors. TDD, frozen clock, gc vacuity disclosed.
+- Ledger repair (same unit): plan-cited `fjall_*` soak names died in 980752b — re-pointed 02:430 + benchmarks.toml + RQ-23 at the current test. Follow-up recorded: RQ-01 evidence still cites dead backend names, needs the same treatment.
+- Review spec ✅ / Approved + doc-only fix round. Neighbors 9/9, search 199/199, clippy + fmt clean. Gate green.
+
+
+### No retrieval semantic or default changes; T-QUALITY-02 stays not_run-with-partial-evidence
+- 12-row inventory: safety legs re-run green; 6 `evaluate()` legs lack retrieve implementations (inventing mappings would be fabrication — not_run with reason); no upstream oracle; BEIR SKIP (no corpus).
+- NEW ignored ANN probe (IvfPq/Cosine, 10.1k rows, stated seeds, untuned defaults): Recall@10 0.176/0.145 (uniform-random adversarial floor); freshness PASS (100/100 pre/post-optimize); build 21.9s. Full source + table in `.superpowers/sdd/wp12-tails/ann-ablation-report.md`.
+- Review spec ✅ / Approved + 1 comment-only fix round (label precision, no re-run). RQ-24 evidence appended. Check/clippy/fmt clean. Gate green.
+
+
+### Test-only; no product semantic changes
+- New `greedy_flood_does_not_starve_interactive_reads` (lifecycle_tests.rs:516): 16-op flood → 8 admitted / 8 typed shed + 1 wire Busy; 5/5 interactive `Success` while greedy held; committed write keeps receipt across drop. TDD RED-first, deterministic (no sleeps/clock/RNG).
+- Caveats: held-state flood (not racing wire contention); FIFO scheduler — fairness via quota isolation, not preemption; global bound roomy, exhaustion matrix out of scope.
+- Gate: neighbors 35/35, daemon 314/314, fmt + clippy clean. RQ-22 evidence appended, stays `executed_partial`. Review spec ✅ / Approved. Gate green.
+
+
+### Executed on live E5-small weights (`tmp/probe-models` scratch cache, gitignored)
+- `live_e5_embed_against_provisioned_cache` PASS (37.86s): structural path proof (384-dim, finite, normalized, role-distinct + seam). RQ-09 evidence appended; pinned thresholds stay rationale-loosened.
+- `calibrate_dense_threshold_on_synthetic_corpus` PASS (574.89s, 300/300): max-t full-retention 0.70, thin margin — reproduces 2026-09-28. Default held at 0.0 pending owner approval. RQ-24 clause updated.
+- `beir_scifact_hybrid_quality` SKIP (no BEIR corpus) → `not_run`, not a pass. T-QUALITY-02 stays not_run.
+- Parity re-run: parallel + batch 1e-5 PASS (29.14s). Review spec ✅ / Approved. Gate green.
+
+- RQ-01: dead WP-02 probe names re-pointed at live atomicity/durability tests (all verified asserting). Stays `executed_passed`.
+## 883e5ea (2026-10-26) — feat: parallel bulk-drive Phase 2 (bounded pool + throughput evidence)
 
 ### Task 4: dedicated parallel chunk pool (TDD, reviewed)
 - `&mut`-to-`&` audit: `E5SmallAdapter::embed_batch`/`embed` are pure functions of inputs + weights (tokenizer `encode(&self)`, `BertModel::forward(&self)`, plain field reads; no mutation in the inference path). Changed one word each (`&mut self` → `&self`); all callers still compile. `SyncEmbedder` worker-thread seam keeps `&mut self` (single-owner, untouched).

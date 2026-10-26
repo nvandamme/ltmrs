@@ -498,6 +498,226 @@ async fn storage_busy_answers_backpressure() {
     }
 }
 
+/// RQ-22 fairness-under-load probe (T-CONC-04/T-BENCH-02 area, one harness
+/// point — not a saturation matrix).
+///
+/// BOUND (explicit): flood = 16 greedy enqueues against a per-client budget
+/// of 8 → exactly 8 Ok + 8 typed `ClientQueueFull`; interactive = 5 short
+/// `ListMemories` reads on a second frontend while the greedy bucket is held
+/// full → 5/5 `Success`, 0 Busy. Total queued never exceeds 8 (greedy) + 1
+/// transient (interactive in-flight). Cancellation tail: 1 committed
+/// `AddMemory` whose connection is dropped mid-flight retains its durable
+/// receipt (`KeepReceipt`).
+///
+/// Determinism: no sleeps, no clock, no RNG; all counts fixed; greedy load
+/// is held quota state (direct `try_enqueue`), not timing-dependent wire
+/// contention, so the run is bounded and repeatable.
+#[tokio::test]
+async fn greedy_flood_does_not_starve_interactive_reads() {
+    use crate::cancellation::{RequestState, decide, receipt_must_survive};
+    use crate::client::IpcClient;
+    use crate::envelope::{HandshakeRequest, IpcResult, PROTOCOL_VERSION};
+    use crate::limits::QuotaError;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Tight per-client budget (8) with a roomy global storage bound (32):
+    // the 16-op greedy flood must shed exactly half as typed Busy while the
+    // second client's reads stay unaffected (per-client isolation, RQ-22).
+    let quotas = Arc::new(QuotaTracker::new(ResourceLimits {
+        max_queued_per_client: 8,
+        ..Default::default()
+    }));
+    let (dispatcher, quotas) = test_dispatcher_with_quotas(&dir, quotas);
+
+    // (a) Greedy flood: 16 enqueues against the greedy bucket.
+    let greedy_fe = fe(10);
+    let mut flood_ok = 0u32;
+    let mut flood_busy = 0u32;
+    for _ in 0..16 {
+        match quotas.try_enqueue(greedy_fe) {
+            Ok(()) => flood_ok += 1,
+            Err(QuotaError::ClientQueueFull) => flood_busy += 1,
+            Err(other) => panic!("greedy flood must shed as ClientQueueFull, got: {other:?}"),
+        }
+    }
+    assert_eq!(flood_ok, 8, "flood volume 16 against budget 8 must admit 8");
+    assert_eq!(
+        flood_busy, 8,
+        "flood excess must shed as 8 typed ClientQueueFull"
+    );
+    assert_eq!(
+        quotas.total_queued(),
+        8,
+        "queueing must stay bounded (8 held), never unbounded"
+    );
+
+    // (a-wire) Greedy excess over the wire sheds as retryable busy while the
+    // bucket is held full. Both connections stay live concurrently below.
+    let (greedy_stream, greedy_server) = tokio::io::duplex(65536);
+    let greedy_task = tokio::spawn(handle_connection(
+        Box::new(greedy_server),
+        Arc::clone(&dispatcher),
+        Arc::clone(&quotas),
+    ));
+    let mut greedy_client = IpcClient::new(std::path::PathBuf::from("unused"));
+    greedy_client.set_stream(Box::new(greedy_stream));
+    let greedy_hs = greedy_client
+        .handshake(&HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(10),
+            channel_id: ch(10),
+            resume_retry_epoch: None,
+        })
+        .await
+        .unwrap();
+    let greedy_env = IpcEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        store_generation: StoreGeneration::FIRST,
+        frontend_id: fe(10),
+        channel_id: ch(10),
+        operation_id: op(1001),
+        session: None,
+        retry_epoch: greedy_hs.retry_epoch,
+        deadline_millis: None,
+        scope: Scope::default(),
+        identity: crate::envelope::EnvelopeIdentity::default(),
+        body: DomainRequest::ListMemories,
+    };
+    let greedy_resp = greedy_client.roundtrip(&greedy_env).await.unwrap();
+    match greedy_resp.result {
+        IpcResult::Error { message, .. } => assert!(
+            message.contains("backpressure")
+                || message.contains("busy")
+                || message.contains("queue full")
+                || message.contains("Queue full"),
+            "greedy wire excess must shed as retryable busy, got: {message}"
+        ),
+        other => panic!("greedy wire excess must shed as busy, got: {other:?}"),
+    }
+
+    // (b) Interactive short reads on a second frontend while the greedy
+    // bucket is held full: 5/5 succeed with normal Success receipts.
+    let (ia_stream, ia_server) = tokio::io::duplex(65536);
+    let ia_task = tokio::spawn(handle_connection(
+        Box::new(ia_server),
+        Arc::clone(&dispatcher),
+        Arc::clone(&quotas),
+    ));
+    let mut ia_client = IpcClient::new(std::path::PathBuf::from("unused"));
+    ia_client.set_stream(Box::new(ia_stream));
+    let ia_hs = ia_client
+        .handshake(&HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(20),
+            channel_id: ch(20),
+            resume_retry_epoch: None,
+        })
+        .await
+        .unwrap();
+    let mut ia_ok = 0u32;
+    for n in 0..5u64 {
+        let env = IpcEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(20),
+            channel_id: ch(20),
+            operation_id: op(2000 + n),
+            session: None,
+            retry_epoch: ia_hs.retry_epoch,
+            deadline_millis: None,
+            scope: Scope::default(),
+            identity: crate::envelope::EnvelopeIdentity::default(),
+            body: DomainRequest::ListMemories,
+        };
+        let resp = ia_client.roundtrip(&env).await.unwrap();
+        match resp.result {
+            IpcResult::Success { .. } => ia_ok += 1,
+            IpcResult::Error { message, .. } => panic!(
+                "interactive read {n} must not shed while greedy is shed, got busy: {message}"
+            ),
+        }
+    }
+    assert_eq!(ia_ok, 5, "all 5 interactive reads must complete");
+    assert_eq!(
+        quotas.total_queued(),
+        8,
+        "interactive reads must not grow the queue beyond the held greedy 8"
+    );
+
+    // Release the held greedy flood; close both live connections.
+    for _ in 0..8 {
+        quotas.dequeue(greedy_fe);
+    }
+    assert_eq!(quotas.total_queued(), 0);
+    greedy_client.close();
+    ia_client.close();
+    let _ = greedy_task.await;
+    let _ = ia_task.await;
+
+    // (c) Committed write retains its receipt if its connection is cancelled
+    // mid-flight (write then drop before reading).
+    let (c_stream, c_server) = tokio::io::duplex(65536);
+    let c_task = tokio::spawn(handle_connection(
+        Box::new(c_server),
+        Arc::clone(&dispatcher),
+        Arc::clone(&quotas),
+    ));
+    let mut c_client = IpcClient::new(std::path::PathBuf::from("unused"));
+    c_client.set_stream(Box::new(c_stream));
+    let c_hs = c_client
+        .handshake(&HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id: fe(30),
+            channel_id: ch(30),
+            resume_retry_epoch: None,
+        })
+        .await
+        .unwrap();
+    let c_env = IpcEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        store_generation: StoreGeneration::FIRST,
+        frontend_id: fe(30),
+        channel_id: ch(30),
+        operation_id: op(7001),
+        session: None,
+        retry_epoch: c_hs.retry_epoch,
+        deadline_millis: None,
+        scope: Scope::default(),
+        identity: crate::envelope::EnvelopeIdentity::default(),
+        body: DomainRequest::AddMemory {
+            memory: test_memory(9001),
+        },
+    };
+    c_client.write_request(&c_env).await.unwrap();
+    drop(c_client);
+    let _ = c_task.await;
+    let receipt = dispatcher
+        .repo()
+        .lookup_receipt(StoreGeneration::FIRST, fe(30), c_hs.retry_epoch, op(7001))
+        .unwrap();
+    assert!(
+        receipt.is_some(),
+        "committed write must retain its receipt after connection drop"
+    );
+    let st = RequestState {
+        committed: true,
+        canceled: true,
+    };
+    assert_eq!(
+        decide(st),
+        crate::cancellation::CancellationAction::KeepReceipt
+    );
+    assert!(receipt_must_survive(st));
+    let memories = dispatcher
+        .repo()
+        .get_memories(&[test_memory(9001).id])
+        .unwrap();
+    assert_eq!(memories.len(), 1, "committed memory must survive");
+}
+
 /// Responses beyond the byte budget are refused explicitly, never
 /// truncated: seed enough content to overflow a tiny budget, then a
 /// list read comes back as an explicit error (control replies such as

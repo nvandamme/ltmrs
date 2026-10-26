@@ -52,7 +52,7 @@ verdict = "put/search not comparable (dedup-gate refusal cascade diverged the co
 
 [[not_run]]
 name = "fault-soak-steady-state"
-reason = "Point fault-injection, fragmented-state kill, deterministic soak and sustained-load consistency are executed in-suite (fjall_backend tests). No long-run clock-time soak harness and no fault injection under sustained load; disk-growth trends, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
+reason = "Point fault-injection (injected_migration_fault_fails_atomically, injected_unknown_outcome_leaves_store_consistent — both ported, still green in crates/service), deterministic soak + fragmented-state kill + generation rotation executed 2026-10-26 (soak_mixed_ops_with_maintenance_then_kill: 5000 seeded ops, 11 optimize passes, kill/reopen at 3500, steady-state growth +1.8KiB/op over 1500 ops); old fjall_backend test names retired with src/storage (980752b), sustained racing-write consistency unported. No long-run clock-time soak harness and no fault injection under sustained load; tail-latency-under-load, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
 
 [[not_run]]
 name = "quality-corpus-300"

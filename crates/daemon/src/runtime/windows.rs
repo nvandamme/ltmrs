@@ -409,6 +409,53 @@ mod tests {
         drop(runtime);
     }
 
+    /// RQ-20 bounded adversarial round (Windows mirror of the unix N-way
+    /// test): N tasks race `acquire_singleton` from a barrier-gated start;
+    /// exactly ONE wins, the rest reject typed, the probe agrees.
+    /// Deterministic, no sleeps. NOTE: this file is cfg(windows) so this
+    /// test does NOT compile on Linux — shape mirrors the unix leg, which
+    /// is the verified one; treat this leg as compile-unverified until a
+    /// Windows runner qualifies it. In-process tasks approximate the OS
+    /// lock; process-level arbitration stays with the lifecycle test.
+    #[tokio::test]
+    async fn n_way_startup_arbitration_has_single_owner() {
+        const N: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::resolve(dir.path(), "test-store");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let paths = paths.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                acquire_singleton(&paths)
+            }));
+        }
+        let mut owners = Vec::new();
+        let mut rejections = 0usize;
+        for handle in handles {
+            match handle.await.expect("arbitration task joins") {
+                Ok(runtime) => owners.push(runtime),
+                Err(RuntimeError::AlreadyRunning(_)) => rejections += 1,
+                Err(other) => panic!("expected AlreadyRunning, got: {other:?}"),
+            }
+        }
+        assert_eq!(owners.len(), 1, "exactly one of {N} wins the lock");
+        assert_eq!(rejections, N - 1, "the other {} reject typed", N - 1);
+        assert_eq!(
+            lock_held_platform(&paths),
+            Some(true),
+            "probe agrees while the owner lives"
+        );
+        drop(owners);
+        assert_eq!(
+            lock_held_platform(&paths),
+            Some(false),
+            "probe reports free after the owner drops"
+        );
+    }
+
     /// The probe reports held while an owner lives, free after it drops,
     /// and unknown when nothing exists to inspect.
     #[tokio::test]

@@ -606,4 +606,560 @@ mod tests {
         );
         assert_eq!(repo.store_generation().unwrap(), gen2);
     }
+
+    /// Recursive byte size of a store directory (canonical Fjall dir or Lance
+    /// dataset dir). Test-only helper for the soak growth checkpoint.
+    fn dir_bytes(path: &std::path::Path) -> u64 {
+        let mut total = 0u64;
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+        total
+    }
+
+    /// One deterministic maintenance pass for the soak: projector drain
+    /// (publish + ack), budgeted Lance optimize, receipt retention sweep, and
+    /// an explicit generation-reaper call. The scheduler's `run_pass` is
+    /// deliberately NOT used: it stamps retention with wall-clock time, which
+    /// would make the soak nondeterministic. Returns (jobs resolved,
+    /// receipts collected, generations reaped).
+    async fn soak_maintenance_pass(
+        repo: &Arc<CanonicalRepository>,
+        table: &SearchTable,
+        projector: &mut crate::search::projector::Projector,
+        retain_millis: u64,
+        frozen_now: u64,
+    ) -> DomainResult<(usize, usize, u64)> {
+        let resolved = projector.run_until_idle().await?;
+        table
+            .optimize_with_budgets(MaintenanceBudget {
+                compaction_threads: 1,
+                max_compact_bytes_per_file: 1024 * 1024,
+                retain_millis: 3_600_000, // 1 hour retention
+            })
+            .await?;
+        let collected = repo.gc_expired(frozen_now)?;
+        let reaped = reap_retired_generations(table, repo, frozen_now, retain_millis).await?;
+        Ok((resolved, collected, reaped))
+    }
+
+    /// T-BENCH-03 steady-state soak with maintenance, then kill/reopen (RQ-23).
+    ///
+    /// Bounded deterministic soak — explicitly NOT a long-run clock-time soak:
+    /// a seeded LCG (seed 0x9E3779B97F4A7C15, same generator family as the
+    /// retired `fjall_soak_mixed_ops_then_kill`) drives N_OPS=5000 mixed
+    /// canonical ops over a 60-key space — puts for fresh ids, updates,
+    /// feedback, Delete-mode forgets — with a maintenance pass every 500 ops
+    /// (projector drain, budgeted optimize, retention sweep, reaper call).
+    /// Kill (drop every handle) at op 3500; reopen the same directories and
+    /// continue to 5000; then drain, assert recovery, cut over to generation
+    /// 2, reap generation 1, and re-establish gen-2 projection.
+    ///
+    /// Asserts: (a) recovered state matches the pre-kill expectation (exact
+    /// per-memory title/fragment/lifecycle match over the full expected map,
+    /// live-count match, plus durable-receipt spot checks at ops 1/1750/3500/
+    /// 5000 — the ACK ledger); (b) no pending projection jobs remain once the
+    /// retired generation's rows are reaped, so no stale worker can resurrect
+    /// them; (c) store-size growth is reported and bounded in two windows —
+    /// op-500→end (loose tripwire spanning the kill/reopen) and
+    /// post-reopen→end (steady-state, no reopen inside); (d) zero unexpected
+    /// errors (every op's preconditions hold by construction, so any Err is
+    /// a real failure, counted and asserted).
+    ///
+    /// Size bound: every op writes fixed-size values (~200 B of text); each op
+    /// costs at most one canonical record rewrite plus at most one Lance row
+    /// version (drains coalesce to one pending job per memory; prune retains
+    /// versions for 1 h, longer than the test). 8 KiB/op is ~40x the nominal
+    /// payload yet fails loudly on any unbounded duplication (a per-op
+    /// full-table rewrite would exceed it by orders of magnitude).
+    ///
+    /// Determinism: seeded RNG, FrozenClock(1000), explicit `now` for GC and
+    /// the reaper. Wall clock is read once for the reported duration only,
+    /// never for a test decision.
+    ///
+    /// RED: pure-additive test, no RED transcript kept — RED was the test not existing (this name matched 0 tests before the body was added).
+    #[tokio::test]
+    async fn soak_mixed_ops_with_maintenance_then_kill() {
+        use ltmrs_domain::command::ForgetMode;
+        use ltmrs_domain::command::MemoryPatch;
+
+        const SEED: u64 = 0x9E3779B97F4A7C15;
+        const N_OPS: u64 = 5000;
+        const KEY_SPACE: u64 = 60;
+        const MAINT_EVERY: u64 = 500;
+        const KILL_AT: u64 = 3500;
+        const FROZEN_NOW: u64 = 1000;
+        const RETAIN_MILLIS: u64 = 60_000;
+        const SIZE_PER_OP_BUDGET: u64 = 8 * 1024;
+
+        let wall_start = std::time::Instant::now();
+
+        // Sibling tempdirs (not nested): repo and Lance sizes are measured
+        // independently, so neither checkpoint double-counts the other.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let lance_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap().to_string();
+        let uri = lance_dir.path().to_str().unwrap().to_string();
+        let clock = Arc::new(ltmrs_domain::clock::FrozenClock::new(FROZEN_NOW));
+        let fe = ltmrs_domain::id::FrontendId::new(Uuid::from_u128(1));
+
+        let mut repo =
+            Arc::new(CanonicalRepository::open_with_clock(&repo_path, clock.clone()).unwrap());
+        assert_eq!(
+            repo.issue_namespace(
+                fe,
+                ltmrs_domain::id::ChannelId::new(Uuid::from_u128(2)),
+                FROZEN_NOW
+            )
+            .unwrap()
+            .retry_epoch,
+            1
+        );
+        let mut table = SearchTable::open(&uri).await.unwrap();
+        let mut projector = crate::search::projector::Projector::new(
+            Arc::clone(&repo),
+            table.clone(),
+            Box::new(FixedEmbedder { dim: 32 }),
+            ltmrs_domain::id::ModelFingerprint::new(1),
+            StoreGeneration::FIRST,
+        );
+
+        struct Expected {
+            title: String,
+            fragment: String,
+            live: bool,
+        }
+        let mut expected: std::collections::HashMap<u64, Expected> =
+            std::collections::HashMap::new();
+        let mut live: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut next_fresh = KEY_SPACE + 1;
+        let mut rng: u64 = SEED;
+        let (mut n_put, mut n_upd, mut n_fb, mut n_del) = (0u64, 0u64, 0u64, 0u64);
+        let mut unexpected_errors = 0u32;
+        let mut size_checkpoint_a = 0u64;
+        let mut size_checkpoint_a2 = 0u64;
+
+        let mut step = 0u64;
+        while step < N_OPS {
+            step += 1;
+            // Seeded LCG: deterministic schedule, no test-harness timing.
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442694820888963407);
+            let roll = rng % 100;
+
+            let outcome = if roll < 50 {
+                // Update a live memory (fall back to put when none live yet).
+                match live.iter().next().copied() {
+                    Some(id) => {
+                        let target = 1 + rng % (live.len() as u64);
+                        let id = *live.iter().nth((target - 1) as usize).unwrap_or(&id);
+                        let title = format!("S{id}-s{step}");
+                        let fragment = format!("frag-S{id}-s{step}");
+                        let r = repo.apply(
+                            &ctx(step),
+                            &DomainCommand::UpdateMemory {
+                                id: eid(id),
+                                expected_revision: None,
+                                patch: MemoryPatch {
+                                    title: Some(title.clone()),
+                                    fragment: Some(fragment.clone()),
+                                    ..Default::default()
+                                },
+                            },
+                        );
+                        if r.is_ok() {
+                            n_upd += 1;
+                            expected.insert(
+                                id,
+                                Expected {
+                                    title,
+                                    fragment,
+                                    live: true,
+                                },
+                            );
+                        }
+                        r.map(|_| ())
+                    }
+                    None => {
+                        let id = next_fresh;
+                        next_fresh += 1;
+                        let mut m = memory(id);
+                        m.title = format!("S{id}-v1");
+                        m.fragment = format!("frag-S{id}-v1");
+                        let r = repo
+                            .apply(
+                                &ctx(step),
+                                &DomainCommand::AddMemory {
+                                    memory: m,
+                                    session: None,
+                                    auto_link: None,
+                                },
+                            )
+                            .map(|_| ());
+                        if r.is_ok() {
+                            n_put += 1;
+                            live.insert(id);
+                            expected.insert(
+                                id,
+                                Expected {
+                                    title: format!("S{id}-v1"),
+                                    fragment: format!("frag-S{id}-v1"),
+                                    live: true,
+                                },
+                            );
+                        }
+                        r
+                    }
+                }
+            } else if roll < 70 {
+                // Feedback on a live memory (skip when none live yet).
+                match live.iter().next().copied() {
+                    Some(id) => {
+                        let target = 1 + rng % (live.len() as u64);
+                        let id = *live.iter().nth((target - 1) as usize).unwrap_or(&id);
+                        let r = repo
+                            .apply(
+                                &ctx(step),
+                                &DomainCommand::Feedback {
+                                    memory_id: eid(id),
+                                    useful: step.is_multiple_of(2),
+                                },
+                            )
+                            .map(|_| ());
+                        if r.is_ok() {
+                            n_fb += 1;
+                        }
+                        r
+                    }
+                    None => Ok(()),
+                }
+            } else if roll < 80 {
+                // Put a fresh id.
+                let id = next_fresh;
+                next_fresh += 1;
+                let mut m = memory(id);
+                m.title = format!("S{id}-v1");
+                m.fragment = format!("frag-S{id}-v1");
+                let r = repo
+                    .apply(
+                        &ctx(step),
+                        &DomainCommand::AddMemory {
+                            memory: m,
+                            session: None,
+                            auto_link: None,
+                        },
+                    )
+                    .map(|_| ());
+                if r.is_ok() {
+                    n_put += 1;
+                    live.insert(id);
+                    expected.insert(
+                        id,
+                        Expected {
+                            title: format!("S{id}-v1"),
+                            fragment: format!("frag-S{id}-v1"),
+                            live: true,
+                        },
+                    );
+                }
+                r
+            } else if roll < 90 {
+                // Delete-mode forget of a live memory (skip when none live).
+                match live.iter().next().copied() {
+                    Some(id) => {
+                        let target = 1 + rng % (live.len() as u64);
+                        let id = *live.iter().nth((target - 1) as usize).unwrap_or(&id);
+                        let r = repo
+                            .apply(
+                                &ctx(step),
+                                &DomainCommand::Forget {
+                                    id: eid(id),
+                                    mode: ForgetMode::Delete,
+                                },
+                            )
+                            .map(|_| ());
+                        if r.is_ok() {
+                            n_del += 1;
+                            live.remove(&id);
+                            if let Some(e) = expected.get_mut(&id) {
+                                e.live = false;
+                            }
+                        }
+                        r
+                    }
+                    None => Ok(()),
+                }
+            } else {
+                // Second update band: keeps update pressure dominant.
+                match live.iter().next().copied() {
+                    Some(id) => {
+                        let target = 1 + rng % (live.len() as u64);
+                        let id = *live.iter().nth((target - 1) as usize).unwrap_or(&id);
+                        let title = format!("S{id}-t{step}");
+                        let fragment = format!("frag-S{id}-t{step}");
+                        let r = repo.apply(
+                            &ctx(step),
+                            &DomainCommand::UpdateMemory {
+                                id: eid(id),
+                                expected_revision: None,
+                                patch: MemoryPatch {
+                                    title: Some(title.clone()),
+                                    fragment: Some(fragment.clone()),
+                                    ..Default::default()
+                                },
+                            },
+                        );
+                        if r.is_ok() {
+                            n_upd += 1;
+                            expected.insert(
+                                id,
+                                Expected {
+                                    title,
+                                    fragment,
+                                    live: true,
+                                },
+                            );
+                        }
+                        r.map(|_| ())
+                    }
+                    None => Ok(()),
+                }
+            };
+            if let Err(e) = outcome {
+                unexpected_errors += 1;
+                eprintln!(
+                    "soak op {step} unexpected error: {} ({})",
+                    e.code.as_str(),
+                    e.message
+                );
+            }
+
+            if step.is_multiple_of(MAINT_EVERY) || step == N_OPS {
+                let (resolved, collected, reaped) =
+                    soak_maintenance_pass(&repo, &table, &mut projector, RETAIN_MILLIS, FROZEN_NOW)
+                        .await
+                        .unwrap();
+                eprintln!(
+                    "soak maintenance at op {step}: {resolved} jobs resolved, \
+                     {collected} receipts collected, {reaped} generations reaped"
+                );
+                if step == MAINT_EVERY {
+                    size_checkpoint_a = dir_bytes(repo_dir.path()) + dir_bytes(lance_dir.path());
+                    eprintln!(
+                        "soak size checkpoint A at op {step}: repo {} bytes + lance {} bytes",
+                        dir_bytes(repo_dir.path()),
+                        dir_bytes(lance_dir.path())
+                    );
+                }
+            }
+
+            if step == KILL_AT {
+                // Kill boundary: drop every handle (repo, table, projector),
+                // then reopen the same directories and continue writing.
+                drop(projector);
+                drop(table);
+                drop(repo);
+                let reopened = Arc::new(
+                    CanonicalRepository::open_with_clock(&repo_path, clock.clone()).unwrap(),
+                );
+                let reopened_table = SearchTable::open(&uri).await.unwrap();
+                projector = crate::search::projector::Projector::new(
+                    Arc::clone(&reopened),
+                    reopened_table.clone(),
+                    Box::new(FixedEmbedder { dim: 32 }),
+                    ltmrs_domain::id::ModelFingerprint::new(1),
+                    StoreGeneration::FIRST,
+                );
+                table = reopened_table;
+                repo = reopened;
+                size_checkpoint_a2 = dir_bytes(repo_dir.path()) + dir_bytes(lance_dir.path());
+                eprintln!(
+                    "soak kill/reopen at op {KILL_AT}; post-reopen size {size_checkpoint_a2} bytes \
+                     (repo {} + lance {})",
+                    dir_bytes(repo_dir.path()),
+                    dir_bytes(lance_dir.path())
+                );
+            }
+        }
+        assert_eq!(
+            unexpected_errors, 0,
+            "soak must produce zero unexpected errors"
+        );
+
+        // Final drain + maintenance before asserting recovery.
+        let (resolved, collected, reaped) =
+            soak_maintenance_pass(&repo, &table, &mut projector, RETAIN_MILLIS, FROZEN_NOW)
+                .await
+                .unwrap();
+        eprintln!(
+            "soak final maintenance: {resolved} jobs resolved, \
+             {collected} receipts collected, {reaped} generations reaped"
+        );
+
+        // (a) Recovered state matches the pre-kill expectation: exact
+        // per-memory match over the full expected map plus live-count match.
+        let snapshot = repo.export_snapshot().unwrap();
+        assert_eq!(
+            snapshot.memories.len(),
+            expected.len(),
+            "canonical memory count must match the expected map"
+        );
+        let live_count = snapshot
+            .memories
+            .iter()
+            .filter(|m| m.lifecycle.is_recallable())
+            .count();
+        assert_eq!(
+            live_count,
+            live.len(),
+            "recallable count must match the live set"
+        );
+        let by_id: std::collections::HashMap<_, _> =
+            snapshot.memories.iter().map(|m| (m.id, m)).collect();
+        for (id, exp) in &expected {
+            let found = by_id
+                .get(&eid(*id))
+                .unwrap_or_else(|| panic!("memory {id} lost across soak/kill"));
+            assert_eq!(
+                &found.title, &exp.title,
+                "last-write-wins violated for {id}"
+            );
+            assert_eq!(&found.fragment, &exp.fragment, "fragment mismatch for {id}");
+            assert_eq!(
+                found.lifecycle.is_recallable(),
+                exp.live,
+                "lifecycle mismatch for {id}"
+            );
+        }
+        // ACK ledger spot checks: durable receipts exist across the kill
+        // boundary (op 1, mid-soak, kill boundary, final op).
+        for probe in [1u64, 1750, KILL_AT, N_OPS] {
+            let receipt = repo
+                .lookup_receipt(
+                    StoreGeneration::FIRST,
+                    fe,
+                    1,
+                    ltmrs_domain::id::OperationId::new(Uuid::from_u128(probe as u128)),
+                )
+                .unwrap();
+            assert!(receipt.is_some(), "durable receipt missing for op {probe}");
+        }
+        // All projection work acknowledged before the generation cutover.
+        assert!(
+            repo.projection_jobs().unwrap().is_empty(),
+            "no pending projection jobs may survive the final drain"
+        );
+
+        // Generation rotation post-recovery: cut over, reap the retired
+        // generation's rows, and prove the index is clean for rotation.
+        let live_now = live.len() as u64;
+        let gen2 = repo
+            .stage_generation(ltmrs_domain::id::ModelFingerprint::new(2))
+            .unwrap();
+        repo.note_generation_progress(gen2, live_now).unwrap();
+        repo.activate_generation(gen2).unwrap();
+        let reaped =
+            reap_retired_generations(&table, &repo, FROZEN_NOW + RETAIN_MILLIS + 1, RETAIN_MILLIS)
+                .await
+                .unwrap();
+        assert_eq!(reaped, 1, "exactly the retired generation must be reaped");
+        assert_eq!(
+            table
+                .count_rows(Some("store_generation = 1"))
+                .await
+                .unwrap(),
+            0,
+            "retired generation rows must be gone after reaping"
+        );
+        // (b) No leaked pending projection jobs for the retired generation:
+        // nothing pending that a stale worker could republish into it.
+        assert!(
+            repo.projection_jobs().unwrap().is_empty(),
+            "no pending jobs may reference the retired generation"
+        );
+        // Rotation did not brick projection: one gen-2 touch publishes.
+        if let Some(&id) = live.iter().next() {
+            let title = "S-rotation-probe".to_string();
+            repo.apply(
+                &ctx_gen(N_OPS + 1, gen2),
+                &DomainCommand::UpdateMemory {
+                    id: eid(id),
+                    expected_revision: None,
+                    patch: MemoryPatch {
+                        title: Some(title),
+                        fragment: None,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+            let mut projector2 = crate::search::projector::Projector::new(
+                Arc::clone(&repo),
+                table.clone(),
+                Box::new(FixedEmbedder { dim: 32 }),
+                ltmrs_domain::id::ModelFingerprint::new(2),
+                gen2,
+            );
+            projector2.run_until_idle().await.unwrap();
+            assert!(
+                table
+                    .count_rows(Some("store_generation = 2"))
+                    .await
+                    .unwrap()
+                    >= 1,
+                "gen-2 projection must publish after rotation"
+            );
+            assert!(
+                repo.projection_jobs().unwrap().is_empty(),
+                "gen-2 drain must leave no pending jobs"
+            );
+        }
+
+        // (c) Store-size growth. Two windows: the full op-500→end window is a
+        // loose tripwire (it spans the kill/reopen; checkpoint A is dominated
+        // by a 64 MiB preallocated Fjall journal, `0.jnl`, reclaimed across
+        // the reopen — the shrink is engine-internal journal lifecycle,
+        // claimed as nothing more); the post-reopen→end window is the honest
+        // steady-state number (no reopen inside it). Both are bounded by the
+        // per-op ceiling below.
+        let repo_bytes_b = dir_bytes(repo_dir.path());
+        let lance_bytes_b = dir_bytes(lance_dir.path());
+        let size_checkpoint_b = repo_bytes_b + lance_bytes_b;
+        let growth = size_checkpoint_b.saturating_sub(size_checkpoint_a);
+        let growth_budget = N_OPS * SIZE_PER_OP_BUDGET;
+        let growth2 = size_checkpoint_b.saturating_sub(size_checkpoint_a2);
+        let growth2_budget = (N_OPS - KILL_AT) * SIZE_PER_OP_BUDGET;
+        eprintln!(
+            "soak size checkpoint B: repo {repo_bytes_b} bytes + lance {lance_bytes_b} bytes"
+        );
+        eprintln!(
+            "T-BENCH-03 soak: {N_OPS} ops (puts {n_put}, updates {n_upd}, \
+             feedback {n_fb}, deletes {n_del}), seed {SEED:#x}, kill at {KILL_AT}, \
+             size {size_checkpoint_a} -> {size_checkpoint_b} bytes (+{growth}, \
+             budget {growth_budget}), post-reopen {size_checkpoint_a2} -> \
+             {size_checkpoint_b} (+{growth2}, budget {growth2_budget}), elapsed {:?}",
+            wall_start.elapsed()
+        );
+        assert!(
+            growth <= growth_budget,
+            "store growth {growth} bytes exceeds {growth_budget} budget"
+        );
+        assert!(
+            growth2 <= growth2_budget,
+            "steady-state growth {growth2} bytes exceeds {growth2_budget} budget"
+        );
+    }
 }
