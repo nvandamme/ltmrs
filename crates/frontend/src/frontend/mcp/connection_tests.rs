@@ -8,6 +8,9 @@ use ltmrs_compat::lemma::tool_args::{MemoryAddArgs, ToolArgs};
 use ltmrs_daemon::client::IpcClient;
 use ltmrs_daemon::envelope::{DomainRequest, IpcResult};
 use ltmrs_domain::id::{ChannelId, FrontendId};
+/// Trait import for the unix-socket test doubles below (method resolution
+/// only); unused on Windows where those tests are gated out.
+#[cfg(unix)]
 use rmcp::ServerHandler;
 use uuid::Uuid;
 
@@ -759,6 +762,8 @@ async fn toolcall_add_resend_after_resume_replays_success() {
 }
 
 /// Wave B1: non-empty store must surface in the FIRST initialize.
+/// Unix-socket test double (`UnixStream::pair`); Windows IPC is named pipes.
+#[cfg(unix)]
 #[tokio::test]
 async fn first_initialize_sees_nonempty_store() {
     use ltmrs_daemon::runtime::RuntimePaths;
@@ -811,6 +816,8 @@ async fn first_initialize_sees_nonempty_store() {
 
 /// Wave B1: prefetch over an empty store keeps the current empty-state
 /// text (no behavior change for fresh stores).
+/// Unix-socket test double (`UnixStream::pair`); Windows IPC is named pipes.
+#[cfg(unix)]
 #[tokio::test]
 async fn prefetch_on_empty_store_keeps_empty_state() {
     use ltmrs_daemon::runtime::RuntimePaths;
@@ -851,6 +858,8 @@ async fn prefetch_on_empty_store_keeps_empty_state() {
 /// already handshaken (probe handshake sets the retry epoch before the
 /// frontend is built). Prefetch must fetch regardless of handshake
 /// state, so `get_info` is populated here too.
+/// Unix-socket test double (`UnixStream::pair`); Windows IPC is named pipes.
+#[cfg(unix)]
 #[tokio::test]
 async fn prefetch_fetches_when_already_handshaken() {
     use ltmrs_daemon::envelope::{HandshakeRequest, PROTOCOL_VERSION};
@@ -929,6 +938,9 @@ fn unconnected_frontend() -> LtmrsFrontend {
     )
 }
 
+/// Unix-socket test double (`UnixStream::pair` drives `handle_connection`
+/// directly); Windows IPC is named pipes, so this helper is unix-only.
+#[cfg(unix)]
 async fn live_frontend_with(
     seeds: &[ltmrs_domain::memory::Memory],
 ) -> (
@@ -971,6 +983,8 @@ fn unattributed_identity() -> ltmrs_daemon::envelope::EnvelopeIdentity {
     ltmrs_daemon::envelope::EnvelopeIdentity::default()
 }
 
+/// Unix-only helper: only the gated `live_frontend_with` callers use it.
+#[cfg(unix)]
 fn stable_identity_named(name: &str, root: &str) -> ltmrs_daemon::envelope::EnvelopeIdentity {
     let (full, _) = ltmrs_domain::project_id::generate_project_id(name);
     ltmrs_daemon::envelope::EnvelopeIdentity {
@@ -981,6 +995,8 @@ fn stable_identity_named(name: &str, root: &str) -> ltmrs_daemon::envelope::Enve
     }
 }
 
+/// Unix-only helper: only the gated `live_frontend_with` callers use it.
+#[cfg(unix)]
 fn sample_guide(name: &str) -> ltmrs_domain::guide::Guide {
     ltmrs_domain::guide::Guide {
         name: name.to_string(),
@@ -1018,6 +1034,8 @@ fn resource_text(out: &rmcp::model::ReadResourceResult) -> Result<String, String
         .ok_or_else(|| format!("no text content in resource result: {out:?}"))
 }
 
+/// Unix-only helper: only the gated `live_frontend_with` callers use it.
+#[cfg(unix)]
 async fn add_via_tool(
     fe: &LtmrsFrontend,
     fragment: &str,
@@ -1085,6 +1103,8 @@ async fn system_prompt_resource_returns_template() {
 }
 
 /// `resources/read lemma://memory/{id}` returns the record as JSON.
+/// Unix-only: drives the unix-socket `live_frontend_with` helper.
+#[cfg(unix)]
 #[tokio::test]
 async fn memory_resource_returns_record_json() {
     let (fe, _dir, _daemon) = live_frontend_with(&[]).await;
@@ -1110,6 +1130,8 @@ async fn memory_resource_returns_record_json() {
 }
 
 /// Unknown memory ids are resource errors, not tool errors.
+/// Unix-only: drives the unix-socket `live_frontend_with` helper.
+#[cfg(unix)]
 #[tokio::test]
 async fn unknown_memory_resource_errors() {
     let (fe, _dir, _daemon) = live_frontend_with(&[]).await;
@@ -1125,6 +1147,8 @@ async fn unknown_memory_resource_errors() {
 
 /// `resources/read lemma://guides/{name}` is case-insensitive;
 /// unknown guides are resource errors.
+/// Unix-only: drives the unix-socket `live_frontend_with` helper.
+#[cfg(unix)]
 #[tokio::test]
 async fn guide_resource_case_insensitive() {
     let (fe, _dir, daemon) = live_frontend_with(&[]).await;
@@ -1190,6 +1214,8 @@ fn unknown_tool_returns_is_error_result() {
 
 /// A stable identity cannot read a foreign project's memory resource,
 /// but the same record is served without identity.
+/// Unix-only: drives the unix-socket `live_frontend_with` helper.
+#[cfg(unix)]
 #[tokio::test]
 async fn memory_resource_stable_scope_refused() {
     let (fe, _dir, _daemon) = live_frontend_with(&[]).await;

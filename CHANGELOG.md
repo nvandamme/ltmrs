@@ -5,7 +5,14 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-26 — feat: CUDA/GPU inference profile (opt-in, CPU default frozen)
+## 2026-10-26 — fix: Windows loader port (daemon now compiles for msvc)
+
+### `cfg(windows)` LoadLibraryW port; POSIX path untouched
+- `lemma_import.rs`: Windows loader twins + per-platform lifecycle tests; `.dll` name; cookie-never-freed pinned; 2 windows-sys feature adds (0.59 pinned).
+- Frontend socket-pair tests `#[cfg(unix)]`-gated per precedent (test-only).
+- Proof: xwin env checks green both crates (was 8×E0425 + 4×E0433); both clippys clean. Compile evidence only. RQ-21 delta. Review Approved, no flags.
+
+## 3cc6ee0 (2026-10-26) — feat: CUDA/GPU inference profile (opt-in, CPU default frozen)
 
 ### Host-native RTX 5090 sm_120 / CUDA 13.4; no containers
 - New `cuda` feature (candle-core/candle-nn cuda) + explicit device constructor; CPU default byte-identical (31+2 green, dup-tree default byte-identical).
