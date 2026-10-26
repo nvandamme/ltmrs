@@ -372,7 +372,7 @@
         "T-EMB-02"
       ],
       "status": "executed_partial",
-      "evidence": "Recipe validation (BertModel + XLMRobertaTokenizer, unsupported-recipe rejection), tokenizer/prefix checks, reference-vector equivalence (cosine >= 0.999, abs <= 1e-3 — proposed 0.99999/1e-4 thresholds were loosened with rationale, not measurements), projector/query bridges with role-equivalence + prefix-asymmetry tests. Weight-gated tests execute where artifacts are present and SKIP otherwise; GPU/mixed-precision profile deferred. Live-weights run 2026-10-26: `live_e5_embed_against_provisioned_cache` PASS (37.86s, provisioned `tmp/probe-models` cache) — serving-time query/passage embeds 384-dim, finite, L2-normalized (1e-4), role-distinct, projection seam + chunk-policy stamp verified; `e5_parallel_matches_sequential_within_tolerance` + `e5_batch_matches_sequential_within_tolerance` PASS (29.14s, 1e-5). Structural path-equivalence only — pinned cosine/abs thresholds remain rationale-loosened, not re-measured here."
+      "evidence": "Recipe validation (BertModel + XLMRobertaTokenizer, unsupported-recipe rejection), tokenizer/prefix checks, reference-vector equivalence (cosine >= 0.999, abs <= 1e-3 — proposed 0.99999/1e-4 thresholds were loosened with rationale, not measurements), projector/query bridges with role-equivalence + prefix-asymmetry tests. Weight-gated tests execute where artifacts are present and SKIP otherwise; GPU/mixed-precision profile deferred. Live-weights run 2026-10-26: `live_e5_embed_against_provisioned_cache` PASS (37.86s, provisioned `tmp/probe-models` cache) — serving-time query/passage embeds 384-dim, finite, L2-normalized (1e-4), role-distinct, projection seam + chunk-policy stamp verified; `e5_parallel_matches_sequential_within_tolerance` + `e5_batch_matches_sequential_within_tolerance` PASS (29.14s, 1e-5). Structural path-equivalence only — pinned cosine/abs thresholds remain rationale-loosened, not re-measured here. GPU (F32) profile EXECUTED 2026-10-26 on host RTX 5090 sm_120 / CUDA 13.4: new opt-in `cuda` feature on ltmrs-embeddings (candle-core/candle-nn cuda; default CPU path byte-identical); `cuda_reference_vector_equivalence_cpu_vs_gpu` PASS — max-abs diff 1.31e-7 (envelope 1e-6), cosine floor 0.999999; `cuda_rank_equivalence_spot_check` PASS (top-3 ids identical); fail-loud without GPU. Mixed-precision (F16/BF16) profile remains not_run. HOLD: cuda-only closure carries upstream-inherent dual cudarc 0.19.10+0.17.8 (via ug-cuda←candle-ug weak dep, default tree unaffected) — revisit on candle 0.12."
     },
     {
       "id": "RQ-10",
@@ -383,7 +383,7 @@
         "T-EMB-03"
       ],
       "status": "executed_partial",
-      "evidence": "Chunking pipeline qualified: t_emb_03_long_document_chunking, t_emb_03_chunking_offsets_and_bounds (e5_small.rs), long_memory_projects_one_row_per_chunk, chunked_rebuild_supersedes_as_unit (projector.rs). Weight-gated tail tests SKIP without artifacts; GPU profile deferred."
+      "evidence": "Chunking pipeline qualified: t_emb_03_long_document_chunking, t_emb_03_chunking_offsets_and_bounds (e5_small.rs), long_memory_projects_one_row_per_chunk, chunked_rebuild_supersedes_as_unit (projector.rs). Weight-gated tail tests SKIP without artifacts; GPU (F32) profile executed 2026-10-26 (see RQ-09); mixed-precision profile remains not_run."
     },
     {
       "id": "RQ-11",

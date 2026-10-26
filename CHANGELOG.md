@@ -5,7 +5,15 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-26 — fix: sccache-wrap.sh fallback + fresh-machine offline-install proof
+## 2026-10-26 — feat: CUDA/GPU inference profile (opt-in, CPU default frozen)
+
+### Host-native RTX 5090 sm_120 / CUDA 13.4; no containers
+- New `cuda` feature (candle-core/candle-nn cuda) + explicit device constructor; CPU default byte-identical (31+2 green, dup-tree default byte-identical).
+- GPU tests green: max-abs 1.31e-7 (envelope 1e-6), ranks identical, VRAM stated. No cudnn (verified unneeded).
+- HOLD: cuda-only dual versions (cudarc/gemm/libloading/safetensors/pulp/yoke — upstream-inherent via ug-cuda, inert, revisit candle 0.12).
+- RQ-09/RQ-10 F32 deltas applied (mixed-precision not_run). Review Approved. Gate green; cuda native surface unaudited follow-up.
+
+## 5ea7434 (2026-10-26) — fix: sccache-wrap.sh fallback + fresh-machine offline-install proof
 
 ### Clean ubuntu:24.04, pure-HEAD archive, `--network=none` serving proofs
 - Release build green (515s, 519 units, 328MB binary); daemon idle-exit 0; stdio recall roundtrip exit 0; 6/6 digests OK. Prior BLOCKED reports superseded, not rewritten.

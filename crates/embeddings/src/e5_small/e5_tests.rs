@@ -18,7 +18,7 @@ fn load_fixture() -> serde_json::Value {
 /// run offline against real weights. Returns false (skip) when artifacts are
 /// not present in tmp/e5-artifacts (CI without network). The artifacts live
 /// at the workspace root, two levels above this crate's manifest dir.
-fn populate_cache(cache: &ArtifactCache, _guard: &tempfile::TempDir) -> bool {
+pub(super) fn populate_cache(cache: &ArtifactCache, _guard: &tempfile::TempDir) -> bool {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/e5-artifacts");
     if !src.join("model.safetensors").exists() {
         return false;
@@ -35,7 +35,7 @@ fn populate_cache(cache: &ArtifactCache, _guard: &tempfile::TempDir) -> bool {
     true
 }
 
-fn test_cache() -> (ArtifactCache, tempfile::TempDir) {
+pub(super) fn test_cache() -> (ArtifactCache, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     (ArtifactCache::new(dir.path()), dir)
 }

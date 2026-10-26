@@ -15,6 +15,8 @@ use crate::recipe::Role;
 use ltmrs_domain::id::ModelFingerprint;
 
 mod adapter;
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests;
 #[cfg(test)]
 mod e5_tests;
 

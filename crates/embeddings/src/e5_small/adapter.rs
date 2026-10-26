@@ -16,7 +16,18 @@ use crate::recipe::{Normalization, Role};
 impl E5SmallAdapter {
     /// Load from a verified artifact directory (digests checked by the cache).
     /// Returns an actionable error for unsupported recipes instead of trying.
+    ///
+    /// Frozen CPU path: production default, byte-identical with or without
+    /// the `cuda` feature (see the CUDA report: default-feature check green).
     pub fn load_verified(dir: &Path) -> ArtifactResult<Self> {
+        Self::load_verified_on_device(dir, &Device::Cpu)
+    }
+
+    /// Load from a verified artifact directory onto an explicit device
+    /// (RQ-09/RQ-10 GPU leg). The ONLY way to reach CUDA inference: callers
+    /// pass `Device::new_cuda(0)` here; nothing in the daemon/service path
+    /// calls this, so production can never silently switch devices.
+    pub fn load_verified_on_device(dir: &Path, device: &Device) -> ArtifactResult<Self> {
         let recipe = e5_small_recipe();
 
         // Task 10: validate the pinned recipe before touching any weights.
@@ -29,13 +40,12 @@ impl E5SmallAdapter {
             })?);
 
         let weights_path = dir.join("model.safetensors");
-        let device = Device::Cpu;
         let weights: std::collections::HashMap<String, Tensor> =
-            candle_core::safetensors::load(&weights_path, &device).map_err(|e| {
+            candle_core::safetensors::load(&weights_path, device).map_err(|e| {
                 ArtifactError::Download(recipe.id.clone(), format!("safetensors: {e}"))
             })?;
 
-        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let vb = VarBuilder::from_tensors(weights, DType::F32, device);
 
         let config = Self::read_bert_config(dir)?;
         let model = BertModel::load(vb, &config).map_err(|e| {
