@@ -11,7 +11,9 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Serve MCP over stdio (default, no arguments).
-    Stdio { socket: Option<String> },
+    Stdio {
+        socket: Option<String>,
+    },
     /// Run the shared daemon: bare form ensures it is serving and exits,
     /// `--foreground` serves inline until idle/SIGTERM (supervisors).
     Daemon {
@@ -19,9 +21,14 @@ pub enum Command {
         idle_ms: Option<u64>,
     },
     /// Print a knowledge-base snapshot from a store.
-    Library { store: Option<String> },
+    Library {
+        store: Option<String>,
+    },
     /// Run the visualizer (wired in a later slice).
-    Visualize { foreground: bool, port: Option<u16> },
+    Visualize {
+        foreground: bool,
+        port: Option<u16>,
+    },
     /// Install/update the managed skill (wired in a later slice).
     InstallSkill,
     /// Bind this checkout to a stable project identity (Wave A3b):
@@ -32,7 +39,9 @@ pub enum Command {
         name: Option<String>,
     },
     /// Show this checkout's bound identity (bind file + env override).
-    ProjectStatus { root: Option<String> },
+    ProjectStatus {
+        root: Option<String>,
+    },
     /// Attach a legacy bucket to this checkout's bound identity (Wave A3c):
     /// records `--slug` in the id's `legacy_slugs` (explicit intent, warns
     /// on slugs shared with other identities).
@@ -43,7 +52,14 @@ pub enum Command {
     },
     /// Install the opt-in legacy `lemma` executable shim.
     InstallShim,
-    /// Download + verify the pinned E5 embedding artifacts into the managed home.
+    /// Hook: inject budget-capped recall into a host session start
+    /// (Slice B; reads one JSON object on stdin, fail-open).
+    HookInject,
+    /// Hook: extract durable findings from a transcript tail
+    /// (Slice B; reads one JSON object on stdin, fail-open).
+    HookExtract,
+    /// Install the opt-in hook snippets + enable hooks.json.
+    InstallHooks,
     ProvisionModels,
     /// Print help to stdout.
     Help,
@@ -98,6 +114,9 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         ProvisionModels,
         Daemon,
         Project,
+        HookInject,
+        HookExtract,
+        InstallHooks,
     }
     let mut selected: Option<Selected> = None;
     let mut select = |next: Selected| -> Result<(), CliError> {
@@ -178,6 +197,11 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             }
             // Daemon subcommand (Part I §7): `ltmrs daemon [--foreground]`.
             "daemon" => select(Selected::Daemon)?,
+            // Slice B hooks: `hook-inject`, `hook-extract`, `install-hooks`
+            // (positional words, like `daemon` above).
+            "hook-inject" => select(Selected::HookInject)?,
+            "hook-extract" => select(Selected::HookExtract)?,
+            "install-hooks" => select(Selected::InstallHooks)?,
             other if other.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown flag: {other}")));
             }
@@ -259,6 +283,26 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 ));
             }
             Ok(Command::InstallShim)
+        }
+        Some(Selected::HookInject) => {
+            if store.is_some() || socket.is_some() || foreground || port.is_some() {
+                return Err(CliError::Usage("hook-inject takes no options".to_string()));
+            }
+            Ok(Command::HookInject)
+        }
+        Some(Selected::HookExtract) => {
+            if store.is_some() || socket.is_some() || foreground || port.is_some() {
+                return Err(CliError::Usage("hook-extract takes no options".to_string()));
+            }
+            Ok(Command::HookExtract)
+        }
+        Some(Selected::InstallHooks) => {
+            if store.is_some() || socket.is_some() || foreground || port.is_some() {
+                return Err(CliError::Usage(
+                    "install-hooks takes no options".to_string(),
+                ));
+            }
+            Ok(Command::InstallHooks)
         }
         Some(Selected::ProvisionModels) => {
             if store.is_some() || socket.is_some() || foreground || port.is_some() {
@@ -408,6 +452,9 @@ Commands (default with no arguments: stdio):
   -vis, --visualize       Run the visualizer [--fg] [-p PORT | --port PORT]
   --install-skill         Install/update the managed skill
   --install-shim          Install the opt-in legacy `lemma` shim
+  hook-inject             Inject budget-capped recall (host session hook, stdin JSON)
+  hook-extract            Extract findings from transcript tail (host hook, stdin JSON)
+  install-hooks           Install opt-in host hook snippets + enable hooks
   --provision-models      Download + verify pinned E5 embedding artifacts
   -h, --help              Show this help
   -V, --version           Print the version
@@ -1266,6 +1313,32 @@ mod tests {
         assert!(parse(&["project", "bind", "-lib"]).is_err());
         assert!(parse(&["-lib", "project", "status"]).is_err());
         assert!(parse(&["project", "status", "--store", "/tmp/s"]).is_err());
+    }
+
+    /// Hook subcommands parse (Slice B Phase 1 RED).
+    #[test]
+    fn hook_subcommands_parse() {
+        assert!(matches!(
+            parse(&["hook-inject"]).unwrap(),
+            Command::HookInject
+        ));
+        assert!(matches!(
+            parse(&["hook-extract"]).unwrap(),
+            Command::HookExtract
+        ));
+        assert!(matches!(
+            parse(&["install-hooks"]).unwrap(),
+            Command::InstallHooks
+        ));
+    }
+
+    /// Help documents the Slice B hook surface.
+    #[test]
+    fn help_documents_hooks() {
+        let help = help_text();
+        for flag in ["hook-inject", "hook-extract", "install-hooks"] {
+            assert!(help.contains(flag), "help must document {flag}");
+        }
     }
 
     /// Help documents the project surface.

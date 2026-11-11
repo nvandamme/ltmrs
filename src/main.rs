@@ -106,6 +106,18 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
+        Ok(Command::HookInject) => {
+            eprintln!("ltmrs: hook-inject not yet implemented (Slice B Phase 2)");
+            CliError::Unimplemented("hook-inject").exit_code()
+        }
+        Ok(Command::HookExtract) => {
+            eprintln!("ltmrs: hook-extract not yet implemented (Slice B Phase 3)");
+            CliError::Unimplemented("hook-extract").exit_code()
+        }
+        Ok(Command::InstallHooks) => {
+            eprintln!("ltmrs: install-hooks not yet implemented (Slice B Phase 4)");
+            CliError::Unimplemented("install-hooks").exit_code()
+        }
         Ok(Command::ProvisionModels) => match provision_models_command(home_dir()).await {
             Ok(text) => {
                 println!("{text}");
