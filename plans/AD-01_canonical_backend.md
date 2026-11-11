@@ -54,10 +54,10 @@ projection refreshed after canonical commits.
 
 ## Configuration
 
-- Fjall: `fjall` 3.1.10 (optimistic transactions, `PersistMode::SyncAll`).
-- Lance: `lancedb` 0.38.0 (`features = ["remote"]`, see F-01) as the
-  projection/search store.
-- Both pinned in `Cargo.toml`; see AD-02 for the full lock.
+- Fjall: `fjall` 3.1.12 (optimistic transactions, `PersistMode::SyncAll`).
+- Lance: `lancedb` 0.40.0 (`features = ["remote"]`, see F-01) as the
+  projection/search store (plus `lance` 13.0.0).
+- All pinned in `Cargo.lock`; see AD-02 for the full lock. (Probe-time versions were fjall 3.1.10 / lancedb 0.38.0; the upgrade kept the AD-01 decision — same gate evidence, re-run green.)
 
 ## Critical pitfall: Fjall `temporary(true)` deletes the data directory on drop
 

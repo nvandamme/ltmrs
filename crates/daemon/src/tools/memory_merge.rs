@@ -97,7 +97,17 @@ pub(crate) fn exec_memory_merge(
         &uuid::Uuid::NAMESPACE_URL,
         format!("ltmrs:entity:{}", envelope.operation_id.as_uuid()).as_bytes(),
     ));
-    let project = args.project.as_deref().and_then(normalize_project);
+    // Stable identity dual-write (Wave A3b, FuncReview C1): the resolved
+    // id keys eligibility, exactly like memory_add. A stable merge never
+    // produces a global row from project-scoped sources.
+    let project_id = resolved.project_id;
+    let project = args
+        .project
+        .as_deref()
+        .and_then(normalize_project)
+        .clone()
+        .or(resolved.name.clone())
+        .or(resolved.legacy.clone());
     let now = disp.clock().now_millis();
     let result = Memory {
         id: eid,
@@ -107,7 +117,7 @@ pub(crate) fn exec_memory_merge(
         description: generate_description(&args.fragment),
         fragment_type: FragmentType::Fact,
         project: project.clone(),
-        project_id: None,
+        project_id,
         source: MemorySource::Ai,
         confidence: 1.0,
         quality_score: None,
@@ -354,6 +364,65 @@ fn memory_merge_same_envelope_replays_recorded() {
         result_text(&second),
         result_text(&first),
         "replay must be byte-identical"
+    );
+}
+
+/// Stable-scope output (FuncReview C1): merging project-scoped
+/// sources under a stable identity must keep the identity on the merged
+/// row — never globalize into every scope.
+#[test]
+fn merge_keeps_stable_identity_on_result() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, id_a) = generate_project_id("shop");
+    let id = ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true);
+    let out1 = add_with(
+        &disp,
+        1,
+        "## Shop S1\n\n### Context\nFirst.",
+        Some("shop"),
+        id.clone(),
+    );
+    let out2 = add_with(
+        &disp,
+        2,
+        "## Shop S2\n\n### Context\nSecond.",
+        Some("shop"),
+        id.clone(),
+    );
+    assert!(!result_is_error(&out1));
+    assert!(!result_is_error(&out2));
+    let id1 = result_structured(&out1).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id2 = result_structured(&out2).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tool = ToolArgs::MemoryMerge(MemoryMergeArgs {
+        ids: vec![id1, id2],
+        title: "Merged".to_string(),
+        fragment: "## Merged\n\n### Context\nCombined.".to_string(),
+        project: None,
+        consolidate: false,
+    });
+    let result = run(&disp, &tool_call_with(3, tool.clone(), id), &tool);
+    assert!(
+        !result_is_error(&result),
+        "merge failed: {}",
+        result_text(&result)
+    );
+    let mid = result_structured(&result).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let eid = disp.repo().resolve_id(&mid).unwrap();
+    let merged = disp.repo().get_memories(&[eid]).unwrap().pop().unwrap();
+    assert_eq!(
+        merged.project_id,
+        Some(id_a),
+        "merged row must keep the stable identity"
     );
 }
 

@@ -128,10 +128,11 @@ impl Dispatcher {
             }
         }
         let export = Arc::new(self.repo.export_snapshot()?);
-        // Per-call scan budget: bound the decode cost of one aggregate
-        // call. Over-budget refuses visibly and is never cached — the next
-        // call re-evaluates after writes expire rows.
-        let rows = export.memories.len() + export.relations.len();
+        // Per-call scan budget: bound the decoded rows of one aggregate
+        // call (all collections via row_count). Over-budget refuses
+        // visibly and is never cached — the next call re-evaluates
+        // after writes expire rows.
+        let rows = export.row_count();
         if rows > self.max_scan_rows {
             return Err(DomainError::new(
                 DomainErrorCode::Validation,

@@ -47,8 +47,6 @@ pub enum QuotaError {
     ClientQueueFull,
     #[error("storage capacity exhausted")]
     StorageBusy,
-    #[error("scan budget exceeded")]
-    ScanBudgetExceeded,
 }
 
 /// Tracks per-client and global resource usage against the configured limits.
@@ -176,17 +174,6 @@ impl QuotaTracker {
     /// In-flight storage operations (for health).
     pub fn in_flight_storage(&self) -> usize {
         *self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-impl QuotaTracker {
-    /// Check a scan's row cost against the budget. Over-budget scans
-    /// refuse visibly (retryable busy), never truncate silently.
-    pub fn check_scan_budget(&self, rows: usize) -> Result<(), QuotaError> {
-        if rows > self.limits.max_scan_rows {
-            return Err(QuotaError::ScanBudgetExceeded);
-        }
-        Ok(())
     }
 }
 

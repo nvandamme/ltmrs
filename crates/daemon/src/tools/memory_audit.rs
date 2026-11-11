@@ -293,15 +293,6 @@ fn memory_audit_same_envelope_replays_identical() {
     assert_eq!(result_text(&second), result_text(&first));
 }
 
-#[test]
-fn scan_budget_gate_trips_over_limit() {
-    use crate::limits::{QuotaTracker, ResourceLimits};
-    let quotas = QuotaTracker::new(ResourceLimits::default());
-    assert!(quotas.check_scan_budget(10_000).is_ok());
-    let err = quotas.check_scan_budget(10_001).unwrap_err();
-    assert_eq!(err, crate::limits::QuotaError::ScanBudgetExceeded);
-}
-
 /// Configured scan caps are honored: a 2-row store refuses under a 1-row
 /// dispatcher cap and serves under the default cap (not the hardcoded
 /// default — the configured value wins).

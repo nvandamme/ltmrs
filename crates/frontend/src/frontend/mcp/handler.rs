@@ -127,20 +127,13 @@ impl ServerHandler for LtmrsFrontend {
     }
 }
 
-/// Tools that mutate canonical memory state (upstream calls notifyMemoryChange
-/// after these). backup_restore replaces the whole store, so hosts must
-/// re-observe after it above all others.
+/// Tools whose successful calls emit `tools/list_changed` so hosts
+/// re-observe. Delegates to the single compat predicate
+/// (`ToolName::notifies_mutation`) — never a parallel string list that
+/// drifts from `mutates_store()`. Reads stay silent (counters re-observed
+/// via recall); every structural mutation notifies.
 pub(crate) fn is_mutating_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "memory_add"
-            | "memory_update"
-            | "memory_feedback"
-            | "memory_forget"
-            | "memory_merge"
-            | "memory_relate"
-            | "backup_restore"
-    )
+    ltmrs_compat::lemma::tool_args::ToolName::parse(name).is_some_and(|t| t.notifies_mutation())
 }
 
 /// Convert an IPC response into a shaped MCP `CallToolResult`.

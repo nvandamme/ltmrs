@@ -1,7 +1,7 @@
 # ltmrs - Part III: Quality Assurance, Tests, Benchmarks and Conformance
 
-**Revision:** 2.0, 2026-09-15  
-**Status:** test specification; product tests and benchmarks not executed  
+**Revision:** 2.0, 2026-09-15; evidence partial per 2026-11-11 (see §11 boxes + WP-12/13 open items)
+**Status:** test specification; product suites + bench legs executed, qualification partial (S8 open)
 **Companions:** [Design and concepts](01_design_and_concepts.md), [Implementation guide](02_implementation_guide.md)
 
 ## 1. Quality model

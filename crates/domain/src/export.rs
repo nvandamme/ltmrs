@@ -37,6 +37,22 @@ impl CanonicalExport {
         self.history.sort_by_key(|h| h.id);
     }
 
+    /// Row budget for the aggregate scan gate (Part I §10.2a): the sum
+    /// over every filled collection. `export_snapshot` fills memories +
+    /// relations today (guides/sessions load via separate repo getters);
+    /// the sum stays correct as more collections fill.
+    pub fn row_count(&self) -> usize {
+        self.memories.len()
+            + self.relations.len()
+            + self.guides.len()
+            + self.sessions.len()
+            + self.feedback.len()
+            + self.suggestions.len()
+            + self.projects.len()
+            + self.archives.len()
+            + self.history.len()
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }

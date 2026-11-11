@@ -1,7 +1,7 @@
 # ltmrs - Part II: Implementation Guide
 
-**Revision:** 2.0, 2026-09-15  
-**Status:** ordered work plan, not implemented code  
+**Revision:** 2.0, 2026-09-15; §20 rewritten delivered + WP-12/13 split into executed/open 2026-11-11 (02 §21 review)
+**Status:** ordered work plan; S0–S7 delivered, S8 open (WP-12 qualification + WP-13 release)
 **Authority:** [Part I](01_design_and_concepts.md) defines the contracts; [Part III](03_quality_tests_benchmarks_conformance.md) defines the evidence.
 
 ## 1. How to use this guide
@@ -236,7 +236,7 @@ Rust snippets and commands in this document are design-level examples or planned
 - [x] Bind implicit legacy sessions per channel; add an explicit native session handle path without changing legacy schemas.
 - [x] Define reconnect/lease/idle-exit behavior and session abandonment rules; preserve history across restart.
 - [x] Add bounded request/response frames, streamed large results, per-client quotas and cancellation handling.
-- [x] Bound aggregate scan cost per call (`max_scan_rows`, Part I §10.2a): generation-gated single-entry snapshot cache on the dispatcher, commit-hook invalidation, visible busy refusal over budget. (Dispatcher::scan_snapshot + invalidate_scan_cache + limits::max_scan_rows/check_scan_budget; scope/budget tests green, daemon suite 322/322.)
+- [x] Bound aggregate scan cost per call (`max_scan_rows`, Part I §10.2a): generation-gated single-entry snapshot cache on the dispatcher, commit-hook invalidation, visible busy refusal over budget. (Dispatcher::scan_snapshot + invalidate_scan_cache + limits::max_scan_rows (single enforcement at the dispatcher; row_count over the decoded export); scope/budget tests green, daemon suite 355/355.)
 - [x] Coordinate shutdown/restore with pending commands and background jobs; keep a receipt available for a committed request whose connection disappears.
 - [x] Add health/doctor output showing readiness, active store, projection state and resource budgets without dumping memory contents.
 
@@ -430,19 +430,19 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 - [x] Record durability, queue time, conflicts, retries, projection lag, maintenance state, disk growth and memory alongside throughput. (Partial: queue time, failure/conflict counts from histories, store dir bytes, declared write-tx durability mode; projection lag/retries/maintenance honestly not-applicable in the storage boundary; RSS delta now recorded per run in all three legs — `run_put_get`, closed-loop, open-loop (`ExperimentSummary.rss_delta_kb` via Linux procfs + `rss_delta_kb` helper, `None` off-Linux; tests `resource_sample_reports_rss_when_available`, `load_run_records_rss_delta`); per-op CPU/fsync-cost still unmeasured.)
 - [x] Run fault and soak tests at steady state, not only on a freshly created unfragmented database. (Partial, executed 2026-09-28: fault-injection point tests green — injected_migration_fault_fails_atomically, injected_unknown_outcome_leaves_store_consistent (both ported, still green in crates/service), persist-barrier fault tests; kill/reopen on fragmented state green; 1000-op deterministic soak green; sustained racing-write load consistency green; Fjall + Lance kill/reopen suites green. Names retired with src/storage in 980752b (workspace split): fjall_kill_reopen_fragmented_state, fjall_soak_mixed_ops_then_kill, fjall_sustained_write_load_stays_consistent no longer resolve — the pattern was ported, not the names. Executed 2026-10-26: soak_mixed_ops_with_maintenance_then_kill (5000 seeded mixed ops + 11 optimize passes + kill/reopen at op 3500 + generation rotation with reaper proof, steady-state +1.8KiB/op). No long-run clock-time soak harness and no fault injection under sustained load: those remain not_run; see benchmarks.toml [[not_run]].)
 - [x] Build development and held-out retrieval labels, split by topic/project to prevent leakage. (Partial: schema + structural validator + 10-case safety fixture with disjoint topics/projects; synthetic 300-case known-answer corpus built+executed 2026-09-28 — experiments/quality/retrieval-calibration.json via tools/gen_calibration_corpus.py, topic-disjoint dev/heldout, paraphrase queries with 0.63 mean shared tokens; human-reviewed 300-case corpus still open.)
-- [x] Run ablations for lexical, dense, hybrid, priority, graph and MMR at the same context budget. (Partial: runner takes any retrieval closure at fixed budgets; lexical, deterministic-engine and real-E5 legs executed; remaining legs not_run.)
+- [x] Run ablations for lexical, dense, hybrid, priority, graph and MMR at the same context budget. (Partial: runner takes any retrieval closure at fixed budgets; lexical, deterministic-engine and real-E5 legs executed; DenseExact/HybridRrf/Priority/Mmr landed 2026-11-11 (14/14 quality green, src/bench/quality/ablation.rs); Graph blocked — frozen corpus has no relation edges; UpstreamReference blocked on owner decision.)
 - [x] Measure no-answer false positives, obsolete advice, conflict coverage and cross-scope leakage in addition to conventional IR scores. (Pure metrics + per-split aggregates; zero-tolerance leakage/obsolete asserts in the executed legs.)
 - [x] Calibrate candidate pools, thresholds, model choice and inference scheduling only on the development split. (Executed 2026-09-28 on the synthetic corpus: 0.70 candidate preserves full dev+heldout retention with thin margin to 0.75 degradation; default held at 0.0 — absolute E5 similarities saturate high so ranking does the work, and the margin is too thin on synthetic data to move the default. Changing it needs owner approval. Request default is 0.0 since WP-13 I6 — a model-independent anti-noise floor filtering anti-correlated rows, not a calibrated threshold; None remains the explicit opt-out for calibration runs. See DEFAULT_MIN_SIMILARITY + default_threshold_filters_negative_dense_noise.)
 - [x] Publish raw results and analysis scripts with every architecture/ranking decision. (Partial: raw JSONL histories + JSON summaries + op-stream export + upstream driver published; no ranking decisions made yet.)
 
 ### Open evidence (WP-12 stays open until these run)
 
-- [ ] CPU/RSS/fsync-cost measurement alongside throughput (see task line 430: unmeasured).
-- [ ] Long-run soak + fault-under-load harness (see task line 431: no long-run harness; `benchmarks.toml [[not_run]] fault-soak-steady-state`).
+- [ ] Per-op CPU + fsync-cost measurement (RSS landed per task line 430: `rss_delta_kb` in all three bench legs).
+- [ ] Long-run soak + fault-under-load harness (`src/bench/soak.rs` skeleton landed 2026-11-11: steady-state accounting + kill/restart; machine-gated clock-time run still open; `benchmarks.toml [[not_run]] fault-soak-steady-state`).
 - [ ] Human-reviewed ≥300-case quality corpus (see task line 432: synthetic substituted, human review open).
-- [ ] Remaining ablation legs — DenseExact/HybridRrf/Priority/Graph/Mmr/UpstreamReference (see task line 433; `benchmarks.toml [[not_run]] ablation-*`).
+- [ ] Remaining ablation legs — Graph (blocked: no edges in corpus) + UpstreamReference (blocked: owner decision) (see task line 433; `benchmarks.toml [[not_run]] ablation-graph-upstream`).
 - [ ] Ranking decisions on frozen held-out labels (see task line 436: none made yet).
-- [ ] BEIR full run, contended-write mix, search-load legs (see `benchmarks.toml [[not_run]]`).
+- [ ] BEIR full run (machine-gated ~5h CPU); contended-write mix + search-load legs (harnesses landed 2026-11-11: RMW hot-skew + counters, run_search_threaded; reference runs open; see `benchmarks.toml [[not_run]]`).
 
 ## 18. WP-13 - Release, documentation and evidence closure
 
@@ -452,7 +452,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 ### Tasks
 
-- [x] Run formatting, lint, unit, integration, property, recovery, conformance and target-specific build suites. (Executed 2026-09-28: `cargo fmt -- --check` clean, `cargo clippy --all-targets -- -D warnings` clean, `cargo test --workspace --all-targets` 664 lib + 2 smoke green (7 ignored); compat fixtures run in-suite; upstream-differential bench not re-run — no contract change, honest not_run.)
+- [x] Run formatting, lint, unit, integration, property, recovery, conformance and target-specific build suites. (Executed 2026-09-28 baseline + continuously since: see RQ-27 evidence + latest release bundle for current suite record — 2026-11-11: fmt clean, workspace clippy `-D warnings` clean, gate-audit 10/10 PASS, full `cargo test --workspace` green. Compat fixtures run in-suite; upstream-differential bench not re-run — no contract change, honest not_run.)
 - [x] Check the CPU binary and resolved dependencies against the audited native-code policy. (No dependency changes across the release delta — Cargo diff is the version label only; getrandom audit stands; 594-component SBOM has no GPL/AGPL/proprietary; see reports/release-01/INDEX.md.)
 - [x] Validate an offline installation from a fresh user directory with pre-provisioned model artifacts and no network access. (Enforced via `unshare -Unr`: provision-in-netns control fails loudly exit 1; full serving flow with pre-provisioned E5 exit 0 and zero routes. Reqwest audit: only the provision CLI builds network clients.)
 - [x] Test migration from the prior ltmrs schema and supported Lemma sources; verify rollback instructions. (Migration unit suites + legacy-refusal tests green; rollback instructions written in README Operations and executed live end-to-end: backup/restore/rollback with state assertions, exit 0, same session.)

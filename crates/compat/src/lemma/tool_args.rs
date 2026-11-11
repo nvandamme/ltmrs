@@ -121,8 +121,31 @@ impl ToolName {
             _ => return None,
         })
     }
-}
 
+    /// Whether a successful call must emit a `tools/list_changed`
+    /// notification so hosts re-observe. Structural mutations only:
+    /// reads change counters (re-observed via recall) but must not
+    /// fan out a notification per read. Single source of truth for
+    /// the frontend notify gate (handler delegates here — never a
+    /// parallel string list that drifts).
+    pub fn notifies_mutation(&self) -> bool {
+        !matches!(
+            self,
+            Self::MemoryRead
+                | Self::MemoryStats
+                | Self::MemoryAudit
+                | Self::MemoryLibrary
+                | Self::SemanticSearch
+                | Self::GuideGet
+                | Self::SessionStats
+                | Self::ConflictScan
+                | Self::ProactiveAnalysis
+                | Self::ProjectAnalytics
+                | Self::BackupCreate
+                | Self::BackupPreview
+        )
+    }
+}
 /// The response format selection (frozen enum: markdown | json).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

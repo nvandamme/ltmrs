@@ -200,7 +200,7 @@
         "enhancement_ledger": "executed_passed"
       },
       "owner_workpackage": "WP-08",
-      "notes": "Scope 2026-11-11 (Part I §10.2/§10.2a): memory_audit_excludes_foreign_stable_row + memory_audit_sees_write_between_calls + scan_budget_gate_trips_over_limit (daemon 322/322, 2026-11-11) Retry 2026-11-11: memory_audit_same_envelope_replays_identical (daemon, 2026-11-11) Enhancement 2026-11-11: ledger DEV-016 (baseline/lemma-0.21.0/deviations.json; DEV-016 proposed-pending-owner-signoff). Oracle 2026-11-11: auditMemory/formatAuditReport pure-oracle legs green (memory_audit.rs:350,478 vs pure_functions.json)."
+      "notes": "Scope 2026-11-11 (Part I §10.2/§10.2a): memory_audit_excludes_foreign_stable_row + memory_audit_sees_write_between_calls + scan_snapshot_honors_configured_budget (daemon 322/322, 2026-11-11) Retry 2026-11-11: memory_audit_same_envelope_replays_identical (daemon, 2026-11-11) Enhancement 2026-11-11: ledger DEV-016 (baseline/lemma-0.21.0/deviations.json; DEV-016 proposed-pending-owner-signoff). Oracle 2026-11-11: auditMemory/formatAuditReport pure-oracle legs green (memory_audit.rs:350,478 vs pure_functions.json)."
     },
     {
       "name": "memory_library",

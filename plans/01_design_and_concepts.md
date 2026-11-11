@@ -1,7 +1,7 @@
 # ltmrs - Part I: Design and Concepts
 
-**Revision:** 2.0, reviewed 2026-09-15  
-**Status:** implementation specification; no backend selected by experiment yet  
+**Revision:** 2.0, reviewed 2026-09-15; §10.2/10.2a/§7.3 added + §13 reconciled 2026-11-11 (02 §21 review)
+**Status:** implementation specification; backend selected by experiment (AD-01 DECIDED Option B 2026-09-16; "no backend selected" line above is the pre-decision baseline)
 **Supersedes:** the preceding 57-section *Revised Implementation and Validation Plan*  
 **Companions:** [Implementation guide](02_implementation_guide.md) and [Quality, tests, benchmarks and conformance](03_quality_tests_benchmarks_conformance.md)
 
@@ -371,7 +371,7 @@ An empty query follows upstream list/priority behavior. A nonempty no-match quer
 
 ### 10.2a Aggregate scan budget and snapshot cache
 
-Per-call scan cost is bounded independently of connection concurrency: `max_scan_rows` (default 10,000) caps the canonical rows one aggregate call may decode. Over-budget scans refuse with a retryable busy naming the bound, never truncate silently, and are never cached. The aggregate snapshot is a single-entry `(live generation, export)` cache: hits serve repeated scans without re-decode; any committed mutation invalidates; a restore generation change misses structurally, never serving the pre-restore store. Tests: `scan_budget_gate_trips_over_limit`, `memory_audit_sees_write_between_calls`, plus per-tool foreign-row exclusion tests.
+Per-call scan cost is bounded independently of connection concurrency: `max_scan_rows` (default 10,000) caps the canonical rows one aggregate call may decode. Over-budget scans refuse with a retryable busy naming the bound, never truncate silently, and are never cached. The aggregate snapshot is a single-entry `(live generation, export)` cache: hits serve repeated scans without re-decode; any committed mutation invalidates; a restore generation change misses structurally, never serving the pre-restore store. Tests: `scan_snapshot_honors_configured_budget`, `memory_audit_sees_write_between_calls`, plus per-tool foreign-row exclusion tests.
 
 ### 10.3 Scoring correction
 
@@ -481,7 +481,7 @@ Import into staging. Preserve all supported fields/IDs, record every unsupported
 |---|---|---|
 | AD-01 Canonical backend A or B | DECIDED: Option B (Fjall + Lance) — see plans/AD-01_canonical_backend.md | WP-02 hard gates and Part III traces |
 | AD-02 Exact crate/feature/toolchain lock | CLOSED (WP-00): toolchain 1.99.0 (`rust-toolchain.toml:4`); resolved fjall 3.1.12, lance 13.0.0, lancedb 0.40.0, candle-core 0.11.0, tokenizers 0.22.2, rmcp 3.7.0 | Reproducible local CPU build and dependency report |
-| AD-03 Legacy contract baseline | CLOSED (WP-00): Lemma 0.21.0 @ d30a816; 29-tool static inventory + wire captures in `baseline/lemma-0.21.0/` | WP-00 generated snapshot and upstream transcripts |
+| AD-03 Legacy contract baseline | CLOSED (WP-00): Lemma 0.21.0 @ d30a816; 29-tool static inventory + deterministic wire snapshots in `baseline/lemma-0.21.0/` (event-driven notifications documented-not-captured, by design) | WP-00 generated snapshot and upstream transcripts |
 | AD-04 Default Candle recipe | CLOSED: E5-small qualified recipe — 384-dim, 512-token window, `query: `/`passage: ` prefixes, MaskedMean + L2 pooling, greedy-unit chunking (`crates/embeddings/src/manifest.rs:78-90`; tests `recipe_matches_manifest_identity`, `recipe_is_the_e5_small_reference`) | Reference equivalence and retrieval quality suite |
 | AD-05 Score/abstention thresholds | CLOSED (frozen): Jaccard dedup >= 0.80 + autolink band 0.25..0.95 (`crates/search/src/similarity.rs:27-30`; test `jaccard_recipe_basics`) | Development tuning plus frozen held-out evaluation |
 | AD-06 FTS freshness/null-vector behavior | CLOSED: `SearchState` Complete/Partial/Unavailable (`crates/search/src/search/backend.rs:194-203`); nullable lexical rows + NULL probe/backfill (`backfill_null_vectors` workers.rs:385; test `backfill_requeues_lexical_null_vector_rows`; `null_vector_row_round_trips_and_filters`) | Local create/update/delete/search capability probes |

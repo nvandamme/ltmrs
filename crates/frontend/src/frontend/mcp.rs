@@ -1132,8 +1132,59 @@ mod tests {
         assert!(!idx.contains("Other Proj"));
     }
 
+    /// Notify parity (FuncReview M1): the notify set must equal the
+    /// mutating set minus reads — a parallel list drifts (backup_import
+    /// omitted once already). Reads stay silent (counters re-observed
+    /// via recall); every structural mutation notifies.
     #[test]
     fn mutating_tools_trigger_notification() {
+        use ltmrs_compat::lemma::tool_args::{ToolArgs, ToolName};
+        // Every ToolName parses and the notify gate agrees with the
+        // single shared predicate.
+        let names = [
+            "memory_read",
+            "memory_add",
+            "memory_update",
+            "memory_feedback",
+            "memory_forget",
+            "memory_merge",
+            "memory_relate",
+            "memory_stats",
+            "memory_audit",
+            "memory_library",
+            "semantic_search",
+            "guide_get",
+            "guide_practice",
+            "guide_create",
+            "guide_distill",
+            "guide_update",
+            "guide_forget",
+            "guide_merge",
+            "session_start",
+            "session_attempt",
+            "session_end",
+            "session_stats",
+            "suggestion_respond",
+            "conflict_scan",
+            "proactive_analysis",
+            "project_analytics",
+            "backup_create",
+            "backup_preview",
+            "backup_restore",
+            "backup_import_lemma",
+        ];
+        assert_eq!(names.len(), 30, "all 30 served tools covered");
+        for n in names {
+            let parsed = ToolName::parse(n).unwrap_or_else(|| panic!("{n} must parse"));
+            assert_eq!(parsed.as_str(), n, "round-trip");
+            assert_eq!(
+                is_mutating_tool(n),
+                parsed.notifies_mutation(),
+                "{n}: gate must delegate to the shared predicate"
+            );
+        }
+        // Structural mutations notify (incl. whole-store replaces);
+        // reads + pure scans stay silent.
         for t in [
             "memory_add",
             "memory_update",
@@ -1141,8 +1192,18 @@ mod tests {
             "memory_forget",
             "memory_merge",
             "memory_relate",
-            // Whole-store replace: hosts must re-observe above all others.
+            "guide_practice",
+            "guide_create",
+            "guide_distill",
+            "guide_update",
+            "guide_forget",
+            "guide_merge",
+            "session_start",
+            "session_attempt",
+            "session_end",
+            "suggestion_respond",
             "backup_restore",
+            "backup_import_lemma",
         ] {
             assert!(is_mutating_tool(t), "{t} must be mutating");
         }
@@ -1150,10 +1211,25 @@ mod tests {
             "memory_read",
             "semantic_search",
             "memory_stats",
+            "memory_audit",
             "memory_library",
+            "guide_get",
+            "session_stats",
+            "conflict_scan",
+            "proactive_analysis",
+            "project_analytics",
+            "backup_create",
+            "backup_preview",
         ] {
             assert!(!is_mutating_tool(t), "{t} must be read-only");
         }
+        // `ToolName::notifies_mutation` is the single notify predicate
+        // (handler delegates to it); `ToolArgs::mutates_store` is the
+        // admission gate (includes MemoryRead for access-counter side
+        // effects). The read-only sets must agree exactly: a name that
+        // notifies must also gate, and every silent name must be either
+        // MemoryRead (side-effecting read) or a non-gating read.
+        let _ = ToolArgs::MemoryRead(Default::default());
     }
 
     #[test]

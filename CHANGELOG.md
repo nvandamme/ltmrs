@@ -5,6 +5,15 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2026-11-12 — fix: double-review gap closure (merge scope, notify parity, scan budget) + plan/ledger remnant sweep
+- FuncReview C1 (!!! S0): `exec_memory_merge` wrote `project_id: None` while `memory_add` dual-writes the stable id — merged rows globalized out of their scope. Fix threads `resolved.project_id` + name/legacy fallback (Wave A3b parity); RED test `merge_keeps_stable_identity_on_result` (pre-fix: merged row `None`, expected `Some(id)`).
+- FuncReview M1 (!! S1): `is_mutating_tool` was a 7-name parallel string list that drifted from `mutates_store()` (backup_import_lemma + all guide/session/suggestion mutations never notified). Fix: single `ToolName::notifies_mutation()` predicate in compat, handler delegates; notify parity test covers all 30 served tools (round-trip + gate==predicate per tool + mutating/silent sets).
+- FuncReview N1 (! S2): scan budget counted only memories+relations while guides/sessions rode free via a duplicated `QuotaTracker::check_scan_budget` that nothing called. Fix: single enforcement at `Dispatcher::scan_snapshot` over `CanonicalExport::row_count()` (all 9 collections); removed `ScanBudgetExceeded` + orphan gate test (covered by `scan_snapshot_honors_configured_budget`).
+- Arch stray (! S2): deleted `crates/search/src/similarity.rsx` (stale monolith-era twin of `similarity.rs`, unreferenced; `mod similarity` resolves to `.rs`).
+- Remnant sweep: deleted `scan_budget_gate_trips_over_limit` renamed in `conformance_matrix.json` + `traceability.json` RQ-22 evidence; `check_scan_budget`/`ScanBudgetExceeded`/`similarity.rsx` zero hits repo-wide; orphan-name sweep clean.
+- Plans (one-review rule): Part I §10.2a test names + §13 AD-03 wording + header; Part II WP-04 budget ref + ablation/soak/BEIR open-item refresh + delivered-status header; Part III qualification-partial header; AD-01 resolved versions (fjall 3.1.12 / lancedb 0.40.0 / lance 13.0.0, Cargo.lock).
+- Proof: daemon lib 355/355, frontend lib 130/130, compat 46/46, domain 56/56; `cargo fmt -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo xtask gate-audit` 13/13 PASS.
+
 ## 2026-11-11 — fix: backup retry cells (content-addressed digest + preview re-READY)
 - Impl 2026-11-11: closed the last 2 retry cells — backup_create/preview retry semantics are real (content-addressed digest replays identical; preview re-reports READY; test backup_create_preview_same_envelope_replays_identical). Matrix 211->213/240; remaining 26 not_run are legacy_oracle cells needing provisioned upstream runs. Proof: daemon lib 355/355, clippy clean, fmt clean, gate-audit 13 PASS lines.
 
