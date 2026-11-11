@@ -22,7 +22,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ## Open — qualification and release (S8)
 
-- [ ] WP-12 — Qualification, quality and performance (S8; matrix 211/240 executed_passed 2026-11-11 (+scope 18, +retry 24, +stragglers 3, +enhancement 30, +oracle 2 pure; remaining: 28 legacy_oracle needing provisioned upstream, 2 honest read-retry N/A); benchmarks harness v3 (RMW/ablation/soak legs landed); Part III §11 open items tracked in-plan)
+- [ ] WP-12 — Qualification, quality and performance (S8; matrix 213/240 executed_passed 2026-11-11 (+scope 18, +retry 24, +stragglers 3, +enhancement 30, +oracle 2 pure; remaining: 28 legacy_oracle needing provisioned upstream, 2 honest read-retry N/A); benchmarks harness v3 (RMW/ablation/soak legs landed); Part III §11 open items tracked in-plan)
 - [ ] WP-13 — Release, documentation and evidence closure (S8; evidence bundle exit 0 on clean checkout; publish needs owner approval)
 - [ ] DEV-008 follow-up — Upstream instructional UX (seed fragments,
   coaching blocks, technology autodetect, distill suggestion).

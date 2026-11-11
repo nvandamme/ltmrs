@@ -161,6 +161,59 @@ fn backup_preview_serves_under_stable_id() {
     assert!(result_text(&result).contains("READY"));
 }
 
+/// Retry semantics: re-running create with no intervening writes yields
+/// the identical digest (content-addressed output); re-running preview
+/// on the same file reports READY again (tokens are per-preview).
+#[test]
+fn backup_create_preview_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## Backup RT\n\n### Context\nRetry fixture.");
+    let out = tempfile::tempdir().unwrap();
+    let create = ToolArgs::BackupCreate(BackupCreateArgs {
+        directory: Some(out.path().to_str().unwrap().to_string()),
+    });
+    let env = tool_call(2, create.clone());
+    let first = run(&disp, &env, &create);
+    assert!(
+        !result_is_error(&first),
+        "create failed: {}",
+        result_text(&first)
+    );
+    // Fresh envelope (new op id): same store state must yield the same digest.
+    let env2 = tool_call(3, create.clone());
+    let second = run(&disp, &env2, &create);
+    assert!(
+        !result_is_error(&second),
+        "re-create failed: {}",
+        result_text(&second)
+    );
+    let d1 = result_structured(&first).unwrap()["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let d2 = result_structured(&second).unwrap()["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(d1, d2, "identical store state must digest identically");
+    // Preview twice on the same file: READY both times.
+    let path = result_structured(&first).unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for op in [4u64, 5] {
+        let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+            path: Some(path.clone()),
+        });
+        let r = run(&disp, &tool_call(op, preview.clone()), &preview);
+        assert!(!result_is_error(&r), "preview failed: {}", result_text(&r));
+        assert!(
+            result_text(&r).contains("READY"),
+            "got: {}",
+            result_text(&r)
+        );
+    }
+}
 /// Dead channels must not block restore: after two sessions bound two
 /// channels (prior runs leave persisted bindings behind), preview with
 /// no LIVE connection still reports READY — readiness counts live

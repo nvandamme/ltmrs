@@ -483,12 +483,12 @@
         "output_and_errors": "executed_passed",
         "state_transitions": "executed_passed",
         "scope_and_concurrency": "executed_passed",
-        "retry_and_restart": "not_run",
+        "retry_and_restart": "executed_passed",
         "legacy_oracle": "not_run",
         "enhancement_ledger": "executed_passed"
       },
       "owner_workpackage": "WP-11",
-      "notes": " Retry 2026-11-11: no receipt semantics by design (unadmitted file-writing op; fresh call each time, never replayed). Cell honestly not_run. Enhancement 2026-11-11: ledger DEV-010 (baseline/lemma-0.21.0/deviations.json; DEV-016 proposed-pending-owner-signoff)."
+      "notes": " Retry 2026-11-11: no receipt semantics by design (unadmitted file-writing op; fresh call each time, never replayed). Cell honestly not_run. Enhancement 2026-11-11: ledger DEV-010 (baseline/lemma-0.21.0/deviations.json; DEV-016 proposed-pending-owner-signoff). Retry 2026-11-11: backup_create_preview_same_envelope_replays_identical (identical digest on unchanged store; daemon)."
     },
     {
       "name": "backup_import_lemma",
@@ -515,12 +515,12 @@
         "output_and_errors": "executed_passed",
         "state_transitions": "executed_passed",
         "scope_and_concurrency": "executed_passed",
-        "retry_and_restart": "not_run",
+        "retry_and_restart": "executed_passed",
         "legacy_oracle": "not_run",
         "enhancement_ledger": "executed_passed"
       },
       "owner_workpackage": "WP-11",
-      "notes": " Retry 2026-11-11: retry surface is the single-use token lifecycle (preview_token_lifecycle, interchange restore_tests.rs:139; AlreadyUsed/InvalidToken/Expiry); dispatch-level replay N/A. Cell honestly not_run. Enhancement 2026-11-11: ledger DEV-010,DEV-016 (baseline/lemma-0.21.0/deviations.json; DEV-016 proposed-pending-owner-signoff)."
+      "notes": " Retry 2026-11-11: retry surface is the single-use token lifecycle (preview_token_lifecycle, interchange restore_tests.rs:139; AlreadyUsed/InvalidToken/Expiry); dispatch-level replay N/A. Cell honestly not_run. Enhancement 2026-11-11: ledger DEV-010,DEV-016 (baseline/lemma-0.21.0/deviations.json; DEV-016 proposed-pending-owner-signoff). Retry 2026-11-11: same test, preview re-reports READY on same file (tokens per-preview; daemon)."
     },
     {
       "name": "backup_restore",

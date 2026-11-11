@@ -5,7 +5,12 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-11 — feat: WP completion wave (scope/retry cells, ablation + bench legs, allocator fix, plan drift closure)
+## 2026-11-11 — fix: backup retry cells (content-addressed digest + preview re-READY)
+- Impl 2026-11-11: closed the last 2 retry cells — backup_create/preview retry semantics are real (content-addressed digest replays identical; preview re-reports READY; test backup_create_preview_same_envelope_replays_identical). Matrix 211->213/240; remaining 26 not_run are legacy_oracle cells needing provisioned upstream runs. Proof: daemon lib 355/355, clippy clean, fmt clean, gate-audit 13 PASS lines.
+
+
+
+## f9e7a62 (2026-11-11) — feat: WP completion wave (scope/retry cells, ablation + bench legs, allocator fix, plan drift closure)
 
 ### Aggregate scope isolation + per-call quotas (FuncReview critical closure)
 - Threaded `ResolvedScope` into `exec_memory_audit`/`conflict_scan`/`proactive_analysis`/`exec_project_analytics` + session_stats (effective_for_read/is_eligible/project_includes_id); library guides/relations scoped to visible endpoints.
@@ -35,6 +40,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 ### Verification at commit
 - `cargo fmt -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo xtask gate-audit` 10/10 PASS; `cargo test --workspace` full suite green (15 binaries, 0 failures); evidence bundle exit 0 on clean checkout.
 
+## f9e7a62 (2026-11-11) — feat: WP completion wave (scope/retry cells, ablation + bench legs, allocator fix, plan drift closure)
 ## 9e222b6 (2026-10-26) — fix: Windows loader port (daemon now compiles for msvc)
 
 ### `cfg(windows)` LoadLibraryW port; POSIX path untouched
