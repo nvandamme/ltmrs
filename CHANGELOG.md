@@ -5,7 +5,18 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — fix: double-review gap closure (merge scope, notify parity, scan budget) + plan/ledger remnant sweep
+## 2026-11-12 — feat: Slice B silent-capture hooks (passive recall/capture, opt-in)
+
+- Phase 1: `hook-inject`/`hook-extract`/`install-hooks` CLI subcommands; `skills/hooks.rs` disabled-by-default gate; main dispatch arms.
+- Phase 2: inject attaches to the running daemon via socket (singleton-safe); shared handshake/envelope ids (fixes `frontend_mismatch`); lexical top-5 recall, 5s timeout, fail-open.
+- Phase 3: extract tails transcript to 8KB, splits marked candidates (<=5), secret pre-filter, one `memory_add` each; server Jaccard dedups reruns.
+- Phase 4: atomic `install-hooks` (marker-versioned, `Installed`/`AlreadyCurrent`/`RefusedForeign`); claude-code snippet; stdin-JSON wiring; skill opt-in paragraph.
+- Phase 5: plan-authority one-review (Part I §11.3, WP-10 task, T-HOOK-01, RQ-25); spec at `plans/2026-11-12-slice-b-silent-capture-hooks-spec.md`.
+- Proof: frontend lib 137/137, daemon lib 355/355; fmt clean; workspace clippy `-D warnings` clean.
+
+---
+
+## aaa2878 (2026-11-12) — fix: double-review gap closure (merge scope, notify parity, scan budget) + plan/ledger remnant sweep
 - FuncReview C1 (!!! S0): `exec_memory_merge` wrote `project_id: None` while `memory_add` dual-writes the stable id — merged rows globalized out of their scope. Fix threads `resolved.project_id` + name/legacy fallback (Wave A3b parity); RED test `merge_keeps_stable_identity_on_result` (pre-fix: merged row `None`, expected `Some(id)`).
 - FuncReview M1 (!! S1): `is_mutating_tool` was a 7-name parallel string list that drifted from `mutates_store()` (backup_import_lemma + all guide/session/suggestion mutations never notified). Fix: single `ToolName::notifies_mutation()` predicate in compat, handler delegates; notify parity test covers all 30 served tools (round-trip + gate==predicate per tool + mutating/silent sets).
 - FuncReview N1 (! S2): scan budget counted only memories+relations while guides/sessions rode free via a duplicated `QuotaTracker::check_scan_budget` that nothing called. Fix: single enforcement at `Dispatcher::scan_snapshot` over `CanonicalExport::row_count()` (all 9 collections); removed `ScanBudgetExceeded` + orphan gate test (covered by `scan_snapshot_honors_configured_budget`).

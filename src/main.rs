@@ -12,14 +12,15 @@ mod visualizer;
 
 use crate::visualizer::run_visualize;
 use ltmrs_frontend::cli::{
-    CliError, Command, help_text, install_shim_command, install_skill_command, parse_args,
-    project_adopt_command, project_bind_command, project_status_command, provision_models_command,
-    run_library, version_text,
+    CliError, Command, help_text, install_hooks_command, install_shim_command,
+    install_skill_command, parse_args, project_adopt_command, project_bind_command,
+    project_status_command, provision_models_command, run_library, version_text,
 };
 use ltmrs_frontend::frontend::serve::daemon::{
     daemon_idle_ms, daemon_socket_path, ensure_daemon_process, run_daemon_foreground, serve_stdio,
 };
 use ltmrs_frontend::frontend::serve::{home_dir, resolve_home, stdio_layout};
+use ltmrs_frontend::skills::hooks::{HookExtractInput, HookInjectInput};
 
 #[tokio::main]
 async fn main() {
@@ -106,18 +107,26 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
+        // Slice B hooks: read one JSON object on stdin, fail open.
         Ok(Command::HookInject) => {
-            eprintln!("ltmrs: hook-inject not yet implemented (Slice B Phase 2)");
-            CliError::Unimplemented("hook-inject").exit_code()
+            let input = read_hook_stdin();
+            let out = run_hook_inject_blocking(input).await;
+            print!("{}", out.stdout);
+            out.exit_code
         }
         Ok(Command::HookExtract) => {
-            eprintln!("ltmrs: hook-extract not yet implemented (Slice B Phase 3)");
-            CliError::Unimplemented("hook-extract").exit_code()
+            let input = read_hook_stdin();
+            let out = run_hook_extract_blocking(input).await;
+            print!("{}", out.stdout);
+            out.exit_code
         }
-        Ok(Command::InstallHooks) => {
-            eprintln!("ltmrs: install-hooks not yet implemented (Slice B Phase 4)");
-            CliError::Unimplemented("install-hooks").exit_code()
-        }
+        Ok(Command::InstallHooks) => match install_hooks_command(home_dir()) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => fail(&e),
+        },
         Ok(Command::ProvisionModels) => match provision_models_command(home_dir()).await {
             Ok(text) => {
                 println!("{text}");
@@ -177,7 +186,52 @@ async fn main() {
     std::process::exit(code);
 }
 
-/// Report an error on stderr and return its exit code.
+/// Read hook stdin (one JSON object; missing/unparseable => empty object downstream).
+fn read_hook_stdin() -> String {
+    use std::io::Read as _;
+    let mut s = String::new();
+    let _ = std::io::stdin().read_to_string(&mut s);
+    s
+}
+
+/// Parse stdin JSON into HookInjectInput, run inject (main is async).
+async fn run_hook_inject_blocking(raw: String) -> ltmrs_frontend::skills::hooks::HookOutput {
+    use ltmrs_frontend::skills::hooks::run_hook_inject;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    let input = HookInjectInput {
+        query_hint: v
+            .get("query_hint")
+            .or_else(|| v.get("prompt"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        project: v
+            .get("project")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    };
+    run_hook_inject(home_dir(), &input).await
+}
+
+/// Parse stdin JSON into HookExtractInput, run extract (main is async).
+async fn run_hook_extract_blocking(raw: String) -> ltmrs_frontend::skills::hooks::HookOutput {
+    use ltmrs_frontend::skills::hooks::run_hook_extract;
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    let input = HookExtractInput {
+        transcript_tail: v
+            .get("transcript_tail")
+            .or_else(|| v.get("transcript"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        project: v
+            .get("project")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    };
+    run_hook_extract(home_dir(), &input).await
+}
+
 fn fail(e: &CliError) -> i32 {
     eprintln!("ltmrs: {e}");
     e.exit_code()

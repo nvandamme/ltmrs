@@ -519,6 +519,17 @@ impl LtmrsFrontend {
     /// error to the host instead of silently minting a fresh operation.
     /// `resend_after_reconnect` stays conservative: only transport
     /// ambiguity flows there, never an explicit healthy-stream refusal.
+    /// Hook path (Slice B): one ToolCall round-trip for CLI hook
+    /// subcommands. Same handshake/resend machinery as MCP calls;
+    /// `legacy_explicit` follows the wire project presence.
+    pub async fn call_daemon_tool(
+        &self,
+        body: DomainRequest,
+        legacy_explicit: bool,
+    ) -> Result<IpcResponse, McpError> {
+        self.roundtrip_with_rehandshake(body, legacy_explicit).await
+    }
+
     async fn roundtrip_with_rehandshake(
         &self,
         body: DomainRequest,

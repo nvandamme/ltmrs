@@ -430,7 +430,7 @@ Ship a managed ltmrs skill and an explicit legacy-skill installation path. Recor
 
 Treat installation, host discovery, model activation and workflow behavior as four separate outcomes. Test host versions explicitly. No promise that every host reads `~/.agents/skills` identically. The native skill may describe multilingual recall; the legacy skill's English-only instruction must be preserved or listed as an intentional workflow enhancement. [S06]
 
-Match the known legacy CLI aliases including visualizer foreground/port behavior where that surface is claimed. A visualizer cannot be counted as compatible while its CLI flag only prints "coming soon."
+Opt-in host hooks (`hook-inject`/`hook-extract`, Slice B) close the passive-recall gap without changing the explicit-tools contract: disabled by default, fail-open always (exit 0, empty stdout on any failure), budget reuse via the existing per-call `scan_snapshot` bound (§10.2a) — never a new budget. `hook-extract` writes only via `memory_add` (server Jaccard dedups reruns; never update/forget/distill from a hook). Host snippets are install-time templates (claude-code verified; others documented-not-verified).
 
 ### 11.4 Data interchange
 

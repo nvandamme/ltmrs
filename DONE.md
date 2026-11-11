@@ -1,16 +1,11 @@
 # DONE.md
 
 Work completed on the current unreleased commit.
-Content before `---` is instructions — do not modify. Add entries after `## Unreleased Commit`.
-
----
-## Unreleased Commit
-
-- Double review vs Lemma target (arch + functional, ADRs kept) + plan/ADR/trackers recheck — 3 code gaps fixed, RED-first:
-- FuncReview C1 (critical): `exec_memory_merge` wrote `project_id: None` while `memory_add` dual-writes the stable id — merged rows globalized out of their scope. Fix threads `resolved.project_id` + name/legacy fallback (Wave A3b parity); RED test `merge_keeps_stable_identity_on_result` (pre-fix: merged row `None`, expected `Some(id)`).
-- FuncReview M1 (major): `is_mutating_tool` was a 7-name parallel string list that drifted from `mutates_store()` (backup_import_lemma + all guide/session/suggestion mutations never notified). Fix: single `ToolName::notifies_mutation()` predicate in compat, handler delegates; notify parity test covers all 30 served tools (round-trip + gate==predicate per tool + mutating/silent sets).
-- FuncReview N1 (minor): scan budget counted only memories+relations while guides/sessions rode free via a duplicated `QuotaTracker::check_scan_budget` that nothing called. Fix: single enforcement at `Dispatcher::scan_snapshot` over `CanonicalExport::row_count()` (all 9 collections); removed `ScanBudgetExceeded` + orphan gate test (covered by `scan_snapshot_honors_configured_budget`).
-- Arch stray: deleted untracked-parity `crates/search/src/similarity.rsx` (stale monolith-era twin of `similarity.rs`, unreferenced; `mod similarity` resolves to `.rs`).
-- Remnant sweep: zero stale refs — deleted `scan_budget_gate_trips_over_limit` renamed in both `conformance_matrix.json` and `traceability.json` RQ-22 evidence; `check_scan_budget`/`ScanBudgetExceeded`/`similarity.rsx` zero hits repo-wide; orphan-name sweep clean; gate-audit 13/13 PASS post-fix.
-- Plan one-review repairs (§10.2a test names, WP-04 budget ref, §13/§20/WP-12/13 boxes, bulk-drive/Windows/split drift, AD-01 versions) — plan authority rule: requirement change = Part I + WP + test + ledger in one review.
-- Proof: daemon lib 355/355, frontend lib 130/130, compat 46/46, domain 56/56; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -D warnings` clean; gate-audit 13/13 PASS.
+Content before `---` is instructions — do not modify. Add entries after `## Unreleased Commit`
+- Slice B silent-capture hooks (opt-in passive recall/capture, explicit-tools contract unchanged) — all 5 phases, TDD RED-first:
+- Phase 1: `hook-inject`/`hook-extract`/`install-hooks` CLI subcommands (mutually exclusive positional words); `help_text` documents all three; `skills/hooks.rs` gate (missing/unparseable config => disabled); main dispatch arms (Unimplemented until Phases 2-4 landed). Tests: `hook_subcommands_parse`, `help_documents_hooks`.
+- Phase 2: inject attaches to the RUNNING daemon over its socket (never spawns — singleton lock); handshake + frontend share ephemeral ids (fixes `frontend_mismatch` found RED); lexical `semantic_search` top-5, 5s timeout, 4k-char cap, fail-open. Test: `hook_inject_returns_matching_recall_live` (live seeded daemon).
+- Phase 3: extract tails transcript to 8KB, splits DECISION/LESSON/FACT/NOTE candidates (<=5), secret pre-filter, one `memory_add` each (`source: hook-extract`, server Jaccard dedups reruns). Tests: store + rerun-idempotent + secret-excluded.
+- Phase 4: `install_hooks` atomic write with version marker (`Installed`/`AlreadyCurrent`/`RefusedForeign`); `hook_snippet("claude-code")` template; `install_hooks_command` + main wiring + stdin-JSON helpers; skill doc opt-in paragraph (workflow list byte-identical, pins green). Tests: installer + snippet.
+- Phase 5: plan-authority one-review — Part I §11.3 hooks principle, Part II WP-10 task, Part III T-HOOK-01, RQ-25 evidence+test, spec at `plans/2026-11-12-slice-b-silent-capture-hooks-spec.md` (tracked; `.kilo/` rejected per user order).
+- Proof: frontend lib 137/137, daemon lib 355/355; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -D warnings` clean.

@@ -387,7 +387,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 - [x] Verify client-configured server names/tool namespaces rather than relying on `serverInfo.name` alone. (routing_needs_no_server_name: routing depends only on tool names; namespaces documented as host-configured in skills/hosts.rs.)
 - [x] Implement the visualizer invocation/foreground/port behavior and the claimed functional routes. Graph rendering itself need not be pixel-identical to upstream. (visualizer/mod.rs + live smoke tests; routes are ltmrs-native: / and /api/library.)
 - [x] Use loopback binding, local access controls and safe output encoding for any UI; a localhost UI is still a separate input surface. (127.0.0.1-only bind pinned; HTML escaping pinned.)
-- [x] Record which host versions discover which skill path and how the workflow is activated. (Mechanism-based recipes in skills/hosts.rs; deviation: no per-host versions claimed — entries are documented recipes, not verified host behavior.)
+- [x] Provide opt-in host hooks for passive recall/capture (Slice B): `hook-inject`/`hook-extract` CLI subcommands + `install-hooks` snippet generator. Disabled by default, fail-open always; budget reuse via `scan_snapshot` (§10.2a); extract writes only via `memory_add`. (skills/hooks.rs + cli.rs + main dispatch; hook_* tests green; claude-code snippet verified, others documented-not-verified.)
 
 **Outputs:** CLI help/reference, installers, host recipes and functional visualizer.
 

@@ -16,6 +16,12 @@ and attempt histories. The agent reasons; ltmrs stores explicit findings.
 5. **Record** (`session_attempt`/`session_end`): abandoned approaches are the
    most valuable records — outcome `rejected` with the reason.
 
+## Hooks (opt-in)
+
+`ltmrs install-hooks` enables `hook-inject`/`hook-extract` for passive
+recall/capture. Explicit `memory_*`/`session_*` tools stay primary; hooks
+fail open and add nothing when disabled.
+
 ## Guides
 
 Reusable procedures distilled from experience (`guide_distill` promotes a

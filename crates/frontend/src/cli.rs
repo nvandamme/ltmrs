@@ -714,6 +714,43 @@ pub async fn project_bind_command(
 }
 
 /// Show a checkout's bound identity: bind file plus env override.
+/// Install opt-in hook snippets: writes `<home>/.ltmrs/hooks.json`
+/// (`{"enabled":true}`) and prints the host snippet paste instructions.
+/// Refusals are runtime errors (foreign content blocks silently overwriting).
+pub fn install_hooks_command(home: Option<String>) -> Result<String, CliError> {
+    use crate::skills::hooks::{InstallOutcome, hook_snippet, hooks_config_path, install_hooks};
+
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        CliError::Runtime(format!(
+            "{} is not set",
+            crate::frontend::serve::home_env_name()
+        ))
+    })?;
+    let exe = std::env::current_exe()
+        .map_err(|e| CliError::Runtime(format!("cannot locate ltmrs binary: {e}")))?;
+    let path = hooks_config_path(std::path::Path::new(&home));
+    match install_hooks(std::path::Path::new(&home), &exe)
+        .map_err(|e| CliError::Runtime(format!("hooks install failed: {e}")))?
+    {
+        InstallOutcome::Installed => Ok(format!(
+            "Installed hooks config at {}; paste into Claude Code settings:\n{}",
+            path.display(),
+            hook_snippet("claude-code", &exe)
+                .map_err(|e| CliError::Runtime(format!("snippet failed: {e}")))?
+        )),
+        InstallOutcome::AlreadyCurrent => Ok(format!(
+            "Hooks already current at {}; snippet:\n{}",
+            path.display(),
+            hook_snippet("claude-code", &exe)
+                .map_err(|e| CliError::Runtime(format!("snippet failed: {e}")))?
+        )),
+        InstallOutcome::RefusedForeign => Err(CliError::Runtime(format!(
+            "refusing: unmanaged file at {} (back it up and remove it first)",
+            path.display()
+        ))),
+    }
+}
+
 pub fn project_status_command(
     root: Option<String>,
     env_override: Option<String>,
