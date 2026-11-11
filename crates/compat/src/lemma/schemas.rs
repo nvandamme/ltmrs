@@ -12,7 +12,7 @@
 
 use serde_json::{Map, Value};
 
-/// The raw frozen tool definitions for the 11 WP-08 tools.
+/// The raw frozen tool definitions for the 26 frozen tools (11 WP-08 + 15 WP-09).
 const FROZEN_TOOLS_JSON: &str = include_str!("tools_lemma_0_21_0.json");
 
 /// A frozen tool definition (name, description, schema, annotations, output).
@@ -30,9 +30,7 @@ pub struct FrozenTool {
     pub output_schema: Option<Map<String, Value>>,
 }
 
-/// Load the 11 frozen WP-08 tool definitions.
-///
-/// Returns them in the frozen baseline order.
+/// Load the 26 frozen tool definitions (11 WP-08 + 15 WP-09).
 pub fn frozen_tools() -> Vec<FrozenTool> {
     let v: Value =
         serde_json::from_str(FROZEN_TOOLS_JSON).expect("frozen tool schemas must be valid JSON");

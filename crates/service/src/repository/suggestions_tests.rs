@@ -190,6 +190,38 @@ fn session_end_files_suggestions_exactly_once_per_operation() {
     );
 }
 
+/// Allocator fallback: a pre-counter store (rows exist, no counter
+/// key) seeds the counter from max-scan once, then the counter takes over.
+#[test]
+fn suggestion_allocator_seeds_from_existing_rows() {
+    use ltmrs_domain::memory::Instant;
+    use ltmrs_domain::session::{Suggestion, SuggestionStatus};
+    let (repo, _dir) = repo_with_ns();
+    for id in [41u64, 42] {
+        repo.put_suggestion(&Suggestion {
+            id,
+            session_id: None,
+            suggestion: format!("legacy {id}"),
+            status: SuggestionStatus::Pending,
+            created_at: Instant::new(1000),
+            resolved_at: None,
+        })
+        .unwrap();
+    }
+    let filed = repo
+        .file_suggestion(None, "fresh".to_string(), 1000)
+        .unwrap();
+    assert!(
+        filed.id > 42,
+        "counter must continue above max-scan seed, got {}",
+        filed.id
+    );
+    let again = repo
+        .file_suggestion(None, "fresher".to_string(), 1000)
+        .unwrap();
+    assert_eq!(again.id, filed.id + 1, "counter must advance monotonically");
+}
+
 /// Concurrent suggestion filing must yield distinct ids: max+1 computed
 /// outside the insert transaction lets two writers claim the same id
 /// and silently overwrite each other.

@@ -311,12 +311,20 @@ pub(crate) fn exec_session_stats(
     disp: &Dispatcher,
     envelope: &IpcEnvelope,
     args: &SessionStatsArgs,
+    resolved: &ltmrs_service::projects::ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let count = args.count.unwrap_or(10);
     let format = args.response_format;
 
-    // Canonical session snapshot (the registry holds bindings only).
-    let sessions = disp.repo().all_sessions()?;
+    // Canonical session snapshot scoped to the resolved identity (stable
+    // scope: own + attached + global; legacy/global stay permissive).
+    let scope = super::effective_for_read(resolved, None, None, None, false)?;
+    let sessions: Vec<ltmrs_domain::session::Session> = disp
+        .repo()
+        .all_sessions()?
+        .into_iter()
+        .filter(|s| scope.project_includes_id(s.project_id, s.project.as_deref()))
+        .collect();
 
     // Recent completed sessions (most recent first).
     let mut completed: Vec<&Session> = sessions

@@ -221,7 +221,14 @@ impl Daemon {
                 // means no table (tests and minimal setups keep the
                 // degraded snapshot path).
                 if config.search_path.is_empty() {
-                    (Arc::new(Dispatcher::new(repo, registry, clock)), None, None)
+                    (
+                        Arc::new(
+                            Dispatcher::new(repo, registry, clock)
+                                .with_scan_budget(config.limits.max_scan_rows),
+                        ),
+                        None,
+                        None,
+                    )
                 } else {
                     let table = SearchTable::open(&config.search_path)
                         .await
@@ -233,7 +240,11 @@ impl Daemon {
                     );
                     let backend = Arc::new(SearchBackend::new(Arc::clone(&repo), table, embedder));
                     (
-                        Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend)),
+                        Arc::new(
+                            Dispatcher::new(repo, registry, clock)
+                                .with_scan_budget(config.limits.max_scan_rows)
+                                .with_search(backend),
+                        ),
                         None,
                         None,
                     )
@@ -266,7 +277,11 @@ impl Daemon {
                         .with_model_fingerprint(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
                 );
                 (
-                    Arc::new(Dispatcher::new(repo, registry, clock).with_search(backend)),
+                    Arc::new(
+                        Dispatcher::new(repo, registry, clock)
+                            .with_scan_budget(config.limits.max_scan_rows)
+                            .with_search(backend),
+                    ),
                     Some(service),
                     Some(cache_dir.clone()),
                 )
@@ -280,10 +295,12 @@ impl Daemon {
         let projection_trigger = ProjectionTrigger::new();
         {
             let waker = projection_trigger.clone();
+            let invalidator = Arc::clone(&dispatcher);
             dispatcher
                 .repo_arc()
                 .set_commit_hook(std::sync::Arc::new(move || {
                     waker.wake();
+                    invalidator.invalidate_scan_cache();
                 }));
         }
 

@@ -19,6 +19,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod ablation;
+#[cfg(test)]
+mod ablation_tests;
 #[cfg(test)]
 mod quality_fixture_tests;
 #[cfg(test)]

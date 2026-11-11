@@ -211,3 +211,47 @@ fn guide_distill_preserves_concurrent_content_update() {
     let bad_result = run(&disp, &bad_env, &bad);
     assert!(result_is_error(&bad_result));
 }
+
+/// P1-2: a retried `guide_distill` (same envelope = lost response +
+/// transport retry) must replay the recorded success byte-identically —
+/// no re-applied link, no recounted usage. (Same-envelope replay is also
+/// asserted inline in `guide_distill_preserves_concurrent_content_update`;
+/// this named test is the retry-promotion counterpart to the
+/// create/forget/merge/update retry tests.)
+#[test]
+fn guide_distill_retry_replays_recorded_success() {
+    let (disp, _dir) = test_dispatcher();
+    let mem_id = add_fragment(
+        &disp,
+        1,
+        "## A pattern worth distilling\n\n### Context\nReusable skill.",
+    );
+    let distill = ToolArgs::GuideDistill(GuideDistillArgs {
+        memory_id: mem_id.clone(),
+        guide: "react".to_string(),
+        category: Some("web-frontend".to_string()),
+    });
+    let env = tool_call(2, distill.clone());
+    let first = run(&disp, &env, &distill);
+    assert!(
+        !result_is_error(&first),
+        "distill failed: {}",
+        result_text(&first)
+    );
+    let second = run(&disp, &env, &distill);
+    assert!(
+        !result_is_error(&second),
+        "distill retry must replay success, got: {}",
+        result_text(&second)
+    );
+    assert_eq!(
+        result_text(&second),
+        result_text(&first),
+        "retry must return the recorded response, not a re-applied one"
+    );
+    let guide = disp.repo().get_guide("react").unwrap().unwrap();
+    assert_eq!(
+        guide.usage_count, 1,
+        "distill replay must not recount usage"
+    );
+}

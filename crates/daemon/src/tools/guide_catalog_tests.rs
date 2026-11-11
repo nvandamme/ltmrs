@@ -200,6 +200,56 @@ async fn dense_wiring_dispatcher() -> (tempfile::TempDir, tempfile::TempDir, Dis
     (dir, lance_dir, disp)
 }
 
+/// Scope semantics: guides are global records (no project binding).
+/// Under a stable identity the catalog still serves — guides are not
+/// project-filtered; per-memory scoping lives in library/relations.
+/// Read retry policy: the same guide_get envelope twice returns the
+/// identical response.
+#[test]
+fn guide_get_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    let tool = ToolArgs::GuideGet(GuideGetArgs {
+        category: None,
+        guide: None,
+        task: None,
+        response_format: None,
+    });
+    let env = tool_call(1, tool.clone());
+    let first = run(&disp, &env, &tool);
+    let second = run(&disp, &env, &tool);
+    assert!(!result_is_error(&first));
+    assert_eq!(result_text(&second), result_text(&first));
+}
+
+#[test]
+fn guide_get_serves_global_catalog_under_stable_id() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    // Register A (guides themselves carry no identity).
+    let out = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out));
+    let tool = ToolArgs::GuideGet(GuideGetArgs {
+        category: None,
+        guide: None,
+        task: None,
+        response_format: None,
+    });
+    let env = tool_call_with(
+        2,
+        tool.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &tool);
+    assert!(!result_is_error(&result));
+}
+
 fn create_alpha_beta(disp: &Dispatcher) {
     for (op, name, desc, ctx, learn) in [
         (
@@ -273,4 +323,139 @@ async fn token_only_without_backend() {
         !text.contains("beta"),
         "beta must stay absent without dense:\n{text}"
     );
+}
+
+/// Scope semantics: guide mutations are global catalog ops (no project
+/// binding). Under a stable identity create + practice still execute —
+/// guides are not project-filtered.
+#[test]
+fn guide_mutations_execute_under_stable_id() {
+    use ltmrs_compat::lemma::tool_args::{GuideCreateArgs, GuidePracticeArgs};
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let id = ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true);
+    let create = ToolArgs::GuideCreate(GuideCreateArgs {
+        guide: "shop-guide".to_string(),
+        category: "shop".to_string(),
+        description: "Shop guide.".to_string(),
+        contexts: vec![],
+        learnings: vec![],
+    });
+    let env = tool_call_with(1, create.clone(), id.clone());
+    let r = run(&disp, &env, &create);
+    assert!(
+        !result_is_error(&r),
+        "create under stable id failed: {}",
+        result_text(&r)
+    );
+    let practice = ToolArgs::GuidePractice(GuidePracticeArgs {
+        guide: "shop-guide".to_string(),
+        category: "shop".to_string(),
+        description: None,
+        contexts: vec![],
+        learnings: vec![],
+        outcome: None,
+    });
+    let env = tool_call_with(2, practice.clone(), id.clone());
+    let r = run(&disp, &env, &practice);
+    assert!(
+        !result_is_error(&r),
+        "practice under stable id failed: {}",
+        result_text(&r)
+    );
+}
+
+/// Scope semantics: the remaining guide mutations execute under a stable
+/// identity (global catalog ops — update/forget/merge/distill carry no
+/// project filter by design).
+#[test]
+fn guide_update_forget_merge_distill_execute_under_stable_id() {
+    use ltmrs_compat::lemma::tool_args::{
+        GuideDistillArgs, GuideForgetArgs, GuideMergeArgs, GuideUpdateArgs,
+    };
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let id = ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true);
+    let create = |n: u64, name: &str| {
+        let tool = ToolArgs::GuideCreate(GuideCreateArgs {
+            guide: name.to_string(),
+            category: "shop".to_string(),
+            description: format!("{name} guide."),
+            contexts: vec![],
+            learnings: vec![],
+        });
+        let r = run(&disp, &tool_call_with(n, tool.clone(), id.clone()), &tool);
+        assert!(
+            !result_is_error(&r),
+            "create {name} failed: {}",
+            result_text(&r)
+        );
+    };
+    create(1, "g-one");
+    create(2, "g-two");
+    // Update.
+    let update = ToolArgs::GuideUpdate(GuideUpdateArgs {
+        guide: "g-one".to_string(),
+        new_name: None,
+        category: None,
+        description: Some("Updated desc.".to_string()),
+        add_anti_patterns: vec![],
+        add_pitfalls: vec![],
+        add_depends_on: vec![],
+        add_enables: vec![],
+        ..Default::default()
+    });
+    let r = run(
+        &disp,
+        &tool_call_with(3, update.clone(), id.clone()),
+        &update,
+    );
+    assert!(!result_is_error(&r), "update failed: {}", result_text(&r));
+    // Distill a guide from a memory.
+    let mem = add_with(
+        &disp,
+        4,
+        "## Shop Tip\n\n### Context\nDistillable fragment.",
+        Some("shop"),
+        id.clone(),
+    );
+    assert!(!result_is_error(&mem));
+    let mem_id = result_structured(&mem).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let distill = ToolArgs::GuideDistill(GuideDistillArgs {
+        memory_id: mem_id,
+        guide: "g-distilled".to_string(),
+        category: Some("shop".to_string()),
+    });
+    let r = run(
+        &disp,
+        &tool_call_with(5, distill.clone(), id.clone()),
+        &distill,
+    );
+    assert!(!result_is_error(&r), "distill failed: {}", result_text(&r));
+    // Merge.
+    let merge = ToolArgs::GuideMerge(GuideMergeArgs {
+        guides: vec!["g-one".to_string(), "g-two".to_string()],
+        guide: "g-merged".to_string(),
+        category: "shop".to_string(),
+        description: None,
+        contexts: None,
+        ..Default::default()
+    });
+    let r = run(&disp, &tool_call_with(6, merge.clone(), id.clone()), &merge);
+    assert!(!result_is_error(&r), "merge failed: {}", result_text(&r));
+    // Forget.
+    let forget = ToolArgs::GuideForget(GuideForgetArgs {
+        guide: "g-merged".to_string(),
+    });
+    let r = run(
+        &disp,
+        &tool_call_with(7, forget.clone(), id.clone()),
+        &forget,
+    );
+    assert!(!result_is_error(&r), "forget failed: {}", result_text(&r));
 }

@@ -1968,3 +1968,66 @@ fn t_sec_04_explanations_carry_no_unredacted_fragment_text() {
     // and the authorized detail section shows it.
     assert!(text[..expl_at].contains(secret));
 }
+
+/// Read retry policy: the same read envelope twice returns the
+/// identical response.
+#[test]
+fn memory_read_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## Read RT\n\n### Context\nRetry fixture.");
+    let tool = ToolArgs::MemoryRead(MemoryReadArgs {
+        query: Some("retry fixture".to_string()),
+        ..Default::default()
+    });
+    let env = tool_call(2, tool.clone());
+    let first = run(&disp, &env, &tool);
+    let second = run(&disp, &env, &tool);
+    assert!(!result_is_error(&first));
+    assert_eq!(result_text(&second), result_text(&first));
+}
+
+/// Stable-scope isolation: an explicit-ID read naming a foreign stable
+/// row is refused as not-found (never leaks content cross-boundary).
+#[test]
+fn memory_read_excludes_foreign_stable_row() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let (full_b, _) = generate_project_id("shop");
+    let out_a = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out_a));
+    let id_a = result_structured(&out_a).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // B registers on its own first write (reads never register unknown ids).
+    let out_b = add_with(
+        &disp,
+        2,
+        "## Shop B\n\n### Context\nB-only fragment.",
+        Some("shop"),
+        ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out_b));
+    let tool = ToolArgs::MemoryRead(MemoryReadArgs {
+        id: Some(id_a),
+        ..Default::default()
+    });
+    let env = tool_call_with(
+        3,
+        tool.clone(),
+        ident(Some(&full_b), Some("/tmp/b/shop"), None, false),
+    );
+    let result = run(&disp, &env, &tool);
+    assert!(
+        result_text(&result).contains("not found"),
+        "foreign explicit-ID read must refuse, got: {}",
+        result_text(&result)
+    );
+}

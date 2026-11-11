@@ -97,8 +97,7 @@ pub(crate) fn exec_memory_stats(
     args: &MemoryStatsArgs,
     resolved: &ltmrs_service::projects::ResolvedScope,
 ) -> DomainResult<DomainPayload> {
-    let repo = disp.repo();
-    let export = repo.export_snapshot()?;
+    let export = disp.scan_snapshot()?;
 
     // Scope stats by id to match recall (I1): a stable identity counts
     // its whole scope (own + attached + global, wire ignored — already
@@ -110,16 +109,18 @@ pub(crate) fn exec_memory_stats(
         let scope = super::effective_for_read(resolved, None, None, None, false)?;
         let scoped: Vec<ltmrs_domain::memory::Memory> = export
             .memories
-            .into_iter()
+            .iter()
             .filter(|m| scope.is_eligible(m))
+            .cloned()
             .collect();
         calculate_stats(&scoped, None)
     } else if resolved.legacy.is_some() {
         let scope = super::effective_for_read(resolved, None, None, None, false)?;
         let scoped: Vec<ltmrs_domain::memory::Memory> = export
             .memories
-            .into_iter()
+            .iter()
             .filter(|m| scope.is_eligible(m))
+            .cloned()
             .collect();
         calculate_stats(&scoped, args.project.as_deref())
     } else {
@@ -139,6 +140,20 @@ use super::execute_tool;
 use super::test_support::*;
 #[cfg(test)]
 use ltmrs_compat::lemma::tool_args::{MemoryReadArgs, ToolArgs};
+
+/// Read retry policy: the same stats envelope twice returns the
+/// identical response.
+#[test]
+fn memory_stats_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## Stats RT\n\n### Context\nRetry fixture.");
+    let tool = ToolArgs::MemoryStats(MemoryStatsArgs::default());
+    let env = tool_call(2, tool.clone());
+    let first = run(&disp, &env, &tool);
+    let second = run(&disp, &env, &tool);
+    assert!(!result_is_error(&first));
+    assert_eq!(result_text(&second), result_text(&first));
+}
 
 #[test]
 fn memory_stats_reports_counts() {
@@ -163,6 +178,44 @@ fn memory_stats_reports_counts() {
     let structured = result_structured(&result).unwrap();
     assert_eq!(structured["total"].as_u64().unwrap(), 2);
     assert!(result_text(&result).contains("## Memory Stats"));
+}
+
+/// Stable-scope isolation: stats under a stable identity count only
+/// in-scope rows (audit parity: healthy rows surface via totals).
+#[test]
+fn memory_stats_excludes_foreign_stable_row() {
+    use super::test_support::*;
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let (_full_b, id_b) = generate_project_id("shop");
+    let out_a = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out_a));
+    let mut foreign = make_memory("foreign-b", Some("shop"), "ai", 0.5, "B-only fragment.");
+    foreign.project_id = Some(id_b);
+    disp.repo().put_memory_direct(&foreign).unwrap();
+    let tool = ToolArgs::MemoryStats(MemoryStatsArgs::default());
+    let env = tool_call_with(
+        2,
+        tool.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &tool);
+    assert!(!result_is_error(&result));
+    assert_eq!(
+        result_structured(&result).unwrap()["total"]
+            .as_u64()
+            .unwrap(),
+        1,
+        "stats counted foreign stable row: {}",
+        result_text(&result)
+    );
 }
 
 /// Provenance flows end-to-end: a `paper` source stores as Paper and

@@ -35,6 +35,37 @@ fn memory_update_changes_content() {
     assert!(mems[0].fragment.contains("Updated Content"));
 }
 
+/// Retry safety (T-CONC-03): the same update envelope twice replays
+/// the recorded response with exactly one effect.
+#[test]
+fn memory_update_same_envelope_replays_recorded() {
+    let (disp, _dir) = test_dispatcher();
+    let id = add_fragment(&disp, 1, "## Replay Update\n\n### Context\nReplay fixture.");
+    let args = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+        id: id.clone(),
+        fragment: Some("## Updated\n\n### Context\nReplayed.".to_string()),
+        ..Default::default()
+    });
+    let env = tool_call(2, args.clone());
+    let first = run(&disp, &env, &args);
+    assert!(
+        !result_is_error(&first),
+        "first failed: {}",
+        result_text(&first)
+    );
+    let second = run(&disp, &env, &args);
+    assert!(
+        !result_is_error(&second),
+        "replay failed: {}",
+        result_text(&second)
+    );
+    assert_eq!(
+        result_text(&second),
+        result_text(&first),
+        "replay must be byte-identical"
+    );
+}
+
 #[test]
 fn memory_update_unknown_id_is_error() {
     let (disp, _dir) = test_dispatcher();
@@ -56,7 +87,44 @@ fn memory_update_unknown_id_is_error() {
     assert!(result_is_error(&result));
 }
 
-/// P2-high (crash-window fidelity): an UNFROZEN update receipt
+/// Stable-scope isolation: an update naming a foreign stable row is
+/// refused as not-found (never leaks, never writes cross-boundary).
+#[test]
+fn memory_update_excludes_foreign_stable_row() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let (full_b, _) = generate_project_id("shop");
+    let out_a = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out_a));
+    let id_a = result_structured(&out_a).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // B's update naming A's row must refuse.
+    let tool = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+        id: id_a,
+        fragment: Some("hijacked".into()),
+        ..Default::default()
+    });
+    let env = tool_call_with(
+        2,
+        tool.clone(),
+        ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &tool);
+    assert!(
+        result_text(&result).contains("not found"),
+        "foreign update must refuse, got: {}",
+        result_text(&result)
+    );
+}
 /// rebuilds from the request alone - a title change landing after
 /// the commit must not rewrite what the first operation reported.
 #[test]

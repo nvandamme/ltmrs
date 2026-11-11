@@ -41,6 +41,73 @@ fn memory_feedback_positive_boosts_confidence() {
     assert_eq!(m.positive_feedback, 1);
 }
 
+/// Stable-scope isolation: feedback naming a foreign stable row is
+/// refused as not-found (no cross-boundary counter move).
+#[test]
+fn memory_feedback_excludes_foreign_stable_row() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let (full_b, _) = generate_project_id("shop");
+    let out_a = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out_a));
+    let id_a = result_structured(&out_a).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tool = ToolArgs::MemoryFeedback(MemoryFeedbackArgs {
+        id: id_a,
+        useful: true,
+    });
+    let env = tool_call_with(
+        2,
+        tool.clone(),
+        ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &tool);
+    assert!(
+        result_text(&result).contains("not found"),
+        "foreign feedback must refuse, got: {}",
+        result_text(&result)
+    );
+}
+
+/// Retry safety (T-CONC-03): the same feedback envelope twice
+/// replays the recorded response with exactly one counter move.
+#[test]
+fn memory_feedback_same_envelope_replays_recorded() {
+    let (disp, _dir) = test_dispatcher();
+    let id = add_fragment(&disp, 1, "## Replay Fb\n\n### Context\nReplay fixture.");
+    let args = ToolArgs::MemoryFeedback(MemoryFeedbackArgs {
+        id: id.clone(),
+        useful: true,
+    });
+    let env = tool_call(2, args.clone());
+    let first = run(&disp, &env, &args);
+    assert!(
+        !result_is_error(&first),
+        "first failed: {}",
+        result_text(&first)
+    );
+    let second = run(&disp, &env, &args);
+    assert!(
+        !result_is_error(&second),
+        "replay failed: {}",
+        result_text(&second)
+    );
+    assert_eq!(
+        result_text(&second),
+        result_text(&first),
+        "replay must be byte-identical"
+    );
+}
+
 #[test]
 fn memory_feedback_negative_reduces_confidence() {
     let (disp, _dir) = test_dispatcher();

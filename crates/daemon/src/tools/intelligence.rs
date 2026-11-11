@@ -85,14 +85,15 @@ pub(crate) fn find_conflicts(
 pub(crate) fn exec_conflict_scan(
     disp: &Dispatcher,
     args: &ConflictScanArgs,
+    resolved: &ltmrs_service::projects::ResolvedScope,
 ) -> DomainResult<DomainPayload> {
-    let repo = disp.repo();
     let format = args.response_format;
-    let export = repo.export_snapshot()?;
+    let export = disp.scan_snapshot()?;
+    let scope = super::effective_for_read(resolved, None, None, None, false)?;
     let memories: Vec<Memory> = export
         .memories
         .iter()
-        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| m.lifecycle.is_recallable() && scope.is_eligible(m))
         .filter(|m| {
             args.project
                 .as_deref()
@@ -113,15 +114,17 @@ pub(crate) fn exec_conflict_scan(
 pub(crate) fn exec_proactive_analysis(
     disp: &Dispatcher,
     args: &ProactiveAnalysisArgs,
+    resolved: &ltmrs_service::projects::ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let format = args.response_format;
-    let export = repo.export_snapshot()?;
+    let export = disp.scan_snapshot()?;
+    let scope = super::effective_for_read(resolved, None, None, None, false)?;
     let guides = repo.get_guides()?;
     let memories: Vec<Memory> = export
         .memories
         .iter()
-        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| m.lifecycle.is_recallable() && scope.is_eligible(m))
         .filter(|m| {
             args.project
                 .as_deref()
@@ -177,18 +180,26 @@ pub(crate) fn exec_proactive_analysis(
 pub(crate) fn exec_project_analytics(
     disp: &Dispatcher,
     args: &ProjectAnalyticsArgs,
+    resolved: &ltmrs_service::projects::ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
     let format = args.response_format;
     let now = disp.clock().now_millis();
-    let export = repo.export_snapshot()?;
+    let export = disp.scan_snapshot()?;
+    let scope = super::effective_for_read(resolved, None, None, None, false)?;
     let mut guides = repo.get_guides()?;
     guides.sort_by_key(|g| std::cmp::Reverse(g.usage_count));
-    let sessions = disp.repo().all_sessions().unwrap();
+    let sessions: Vec<ltmrs_domain::session::Session> = disp
+        .repo()
+        .all_sessions()
+        .unwrap()
+        .into_iter()
+        .filter(|s| scope.project_includes_id(s.project_id, s.project.as_deref()))
+        .collect();
     let memories: Vec<Memory> = export
         .memories
         .iter()
-        .filter(|m| m.lifecycle.is_recallable())
+        .filter(|m| m.lifecycle.is_recallable() && scope.is_eligible(m))
         .cloned()
         .collect();
 

@@ -62,6 +62,23 @@ pub struct Dispatcher {
     /// Lance query + one commit); different scopes still share it because
     /// unprojected writes are globally visible to every scope's scan.
     similarity_gate: std::sync::Mutex<()>,
+    /// Scan-snapshot cache (quota hardening): single-entry
+    /// `(generation, export)` shared by the aggregate read-only tools
+    /// (audit/library/conflict/proactive/analytics/stats). Keyed on the
+    /// live store generation so a restore miss is structural, never a
+    /// stale cross-generation serve. Invalidated by `invalidate_scan_cache`
+    /// (wired to the repository commit hook at daemon start; tests call it
+    /// directly after direct-seed writes that bypass the hook).
+    scan_cache: Mutex<
+        Option<(
+            ltmrs_domain::id::StoreGeneration,
+            Arc<ltmrs_domain::export::CanonicalExport>,
+        )>,
+    >,
+    /// Per-call aggregate scan row budget (Part I §10.2a). Set from the
+    /// daemon's configured `ResourceLimits` at construction; tests use
+    /// `with_scan_budget` for tight caps.
+    max_scan_rows: usize,
 }
 
 impl Dispatcher {
@@ -80,7 +97,55 @@ impl Dispatcher {
             sessions_path: Mutex::new(None),
             conflict_sigs: Mutex::new(ltmrs_compat::lemma::intelligence::SignatureCache::new()),
             similarity_gate: std::sync::Mutex::new(()),
+            scan_cache: Mutex::new(None),
+            max_scan_rows: crate::limits::ResourceLimits::default().max_scan_rows,
         }
+    }
+
+    /// Override the scan row budget (tests: tight caps without a daemon).
+    pub fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
+        self.max_scan_rows = max_scan_rows;
+        self
+    }
+
+    /// Cached canonical export for aggregate scans, keyed on the live
+    /// store generation. Miss (empty or generation change) re-decodes
+    /// from the repository and stores the fresh entry.
+    pub fn scan_snapshot(&self) -> DomainResult<Arc<ltmrs_domain::export::CanonicalExport>> {
+        use ltmrs_domain::command::{DomainError, DomainErrorCode};
+        let live = self.store_generation().map_err(|e| {
+            DomainError::new(
+                DomainErrorCode::Validation,
+                format!("cannot read live store generation: {}", e.message),
+            )
+        })?;
+        {
+            let cache = self.scan_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_gen, export)) = cache.as_ref()
+                && *cached_gen == live
+            {
+                return Ok(Arc::clone(export));
+            }
+        }
+        let export = Arc::new(self.repo.export_snapshot()?);
+        // Per-call scan budget: bound the decode cost of one aggregate
+        // call. Over-budget refuses visibly and is never cached — the next
+        // call re-evaluates after writes expire rows.
+        let rows = export.memories.len() + export.relations.len();
+        if rows > self.max_scan_rows {
+            return Err(DomainError::new(
+                DomainErrorCode::Validation,
+                format!("scan budget exceeded ({rows} rows)"),
+            ));
+        }
+        *self.scan_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((live, Arc::clone(&export)));
+        Ok(export)
+    }
+
+    /// Drop the cached scan snapshot (commit path). Next scan re-decodes.
+    pub fn invalidate_scan_cache(&self) {
+        *self.scan_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Attach a search backend (WP-08 semantic retrieval).
@@ -518,7 +583,6 @@ impl Dispatcher {
         PROTOCOL_VERSION
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -66,10 +66,65 @@ pub struct ExperimentSummary {
     pub total_ops: u64,
     pub total_failures: u64,
     pub wall_micros: u64,
+    /// Resident-set delta around the run (Linux procfs; `None` off-Linux
+    /// or when the kernel table is unreadable — declared, not fabricated).
+    #[serde(default)]
+    pub rss_delta_kb: Option<i64>,
+}
+
+/// Current process RSS in KiB (Linux `/proc/self/statm` field 2 × page
+/// size; `None` off-Linux or on any read/parse failure — the caller
+/// records absence, never a zero).
+pub fn current_rss_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        let page_kb = libc_page_size()? / 1024;
+        resident_pages.checked_mul(page_kb)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// OS page size in bytes via libc (already a direct root edge — no new
+/// crates). Linux-only caller.
+#[cfg(target_os = "linux")]
+fn libc_page_size() -> Option<u64> {
+    // SAFETY: sysconf(_SC_PAGESIZE) takes no pointers and installs no
+    // handlers; it returns -1 only for an invalid name, impossible here.
+    let pagesize = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(pagesize).ok()
+}
+
+/// RSS delta between two samples. `None` when either endpoint is
+/// unavailable — absence is declared, never zero-filled.
+pub fn rss_delta_kb(before: Option<u64>, after: Option<u64>) -> Option<i64> {
+    match (before, after) {
+        (Some(b), Some(a)) => Some(a.saturating_sub(b) as i64),
+        _ => None,
+    }
 }
 
 /// Deterministic workload memory: id and title derive from the key, the
 /// fragment pads to `bytes` so value sizes stay workload-controlled.
+/// With `salt = Some(seq)`, a unique per-seq trailer rides the fragment
+/// (the lemma-comparison salt: same-key payloads differ, so the upstream
+/// dedup gate cannot collapse the write path). `None` is the unsalted
+/// contract: same key gives byte-identical content.
+pub fn salted_workload_memory(key: u64, bytes: usize, salt: Option<u64>) -> Memory {
+    let mut memory = workload_memory(key, bytes);
+    if let Some(seq) = salt {
+        memory.fragment.push_str(&format!(" Salt seq {seq}."));
+    }
+    memory
+}
+
+#[allow(dead_code)]
+/// Unsalted constructor (dedup-collapsible by design): id and title derive
+/// from the key, the fragment pads to `bytes`.
 pub fn workload_memory(key: u64, bytes: usize) -> Memory {
     use ltmrs_domain::id::{DocumentRevision, EligibilityRevision, EntityRevision};
     let title = format!("Workload {key}");
@@ -119,7 +174,9 @@ pub fn workload_memory(key: u64, bytes: usize) -> Memory {
 /// Exported op for cross-implementation runs: the exact stream both sides
 /// execute (consumed by tools/bench_against_lemma.mjs). Put payloads are
 /// embedded so the upstream side needs no Rust code; search queries are
-/// pre-rendered so term derivation cannot drift between sides.
+/// pre-rendered so term derivation cannot drift between sides. RMW ops
+/// export as revision-checked updates (`kind: "rmw"`); the driver maps
+/// them onto the freshest read + conditional patch of the same key.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExportedOp {
     pub seq: u64,
@@ -132,10 +189,28 @@ pub struct ExportedOp {
 }
 
 /// Write `n` stream ops as JSONL (one object per line). Returns the count.
+/// Unsalted export: put/RMW payloads derive from the key alone, so every
+/// seq touching the same key carries byte-identical content (dedup-gated
+/// upstream comparisons refuse the repeats; see the salted variant).
 pub fn export_workload_ops(
     generator: &GeneratorConfig,
     n: u64,
     path: &Path,
+) -> std::io::Result<u64> {
+    export_workload_ops_salted(generator, n, path, false)
+}
+
+/// Salted export: when `salted`, every put/RMW fragment carries a
+/// per-seq unique trailer (`seq {seq}`), so same-key payloads differ and
+/// upstream dedup gates cannot collapse the write path. Unsalted output
+/// is byte-identical to [`export_workload_ops`] with `salted = false`.
+/// Both sides of a comparison must agree on the flag: salt changes the
+/// payload bytes, so salted and unsalted streams are NOT comparable.
+pub fn export_workload_ops_salted(
+    generator: &GeneratorConfig,
+    n: u64,
+    path: &Path,
+    salted: bool,
 ) -> std::io::Result<u64> {
     use std::io::Write;
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
@@ -143,10 +218,22 @@ pub fn export_workload_ops(
     for seq in 0..n {
         let exported = match stream.next_op() {
             WorkloadOp::Put { key, bytes } => {
-                let memory = workload_memory(key, bytes);
+                let memory = salted_workload_memory(key, bytes, salted.then_some(seq));
                 ExportedOp {
                     seq,
                     kind: "put".to_string(),
+                    key,
+                    title: memory.title,
+                    fragment: memory.fragment,
+                    query: String::new(),
+                    top_k: 0,
+                }
+            }
+            WorkloadOp::Rmw { key, bytes } => {
+                let memory = salted_workload_memory(key, bytes, salted.then_some(seq));
+                ExportedOp {
+                    seq,
+                    kind: "rmw".to_string(),
                     key,
                     title: memory.title,
                     fragment: memory.fragment,
@@ -182,11 +269,12 @@ pub fn export_workload_ops(
     Ok(n)
 }
 
-/// Short op name for grouping (`put`, `get`, `search`).
+/// Short op name for grouping (`put`, `get`, `rmw`, `search`).
 pub fn op_name(op: &WorkloadOp) -> &'static str {
     match op {
         WorkloadOp::Put { .. } => "put",
         WorkloadOp::Get { .. } => "get",
+        WorkloadOp::Rmw { .. } => "rmw",
         WorkloadOp::Search { .. } => "search",
     }
 }
@@ -235,6 +323,7 @@ pub fn run_put_get(
     config: &ExperimentConfig,
     history_path: &Path,
 ) -> std::io::Result<(ExperimentSummary, u64)> {
+    let rss_before = current_rss_kb();
     let wall = Instant::now();
     let mut recorder = HistoryRecorder::create(history_path)?;
     let mut generator = OpGenerator::new(config.generator.clone());
@@ -274,6 +363,7 @@ pub fn run_put_get(
             total_failures,
             wall_micros: wall.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
             op_stats,
+            rss_delta_kb: rss_delta_kb(rss_before, current_rss_kb()),
         },
         skipped,
     ))
@@ -330,24 +420,151 @@ pub async fn run_search(
             Ok(rows) => (true, format!("found={}", rows.len())),
             Err(e) => (false, e.message.clone()),
         };
-        recorder.record(
-            WorkloadOp::Search {
-                probe: *probe,
-                top_k: *top_k,
-            },
-            elapsed,
-            ok,
-            &detail,
-        )?;
+        record_search_outcome(recorder, *probe, *top_k, elapsed, ok, &detail)?;
         executed += 1;
     }
     Ok(executed)
+}
+
+/// Shared per-probe record path (single-threaded [`run_search`] and the
+/// threaded [`run_search_threaded`] leg record identically).
+pub fn record_search_outcome(
+    recorder: &mut HistoryRecorder,
+    probe: u64,
+    top_k: usize,
+    elapsed_micros: u64,
+    ok: bool,
+    detail: &str,
+) -> std::io::Result<()> {
+    recorder.record(
+        WorkloadOp::Search { probe, top_k },
+        elapsed_micros,
+        ok,
+        detail,
+    )
+}
+
+/// Threaded search-load leg: `workers` OS threads share one [`SearchTable`]
+/// handle and issue `queries` round-robin; each thread blocks on its own
+/// single-thread Tokio runtime, so no query future ever crosses an executor
+/// and the only shared state is the proved `Send + Sync` table handle
+/// itself. Returns per-query measurements in input order. The
+/// index-readiness gate runs first on the calling thread: without an FTS
+/// index this refuses rather than recording fast zero-hit evidence.
+pub fn run_search_threaded(
+    table: &SearchTable,
+    queries: &[(u64, String, usize)],
+    workers: usize,
+) -> std::io::Result<Vec<crate::bench::load::MeasuredOp>> {
+    use crate::bench::load::MeasuredOp;
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    assert!(workers >= 1, "at least one worker");
+    let workers = workers.min(queries.len());
+    let gate_table = table.clone();
+    let gate = std::thread::Builder::new()
+        .name("bench-search-gate".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(std::io::Error::other)?;
+            runtime
+                .block_on(async { gate_table.fts_index_ready().await })
+                .map_err(|e| std::io::Error::other(e.message.clone()))
+        })
+        .map_err(std::io::Error::other)?;
+    if !gate.join().expect("search gate thread panicked")? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no FTS index: create it before the search leg",
+        ));
+    }
+    let mut out: Vec<MeasuredOp> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let table = table.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("bench-search-{worker}"))
+                    .spawn_scoped(scope, move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("bench search worker runtime builds");
+                        let mut local = Vec::new();
+                        let mut index = worker;
+                        while index < queries.len() {
+                            let (probe, terms, top_k) = &queries[index];
+                            let start = std::time::Instant::now();
+                            let outcome = runtime.block_on(table.fts_query(terms, *top_k, None));
+                            let elapsed =
+                                start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                            let (ok, detail) = match outcome {
+                                Ok(rows) => (true, format!("found={}", rows.len())),
+                                Err(e) => (false, e.message.clone()),
+                            };
+                            local.push(MeasuredOp {
+                                index,
+                                op: WorkloadOp::Search {
+                                    probe: *probe,
+                                    top_k: *top_k,
+                                },
+                                elapsed_micros: elapsed,
+                                queued_micros: 0,
+                                ok,
+                                detail,
+                                retries: 0,
+                                conflicts: 0,
+                            });
+                            index += workers;
+                        }
+                        local
+                    })
+                    .expect("bench search worker spawns"),
+            );
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("search worker panicked"))
+            .collect::<Vec<Vec<MeasuredOp>>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    });
+    out.sort_by_key(|m| m.index);
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Resource sampling reports RSS around a workload (Linux procfs;
+    /// `None` off-Linux — declared, not fabricated).
+    #[test]
+    fn resource_sample_reports_rss_when_available() {
+        let before = current_rss_kb();
+        // Touch memory so the sampler has something real to observe.
+        let v: Vec<u8> = vec![7u8; 1 << 20];
+        assert!(!v.is_empty());
+        let after = current_rss_kb();
+        #[cfg(target_os = "linux")]
+        {
+            let (Some(b), Some(a)) = (before, after) else {
+                panic!("RSS sampling must succeed on Linux: {before:?} -> {after:?}");
+            };
+            assert!(a >= b, "RSS must not shrink: {b} -> {a}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(
+                before.is_none() && after.is_none(),
+                "off-Linux sampler must report None"
+            );
+        }
+    }
     fn record(op: WorkloadOp, elapsed_micros: u64, ok: bool) -> HistoryRecord {
         HistoryRecord {
             seq: 0,
@@ -356,6 +573,8 @@ mod tests {
             ok,
             detail: String::new(),
             queued_micros: 0,
+            retries: 0,
+            conflicts: 0,
         }
     }
 
@@ -490,6 +709,7 @@ mod tests {
             key_space: 500,
             value_bytes: 64,
             top_k: 10,
+            ..Default::default()
         };
         let a = dir.path().join("a.jsonl");
         let b = dir.path().join("b.jsonl");
@@ -520,6 +740,141 @@ mod tests {
         }
     }
 
+    /// Salted exports defeat same-key dedup collapse: every put/RMW
+    /// fragment carries its seq trailer; unsalted output is unchanged.
+    #[test]
+    fn salted_export_defeats_dedup_collapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let generator = GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 1000,
+            key_space: 4,
+            value_bytes: 64,
+            top_k: 10,
+            ..Default::default()
+        };
+        let salted = dir.path().join("salted.jsonl");
+        assert_eq!(
+            export_workload_ops_salted(&generator, 60, &salted, true).unwrap(),
+            60
+        );
+        let raw = std::fs::read_to_string(&salted).unwrap();
+        let ops: Vec<ExportedOp> = raw
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let puts: Vec<&ExportedOp> = ops.iter().filter(|op| op.kind == "put").collect();
+        assert!(!puts.is_empty(), "all-put stream must export puts");
+        for op in &puts {
+            assert!(
+                op.fragment.contains(&format!("Salt seq {}.", op.seq)),
+                "put seq {} must carry its salt trailer",
+                op.seq
+            );
+        }
+        // Same key, different seqs: fragments differ (dedup cannot collapse).
+        let mut by_key: std::collections::BTreeMap<u64, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for op in &puts {
+            by_key.entry(op.key).or_default().push(&op.fragment);
+        }
+        let repeated = by_key
+            .values()
+            .any(|fragments| fragments.len() > 1 && fragments.windows(2).any(|w| w[0] != w[1]));
+        assert!(repeated, "salted same-key payloads must differ");
+        // Unsalted export is byte-identical to the legacy path.
+        let plain = dir.path().join("plain.jsonl");
+        let legacy = dir.path().join("legacy.jsonl");
+        assert_eq!(
+            export_workload_ops_salted(&generator, 60, &plain, false).unwrap(),
+            60
+        );
+        assert_eq!(export_workload_ops(&generator, 60, &legacy).unwrap(), 60);
+        assert_eq!(
+            std::fs::read(&plain).unwrap(),
+            std::fs::read(&legacy).unwrap(),
+            "unsalted export must match the legacy path byte-for-byte"
+        );
+        assert!(
+            !std::fs::read_to_string(&plain)
+                .unwrap()
+                .contains("Salt seq"),
+            "unsalted export must not salt"
+        );
+    }
+
+    /// Salted helper: `None` is the unsalted contract (key-identical
+    /// content); `Some(seq)` appends the unique trailer.
+    #[test]
+    fn salted_memory_helper_contract() {
+        let a = salted_workload_memory(9, 64, None);
+        let b = salted_workload_memory(9, 64, None);
+        assert_eq!(a.fragment, b.fragment, "unsalted must be key-deterministic");
+        assert_eq!(a.fragment, workload_memory(9, 64).fragment);
+        let salted = salted_workload_memory(9, 64, Some(3));
+        assert_ne!(salted.fragment, a.fragment);
+        assert!(salted.fragment.contains("Salt seq 3."));
+    }
+
+    /// Threaded search leg matches single-threaded results hit-for-hit and
+    /// preserves input order; without an index it refuses loudly.
+    #[tokio::test]
+    async fn threaded_search_matches_single_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = SearchTable::open(dir.path().join("search").to_str().unwrap())
+            .await
+            .unwrap();
+        table
+            .publish_rows(&[
+                search_row_for(1, "alpha bravo charlie"),
+                search_row_for(2, "delta echo foxtrot"),
+            ])
+            .await
+            .unwrap();
+        table.create_fts_index().await.unwrap();
+        let queries = vec![
+            (0u64, "bravo".to_string(), 5),
+            (1u64, "zzz-no-such-token".to_string(), 5),
+            (2u64, "delta".to_string(), 5),
+        ];
+        let history = dir.path().join("single.jsonl");
+        let mut recorder = HistoryRecorder::create(&history).unwrap();
+        let executed = run_search(&table, &queries, &mut recorder).await.unwrap();
+        recorder.flush().unwrap();
+        assert_eq!(executed, 3);
+        drop(recorder);
+        let single = read_history(&history).unwrap();
+        let threaded = run_search_threaded(&table, &queries, 2).unwrap();
+        assert_eq!(threaded.len(), 3, "every query measured");
+        for (i, m) in threaded.iter().enumerate() {
+            assert_eq!(m.index, i, "input order preserved");
+            assert_eq!(m.op, single[i].op);
+            assert_eq!(
+                (m.ok, m.detail.clone()),
+                (single[i].ok, single[i].detail.clone())
+            );
+        }
+        // No index: loud refusal, never fast zero-hit evidence.
+        let bare = SearchTable::open(dir.path().join("bare").to_str().unwrap())
+            .await
+            .unwrap();
+        let err = run_search_threaded(&bare, &queries, 2).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Op names group the new leg (`rmw` joins `put`/`get`/`search`).
+    #[test]
+    fn op_name_covers_rmw() {
+        assert_eq!(op_name(&WorkloadOp::Rmw { key: 1, bytes: 8 }), "rmw");
+        assert_eq!(op_name(&WorkloadOp::Put { key: 1, bytes: 8 }), "put");
+        assert_eq!(op_name(&WorkloadOp::Get { key: 1 }), "get");
+        assert_eq!(
+            op_name(&WorkloadOp::Search { probe: 1, top_k: 5 }),
+            "search"
+        );
+    }
+
     /// Export the reference comparison stream (slice E): same config as the
     /// wp12-storage-01 ltmrs run so the upstream comparison is stream-identical.
     /// Ignored in normal runs; invoke explicitly.
@@ -534,6 +889,7 @@ mod tests {
             key_space: 500,
             value_bytes: 256,
             top_k: 10,
+            ..Default::default()
         };
         let n = export_workload_ops(&generator, 2000, &out.join("ops.jsonl")).unwrap();
         assert_eq!(n, 2000);
@@ -568,6 +924,7 @@ mod tests {
                 key_space: 500,
                 value_bytes: 256,
                 top_k: 10,
+                ..Default::default()
             },
         };
         let history_putget = out.join("history-putget.jsonl");
@@ -645,6 +1002,7 @@ mod tests {
             total_failures: op_stats.values().map(|s| s.failures).sum(),
             wall_micros,
             op_stats,
+            rss_delta_kb: None,
         };
         std::fs::write(
             out.join("summary-search.json"),

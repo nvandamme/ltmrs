@@ -20,6 +20,7 @@ measured at split time (CHANGELOG note); the later faster-builds wave
 (`99c546e`) moved dev to `lto = false` — current profile is authoritative.
 Code landed via the file-split wave (`db3371f`) and the `53f9c7c` merge; boxes
 record end-state, not per-task SHAs.
+Reconciliation (2026-11-11): (a) skills did NOT stay in the binary — the skills domain ships in `ltmrs-frontend` at `crates/frontend/src/skills/` (`src/skills/` does not exist; only `visualizer/` + `bench/` are root-binary-local); the Task 10 Step 2 / line-62 / line-68 "binary" spellings read as `ltmrs-frontend`. (b) Final membership is root + 8 lib crates + private `xtask` runner, with `crates/lemma-import` excluded (own workspace, Wave B5c cdylib) — see root `Cargo.toml` members/exclude; the §DAG + Task 1 `members = ["."]` predate the xtask wave and the lemma-import exclusion; AGENTS.md rule 5 + the root manifest are authoritative.
 
 ## Global Constraints
 

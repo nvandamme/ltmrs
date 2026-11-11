@@ -50,6 +50,117 @@ fn backup_preview_reports_ready_with_token() {
     assert!(result_is_error(&result));
 }
 
+/// Scope semantics: backup restore under a stable identity executes
+/// the store-level replace (backups are not project-filtered; the
+/// confirmation token binds channel + store generation).
+#[test]
+fn backup_restore_executes_under_stable_id() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let id = ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true);
+    let out_a = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        id.clone(),
+    );
+    assert!(!result_is_error(&out_a));
+    let out = tempfile::tempdir().unwrap();
+    let create = ToolArgs::BackupCreate(BackupCreateArgs {
+        directory: Some(out.path().to_str().unwrap().to_string()),
+    });
+    let r = run(
+        &disp,
+        &tool_call_with(2, create.clone(), id.clone()),
+        &create,
+    );
+    assert!(!result_is_error(&r), "create failed: {}", result_text(&r));
+    let backup_path = result_structured(&r).unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let preview = ToolArgs::BackupPreview(BackupPreviewArgs {
+        path: Some(backup_path),
+    });
+    let r = run(
+        &disp,
+        &tool_call_with(3, preview.clone(), id.clone()),
+        &preview,
+    );
+    assert!(!result_is_error(&r), "preview failed: {}", result_text(&r));
+    let token = result_structured(&r).unwrap()["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let restore = ToolArgs::BackupRestore(BackupRestoreArgs {
+        confirmation_token: Some(token),
+        confirm: Some(true),
+    });
+    let r = run(
+        &disp,
+        &tool_call_with(4, restore.clone(), id.clone()),
+        &restore,
+    );
+    assert!(!result_is_error(&r), "restore failed: {}", result_text(&r));
+    assert!(
+        result_text(&r).contains("Restored"),
+        "got: {}",
+        result_text(&r)
+    );
+}
+
+/// Scope semantics: backup preview under a stable identity still
+/// inventories the canonical store (backups are store-level, not
+/// project-filtered) — identity rides the confirmation token binding.
+#[test]
+fn backup_preview_serves_under_stable_id() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let out_a = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out_a));
+    let out = tempfile::tempdir().unwrap();
+    let create = ToolArgs::BackupCreate(BackupCreateArgs {
+        directory: Some(out.path().to_str().unwrap().to_string()),
+    });
+    let env = tool_call_with(
+        2,
+        create.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &create);
+    assert!(
+        !result_is_error(&result),
+        "create failed: {}",
+        result_text(&result)
+    );
+    let path = result_structured(&result).unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let preview = ToolArgs::BackupPreview(BackupPreviewArgs { path: Some(path) });
+    let env = tool_call_with(
+        3,
+        preview.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &preview);
+    assert!(
+        !result_is_error(&result),
+        "preview failed: {}",
+        result_text(&result)
+    );
+    assert!(result_text(&result).contains("READY"));
+}
+
 /// Dead channels must not block restore: after two sessions bound two
 /// channels (prior runs leave persisted bindings behind), preview with
 /// no LIVE connection still reports READY — readiness counts live

@@ -2,10 +2,25 @@
 
 use super::test_support::*;
 use ltmrs_compat::lemma::tool_args::{
-    SessionAttemptArgs, SessionStartArgs, SuggestionRespondArgs, ToolArgs,
+    SessionAttemptArgs, SessionStartArgs, SessionStatsArgs, SuggestionRespondArgs, ToolArgs,
 };
 use ltmrs_domain::memory::Instant;
 use ltmrs_domain::session::{Suggestion, SuggestionStatus};
+
+/// Read retry policy: stats/suggest envelopes replay identically.
+#[test]
+fn session_suggest_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    let stats = ToolArgs::SessionStats(SessionStatsArgs {
+        count: Some(10),
+        response_format: None,
+    });
+    let env = tool_call(1, stats.clone());
+    let first = run(&disp, &env, &stats);
+    let second = run(&disp, &env, &stats);
+    assert!(!result_is_error(&first));
+    assert_eq!(result_text(&second), result_text(&first));
+}
 
 #[test]
 fn suggestion_respond_requires_valid_action() {
@@ -107,10 +122,61 @@ fn suggestion_respond_retry_adjusts_attempt_once() {
         "respond retry must replay success, got: {}",
         result_text(&second)
     );
+
     let confidence_after_retry =
         disp.repo().get_session(handle).unwrap().unwrap().attempts[0].confidence;
     assert_eq!(
         confidence_after_retry, confidence_after_first,
         "retry must not adjust confidence twice"
+    );
+}
+
+/// Scope semantics: suggestions carry numeric legacy IDs (no project
+/// binding). Responding under a stable identity still executes — the
+/// receipt is channel-scoped, the suggestion is global.
+#[test]
+fn suggestion_respond_executes_under_stable_id() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let start = ToolArgs::SessionStart(SessionStartArgs {
+        task_type: "shop-task".to_string(),
+        technologies: vec![],
+        initial_approach: None,
+    });
+    let senv = tool_call_with(
+        1,
+        start.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let sr = run(&disp, &senv, &start);
+    assert!(!result_is_error(&sr), "start failed: {}", result_text(&sr));
+    let handle = disp
+        .registry()
+        .channel_session(fe(1), ch(1))
+        .expect("channel must be bound after start");
+    let suggestion = Suggestion {
+        id: 7,
+        session_id: Some(handle.as_uuid().to_string()),
+        suggestion: "Try Z next.".to_string(),
+        status: SuggestionStatus::Pending,
+        created_at: Instant::new(1000),
+        resolved_at: None,
+    };
+    disp.repo().put_suggestion(&suggestion).unwrap();
+    let respond = ToolArgs::SuggestionRespond(SuggestionRespondArgs {
+        id: 7,
+        action: "accept".to_string(),
+    });
+    let env = tool_call_with(
+        2,
+        respond.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &respond);
+    assert!(
+        !result_is_error(&result),
+        "respond failed: {}",
+        result_text(&result)
     );
 }

@@ -1,9 +1,8 @@
-//! Legacy MCP tool execution (WP-08).
+//! Legacy MCP tool execution (WP-08 + WP-09 frozen baseline).
 //!
-//! Executes the 11 WP-08 tools against the canonical repository and search
-//! backend, shaping responses to match the frozen Lemma 0.21.0 wire contract
-//! (text + structuredContent + error flag). This is the compatibility
-//! adapter: it maps ltmrs canonical state to the legacy observable surface.
+//! Executes the 26 frozen tools (11 WP-08 + 15 WP-09) against the canonical
+//! repository and search backend, shaping responses to match the frozen
+//! Lemma 0.21.0 wire contract (text + structuredContent + error flag).
 //!
 //! Design 11.1: preserves the full supported Lemma API/workflow surface.
 //! Design 12.1: memory_add privacy (confirm override, DEV-002).
@@ -144,7 +143,7 @@ pub fn execute_tool(
             memory_relate::exec_memory_relate(disp, envelope, adm(), args, &resolved)
         }
         ToolArgs::MemoryStats(args) => memory_stats::exec_memory_stats(disp, args, &resolved),
-        ToolArgs::MemoryAudit(args) => memory_audit::exec_memory_audit(disp, args),
+        ToolArgs::MemoryAudit(args) => memory_audit::exec_memory_audit(disp, args, &resolved),
         ToolArgs::MemoryLibrary(args) => memory_library::exec_memory_library(disp, args, &resolved),
         ToolArgs::SemanticSearch(args) => {
             semantic_search::exec_semantic_search(disp, envelope, args, &resolved)
@@ -167,18 +166,30 @@ pub fn execute_tool(
             sessions::exec_session_attempt(disp, envelope, adm(), args)
         }
         ToolArgs::SessionEnd(args) => sessions::exec_session_end(disp, envelope, adm(), args),
-        ToolArgs::SessionStats(args) => sessions::exec_session_stats(disp, envelope, args),
+        ToolArgs::SessionStats(args) => {
+            sessions::exec_session_stats(disp, envelope, args, &resolved)
+        }
         ToolArgs::SuggestionRespond(args) => {
             suggest::exec_suggestion_respond(disp, envelope, adm(), args)
         }
-        ToolArgs::ConflictScan(args) => intelligence::exec_conflict_scan(disp, args),
-        ToolArgs::ProactiveAnalysis(args) => intelligence::exec_proactive_analysis(disp, args),
-        ToolArgs::ProjectAnalytics(args) => intelligence::exec_project_analytics(disp, args),
+        ToolArgs::ConflictScan(args) => intelligence::exec_conflict_scan(disp, args, &resolved),
+        ToolArgs::ProactiveAnalysis(args) => {
+            intelligence::exec_proactive_analysis(disp, args, &resolved)
+        }
+        ToolArgs::ProjectAnalytics(args) => {
+            intelligence::exec_project_analytics(disp, args, &resolved)
+        }
         ToolArgs::BackupCreate(args) => backup::exec_backup_create(disp, args),
         ToolArgs::BackupPreview(args) => backup::exec_backup_preview(disp, envelope, args),
         ToolArgs::BackupRestore(args) => backup::exec_backup_restore(disp, envelope, args),
         ToolArgs::BackupImportLemma(args) => backup::exec_backup_import_lemma(disp, envelope, args),
     }?;
+    // Scan-cache coherence: a successful mutating tool committed (or
+    // replayed a commit), so the cached export is stale. Reads never
+    // invalidate (the cache exists for them).
+    if tool.mutates_store() {
+        disp.invalidate_scan_cache();
+    }
     // Proceed-with-warning (Wave A3b shadow matrix): the resolution note
     // rides the human-readable text; the frozen structured shape is
     // untouched and frozen replays stay verbatim (they return above).

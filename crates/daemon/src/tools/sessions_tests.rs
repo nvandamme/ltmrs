@@ -244,6 +244,84 @@ fn session_stats_reports_active_completed_and_empty() {
     assert!(!text.contains("Active session:"));
 }
 
+/// Stable-scope isolation: session_stats under a stable identity must
+/// not surface another identity's sessions.
+#[test]
+fn session_stats_excludes_foreign_channel_sessions() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let (full_b, _) = generate_project_id("shop");
+    // A starts + ends a session under its identity.
+    for (op, tool) in [
+        (
+            1u64,
+            ToolArgs::SessionStart(SessionStartArgs {
+                task_type: "a-task".to_string(),
+                technologies: vec![],
+                initial_approach: None,
+            }),
+        ),
+        (
+            2u64,
+            ToolArgs::SessionEnd(SessionEndArgs {
+                outcome: "success".to_string(),
+                final_approach: None,
+                lessons: vec![],
+            }),
+        ),
+    ] {
+        let env = tool_call_with(
+            op,
+            tool.clone(),
+            ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+        );
+        let r = run(&disp, &env, &tool);
+        assert!(
+            !result_is_error(&r),
+            "A session op failed: {}",
+            result_text(&r)
+        );
+    }
+    // B registers via its own session start.
+    let bstart = ToolArgs::SessionStart(SessionStartArgs {
+        task_type: "b-task".to_string(),
+        technologies: vec![],
+        initial_approach: None,
+    });
+    let benv = tool_call_with(
+        3,
+        bstart.clone(),
+        ident(Some(&full_b), Some("/tmp/b/shop"), Some("shop"), true),
+    );
+    let br = run(&disp, &benv, &bstart);
+    assert!(
+        !result_is_error(&br),
+        "B start failed: {}",
+        result_text(&br)
+    );
+    // Stats under B must not name A's session task.
+    let stats = ToolArgs::SessionStats(SessionStatsArgs {
+        count: Some(10),
+        response_format: None,
+    });
+    let env = tool_call_with(
+        4,
+        stats.clone(),
+        ident(Some(&full_b), Some("/tmp/b/shop"), None, false),
+    );
+    let result = run(&disp, &env, &stats);
+    assert!(!result_is_error(&result));
+    // Stats carry no task names (counts + UUIDs only): scope shows in the
+    // completed-session count — B sees 0 completed (its own is active),
+    // not A's ended session.
+    assert!(
+        result_text(&result).contains("No past sessions recorded yet."),
+        "B must see no completed sessions, got: {}",
+        result_text(&result)
+    );
+}
+
 /// RQ-06 dispatch gate: a mutating tool under an unknown/expired
 /// namespace is refused before reaching any repository primitive,
 /// while read-only tools on the same dead epoch still serve.
@@ -350,6 +428,46 @@ fn cross_channel_op_reuse_starts_own_session() {
     assert_ne!(ha, hb, "B must own a fresh session, not A's");
     assert_eq!(disp.resolve_session(fe(1), ch(1)), Some(ha));
     assert!(disp.repo().get_session(ha).unwrap().is_some());
+}
+
+/// Scope semantics: attempts are channel-bound; under a stable identity
+/// the attempt lands in the identity's project session (project_id set
+/// at start from the resolved scope).
+#[test]
+fn session_attempt_lands_in_identity_project_session() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, id_a) = generate_project_id("shop");
+    let start = ToolArgs::SessionStart(SessionStartArgs {
+        task_type: "shop-task".to_string(),
+        technologies: vec![],
+        initial_approach: None,
+    });
+    let env = tool_call_with(
+        1,
+        start.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let r = run(&disp, &env, &start);
+    assert!(!result_is_error(&r), "start failed: {}", result_text(&r));
+    let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+        approach: "try shop".to_string(),
+        outcome: "rejected".to_string(),
+        critique: None,
+        rationale: None,
+        related_memory_id: None,
+    });
+    let env = tool_call_with(
+        2,
+        attempt.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let r = run(&disp, &env, &attempt);
+    assert!(!result_is_error(&r), "attempt failed: {}", result_text(&r));
+    let sessions = disp.repo().all_sessions().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].project_id, Some(id_a));
+    assert_eq!(sessions[0].attempts.len(), 1);
 }
 
 #[test]
@@ -545,6 +663,50 @@ fn session_end_replay_returns_recorded_outcome() {
 
 /// Re-review R5: a retried attempt with changed arguments rejects
 /// instead of recording different content under one identity.
+/// Retry safety: the same attempt envelope twice replays the
+/// recorded response with exactly one attempt recorded.
+#[test]
+fn session_attempt_same_envelope_replays_recorded() {
+    let (disp, _dir) = test_dispatcher();
+    let start = ToolArgs::SessionStart(SessionStartArgs {
+        task_type: "debugging".to_string(),
+        technologies: vec![],
+        initial_approach: None,
+    });
+    run(&disp, &tool_call(1, start.clone()), &start);
+    let attempt = ToolArgs::SessionAttempt(SessionAttemptArgs {
+        approach: "try X".to_string(),
+        outcome: "rejected".to_string(),
+        critique: None,
+        rationale: None,
+        related_memory_id: None,
+    });
+    let env = tool_call(2, attempt.clone());
+    let first = run(&disp, &env, &attempt);
+    assert!(
+        !result_is_error(&first),
+        "first failed: {}",
+        result_text(&first)
+    );
+    let second = run(&disp, &env, &attempt);
+    assert!(
+        !result_is_error(&second),
+        "replay failed: {}",
+        result_text(&second)
+    );
+    assert_eq!(
+        result_text(&second),
+        result_text(&first),
+        "replay must be byte-identical"
+    );
+    let sessions = disp.repo().all_sessions().unwrap();
+    assert_eq!(
+        sessions[0].attempts.len(),
+        1,
+        "exactly one attempt may record"
+    );
+}
+
 #[test]
 fn session_attempt_replay_with_changed_args_rejects() {
     let (disp, _dir) = test_dispatcher();

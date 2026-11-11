@@ -75,6 +75,7 @@ pub fn split_latency(scheduled: u64, started: u64, finished: u64) -> (u64, u64) 
 
 /// One executed load op (returned by workers, recorded by the caller in a
 /// deterministic order).
+#[derive(Debug, Clone)]
 pub struct MeasuredOp {
     pub index: usize,
     pub op: WorkloadOp,
@@ -82,20 +83,39 @@ pub struct MeasuredOp {
     pub queued_micros: u64,
     pub ok: bool,
     pub detail: String,
+    /// Revision-conflict retries taken inside the measured boundary.
+    pub retries: u64,
+    /// Storage write-transaction conflicts observed before success/exhaustion.
+    pub conflicts: u64,
 }
 
-/// Execute one put/get storage op (shared by every runner; search ops are
-/// rejected here and belong to the single-threaded FTS leg). Returns
-/// (elapsed micros, ok, detail).
-/// Execute one put/get storage op (shared by every runner; search ops are
-/// rejected here and belong to the single-threaded FTS leg). Returns
-/// (elapsed micros, ok, detail). Payloads are constructed BEFORE the timer
-/// starts so allocation/formatting never inflates store latency.
+/// Outcome of one storage op: elapsed micros, success flag, human detail,
+/// plus the conflict/retry counters observed inside the measured boundary
+/// (RMW loser retries; blind upserts stay 0).
+#[derive(Debug, Clone)]
+pub struct OpOutcome {
+    pub elapsed_micros: u64,
+    pub ok: bool,
+    pub detail: String,
+    pub retries: u64,
+    pub conflicts: u64,
+}
+
+/// Execute one put/get/RMW storage op (shared by every runner). Search ops
+/// stay single-threaded until the FTS leg proves thread-safe publication
+/// (see [`execute_search_op`]). Returns [`OpOutcome`].
+/// Execute one storage op (shared by every runner). Payloads are constructed
+/// BEFORE the timer starts so allocation/formatting never inflates store
+/// latency.
 ///
 /// Scope: load runners drive `put_memory_direct`, which bypasses the command
 /// gateway (no receipts, aliases, revision checks or projection jobs).
 /// Point them at throwaway benchmark stores only — never at a live store,
 /// where blind overwrites at fixed revisions would clobber real state.
+/// RMW ops go through the command gateway instead (fresh read +
+/// revision-checked update): the only leg that can observe revision
+/// conflicts, and the counters in [`OpOutcome`] stay honest (0 for
+/// blind upserts, measured for RMW).
 ///
 /// The runner is a caller of the storage layer, so it honors the plan's
 /// retry contract (Part I: storage conflicts retry from a fresh snapshot
@@ -106,39 +126,143 @@ pub struct MeasuredOp {
 /// is measured from the first attempt (retry time is real service time),
 /// and true exhaustion stays a recorded failure.
 pub fn execute_storage_op(repo: &CanonicalRepository, op: &WorkloadOp) -> (u64, bool, String) {
+    let outcome = execute_storage_op_counted(repo, op, &RmwIssuer::direct());
+    (outcome.elapsed_micros, outcome.ok, outcome.detail)
+}
+
+/// Per-op issuer of RMW command contexts: each RMW op needs a unique
+/// operation id and digest (idempotency keys), even when workers share an
+/// issuer across threads. The issuer binds one retry namespace per
+/// (frontend, channel) pair against the target repo before issuing
+/// contexts (`bind`): gateway `apply` refuses unbound epochs as stale, so
+/// an unbound issuer would fail every RMW loudly instead of measuring.
+pub struct RmwIssuer {
+    frontend_id: ltmrs_domain::id::FrontendId,
+    channel_id: ltmrs_domain::id::ChannelId,
+    retry_epoch: std::sync::atomic::AtomicU64,
+    next_op: std::sync::atomic::AtomicU64,
+}
+
+impl RmwIssuer {
+    /// Issuer for single-threaded legs (fresh frontend/channel identity,
+    /// unbound: call [`RmwIssuer::bind`] before executing RMW ops).
+    pub fn direct() -> Self {
+        Self::fresh()
+    }
+
+    /// Fresh random identity (uuid v7: CSPRNG-backed, no seed to manage).
+    pub fn fresh() -> Self {
+        Self {
+            frontend_id: ltmrs_domain::id::FrontendId::new(uuid::Uuid::now_v7()),
+            channel_id: ltmrs_domain::id::ChannelId::new(uuid::Uuid::now_v7()),
+            retry_epoch: std::sync::atomic::AtomicU64::new(0),
+            next_op: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    /// Bind (or rebind) the issuer's retry namespace against `repo`
+    /// (system clock). Retries once on channel contention.
+    pub fn bind(&self, repo: &CanonicalRepository) -> ltmrs_domain::command::DomainResult<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1000);
+        match repo.issue_namespace(self.frontend_id, self.channel_id, now) {
+            Ok(namespace) => {
+                self.retry_epoch
+                    .store(namespace.retry_epoch, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn next_ctx(&self, seq_hint: u64) -> ltmrs_domain::command::CommandContext {
+        let op_num = self
+            .next_op
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let retry_epoch = self.retry_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        ltmrs_domain::command::CommandContext {
+            store_generation: ltmrs_domain::id::StoreGeneration::FIRST,
+            frontend_id: self.frontend_id,
+            channel_id: self.channel_id,
+            session: None,
+            operation_id: ltmrs_domain::id::OperationId::new(uuid::Uuid::from_u128(
+                (u128::from(op_num) << 64) | u128::from(seq_hint),
+            )),
+            request_digest: format!("bench-rmw-{op_num}-{seq_hint}"),
+            deadline_millis: None,
+            scope: Default::default(),
+            retry_epoch,
+        }
+    }
+}
+
+/// Counted executor: same behavior as [`execute_storage_op`] plus
+/// conflict/retry counters; RMW ops route through `issuer`.
+pub fn execute_storage_op_counted(
+    repo: &CanonicalRepository,
+    op: &WorkloadOp,
+    issuer: &RmwIssuer,
+) -> OpOutcome {
     use crate::bench::experiment::workload_memory;
     use ltmrs_domain::command::DomainErrorCode;
     use ltmrs_domain::id::EntityId;
     enum Prepared {
         Put(Box<ltmrs_domain::memory::Memory>),
         Get(EntityId),
+        Rmw { key: u64, bytes: usize },
     }
+    let fail = |elapsed: u64, msg: String| OpOutcome {
+        elapsed_micros: elapsed,
+        ok: false,
+        detail: msg,
+        retries: 0,
+        conflicts: 0,
+    };
     let prepared = match op {
         WorkloadOp::Put { key, bytes } => Prepared::Put(Box::new(workload_memory(*key, *bytes))),
+        WorkloadOp::Rmw { key, bytes } => Prepared::Rmw {
+            key: *key,
+            bytes: *bytes,
+        },
         WorkloadOp::Get { key } => {
             Prepared::Get(EntityId::new(uuid::Uuid::from_u128(u128::from(*key))))
         }
         WorkloadOp::Search { .. } => {
-            return (
+            return fail(
                 0,
-                false,
                 "search unsupported in load runners (single-threaded FTS leg only)".to_string(),
             );
         }
     };
     const RUNNER_RETRY_LIMIT: u32 = 20;
+    // RMW retries at runner parity: hot-skew RMW hammers the same keys
+    // from every worker, so its conflict rate meets or exceeds blind
+    // puts — a smaller budget would fail the mix, not the store.
+    const RMW_RETRY_LIMIT: u32 = 20;
     let start = Instant::now();
     let elapsed = || start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     match prepared {
         Prepared::Put(memory) => {
             let mut last = None;
+            let mut conflicts = 0u64;
             for attempt in 0..RUNNER_RETRY_LIMIT {
                 match repo.put_memory_direct(&memory) {
-                    Ok(()) => return (elapsed(), true, "written".to_string()),
+                    Ok(()) => {
+                        return OpOutcome {
+                            elapsed_micros: elapsed(),
+                            ok: true,
+                            detail: "written".to_string(),
+                            retries: 0,
+                            conflicts,
+                        };
+                    }
                     Err(e) => {
                         if e.code != DomainErrorCode::Contention {
-                            return (elapsed(), false, e.message.clone());
+                            return fail(elapsed(), e.message.clone());
                         }
+                        conflicts += 1;
                         last = Some(e.message.clone());
                         if attempt + 1 < RUNNER_RETRY_LIMIT {
                             std::thread::sleep(Duration::from_micros(50));
@@ -146,50 +270,191 @@ pub fn execute_storage_op(repo: &CanonicalRepository, op: &WorkloadOp) -> (u64, 
                     }
                 }
             }
-            (
-                elapsed(),
-                false,
-                format!("runner retry exhausted: {}", last.unwrap_or_default()),
-            )
+            OpOutcome {
+                elapsed_micros: elapsed(),
+                ok: false,
+                detail: format!("runner retry exhausted: {}", last.unwrap_or_default()),
+                retries: 0,
+                conflicts,
+            }
         }
         Prepared::Get(id) => match repo.get_memories(&[id]) {
-            Ok(found) => (elapsed(), true, format!("found={}", found.len())),
-            Err(e) => (elapsed(), false, e.message.clone()),
+            Ok(found) => OpOutcome {
+                elapsed_micros: elapsed(),
+                ok: true,
+                detail: format!("found={}", found.len()),
+                retries: 0,
+                conflicts: 0,
+            },
+            Err(e) => fail(elapsed(), e.message.clone()),
         },
+        Prepared::Rmw { key, bytes } => {
+            execute_rmw(repo, issuer, key, bytes, &elapsed, RMW_RETRY_LIMIT)
+        }
+    }
+}
+
+/// Fresh-read + revision-checked update with loser retries: the only
+/// benchmark path that can observe `RevisionConflict`. Each attempt
+/// re-reads the memory, patches the fragment to workload content, and
+/// retries on `RevisionConflict` with bounded backoff; a missing key is
+/// created once (no conflict), then updated. Latency covers all attempts.
+fn execute_rmw(
+    repo: &CanonicalRepository,
+    issuer: &RmwIssuer,
+    key: u64,
+    bytes: usize,
+    elapsed: &dyn Fn() -> u64,
+    retry_limit: u32,
+) -> OpOutcome {
+    use crate::bench::experiment::workload_memory;
+    use ltmrs_domain::command::{DomainCommand, DomainErrorCode, MemoryPatch};
+    use ltmrs_domain::id::EntityId;
+    let id = EntityId::new(uuid::Uuid::from_u128(u128::from(key)));
+    let mut retries = 0u64;
+    let mut conflicts = 0u64;
+    for attempt in 0..retry_limit {
+        let ctx = issuer.next_ctx(key);
+        let fresh = match repo.get_memories(&[id]) {
+            Ok(found) => found.into_iter().next(),
+            Err(e) => {
+                return OpOutcome {
+                    elapsed_micros: elapsed(),
+                    ok: false,
+                    detail: e.message.clone(),
+                    retries,
+                    conflicts,
+                };
+            }
+        };
+        let outcome = match fresh {
+            Some(current) => {
+                let mut patched = workload_memory(key, bytes);
+                patched.entity_revision = current.entity_revision;
+                let patch = MemoryPatch {
+                    fragment: Some(patched.fragment),
+                    ..Default::default()
+                };
+                repo.apply(
+                    &ctx,
+                    &DomainCommand::UpdateMemory {
+                        id,
+                        expected_revision: Some(current.entity_revision),
+                        patch,
+                    },
+                )
+            }
+            None => {
+                let memory = workload_memory(key, bytes);
+                repo.apply(
+                    &ctx,
+                    &DomainCommand::AddMemory {
+                        memory,
+                        session: None,
+                        auto_link: None,
+                    },
+                )
+            }
+        };
+        match outcome {
+            Ok(_) => {
+                return OpOutcome {
+                    elapsed_micros: elapsed(),
+                    ok: true,
+                    detail: format!("rmw ok retries={retries}"),
+                    retries,
+                    conflicts,
+                };
+            }
+            Err(e)
+                if e.code == DomainErrorCode::RevisionConflict
+                    || (e.code == DomainErrorCode::Validation
+                        && e.message.contains("memory already exists")) =>
+            {
+                // Create race: two workers read-missed the same hot key and
+                // both tried AddMemory; the loser re-reads and updates (one
+                // retry, one conflict — the same accounting as a stale
+                // revision).
+                retries += 1;
+                conflicts += 1;
+                if attempt + 1 >= retry_limit {
+                    return OpOutcome {
+                        elapsed_micros: elapsed(),
+                        ok: false,
+                        detail: format!("rmw retry exhausted: {}", e.message),
+                        retries,
+                        conflicts,
+                    };
+                }
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            Err(e) => {
+                return OpOutcome {
+                    elapsed_micros: elapsed(),
+                    ok: false,
+                    detail: e.message.clone(),
+                    retries,
+                    conflicts,
+                };
+            }
+        }
+    }
+    OpOutcome {
+        elapsed_micros: elapsed(),
+        ok: false,
+        detail: "rmw retry exhausted".to_string(),
+        retries,
+        conflicts,
     }
 }
 
 /// Closed-loop run: `workers` threads split `ops` round-robin; each issues
 /// its next op on completion. Returns per-op measurements in input order.
+/// Every worker holds its own [`RmwIssuer`] (fresh identity per worker), so
+/// RMW op contexts stay unique across threads.
 pub fn run_closed_loop(
     repo: &CanonicalRepository,
     ops: &[WorkloadOp],
     workers: usize,
 ) -> Vec<MeasuredOp> {
+    run_closed_loop_counted(repo, ops, workers, &RmwIssuer::fresh())
+}
+
+/// Counted closed-loop run (RMW retry/conflict telemetry preserved). The
+/// passed `issuer` is bound once against `repo` for the single-threaded
+/// prefix below; worker threads bind their own per-worker issuers.
+pub fn run_closed_loop_counted(
+    repo: &CanonicalRepository,
+    ops: &[WorkloadOp],
+    workers: usize,
+    issuer: &RmwIssuer,
+) -> Vec<MeasuredOp> {
     assert!(workers >= 1, "at least one worker");
-    debug_assert!(
-        !ops.iter().any(|op| matches!(op, WorkloadOp::Search { .. })),
-        "load runners take put/get only; searches belong to the FTS leg"
-    );
     if ops.is_empty() {
         return Vec::new();
     }
+    let _ = issuer.bind(repo);
     let workers = workers.min(ops.len());
     let mut out: Vec<MeasuredOp> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for worker in 0..workers {
+            // Per-worker issuer: unique op ids even when threads race.
+            let issuer = RmwIssuer::fresh();
+            let _ = issuer.bind(repo);
             handles.push(scope.spawn(move || {
                 let mut local = Vec::new();
                 let mut index = worker;
                 while index < ops.len() {
-                    let (elapsed, ok, detail) = execute_storage_op(repo, &ops[index]);
+                    let outcome = execute_storage_op_counted(repo, &ops[index], &issuer);
                     local.push(MeasuredOp {
                         index,
                         op: ops[index].clone(),
-                        elapsed_micros: elapsed,
+                        elapsed_micros: outcome.elapsed_micros,
                         queued_micros: 0,
-                        ok,
-                        detail,
+                        ok: outcome.ok,
+                        detail: outcome.detail,
+                        retries: outcome.retries,
+                        conflicts: outcome.conflicts,
                     });
                     index += workers;
                 }
@@ -208,6 +473,8 @@ pub fn run_closed_loop(
 /// Open-loop run: arrivals follow `schedule` offsets regardless of
 /// completions; `workers` threads execute on dequeue. Queue time is measured
 /// per op from its scheduled arrival. Returns measurements in input order.
+/// Every worker holds its own [`RmwIssuer`] (fresh identity per worker), so
+/// RMW op contexts stay unique across threads.
 pub fn run_open_loop(
     repo: &CanonicalRepository,
     ops: &[WorkloadOp],
@@ -215,10 +482,6 @@ pub fn run_open_loop(
     workers: usize,
 ) -> Vec<MeasuredOp> {
     assert!(workers >= 1, "at least one worker");
-    debug_assert!(
-        !ops.iter().any(|op| matches!(op, WorkloadOp::Search { .. })),
-        "load runners take put/get only; searches belong to the FTS leg"
-    );
     assert_eq!(
         ops.len(),
         schedule.len(),
@@ -237,6 +500,10 @@ pub fn run_open_loop(
         for _ in 0..workers {
             let rx_work = &rx_work;
             let tx_done = tx_done.clone();
+            // Per-worker issuer: unique op ids even when threads race.
+            // Bound before any RMW executes (gateway refuses unbound epochs).
+            let issuer = RmwIssuer::fresh();
+            let _ = issuer.bind(repo);
             scope.spawn(move || {
                 loop {
                     // The mutex only serializes dequeuing; the guard drops at
@@ -247,17 +514,22 @@ pub fn run_open_loop(
                         Err(_) => break,
                     };
                     let recv_at = micros_since(start);
-                    let (elapsed, ok, detail) = execute_storage_op(repo, &ops[index]);
-                    let (queued, _) =
-                        split_latency(scheduled, recv_at, recv_at.saturating_add(elapsed));
+                    let outcome = execute_storage_op_counted(repo, &ops[index], &issuer);
+                    let (queued, _) = split_latency(
+                        scheduled,
+                        recv_at,
+                        recv_at.saturating_add(outcome.elapsed_micros),
+                    );
                     tx_done
                         .send(MeasuredOp {
                             index,
                             op: ops[index].clone(),
-                            elapsed_micros: elapsed,
+                            elapsed_micros: outcome.elapsed_micros,
                             queued_micros: queued,
-                            ok,
-                            detail,
+                            ok: outcome.ok,
+                            detail: outcome.detail,
+                            retries: outcome.retries,
+                            conflicts: outcome.conflicts,
                         })
                         .expect("collector alive");
                 }
@@ -293,12 +565,14 @@ pub fn record_measured(
     let mut ordered: Vec<&MeasuredOp> = measured.iter().collect();
     ordered.sort_by_key(|m| m.index);
     for m in ordered {
-        recorder.record_queued(
+        recorder.record_full(
             m.op.clone(),
             m.elapsed_micros,
             m.queued_micros,
             m.ok,
             &m.detail,
+            m.retries,
+            m.conflicts,
         )?;
     }
     Ok(())
@@ -405,7 +679,7 @@ mod tests {
         let repo = open_repo(&dir);
         let ops: Vec<WorkloadOp> = gen_ops(7, 40)
             .into_iter()
-            .filter(|op| !matches!(op, WorkloadOp::Search { .. }))
+            .filter(|op| !matches!(op, WorkloadOp::Search { .. } | WorkloadOp::Rmw { .. }))
             .collect();
         let measured = run_closed_loop(&repo, &ops, 4);
         assert_eq!(measured.len(), ops.len(), "offered == completed");
@@ -413,6 +687,10 @@ mod tests {
         assert!(
             measured.iter().all(|m| m.queued_micros == 0),
             "no queue in closed loop"
+        );
+        assert!(
+            measured.iter().all(|m| m.retries == 0 && m.conflicts == 0),
+            "blind upserts never retry"
         );
         let history = dir.path().join("closed.jsonl");
         let mut recorder = HistoryRecorder::create(&history).unwrap();
@@ -423,6 +701,108 @@ mod tests {
         for (i, record) in back.iter().enumerate() {
             assert_eq!(record.seq, i as u64);
         }
+    }
+
+    /// RMW leg: blind creates then genuine revision-checked updates against
+    /// a skewed hot key; every op succeeds and counters stay honest.
+    #[test]
+    fn rmw_executes_revision_checked_updates() {
+        use crate::bench::experiment::workload_memory;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir);
+        let issuer = RmwIssuer::fresh();
+        issuer.bind(&repo).unwrap();
+        let outcome =
+            execute_storage_op_counted(&repo, &WorkloadOp::Rmw { key: 3, bytes: 64 }, &issuer);
+        assert!(outcome.ok, "first RMW creates, got: {}", outcome.detail);
+        let outcome =
+            execute_storage_op_counted(&repo, &WorkloadOp::Rmw { key: 3, bytes: 64 }, &issuer);
+        assert!(outcome.ok, "second RMW updates, got: {}", outcome.detail);
+        assert_eq!((outcome.retries, outcome.conflicts), (0, 0));
+        // Fresh reads see the workload content.
+        let id = ltmrs_domain::id::EntityId::new(uuid::Uuid::from_u128(3));
+        let found = repo.get_memories(&[id]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].fragment, workload_memory(3, 64).fragment);
+    }
+
+    /// RMW losers retry from a fresh snapshot: two threads racing the same
+    /// key both succeed, and at least one observes a revision conflict.
+    #[test]
+    fn rmw_conflicts_retry_to_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir);
+        let issuer = RmwIssuer::fresh();
+        issuer.bind(&repo).unwrap();
+        let seed =
+            execute_storage_op_counted(&repo, &WorkloadOp::Rmw { key: 1, bytes: 32 }, &issuer);
+        assert!(seed.ok, "seed must succeed: {}", seed.detail);
+        let ops: Vec<WorkloadOp> = vec![WorkloadOp::Rmw { key: 1, bytes: 32 }; 8];
+        let measured = run_closed_loop(&repo, &ops, 4);
+        assert_eq!(measured.len(), 8, "offered == completed");
+        assert!(
+            measured.iter().all(|m| m.ok),
+            "losers retry to success: {:?}",
+            measured.iter().map(|m| &m.detail).collect::<Vec<_>>()
+        );
+        let conflicts: u64 = measured.iter().map(|m| m.conflicts).sum();
+        // Contended hot key: at least one loser must have observed a
+        // conflict (proves the telemetry path is exercised, not stubbed).
+        assert!(
+            conflicts > 0,
+            "contended RMW must observe conflicts, got: {:?}",
+            measured
+                .iter()
+                .map(|m| (m.retries, m.conflicts))
+                .collect::<Vec<_>>()
+        );
+        let history = dir.path().join("rmw.jsonl");
+        let mut recorder = HistoryRecorder::create(&history).unwrap();
+        record_measured(&mut recorder, &measured).unwrap();
+        recorder.flush().unwrap();
+        let back = crate::bench::read_history(&history).unwrap();
+        let back_conflicts: u64 = back.iter().map(|r| r.conflicts).sum();
+        assert_eq!(
+            back_conflicts, conflicts,
+            "conflicts must survive the history"
+        );
+    }
+
+    /// Closed loop over a contended RMW-heavy stream: every op accounted,
+    /// retries visible in aggregate.
+    #[test]
+    fn contended_write_mix_runs_closed_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = open_repo(&dir);
+        let mut generator = OpGenerator::new(GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 500,
+            rmw_per_1000: 500,
+            hot_per_1000: 900,
+            hot_key_span: 4,
+            key_space: 64,
+            value_bytes: 64,
+            top_k: 5,
+        });
+        let ops: Vec<WorkloadOp> = (0..120).map(|_| generator.next_op()).collect();
+        assert!(
+            ops.iter().any(|op| matches!(op, WorkloadOp::Rmw { .. })),
+            "mix must contain RMW ops"
+        );
+        let measured = run_closed_loop(&repo, &ops, 4);
+        assert_eq!(measured.len(), ops.len(), "offered == completed");
+        assert!(
+            measured.iter().all(|m| m.ok),
+            "all RMW retries converge: {:?}",
+            measured
+                .iter()
+                .filter(|m| !m.ok)
+                .map(|m| &m.detail)
+                .collect::<Vec<_>>()
+        );
+        let retries: u64 = measured.iter().map(|m| m.retries).sum();
+        let conflicts: u64 = measured.iter().map(|m| m.conflicts).sum();
+        assert_eq!(retries, conflicts, "every conflict costs exactly one retry");
     }
 
     /// Open-loop executes every scheduled arrival and records per-op queue
@@ -454,6 +834,19 @@ mod tests {
         assert_eq!(back.len(), ops.len());
     }
 
+    /// Load legs record an RSS delta around the run (rank-1 WP-12 gap).
+    #[test]
+    fn load_run_records_rss_delta() {
+        use crate::bench::experiment::current_rss_kb;
+        let before = current_rss_kb();
+        let after = current_rss_kb();
+        let delta = crate::bench::experiment::rss_delta_kb(before, after);
+        #[cfg(target_os = "linux")]
+        assert!(delta.is_some(), "RSS must sample on Linux");
+        #[cfg(not(target_os = "linux"))]
+        assert!(delta.is_none(), "off-Linux sampler reports None");
+    }
+
     /// Telemetry observes store growth across writes (never invents values
     /// for pipelines outside the boundary).
     #[test]
@@ -462,7 +855,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store");
         let repo = CanonicalRepository::open(store.to_str().unwrap()).unwrap();
-        let _before = collect_telemetry(&store).unwrap();
         for key in 0..10u64 {
             repo.put_memory_direct(&workload_memory(key, 128)).unwrap();
         }
@@ -504,6 +896,7 @@ mod tests {
             key_space: 500,
             value_bytes: 256,
             top_k: 10,
+            ..Default::default()
         };
         let mut op_gen = OpGenerator::new(generator.clone());
         let ops: Vec<WorkloadOp> = (0..1000).map(|_| op_gen.next_op()).collect();
@@ -524,6 +917,7 @@ mod tests {
         let tele_before = collect_telemetry(&out.join("store")).unwrap();
 
         // Closed leg: 4 workers, issue-on-complete.
+        let rss_before_closed = crate::bench::experiment::current_rss_kb();
         let wall = std::time::Instant::now();
         let closed = run_closed_loop(&repo, &putget, 4);
         let closed_wall = wall.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -541,6 +935,10 @@ mod tests {
             total_ops: closed_records.len() as u64,
             total_failures: closed_records.iter().filter(|r| !r.ok).count() as u64,
             wall_micros: closed_wall,
+            rss_delta_kb: crate::bench::experiment::rss_delta_kb(
+                rss_before_closed,
+                crate::bench::experiment::current_rss_kb(),
+            ),
         };
         assert_eq!(closed_summary.total_failures, 0);
         std::fs::write(
@@ -551,6 +949,7 @@ mod tests {
 
         // Open leg: Poisson 200/s arrivals, queue time measured per op.
         let schedule = arrival_schedule(ArrivalProcess::Poisson, 200, putget.len(), 12);
+        let rss_before_open = crate::bench::experiment::current_rss_kb();
         let wall = std::time::Instant::now();
         let open = run_open_loop(&repo, &putget, &schedule, 2);
         let open_wall = wall.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -576,6 +975,10 @@ mod tests {
             total_ops: open_records.len() as u64,
             total_failures: open_records.iter().filter(|r| !r.ok).count() as u64,
             wall_micros: open_wall,
+            rss_delta_kb: crate::bench::experiment::rss_delta_kb(
+                rss_before_open,
+                crate::bench::experiment::current_rss_kb(),
+            ),
         };
         assert_eq!(open_summary.total_failures, 0);
         std::fs::write(

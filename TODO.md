@@ -15,19 +15,15 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [x] WP-05 — Versioned Lance search projection (S3)
 - [x] WP-06 — Candle embedding service and model qualification (S4)
 - [x] WP-07 — Retrieval, graph context and explanations (S5)
-- [x] WP-08 — Complete memory MCP contract (S2/S6) — 11 tool handlers + read side effects + instructions + notifications; differential replay harness (task 9) deferred
+- [x] WP-08 — Complete memory MCP contract (S2/S6) — 11 tool handlers + read side effects + instructions + notifications; differential harness live (02:340 byte-for-byte, 02:367 8-step replay)
 - [x] WP-09 — Guides, sessions and intelligence (S6, 29-tool surface live)
 - [x] WP-10 — CLI, managed skills, hosts and visualizer (S6)
 - [x] WP-11 — Import, legacy interchange, backup and restore (S7)
 
 ## Open — qualification and release (S8)
 
-- [ ] WP-12 — Qualification, quality and performance (S8; conformance 117/232 executed, Part III checklist open)
-- [ ] WP-13 — Release, documentation and evidence closure (S8; publish needs owner approval)
-- [ ] Parallel bulk drive — phased plan at
-  plans/2026-09-28-parallel-bulk-drive.md
-  (batch-per-memory → bounded chunk pool → CUDA-gated; fairness
-  first, owner-ordered 2026-09-28)
+- [ ] WP-12 — Qualification, quality and performance (S8; matrix 211/240 executed_passed 2026-11-11 (+scope 18, +retry 24, +stragglers 3, +enhancement 30, +oracle 2 pure; remaining: 28 legacy_oracle needing provisioned upstream, 2 honest read-retry N/A); benchmarks harness v3 (RMW/ablation/soak legs landed); Part III §11 open items tracked in-plan)
+- [ ] WP-13 — Release, documentation and evidence closure (S8; evidence bundle exit 0 on clean checkout; publish needs owner approval)
 - [ ] DEV-008 follow-up — Upstream instructional UX (seed fragments,
   coaching blocks, technology autodetect, distill suggestion).
   Baseline captures mechanisms only, no content/heuristics. First
@@ -39,9 +35,10 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 ## Open decisions (from Part I §13)
 
 - [x] AD-01 — Canonical backend: Fjall canonical + Lance projection (`AD-01_canonical_backend.md`)
-- [x] AD-02 — Exact crate/feature/toolchain lock (`rust-toolchain.toml` pins 1.99.0)
-- [x] AD-03 — Legacy contract baseline wire capture — done in WP-00
-- [x] AD-04 — Default Candle recipe E5-small (`crates/embeddings`, recipe manifest tests green)
-- [x] AD-05 — Score/abstention thresholds (frozen Jaccard recipe: dedup 0.80, autolink band)
-- [x] AD-06 — FTS freshness / null-vector behavior (`SearchState` Complete/Partial/Unavailable, NULL-row backfill)
+- [x] AD-02 — Toolchain 1.99.0 + resolved fjall 3.1.12 / lance 13.0.0 / lancedb 0.40.0 / candle-core 0.11.0 / tokenizers 0.22.2 / rmcp 3.7.0
+- [x] AD-03 — Legacy contract baseline — Lemma 0.21.0 @ d30a816, wire + static inventory in `baseline/lemma-0.21.0/`
+- [x] AD-04 — E5-small qualified recipe, 384-dim / 512-token / MaskedMean+L2 (`manifest.rs:78-90`, recipe tests green)
+- [x] AD-05 — Jaccard dedup >= 0.80 + autolink band 0.25..0.95 (`similarity.rs:27-30`, `jaccard_recipe_basics`)
+- [x] AD-06 — `SearchState` Complete/Partial/Unavailable + NULL-row backfill (`backend.rs:194-203`, `backfill_requeues_lexical_null_vector_rows`)
 - [x] AD-07 — Host/platform support matrix (Windows named-pipe daemon certified, `windows_certification` ledger)
+- Stale-plan sweep 2026-11-11 CLOSED (02 §21 reviews): §13, §20, WP-12/13 boxes, bulk-drive paths/pointer, Windows shim/naming/ctrl-break, split membership/skills, FuncReview minors (backup descriptions verified honest, untouched).

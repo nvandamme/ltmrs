@@ -19,10 +19,11 @@ use std::path::Path;
 pub mod experiment;
 pub mod load;
 pub mod quality;
+pub mod soak;
 
 /// Harness version, bumped when the generator or record format changes (old
 /// raw histories stay readable; comparisons must match versions).
-pub const HARNESS_VERSION: u32 = 2;
+pub const HARNESS_VERSION: u32 = 3;
 
 /// Crate root for locating tracked test assets (fixtures, artifact probes)
 /// and report output dirs. Tests must not depend on the runner's working
@@ -65,11 +66,15 @@ impl WorkloadRng {
 
 /// Storage-only workload op. `Search` carries a probe id, never a live
 /// embedding: the measured boundary resolves it through [`probe_vector`].
+/// `Rmw` is a read-modify-write against one key (fresh read +
+/// revision-checked update): the only leg that exercises revision
+/// conflicts and retry telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WorkloadOp {
     Put { key: u64, bytes: usize },
     Get { key: u64 },
     Search { probe: u64, top_k: usize },
+    Rmw { key: u64, bytes: usize },
 }
 
 /// Generator configuration (part of the workload config digest).
@@ -77,10 +82,17 @@ pub enum WorkloadOp {
 pub struct GeneratorConfig {
     /// Workload seed (pins the op stream and probe vectors).
     pub seed: u64,
-    /// Puts per 1000 ops (remainder split between get/search).
+    /// Puts per 1000 ops (RMW draws next from the post-put remainder;
+    /// the rest splits between get/search).
     pub puts_per_1000: u64,
     /// Key space size (keys uniform in `[0, key_space)`).
     pub key_space: u64,
+    /// Read-modify-write ops per 1000 (hot-key RMW leg; default 0, off).
+    pub rmw_per_1000: u64,
+    /// Hot-key fraction per 1000 routed to the lowest `hot_key_span` keys.
+    pub hot_per_1000: u64,
+    /// Hot-slice width in keys (genuine only when `hot_per_1000 > 0`).
+    pub hot_key_span: u64,
     /// Value payload bytes per put.
     pub value_bytes: usize,
     /// Candidate count per search op.
@@ -93,6 +105,9 @@ impl Default for GeneratorConfig {
             seed: 1,
             puts_per_1000: 500,
             key_space: 10_000,
+            rmw_per_1000: 0,
+            hot_per_1000: 0,
+            hot_key_span: 0,
             value_bytes: 256,
             top_k: 10,
         }
@@ -110,6 +125,22 @@ impl OpGenerator {
     pub fn new(config: GeneratorConfig) -> Self {
         assert!(config.key_space > 0, "key space must be positive");
         assert!(config.puts_per_1000 <= 1000, "puts share must be per-1000");
+        assert!(
+            config.puts_per_1000 + config.rmw_per_1000 <= 1000,
+            "put + rmw shares must be per-1000"
+        );
+        assert!(
+            config.hot_per_1000 <= 1000,
+            "hot-key share must be per-1000"
+        );
+        assert!(
+            config.hot_key_span <= config.key_space,
+            "hot slice must fit the key space"
+        );
+        assert!(
+            config.hot_per_1000 == 0 || config.hot_key_span > 0,
+            "hot-key routing needs a nonzero hot slice"
+        );
         let seed = config.seed;
         Self {
             rng: WorkloadRng::new(seed),
@@ -118,15 +149,41 @@ impl OpGenerator {
         }
     }
 
+    /// Route a uniform key into the hot slice with probability
+    /// `hot_per_1000 / 1000` (one extra draw; deterministic per stream).
+    fn route_hot(&mut self, key: u64) -> u64 {
+        if self.config.hot_per_1000 == 0 {
+            return key;
+        }
+        if self.rng.below(1000) < self.config.hot_per_1000 {
+            key % self.config.hot_key_span
+        } else {
+            key
+        }
+    }
+
     pub fn next_op(&mut self) -> WorkloadOp {
         let draw = self.rng.below(1000);
         self.emitted += 1;
         if draw < self.config.puts_per_1000 {
+            let uniform = self.rng.below(self.config.key_space);
+            let key = self.route_hot(uniform);
             WorkloadOp::Put {
-                key: self.rng.below(self.config.key_space),
+                key,
                 bytes: self.config.value_bytes,
             }
-        } else if draw < self.config.puts_per_1000 + (1000 - self.config.puts_per_1000) / 2 {
+        } else if draw < self.config.puts_per_1000 + self.config.rmw_per_1000 {
+            let uniform = self.rng.below(self.config.key_space);
+            let key = self.route_hot(uniform);
+            WorkloadOp::Rmw {
+                key,
+                bytes: self.config.value_bytes,
+            }
+        } else if draw
+            < self.config.puts_per_1000
+                + self.config.rmw_per_1000
+                + (1000 - self.config.puts_per_1000 - self.config.rmw_per_1000) / 2
+        {
             WorkloadOp::Get {
                 key: self.rng.below(self.config.key_space),
             }
@@ -178,6 +235,16 @@ pub struct HistoryRecord {
     /// coincide; open-loop runners measure it per op (T-BENCH-02: latency
     /// from scheduled arrival, queue time never omitted).
     pub queued_micros: u64,
+    /// Revision-conflict retries actually taken inside the measured boundary
+    /// (RMW leg: loser re-read + re-patch attempts; blind upserts stay 0).
+    /// Old histories without this column load as 0 (serde default).
+    #[serde(default)]
+    pub retries: u64,
+    /// Storage write-transaction conflicts observed (attempts that returned
+    /// a conflict before eventual success or exhaustion). Old histories
+    /// load as 0 (serde default).
+    #[serde(default)]
+    pub conflicts: u64,
 }
 
 /// Append-only JSONL history recorder.
@@ -201,7 +268,7 @@ impl HistoryRecorder {
         ok: bool,
         detail: &str,
     ) -> std::io::Result<()> {
-        self.record_queued(op, elapsed_micros, 0, ok, detail)
+        self.record_full(op, elapsed_micros, 0, ok, detail, 0, 0)
     }
 
     /// Record with an explicit queue-time component (open-loop runners).
@@ -213,6 +280,22 @@ impl HistoryRecorder {
         ok: bool,
         detail: &str,
     ) -> std::io::Result<()> {
+        self.record_full(op, elapsed_micros, queued_micros, ok, detail, 0, 0)
+    }
+
+    /// Full record path for contention legs: queue time plus the
+    /// conflict/retry counters observed inside the measured boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_full(
+        &mut self,
+        op: WorkloadOp,
+        elapsed_micros: u64,
+        queued_micros: u64,
+        ok: bool,
+        detail: &str,
+        retries: u64,
+        conflicts: u64,
+    ) -> std::io::Result<()> {
         let record = HistoryRecord {
             seq: self.seq,
             op,
@@ -220,6 +303,8 @@ impl HistoryRecorder {
             ok,
             detail: detail.to_string(),
             queued_micros,
+            retries,
+            conflicts,
         };
         self.seq += 1;
         let mut line = serde_json::to_string(&record)
@@ -301,7 +386,31 @@ impl Histogram {
 
 /// Config digest: hex sha256 over the canonical workload parameters (same
 /// config always yields the same digest; it identifies the workload, while
-/// the seed identifies the stream instance).
+/// the seed identifies the stream instance). RMW share, hot-key skew and the
+/// salt flag ride the preimage so a contended/salted/salted variant can
+/// never alias a digest from the uniform blind-upsert stream.
+pub fn config_digest_for(config: &GeneratorConfig, ops: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let s = format!(
+        "v3:{}:{}:{}:{}:{}:{}:{}:{}",
+        config.seed,
+        config.puts_per_1000,
+        config.rmw_per_1000,
+        config.hot_per_1000,
+        config.hot_key_span,
+        config.key_space,
+        config.value_bytes,
+        config.top_k,
+    );
+    let _ = ops;
+    h.update(s.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Positional digest kept for the three existing callers (uniform put/get
+/// and search legs with RMW/hot/salt at zero): forwards to
+/// [`config_digest_for`] with RMW/hot unset so digests stay comparable.
 pub fn config_digest(
     seed: u64,
     puts_per_1000: u64,
@@ -310,11 +419,19 @@ pub fn config_digest(
     top_k: usize,
     ops: u64,
 ) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    let s = format!("{seed}:{puts_per_1000}:{key_space}:{value_bytes}:{top_k}:{ops}");
-    h.update(s.as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    config_digest_for(
+        &GeneratorConfig {
+            seed,
+            puts_per_1000,
+            rmw_per_1000: 0,
+            hot_per_1000: 0,
+            hot_key_span: 0,
+            key_space,
+            value_bytes,
+            top_k,
+        },
+        ops,
+    )
 }
 
 /// Machine + workload provenance attached to every report (RQ-23: declared
@@ -443,5 +560,181 @@ mod tests {
         assert_eq!(p.seed, 7);
         assert_eq!(p.workload_digest, "digest-abc");
         assert_eq!(p.harness_version, HARNESS_VERSION);
+    }
+
+    /// RMW ops draw from their own per-1000 region after puts (TDD RED:
+    /// fails until the `Rmw` draw region exists).
+    #[test]
+    fn rmw_draw_region_emits_rmw_ops() {
+        let mut generator = OpGenerator::new(GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 500,
+            rmw_per_1000: 300,
+            key_space: 64,
+            ..Default::default()
+        });
+        let ops: Vec<WorkloadOp> = (0..2000).map(|_| generator.next_op()).collect();
+        let rmw = ops
+            .iter()
+            .filter(|op| matches!(op, WorkloadOp::Rmw { .. }))
+            .count();
+        assert!(rmw > 100, "rmw region must emit, got {rmw}/2000");
+        assert!(rmw < 900, "rmw region must stay bounded, got {rmw}/2000");
+        let puts = ops
+            .iter()
+            .filter(|op| matches!(op, WorkloadOp::Put { .. }))
+            .count();
+        assert!(puts > 800, "put region must hold, got {puts}/2000");
+    }
+
+    /// Zero RMW share is the legacy stream: byte-identical op sequence to
+    /// the pre-RMW generator (proves the draw regions did not shift).
+    #[test]
+    fn zero_rmw_matches_legacy_stream() {
+        let legacy = GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 600,
+            key_space: 500,
+            ..Default::default()
+        };
+        let mut a = OpGenerator::new(legacy.clone());
+        let mut b = OpGenerator::new(GeneratorConfig {
+            rmw_per_1000: 0,
+            hot_per_1000: 0,
+            hot_key_span: 0,
+            ..legacy
+        });
+        let stream_a: Vec<WorkloadOp> = (0..2000).map(|_| a.next_op()).collect();
+        let stream_b: Vec<WorkloadOp> = (0..2000).map(|_| b.next_op()).collect();
+        assert_eq!(
+            stream_a, stream_b,
+            "zero shares must replay the legacy stream"
+        );
+    }
+
+    /// Hot-key skew routes the hot fraction into the lowest `hot_key_span`
+    /// keys (TDD RED: fails until skew routing exists).
+    #[test]
+    fn hot_skew_concentrates_puts() {
+        let mut generator = OpGenerator::new(GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 1000,
+            hot_per_1000: 900,
+            hot_key_span: 4,
+            key_space: 1000,
+            ..Default::default()
+        });
+        let ops: Vec<WorkloadOp> = (0..2000).map(|_| generator.next_op()).collect();
+        let put_keys: Vec<u64> = ops
+            .iter()
+            .filter_map(|op| match op {
+                WorkloadOp::Put { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(put_keys.len(), 2000);
+        let hot = put_keys.iter().filter(|k| **k < 4).count();
+        assert!(hot > 1500, "hot fraction must concentrate, got {hot}/2000");
+    }
+
+    /// Invalid shares fail fast (guard clauses, never silent clamping).
+    #[test]
+    #[should_panic(expected = "put + rmw shares must be per-1000")]
+    fn put_plus_rmw_over_1000_panics() {
+        let _ = OpGenerator::new(GeneratorConfig {
+            seed: 1,
+            puts_per_1000: 800,
+            rmw_per_1000: 300,
+            ..Default::default()
+        });
+    }
+
+    /// A nonzero hot fraction with no hot slice fails fast.
+    #[test]
+    #[should_panic(expected = "hot-key routing needs a nonzero hot slice")]
+    fn hot_without_slice_panics() {
+        let _ = OpGenerator::new(GeneratorConfig {
+            seed: 1,
+            puts_per_1000: 1000,
+            hot_per_1000: 100,
+            hot_key_span: 0,
+            ..Default::default()
+        });
+    }
+
+    /// The extended digest distinguishes RMW/hot variants and stays stable
+    /// for identical configs.
+    #[test]
+    fn digest_covers_rmw_and_hot() {
+        let base = GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 500,
+            key_space: 500,
+            ..Default::default()
+        };
+        assert_eq!(
+            config_digest_for(&base, 2000),
+            config_digest_for(&base, 2000),
+            "same config must digest identically"
+        );
+        let rmw = GeneratorConfig {
+            rmw_per_1000: 200,
+            ..base.clone()
+        };
+        assert_ne!(
+            config_digest_for(&base, 2000),
+            config_digest_for(&rmw, 2000),
+            "rmw share must change the digest"
+        );
+        let hot = GeneratorConfig {
+            hot_per_1000: 900,
+            hot_key_span: 8,
+            ..base.clone()
+        };
+        assert_ne!(
+            config_digest_for(&base, 2000),
+            config_digest_for(&hot, 2000),
+            "hot skew must change the digest"
+        );
+        // Positional shim forwards the uniform case.
+        assert_eq!(
+            config_digest(7, 500, 500, 256, 10, 2000),
+            config_digest_for(&base, 2000),
+            "positional digest must match the uniform full-config digest"
+        );
+    }
+
+    /// Contention counters round-trip through the history (old histories
+    /// without the columns load as 0 via serde defaults).
+    #[test]
+    fn contention_counters_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contention.jsonl");
+        let mut rec = HistoryRecorder::create(&path).unwrap();
+        rec.record_full(
+            WorkloadOp::Rmw { key: 3, bytes: 8 },
+            41,
+            0,
+            true,
+            "rmw ok",
+            2,
+            3,
+        )
+        .unwrap();
+        rec.flush().unwrap();
+        let back = read_history(&path).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!((back[0].retries, back[0].conflicts), (2, 3));
+        // Old-format line (no counters) loads as zero.
+        let legacy = serde_json::json!({
+            "seq": 0,
+            "op": {"Put": {"key": 1, "bytes": 4}},
+            "elapsed_micros": 11,
+            "ok": true,
+            "detail": "written",
+            "queued_micros": 0,
+        });
+        let record: HistoryRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!((record.retries, record.conflicts), (0, 0));
     }
 }

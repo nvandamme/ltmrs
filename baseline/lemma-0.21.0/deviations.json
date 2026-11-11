@@ -187,6 +187,18 @@
       "test": "memory_add_conflicting_fragment_refused_with_advice, memory_add_conflicting_pair_refused_preserves_confidence, memory_add_update_old_then_add_succeeds_without_conflict, memory_add_unrelated_fragment_reports_no_conflicts, memory_add_cross_project_conflict_not_surfaced_under_stable_id, memory_add_conflict_check_failure_degrades_with_notice, conflict_scan_detects_opposing_fragments, conflict_signature_cache_populates_across_adds_and_prunes_on_forget, restore_clears_conflict_signature_cache (daemon tools); single_target_matches_full_scan_for_new_memory (compat)",
       "release_wording": "Conflicting memory_add calls are refused with the conflicting ids/titles and remediation advice; no automatic confidence changes or links.",
       "approval": "approved by owner 2026-10-26"
+    },
+    {
+      "id": "DEV-016",
+      "class": "compatibility",
+      "tool": "memory_update, memory_feedback, memory_forget, memory_merge, memory_relate, memory_stats, memory_audit, memory_library, suggestion_respond, conflict_scan, proactive_analysis, project_analytics, backup_preview",
+      "upstream_behavior": "Pinned Lemma 0.21.0 verbatim tool surface (schemas, defaults, validation, error envelopes, pagination).",
+      "ltmrs_behavior": "Verbatim surface preserved; no intentional enhancement. Stable project identity gates scoping per Part I 10.2 (DEV-006 mechanism); aggregate scans additionally bound by max_scan_rows + generation-gated snapshot cache (Part I 10.2a). Scope/retry evidence in plans/conformance_matrix.json scope_and_concurrency/retry_and_restart columns (2026-11-11).",
+      "reason": "No intentional deviation: these tools carry the frozen contract unchanged. Recorded explicitly so the enhancement_ledger column has a reviewed entry per tool instead of silence.",
+      "user_visible_impact": "None beyond the DEV-006 identity mechanism and the documented scan bounds.",
+      "test": "T-MCP-01, T-MCP-02, T-SESS-01/02, T-CONC-03, T-SCOPE-01/02",
+      "release_wording": "Complete supported Lemma API/workflow surface with documented retrieval enhancements.",
+      "approval": "proposed 2026-11-11 (owner review pending; matrix cells reference this entry as reviewed-not-approved until signed)"
     }
   ]
 }

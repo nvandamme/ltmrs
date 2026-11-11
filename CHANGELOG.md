@@ -5,7 +5,37 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-10-26 — fix: Windows loader port (daemon now compiles for msvc)
+## 2026-11-11 — feat: WP completion wave (scope/retry cells, ablation + bench legs, allocator fix, plan drift closure)
+
+### Aggregate scope isolation + per-call quotas (FuncReview critical closure)
+- Threaded `ResolvedScope` into `exec_memory_audit`/`conflict_scan`/`proactive_analysis`/`exec_project_analytics` + session_stats (effective_for_read/is_eligible/project_includes_id); library guides/relations scoped to visible endpoints.
+- Per-call `max_scan_rows: 10_000` budget (now honors configured `ResourceLimits` via `Dispatcher::max_scan_rows` + `with_scan_budget`, wired at all 3 daemon construction sites) + single-entry `(generation, export)` snapshot cache with commit-hook + execute_tool invalidation.
+- 18 scope_and_concurrency + 24 retry_and_restart matrix cells flipped with named tests (134→211/240); semantic contract test (defaults/validation/output/mode); guide + backup + session + suggest + semantic read/scope/retry coverage.
+- Proof: daemon lib 354/354 (incl. 6 RED-first scope tests + freshness + budget + configured-cap + 13 read/scope/retry tests), clippy clean, fmt clean.
+
+### Benchmark legs (WP-12)
+- 4 ablation legs (DenseExact/HybridRrf/Priority/Mmr via engine primitives, 14/14 quality green; Graph blocked: frozen corpus has no edges; UpstreamReference blocked on owner decision).
+- RMW contended-write leg (hot-skew generator + revision-checked executor + OpOutcome counters); salted export; threaded FTS search; soak skeleton (steady-state + kill/restart accounting); RMW_RETRY_LIMIT 8→20 at runner parity.
+- RSS delta in all three bench legs (`rss_delta_kb` via procfs + libc sysconf); benchmarks.toml ledger updated + harness v2→3.
+- Proof: bench 47/47 (+ quality 14/14), workspace clippy clean, fmt clean.
+
+### Durability fix (bundle-blocking flake, root-caused)
+- Concurrent suggestion filing exhausted retries under full-workspace load: max-scan read dependency + shared op_seq key per attempt = wide conflict window. Fix: dedicated `suggestion-seq` allocator counter in `namespaces` (no migration), single-key read+increment; max-scan only seeds pre-counter stores.
+- Proof: service lib 126/126 (incl. fallback test), 4/4 stress passes; evidence bundle (`cargo xtask evidence --release`) exit 0.
+
+### Conformance + oracle
+- DEV-016 verbatim ledger (13 tools with no intentional deviation); pure oracles promoted (stats/audit); differential_fixture.json proven stale (fields≠expectedResponse) and removed (regenerable).
+- Remaining legacy_oracle 28 cells need provisioned upstream runs; 2 retry cells honest not_run (backup_create: no receipt semantics; preview: token lifecycle at interchange level).
+
+### Plans (02 §21 one-review repairs)
+- Part I §10.2/§10.2a/§7.3 (scope/budget/cache) + §13 AD-02..07 reconciled with exact versions/tests; Part II WP-04/WP-08 + §20 rewritten delivered + WP-12/13 split into executed + 11 explicit open items.
+- Bulk-drive file map → crates/, phantom pointer struck; Windows shim/design-win + detach_child naming + ctrl-break explicit not_run; split-plan membership/skills; FuncReview minors (26-tool comments, score comment, library sessions count).
+- traceability RQ-13/RQ-22 evidence appended.
+
+### Verification at commit
+- `cargo fmt -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo xtask gate-audit` 10/10 PASS; `cargo test --workspace` full suite green (15 binaries, 0 failures); evidence bundle exit 0 on clean checkout.
+
+## 9e222b6 (2026-10-26) — fix: Windows loader port (daemon now compiles for msvc)
 
 ### `cfg(windows)` LoadLibraryW port; POSIX path untouched
 - `lemma_import.rs`: Windows loader twins + per-platform lifecycle tests; `.dll` name; cookie-never-freed pinned; 2 windows-sys feature adds (0.59 pinned).

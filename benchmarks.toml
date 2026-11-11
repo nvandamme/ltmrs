@@ -8,7 +8,7 @@
 # storage_experiment_reference_run` (and later runners). Only workloads with
 # real evidence are listed here — no aspirations.
 
-harness_version = 2
+harness_version = 3
 
 [[workload]]
 name = "wp12-storage-01"
@@ -52,32 +52,31 @@ verdict = "put/search not comparable (dedup-gate refusal cascade diverged the co
 
 [[not_run]]
 name = "fault-soak-steady-state"
-reason = "Point fault-injection (injected_migration_fault_fails_atomically, injected_unknown_outcome_leaves_store_consistent — both ported, still green in crates/service), deterministic soak + fragmented-state kill + generation rotation executed 2026-10-26 (soak_mixed_ops_with_maintenance_then_kill: 5000 seeded ops, 11 optimize passes, kill/reopen at 3500, steady-state growth +1.8KiB/op over 1500 ops); old fjall_backend test names retired with src/storage (980752b), sustained racing-write consistency unported. No long-run clock-time soak harness and no fault injection under sustained load; tail-latency-under-load, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
+reason = "Point fault-injection (injected_migration_fault_fails_atomically, injected_unknown_outcome_leaves_store_consistent — both ported, still green in crates/service), deterministic soak + fragmented-state kill + generation rotation executed 2026-10-26 (soak_mixed_ops_with_maintenance_then_kill: 5000 seeded ops, 11 optimize passes, kill/reopen at 3500, steady-state growth +1.8KiB/op over 1500 ops); old fjall_backend test names retired with src/storage (980752b), sustained racing-write consistency unported. No long-run clock-time soak harness and no fault injection under sustained load (soak skeleton implemented 2026-11-11: src/bench/soak.rs steady-state + kill/restart accounting; tests green); tail-latency-under-load, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
 
 [[not_run]]
 name = "quality-corpus-300"
 reason = "Human-reviewed corpus target (§8.1, ≥300 cases) not built; a synthetic 300-case known-answer corpus (topic-disjoint dev/heldout, paraphrase queries) is built and executed instead — experiments/quality/retrieval-calibration.json. The 10-case safety fixture pins mechanics, not retrieval quality."
 
 [[not_run]]
-name = "ablation-dense-hybrid-priority-graph-mmr-upstream"
-reason = "Ablation runner takes any retrieval closure, but only the lexical, deterministic-engine and real-E5 legs are executed. DenseExact/HybridRrf/Priority/Graph/Mmr/UpstreamReference legs have no implementation behind them."
+name = "ablation-graph-upstream"
+reason = "DenseExact/HybridRrf/Priority/Mmr legs landed 2026-11-11 (src/bench/quality/ablation.rs + ablation_tests.rs, 14/14 quality green, zero leakage on frozen corpus). Graph leg blocked: frozen corpus carries no relation edges and synthesizing them would leak answers. UpstreamReference blocked on owner decision (TF-IDF port vs provisioned upstream). Neither zero-filled."
 
 [[not_run]]
 name = "ann-vs-exact"
 reason = "No ANN index configuration evaluated (§8.3 orders exact search first; T-QUALITY-02)."
-
 [[not_run]]
 name = "beir-scifact-full"
 reason = "Harness built and proven through 709 real indexed docs (ignored test beir_scifact_hybrid_quality; needs LTMRS_PROBE_MODELS + LTMRS_BEIR_DIR). Full 5,183-doc run needs ~5h CPU single-threaded bulk indexing (~4s/job measured: multi-chunk candle forwards + per-job Lance commits); run on a GPU-backed or unattended box, not interactively."
 
 [[not_run]]
 name = "contended-write-mix"
-reason = "Workload puts blind-upsert by key, so write conflicts and read-modify-write retries never occur; conflict/retry telemetry paths unexercised."
+reason = "Workload puts blind-upsert by key, so write conflicts and read-modify-write retries never occur; conflict/retry telemetry paths unexercised. Harness implemented 2026-11-11 (WorkloadOp::Rmw + hot-skew generator + execute_rmw revision-checked path + OpOutcome counters; test contended_write_mix_runs_closed_loop green, RMW_RETRY_LIMIT=20 at runner parity). Reference evidence run still open — add ignored runner or accept unit tests."
 
 [[not_run]]
 name = "search-load-legs"
-reason = "Closed/open-loop runners take put/get only; the FTS leg stays single-threaded until the table proves thread-safe publication under load."
+reason = "Closed/open-loop runners take put/get only. Threaded FTS harness implemented 2026-11-11 (run_search_threaded: shared &SearchTable, per-thread runtimes, fts_index_ready gate; test threaded_search_matches_single_thread green). Reference load run under the threaded leg still open."
 
 [[not_run]]
 name = "lemma-unique-content-variant"
-reason = "Follow-up to wp12-lemma-01: per-seq salted put content defeating the upstream dedup gate, for a pure write-path comparison (see comparison.json follow_up_not_run)."
+reason = "Follow-up to wp12-lemma-01: per-seq salted put content defeating the upstream dedup gate, for a pure write-path comparison (see comparison.json follow_up_not_run). Salted export implemented 2026-11-11 (export_workload_ops_salted + salted_workload_memory; tests salted_export_defeats_dedup_collapse + salted_memory_helper_contract green). Needs bench_against_lemma.mjs rmw-kind mapping + salted reference stream run."

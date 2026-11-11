@@ -110,9 +110,11 @@ pub(crate) fn exec_semantic_search(
             ..Default::default()
         };
         if let Ok(result) = sb.retrieve_sync(&req) {
-            // Map each result to its engine score (native calibrated score,
-            // falling back to the legacy reference score). Not a claim of
-            // identical TF-IDF — the legacy `score` field is a display value.
+            // Selection score for display + ranking: max(native calibrated,
+            // legacy reference) via `engine_selection_score` (one derivation,
+            // one meaning — see `recall.rs`). Not TF-IDF identical; the wire
+            // `score` field keeps the legacy shape while carrying the
+            // engine-selected value.
             let scores = &result.explanation.candidates;
             for r in result.results {
                 let s = engine_selection_score(scores, r.memory.id);
@@ -400,6 +402,78 @@ fn semantic_search_finds_relevant() {
     let structured = result_structured(&result).unwrap();
     assert!(structured["count"].as_u64().unwrap() >= 1);
     assert!(result_text(&result).contains("SEMANTIC SEARCH RESULTS"));
+}
+
+/// Stable-scope isolation: hybrid:false TF-IDF search under a stable
+/// identity counts only in-scope rows (lexical leg honors eligibility).
+#[test]
+fn semantic_search_excludes_foreign_stable_row() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _) = generate_project_id("shop");
+    let (_full_b, id_b) = generate_project_id("shop");
+    let out_a = add_with(
+        &disp,
+        1,
+        "## Shop Rust Testing\n\n### Context\nHow to write Rust tests in shop.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out_a));
+    let mut foreign = make_memory(
+        "foreign-b",
+        Some("shop"),
+        "ai",
+        0.5,
+        "Rust testing cargo shop B-only fragment.",
+    );
+    foreign.project_id = Some(id_b);
+    disp.repo().put_memory_direct(&foreign).unwrap();
+    let ss = SemanticSearchArgs {
+        query: "rust testing cargo".to_string(),
+        project: None,
+        top_k: None,
+        offset: None,
+        hybrid: Some(false),
+        explain: false,
+        response_format: None,
+    };
+    let tool = ToolArgs::SemanticSearch(ss);
+    let env = tool_call_with(
+        2,
+        tool.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &tool);
+    assert!(!result_is_error(&result));
+    assert!(
+        !result_text(&result).contains("B-only fragment"),
+        "foreign stable row leaked into semantic_search under A: {}",
+        result_text(&result)
+    );
+}
+
+/// Read retry policy: the same semantic envelope twice returns the
+/// identical response.
+#[test]
+fn semantic_search_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## Sem RT\n\n### Context\nRetry fixture.");
+    let ss = SemanticSearchArgs {
+        query: "retry fixture".to_string(),
+        project: None,
+        top_k: None,
+        offset: None,
+        hybrid: Some(false),
+        explain: false,
+        response_format: None,
+    };
+    let tool = ToolArgs::SemanticSearch(ss);
+    let env = tool_call(2, tool.clone());
+    let first = run(&disp, &env, &tool);
+    let second = run(&disp, &env, &tool);
+    assert!(!result_is_error(&first));
+    assert_eq!(result_text(&second), result_text(&first));
 }
 
 #[test]
@@ -999,6 +1073,55 @@ fn semantic_search_hybrid_false_uses_tfidf_profile() {
     );
 }
 
+/// Defaults/validation/output/state contract: default top_k serves,
+/// out-of-range top_k errors loudly with the bound, hybrid:false pins the
+/// TF-IDF profile, and explain reports the effective mode.
+#[test]
+fn semantic_search_defaults_validation_output_modes() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## Sem Modes\n\n### Context\nModes fixture.");
+    let base = SemanticSearchArgs {
+        query: "modes".to_string(),
+        project: None,
+        top_k: None,
+        offset: None,
+        hybrid: Some(false),
+        explain: true,
+        response_format: None,
+    };
+    // Defaults serve.
+    let tool = ToolArgs::SemanticSearch(base.clone());
+    let r = run(&disp, &tool_call(2, tool.clone()), &tool);
+    assert!(
+        !result_is_error(&r),
+        "defaults must serve: {}",
+        result_text(&r)
+    );
+    // Out-of-range top_k fails loudly naming the bound (execute_tool
+    // surfaces the typed error; run() would unwrap-panic).
+    for (op, k) in [(3u64, Some(31)), (4u64, Some(0))] {
+        let tool = ToolArgs::SemanticSearch(SemanticSearchArgs {
+            top_k: k,
+            ..base.clone()
+        });
+        let err =
+            crate::tools::execute_tool(&disp, &tool_call(op, tool.clone()), &tool).unwrap_err();
+        assert!(
+            err.message.contains("1..=30"),
+            "must name bound, got: {}",
+            err.message
+        );
+    }
+    // Explain reports the effective TF-IDF/lexical mode.
+    let tool = ToolArgs::SemanticSearch(base);
+    let structured = result_structured(&run(&disp, &tool_call(5, tool.clone()), &tool)).unwrap();
+    let mode = structured["explanation"]["mode"].as_str().unwrap_or("");
+    assert!(
+        mode.contains("lexical") || mode.contains("tf-idf") || mode.contains("tfidf"),
+        "explain must report effective mode, got: {structured:?}"
+    );
+}
+
 #[tokio::test]
 async fn semantic_search_pagination_honest_totals_hybrid() {
     use ltmrs_search::search::backend::SearchBackend;
@@ -1104,4 +1227,119 @@ fn semantic_search_pagination_honest_totals_lexical() {
             expect_pagination_page(&structured, n as u64, 10, offset);
         }
     }
+}
+
+/// hybrid:true is the explicit hybrid request: with a backend attached it
+/// serves the engine path (mode "hybrid", method "hybrid_rrf_mmr"),
+/// exactly like the absent-hybrid default. Pins the remaining
+/// flag-vs-explain cell (explicit true x explain).
+#[tokio::test]
+async fn semantic_search_hybrid_true_matches_default_hybrid() {
+    use ltmrs_search::search::backend::SearchBackend;
+    use ltmrs_search::search::backend::embedders::ClosureEmbedder;
+    use ltmrs_search::search::table::SearchTable;
+
+    let dir = tempfile::tempdir().unwrap();
+    let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+    let repo = Arc::new(
+        CanonicalRepository::open_with_clock(dir.path().to_str().unwrap(), Arc::clone(&clock))
+            .unwrap(),
+    );
+    repo.issue_namespace(fe(1), ch(1), 1000).unwrap();
+    let seed = Dispatcher::new(
+        Arc::clone(&repo),
+        crate::registry::FrontendRegistry::new(),
+        Arc::clone(&clock),
+    );
+    add_fragment(
+        &seed,
+        1,
+        "## Explained Search\n\n### Context\nRecall with reasons.",
+    );
+
+    let lance_dir = tempfile::tempdir().unwrap();
+    let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    publish_search_row(
+        &repo,
+        &table,
+        "explained reasons recall",
+        ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT,
+    )
+    .await;
+    table.create_fts_index().await.unwrap();
+    let embedder = Arc::new(ClosureEmbedder::new(|_| Ok(vec![0.0; 384])));
+    let backend = Arc::new(
+        SearchBackend::new(
+            Arc::clone(&repo),
+            table,
+            Arc::new(ltmrs_search::search::backend::embedders::QueryEmbedderAdapter::new(embedder)),
+        )
+        .with_model_fingerprint(ltmrs_embeddings::e5_small::E5_SMALL_FINGERPRINT),
+    );
+    let disp = std::sync::Arc::new(
+        Dispatcher::new(repo, crate::registry::FrontendRegistry::new(), clock).with_search(backend),
+    );
+    for (i, hybrid) in [None, Some(true)].into_iter().enumerate() {
+        let args = SemanticSearchArgs {
+            query: "explained reasons".to_string(),
+            project: None,
+            top_k: None,
+            offset: None,
+            hybrid,
+            explain: true,
+            response_format: None,
+        };
+        let env = tool_call(2 + i as u64, ToolArgs::SemanticSearch(args.clone()));
+        let tool = ToolArgs::SemanticSearch(args);
+        let d = std::sync::Arc::clone(&disp);
+        let result = tokio::task::spawn_blocking(move || run(&d, &env, &tool))
+            .await
+            .unwrap();
+        assert!(!result_is_error(&result));
+        let structured = result_structured(&result).unwrap();
+        assert_eq!(
+            structured["explanation"]["mode"], "hybrid",
+            "hybrid:{hybrid:?} must report the hybrid mode actually run"
+        );
+        let items = structured["recall_explanation"]["items"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items[0]["selection"]["method"], json!("hybrid_rrf_mmr"));
+    }
+}
+
+/// hybrid:true without a backend degrades honestly: the dense leg was
+/// requested but unavailable, so explain reports the fallback mode and
+/// the substring method — never a hybrid that ran nothing.
+#[test]
+fn semantic_search_hybrid_true_without_backend_reports_fallback() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(
+        &disp,
+        1,
+        "## Rust Cargo Testing\n\n### Context\nHow to write tests in Rust with cargo test.",
+    );
+    let args = SemanticSearchArgs {
+        query: "rust cargo".to_string(),
+        project: None,
+        top_k: None,
+        offset: None,
+        hybrid: Some(true),
+        explain: true,
+        response_format: None,
+    };
+    let env = tool_call(2, ToolArgs::SemanticSearch(args.clone()));
+    let result = run(&disp, &env, &ToolArgs::SemanticSearch(args));
+    assert!(!result_is_error(&result));
+    let structured = result_structured(&result).unwrap();
+    assert_eq!(
+        structured["explanation"]["mode"], "lexical-fallback",
+        "requested-but-unavailable dense leg must not report hybrid"
+    );
+    let items = structured["recall_explanation"]["items"]
+        .as_array()
+        .unwrap();
+    assert_eq!(items[0]["selection"]["method"], json!("substring_fallback"));
 }

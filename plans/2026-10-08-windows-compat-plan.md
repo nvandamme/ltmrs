@@ -23,8 +23,13 @@
 ## Review Focus — reconciliation (2026-10-25, commit boxes checked post-hoc)
 
 Tasks 1–6 implementation steps were verified landed (runtime/unix.rs +
-windows.rs platform core, boxed `IpcStream` transport, `spawn_detached` +
-HOME-wins serve, `lemma.cmd` shim writer, visualizer via shared helper,
+windows.rs platform core, boxed `IpcStream` transport, `detach_child`
+(plan spelling `spawn_detached` in Tasks 3/5/6 superseded by design §2.5
+shipped shape `detach_child(&mut Command)` + caller `spawn_daemon_child`) +
+HOME-wins serve, `lemma.cmd` shim writer (shipped bytes per design §2.7
++ `shim.rs:66-71`: `@echo off\r\n"<exe>" %*\r\nexit /b %ERRORLEVEL%\r\n`
+CRLF; plan Task 4 text omits the exit line — design + code win),
+visualizer via shared helper,
 `daemon_lifecycle` + full Windows gate 2026-10-08); ledger entries verified in
 `plans/traceability.json` (`windows_certification_2026_10_08`), the
 conformance visualizer table, Part I §7.1 + AD-07 row, and Part III T-SEC-01.
@@ -98,8 +103,8 @@ record end-state, not per-task SHAs.
   - `mcp.rs` test harness: replace `UnixListener::bind` with `Daemon::start` + `spawn_socket_server` (live listener) so all 4 harness tests are platform-neutral.
 - Consumes: `IpcClient::set_stream(IpcStream)`, `DaemonListener` (Task 2).
 
-- [x] **Step 1:** Failing tests: `resolve_home_prefers_home_over_userprofile` (both env set → HOME wins; cfg(windows): USERPROFILE-only resolves); `spawn_detached_child_exits_and_survives_group_signal` (spawn `daemon --foreground --daemon-idle-ms 0`… no — spawn a child running `daemon --foreground --daemon-idle-ms 10`, `try_wait` within bounded timeout exits success); `start_local_daemon` duplex bridge roundtrip (existing `local_daemon_bridge_roundtrips_memory_add` must pass via duplex). Scoped run → FAIL.
-- [x] **Step 2:** Implement the interfaces above. `spawn_daemon_child` becomes a thin wrapper over `spawn_detached` (log-file Stdio preserved).
+- [x] **Step 1:** Failing tests: `resolve_home_prefers_home_over_userprofile` (both env set → HOME wins; cfg(windows): USERPROFILE-only resolves); `spawn_detached_child_exits_and_survives_group_signal` (spawn `daemon --foreground --daemon-idle-ms 0`… no — spawn a child running `daemon --foreground --daemon-idle-ms 10`, `try_wait` within bounded timeout exits success); `start_local_daemon` duplex bridge roundtrip (existing `local_daemon_bridge_roundtrips_memory_add` must pass via duplex). Scoped run → FAIL. Reconciliation (2026-11-11): `spawn_detached_child_*` reads as the shipped `detach_child`/`spawn_daemon_child` shape per design §2.5.
+- [x] **Step 2:** Implement the interfaces above. `spawn_daemon_child` becomes a thin wrapper over `spawn_detached` (log-file Stdio preserved). Reconciliation (2026-11-11): shipped as design §2.5 — `detach_child(&mut Command)` + caller `spawn_daemon_child`; `spawn_detached` spelling superseded.
 - [x] **Step 3:** `cargo test -p ltmrs-frontend --lib` → PASS.
 - [x] **Step 4:** Commit.
 
@@ -110,7 +115,7 @@ record end-state, not per-task SHAs.
 - Test: `shim.rs` unit tests
 
 **Interfaces:**
-- Produces: `install_shim(exe, home) -> ShimOutcome` unchanged in behavior; Windows path writes `<home>/.local/bin/lemma.cmd` with exact bytes `@echo off\r\n"<exe-path>" %*\r\n`; existing-file identity = byte-for-byte equality with that content (accept), anything else refuses (foreign rule unchanged); install result string names the dir + PATH hint on Windows.
+- Produces: `install_shim(exe, home) -> ShimOutcome` unchanged in behavior; Windows path writes `<home>/.local/bin/lemma.cmd` with exact bytes `@echo off\r\n"<exe-path>" %*\r\n`; existing-file identity = byte-for-byte equality with that content (accept), anything else refuses (foreign rule unchanged); install result string names the dir + PATH hint on Windows. Reconciliation (2026-11-11): shipped signature is `install_shim(home, exe, path_env)` (`shim.rs:76-80`); shipped bytes per design §2.7 + `shim.rs:66-71` append `exit /b %ERRORLEVEL%\r\n` CRLF — the Task 4 byte text omits the exit line, design + code win.
 - Consumes: nothing new.
 
 - [x] **Step 1:** Failing tests: `cmd_shim_accepts_our_exact_bytes` (pre-write expected content, re-install → accepted, file unchanged); `cmd_shim_refuses_foreign_content` (write `@echo off\r\nother.exe %*\r\n` → refuse); symlink tests stay cfg(unix). Scoped run → FAIL.
@@ -125,23 +130,22 @@ record end-state, not per-task SHAs.
 - Test: `tests/vis_smoke.rs` (existing live smoke)
 
 **Interfaces:**
-- Consumes: `ltmrs_frontend::frontend::serve::spawn_detached` (Task 3).
+- Consumes: `ltmrs_frontend::frontend::serve::spawn_detached` (Task 3). Reconciliation (2026-11-11): reads as `detach_child`/`spawn_daemon_child` per design §2.5.
 - Produces: unchanged public behavior (URL+pid printed, port probe, `owns_port` token probe).
 
-- [x] **Step 1:** Replace `pre_exec`+`setsid` with `spawn_detached(exe, ["-vis","--fg","-p",port], [("LTMRS_VIS_TOKEN", token)], Stdio::null(), Stdio::inherit())`; keep the `owns_port` probe logic verbatim.
+- [x] **Step 1:** Replace `pre_exec`+`setsid` with `spawn_detached(exe, ["-vis","--fg","-p",port], [("LTMRS_VIS_TOKEN", token)], Stdio::null(), Stdio::inherit())`; keep the `owns_port` probe logic verbatim. Reconciliation (2026-11-11): reads as `detach_child` + `spawn_daemon_child` per design §2.5.
 - [x] **Step 2:** `cargo test -p ltmrs --test vis_smoke` (root binary, scoped to that target) → PASS on Windows.
 - [x] **Step 3:** Commit.
 
 ### Task 6: Root tests + full Windows gate
 
 **Files:**
-- Modify: `Cargo.toml` (root dev-dependency `windows-sys`, cfg(windows), same features, called out in manifest), `tests/daemon_lifecycle.rs`
-- Test: existing `tests/*` + new `windows_graceful_shutdown_via_ctrl_break`
+- Test: existing `tests/*` + new `windows_graceful_shutdown_via_ctrl_break` (shipped as `foreground_daemon_ctrlbreak_shuts_down_gracefully`, tests/daemon_lifecycle.rs:423, cfg(windows) `#[ignore]` with reason)
 
 **Interfaces:**
 - Consumes: `CREATE_NEW_PROCESS_GROUP`, `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` (windows-sys; SAFETY: console control events target only our spawned group).
 
-- [x] **Step 1:** Failing test `windows_graceful_shutdown_via_ctrl_break` (cfg(windows)): spawn `ltmrs daemon --foreground --daemon-idle-ms 0` with `CREATE_NEW_PROCESS_GROUP` + isolated HOME, send `CTRL_BREAK_EVENT` to the child pid, assert exit code 0 within bounded timeout. SIGTERM test gated cfg(unix). Scoped: `cargo test -p ltmrs --test daemon_lifecycle` → FAIL, then implement (signal select in Task 3 already handles ctrl_break; this test pins the binary path). **Deviation (2026-10-08, probe-verified):** programmatic console-event delivery is not achievable under `cargo test` on this conhost (group-0 kills cargo; targeted delivery is delayed tens of seconds and hangs `try_wait` after the daemon exits). The test is kept as `#[ignore]` with the reason; handler registration is pinned executably by `serve::tests::shutdown_handlers_register` (ctrl_c + ctrl_break Ok on Windows); the visualizer smoke stops its detached child via `TerminateProcess` on Windows.
+- [x] **Step 1:** Failing test `windows_graceful_shutdown_via_ctrl_break` (cfg(windows)): spawn `ltmrs daemon --foreground --daemon-idle-ms 0` with `CREATE_NEW_PROCESS_GROUP` + isolated HOME, send `CTRL_BREAK_EVENT` to the child pid, assert exit code 0 within bounded timeout. SIGTERM test gated cfg(unix). Scoped: `cargo test -p ltmrs --test daemon_lifecycle` → FAIL, then implement (signal select in Task 3 already handles ctrl_break; this test pins the binary path). **Deviation (2026-10-08, probe-verified):** programmatic console-event delivery is not achievable under `cargo test` on this conhost (group-0 kills cargo; targeted delivery is delayed tens of seconds and hangs `try_wait` after the daemon exits). The test is kept as `#[ignore]` with the reason; handler registration is pinned executably by `serve::tests::shutdown_handlers_register` (ctrl_c + ctrl_break Ok on Windows); the visualizer smoke stops its detached child via `TerminateProcess` on Windows. **Evidence status (2026-11-11): explicit `not_run`** — the ignored shutdown-path test is not executed evidence; T-SEC-01/T-CLI-01 rows relying on graceful Windows shutdown stay `not_run` with this reason until a dedicated conhost harness exists.
 - [x] **Step 2:** Full gate on Windows, in this order, all four commands:
   `cargo fmt -- --check`
   `cargo clippy --workspace --all-targets -- -D warnings`
@@ -168,5 +172,5 @@ record end-state, not per-task SHAs.
 ## Self-review notes
 
 - Spec coverage: §2.1→Tasks 1-2, §2.2→Task 1, §2.3→Tasks 1,6, §2.4→Tasks 1,3, §2.5→Tasks 3,6, §2.6→Task 3, §2.7→Task 4, §2.8→Tasks 5,7, §4→Task 7, §5→all, §6→Task 6.
-- Types: `IpcStream`, `DaemonListener::accept`, `spawn_detached` signatures consistent across tasks.
+- Types: `IpcStream`, `DaemonListener::accept`, `spawn_detached` signatures consistent across tasks. Reconciliation (2026-11-11): `spawn_detached` reads as `detach_child`/`spawn_daemon_child` per design §2.5.
 - Review Focus lines map to: T1 (SID token, LockFileEx, DACL), T3/T6 (process group, ctrl-break), T4 (byte identity), T3 (HOME precedence).

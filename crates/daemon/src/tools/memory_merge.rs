@@ -323,6 +323,40 @@ fn memory_merge_requires_two_ids() {
     assert!(result_is_error(&result));
 }
 
+/// Retry safety (T-CONC-03): the same merge envelope twice replays
+/// the recorded response with a single supersession edge set.
+#[test]
+fn memory_merge_same_envelope_replays_recorded() {
+    let (disp, _dir) = test_dispatcher();
+    let id1 = add_fragment(&disp, 1, "## Merge One\n\n### Context\nFirst.");
+    let id2 = add_fragment(&disp, 2, "## Merge Two\n\n### Context\nSecond.");
+    let args = ToolArgs::MemoryMerge(MemoryMergeArgs {
+        ids: vec![id1, id2],
+        title: "Merged".to_string(),
+        fragment: "## Merged\n\n### Context\nCombined.".to_string(),
+        project: None,
+        consolidate: false,
+    });
+    let env = tool_call(3, args.clone());
+    let first = run(&disp, &env, &args);
+    assert!(
+        !result_is_error(&first),
+        "first failed: {}",
+        result_text(&first)
+    );
+    let second = run(&disp, &env, &args);
+    assert!(
+        !result_is_error(&second),
+        "replay failed: {}",
+        result_text(&second)
+    );
+    assert_eq!(
+        result_text(&second),
+        result_text(&first),
+        "replay must be byte-identical"
+    );
+}
+
 #[test]
 fn cross_project_merge_refused() {
     use ltmrs_domain::project_id::generate_project_id;

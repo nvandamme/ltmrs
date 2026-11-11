@@ -114,13 +114,31 @@ pub(crate) fn format_audit_report(result: &Value) -> String {
 pub(crate) fn exec_memory_audit(
     disp: &Dispatcher,
     args: &MemoryAuditArgs,
+    resolved: &ltmrs_service::projects::ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
-    let export = repo.export_snapshot()?;
+    let export = disp.scan_snapshot()?;
+    // Stable-scope isolation: audit only in-scope rows, like memory_library
+    // fragments. Legacy/global scopes stay permissive via eligibility.
+    let scope = super::effective_for_read(resolved, None, None, None, false)?;
+    let memories: Vec<ltmrs_domain::memory::Memory> = export
+        .memories
+        .iter()
+        .filter(|m| scope.is_eligible(m))
+        .cloned()
+        .collect();
+    let ids: std::collections::BTreeSet<ltmrs_domain::id::EntityId> =
+        memories.iter().map(|m| m.id).collect();
+    let relations: Vec<ltmrs_domain::relation::Relation> = export
+        .relations
+        .iter()
+        .filter(|r| ids.contains(&r.source) && ids.contains(&r.target))
+        .cloned()
+        .collect();
 
     let result = audit_memory(
-        &export.memories,
-        &export.relations,
+        &memories,
+        &relations,
         |m| legacy_id_of(repo, m),
         |assoc| {
             repo.resolve_id(assoc)
@@ -185,6 +203,146 @@ fn memory_audit_golden_text() {
     );
     assert!(!result_is_error(&result));
     assert_eq!(result_text(&result), GOLDEN_AUDIT_TEXT);
+}
+/// Stable-scope isolation (FuncReview critical): a foreign stable row must
+/// not surface in audit issues under identity A.
+#[test]
+fn memory_audit_excludes_foreign_stable_row() {
+    use ltmrs_domain::project_id::generate_project_id;
+    let (disp, _dir) = test_dispatcher();
+    let (full_a, _id_a) = generate_project_id("shop");
+    let (_full_b, id_b) = generate_project_id("shop");
+    // A writes under its identity (registers A).
+    let out = add_with(
+        &disp,
+        1,
+        "## Shop A\n\n### Context\nA-only fragment.",
+        Some("shop"),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    assert!(!result_is_error(&out));
+    // B's row seeded direct (bypasses the add gate like the conflict fixture).
+    let mut foreign = make_memory(
+        "foreign-b",
+        Some("shop"),
+        "ai",
+        0.5,
+        "B-only fragment with an AQWERTYUIOP edge",
+    );
+    foreign.project_id = Some(id_b);
+    disp.repo().put_memory_direct(&foreign).unwrap();
+    // Audit under A must not name the foreign row.
+    let tool = ToolArgs::MemoryAudit(MemoryAuditArgs::default());
+    let env = tool_call_with(
+        2,
+        tool.clone(),
+        ident(Some(&full_a), Some("/tmp/a/shop"), Some("shop"), true),
+    );
+    let result = run(&disp, &env, &tool);
+    assert!(!result_is_error(&result));
+    // Healthy rows surface via total_fragments even when no issue names
+    // them: under A the count must be 1, not 2.
+    let structured = result_structured(&result).unwrap();
+    assert_eq!(
+        structured["total_fragments"].as_u64().unwrap(),
+        1,
+        "audit counted foreign stable row: {}",
+        result_text(&result)
+    );
+}
+/// Snapshot freshness: a write between two audits must be visible in the
+/// second audit (no stale cached snapshot served across a commit).
+#[test]
+fn memory_audit_sees_write_between_calls() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## First\n\n### Context\nFirst fragment.");
+    let tool = ToolArgs::MemoryAudit(MemoryAuditArgs::default());
+    let env1 = tool_call(2, tool.clone());
+    let first = run(&disp, &env1, &tool);
+    assert_eq!(
+        result_structured(&first).unwrap()["total_fragments"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    add_fragment(&disp, 3, "## Second\n\n### Context\nSecond fragment.");
+    let env2 = tool_call(4, tool.clone());
+    let second = run(&disp, &env2, &tool);
+    assert_eq!(
+        result_structured(&second).unwrap()["total_fragments"]
+            .as_u64()
+            .unwrap(),
+        2,
+        "second audit must see the committed write"
+    );
+}
+
+/// Scan budget: the tracker gate trips just over the row limit so an
+/// oversized store refuses visibly instead of decoding unboundedly.
+/// Read retry policy (T-CONC-03): the same audit envelope twice
+/// returns the identical response (reads are side-effect-free).
+#[test]
+fn memory_audit_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## Audit RT\n\n### Context\nRetry fixture.");
+    let tool = ToolArgs::MemoryAudit(MemoryAuditArgs::default());
+    let env = tool_call(2, tool.clone());
+    let first = run(&disp, &env, &tool);
+    let second = run(&disp, &env, &tool);
+    assert!(!result_is_error(&first));
+    assert_eq!(result_text(&second), result_text(&first));
+}
+
+#[test]
+fn scan_budget_gate_trips_over_limit() {
+    use crate::limits::{QuotaTracker, ResourceLimits};
+    let quotas = QuotaTracker::new(ResourceLimits::default());
+    assert!(quotas.check_scan_budget(10_000).is_ok());
+    let err = quotas.check_scan_budget(10_001).unwrap_err();
+    assert_eq!(err, crate::limits::QuotaError::ScanBudgetExceeded);
+}
+
+/// Configured scan caps are honored: a 2-row store refuses under a 1-row
+/// dispatcher cap and serves under the default cap (not the hardcoded
+/// default — the configured value wins).
+#[test]
+fn scan_snapshot_honors_configured_budget() {
+    use crate::dispatcher::Dispatcher;
+    use crate::registry::FrontendRegistry;
+    use ltmrs_domain::clock::FrozenClock;
+    use std::sync::Arc;
+    fn dispatcher_with_cap(cap: usize) -> Dispatcher {
+        let dir = tempfile::tempdir().unwrap();
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let repo = Arc::new(
+            ltmrs_service::repository::CanonicalRepository::open_with_clock(
+                dir.path().to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        std::mem::forget(dir);
+        Dispatcher::new(repo, FrontendRegistry::new(), clock).with_scan_budget(cap)
+    }
+    fn seed_two(disp: &Dispatcher) {
+        for key in [11u128, 22u128] {
+            let mut m = make_memory(&format!("m{key}"), None, "ai", 0.5, "Budget probe.");
+            m.id = ltmrs_domain::id::EntityId::new(uuid::Uuid::from_u128(key));
+            disp.repo().put_memory_direct(&m).unwrap();
+        }
+    }
+    let tight = dispatcher_with_cap(1);
+    seed_two(&tight);
+    let err = tight.scan_snapshot().unwrap_err();
+    assert!(
+        err.message.contains("scan budget exceeded"),
+        "tight cap must refuse, got: {}",
+        err.message
+    );
+    let roomy = dispatcher_with_cap(10_000);
+    seed_two(&roomy);
+    assert_eq!(roomy.scan_snapshot().unwrap().memories.len(), 2);
 }
 
 #[test]

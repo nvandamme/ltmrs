@@ -264,22 +264,53 @@ impl CanonicalRepository {
     ) -> DomainResult<ltmrs_domain::session::Suggestion> {
         let _restore_guard = self.restore_lock.read().unwrap();
         let seq_key = op_seq_key_system("suggestion");
+        // Monotonic allocator key (same `namespaces` keyspace as the op-seq
+        // keys — no migration): single-key read+increment per filing, so
+        // concurrent filings contend on one 8-byte key with a tiny window
+        // instead of re-scanning the whole suggestions table per attempt.
+        // Pre-counter stores fall back to max-scan once, then the counter
+        // takes over (counter wins on every later write).
+        let alloc_key = "suggestion-seq";
         for _attempt in 0..MAX_RETRIES {
             let mut tx = self
                 .db
                 .write_tx()
                 .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-            let mut max: u64 = 0;
-            for kv in tx.iter(&self.suggestions) {
-                let (k, _) = kv
-                    .into_inner()
-                    .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?;
-                if let Ok(id) = String::from_utf8_lossy(k.as_ref()).parse::<u64>() {
-                    max = max.max(id);
+            // Counter first (single-key dependency); max-scan only seeds
+            // pre-counter stores. Counter wins: after the first counter
+            // write, later txs always see it and skip the scan.
+            let next_id = match tx
+                .get(&self.namespaces, alloc_key)
+                .map_err(|e| DomainError::new(DomainErrorCode::Validation, e.to_string()))?
+            {
+                Some(raw) => {
+                    let bytes = raw.as_ref();
+                    if bytes.len() != 8 {
+                        return Err(DomainError::new(
+                            DomainErrorCode::Validation,
+                            "corrupt suggestion allocator counter",
+                        ));
+                    }
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(bytes);
+                    u64::from_le_bytes(arr) + 1
                 }
-            }
+                None => {
+                    let mut max: u64 = 0;
+                    for kv in tx.iter(&self.suggestions) {
+                        let (k, _) = kv.into_inner().map_err(|e| {
+                            DomainError::new(DomainErrorCode::Validation, e.to_string())
+                        })?;
+                        if let Ok(id) = String::from_utf8_lossy(k.as_ref()).parse::<u64>() {
+                            max = max.max(id);
+                        }
+                    }
+                    max + 1
+                }
+            };
+            tx.insert(&self.namespaces, alloc_key, next_id.to_le_bytes());
             let suggestion = ltmrs_domain::session::Suggestion {
-                id: max + 1,
+                id: next_id,
                 session_id: session_id.clone(),
                 suggestion: text.clone(),
                 status: ltmrs_domain::session::SuggestionStatus::Pending,

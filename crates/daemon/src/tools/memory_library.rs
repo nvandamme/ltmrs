@@ -18,7 +18,7 @@ pub(crate) fn exec_memory_library(
     resolved: &ltmrs_service::projects::ResolvedScope,
 ) -> DomainResult<DomainPayload> {
     let repo = disp.repo();
-    let export = repo.export_snapshot()?;
+    let export = disp.scan_snapshot()?;
     let now = disp.clock().now_millis();
 
     let focus = args.focus.as_deref().unwrap_or("full");
@@ -43,7 +43,7 @@ pub(crate) fn exec_memory_library(
     );
 
     // Fragments (project-scoped).
-    let mut fragments: Vec<&Memory> = export
+    let fragments: Vec<&Memory> = export
         .memories
         .iter()
         .filter(|m| {
@@ -57,11 +57,6 @@ pub(crate) fn exec_memory_library(
             }
         })
         .collect();
-    fragments.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
 
     let frag_total = fragments.len();
     let page: Vec<&Memory> = fragments.iter().skip(offset).take(limit).copied().collect();
@@ -90,12 +85,21 @@ pub(crate) fn exec_memory_library(
             })
         })
         .collect();
-
+    // In-scope identity set: relations below filter to edges with both
+    // endpoints visible (FuncReview minor). Guides are global records with
+    // no project binding; under a stable identity only guides referenced
+    // by visible memories are shown, preserving list-all when unattributed.
+    let visible_ids: BTreeSet<EntityId> = fragments.iter().map(|m| m.id).collect();
+    let referenced_guides: BTreeSet<String> = fragments
+        .iter()
+        .flat_map(|m| m.related_guides.iter().cloned())
+        .collect();
     // Guides.
     let guides_jsons: Vec<Value> = if need_guides {
         export
             .guides
             .iter()
+            .filter(|g| unattributed || referenced_guides.contains(&g.name))
             .map(|g| {
                 json!({
                     "name": g.name,
@@ -111,34 +115,38 @@ pub(crate) fn exec_memory_library(
         Vec::new()
     };
 
-    // Relations.
+    // Relations (both endpoints must be visible; isolated/hubs derive
+    // from the visible edge set, totals count visible edges only).
+    let visible_relations: Vec<&ltmrs_domain::relation::Relation> = export
+        .relations
+        .iter()
+        .filter(|r| visible_ids.contains(&r.source) && visible_ids.contains(&r.target))
+        .collect();
     let (rel_total, rel_by_type, isolated, hubs) = if need_relations {
         let mut by_type: BTreeMap<String, u64> = BTreeMap::new();
-        for r in &export.relations {
+        for r in &visible_relations {
             *by_type
                 .entry(r.relation_type.as_str().to_string())
                 .or_insert(0) += 1;
         }
-        let connected: BTreeSet<EntityId> = export
-            .relations
+        let connected: BTreeSet<EntityId> = visible_relations
             .iter()
             .flat_map(|r| [r.source, r.target])
             .collect();
-        let isolated: Vec<String> = export
-            .memories
+        let isolated: Vec<String> = fragments
             .iter()
             .filter(|m| !connected.contains(&m.id))
             .map(|m| legacy_id_of(repo, m))
             .collect();
         let mut counts: BTreeMap<EntityId, u64> = BTreeMap::new();
-        for r in &export.relations {
+        for r in &visible_relations {
             *counts.entry(r.source).or_insert(0) += 1;
         }
         let hubs: Vec<Value> = counts
             .iter()
             .filter(|(_, c)| **c >= 5)
             .filter_map(|(id, c)| {
-                export.memories.iter().find(|m| &m.id == id).map(|m| {
+                fragments.iter().find(|m| &m.id == id).map(|m| {
                     json!({
                         "id": legacy_id_of(repo, m),
                         "title": m.title,
@@ -147,7 +155,7 @@ pub(crate) fn exec_memory_library(
                 })
             })
             .collect();
-        (export.relations.len(), by_type, isolated, hubs)
+        (visible_relations.len(), by_type, isolated, hubs)
     } else {
         (0, BTreeMap::new(), Vec::new(), Vec::new())
     };
@@ -246,11 +254,11 @@ pub(crate) fn exec_memory_library(
 
     // Text rendering.
     let mut text = String::from("== LIBRARY MODE SNAPSHOT ==\n");
-    text.push_str(&format!("Generated: {now}\n"));
     text.push_str(&format!(
-        "Total memories: {} | Total guides: {} | Total sessions: 0\n",
+        "Total memories: {} | Total guides: {} | Total sessions: {}\n",
         frag_total,
-        guides_jsons.len()
+        guides_jsons.len(),
+        export.sessions.len()
     ));
     if need_fragments {
         text.push_str(&format!(
@@ -284,6 +292,20 @@ pub(crate) fn exec_memory_library(
 use super::test_support::*;
 #[cfg(test)]
 use ltmrs_compat::lemma::tool_args::ToolArgs;
+
+/// Read retry policy: the same library envelope twice returns the
+/// identical response.
+#[test]
+fn memory_library_same_envelope_replays_identical() {
+    let (disp, _dir) = test_dispatcher();
+    add_fragment(&disp, 1, "## Lib RT\n\n### Context\nRetry fixture.");
+    let tool = ToolArgs::MemoryLibrary(MemoryLibraryArgs::default());
+    let env = tool_call(2, tool.clone());
+    let first = run(&disp, &env, &tool);
+    let second = run(&disp, &env, &tool);
+    assert!(!result_is_error(&first));
+    assert_eq!(result_text(&second), result_text(&first));
+}
 
 #[test]
 fn memory_library_returns_snapshot() {

@@ -21,6 +21,9 @@ pub struct ResourceLimits {
     pub max_in_flight_storage: usize,
     /// Maximum response bytes per frame.
     pub max_response_bytes: usize,
+    /// Maximum canonical rows a single aggregate scan may decode.
+    /// Over-budget scans refuse with a retryable busy, never truncate.
+    pub max_scan_rows: usize,
 }
 
 impl Default for ResourceLimits {
@@ -30,6 +33,7 @@ impl Default for ResourceLimits {
             max_queued_per_client: 128,
             max_in_flight_storage: 32,
             max_response_bytes: 8 * 1024 * 1024,
+            max_scan_rows: 10_000,
         }
     }
 }
@@ -43,6 +47,8 @@ pub enum QuotaError {
     ClientQueueFull,
     #[error("storage capacity exhausted")]
     StorageBusy,
+    #[error("scan budget exceeded")]
+    ScanBudgetExceeded,
 }
 
 /// Tracks per-client and global resource usage against the configured limits.
@@ -170,6 +176,17 @@ impl QuotaTracker {
     /// In-flight storage operations (for health).
     pub fn in_flight_storage(&self) -> usize {
         *self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl QuotaTracker {
+    /// Check a scan's row cost against the budget. Over-budget scans
+    /// refuse visibly (retryable busy), never truncate silently.
+    pub fn check_scan_budget(&self, rows: usize) -> Result<(), QuotaError> {
+        if rows > self.limits.max_scan_rows {
+            return Err(QuotaError::ScanBudgetExceeded);
+        }
+        Ok(())
     }
 }
 

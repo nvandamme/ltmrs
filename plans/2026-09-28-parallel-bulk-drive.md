@@ -38,12 +38,12 @@ re-add a `plans/02` pointer without an owner-reviewed plan change.
 
 ---
 
-## File map
+## File map (post workspace-split paths; pre-split `src/` in task bodies below is historical)
 
-- Modify: `src/search/projector.rs` — `Embedder` trait (add default `embed_texts`), `render_chunk_rows` (single batch call per memory).
-- Modify: `src/search/backend.rs` — `E5SmallAdapter::embed_texts` override (one `embed_batch`), shared-adapter audit.
-- Modify: `src/embeddings/e5_small.rs` — ONLY if the `&mut`-to-`&` audit requires it (verify first; prefer no change).
-- Modify: `src/daemon/server.rs` — pool construction + size const (Phase 2 only).
+- Modify: `crates/search/src/search/projector.rs` — `Embedder` trait (add default `embed_texts`), `render_chunk_rows` (single batch call per memory).
+- Modify: `crates/search/src/search/backend.rs` — `E5SmallAdapter::embed_texts` override (one `embed_batch`), shared-adapter audit.
+- Modify: `crates/embeddings/src/e5_small.rs` — ONLY if the `&mut`-to-`&` audit requires it (verify first; prefer no change).
+- Modify: `crates/daemon/src/server.rs` — pool construction + size const (Phase 2 only).
 - Test: existing suites cover the default path (no test-file changes in Phase 1 except new tests below).
 - Docs: `docs/RELEASE.md` throughput note update on completion.
 
@@ -364,7 +364,7 @@ git commit -m "feat: bounded parallel chunk embedding for bulk drive"
 Run the BEIR slice probe pattern (or 300-doc calibration index) before/after on the same box; record per-job wall time in DONE.md.
 Expected: numbers only. Do NOT gate the release on a fixed speedup.
 
-- [x] **Step 2: Update `docs/RELEASE.md` throughput note + `plans/02` fairness parenthetical**
+- [x] **Step 2: Update `docs/RELEASE.md` throughput note** (fairness rationale lives in code + Task 5 report, not `plans/02` — see reconciliation note at top)
 
 Record measured bulk rate and pool size. No requirement text changes.
 

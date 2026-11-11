@@ -276,9 +276,7 @@ On reconnect, restore only a verified channel binding. An unexpected disconnect 
 
 Keep synchronous KV transactions and CPU inference off Tokio core workers. A concrete embedding service owns a bounded worker queue; the model may be a synchronous `&mut self` adapter. An async trait spelling is not itself a working dynamic plugin system.
 
-Enforce limits for clients, per-client queued work, in-flight storage operations, snapshot lifetime, inference tokens, batch size, response bytes and maintenance jobs. Fairness must prevent an indexing rebuild from starving interactive recall. Backpressure is visible as a retryable busy/error state, not unbounded allocation.
-
-Cancellation before publication may abort. Cancellation after publication must not hide or undo the durable receipt. Index tasks may continue for committed writes; canceled uncommitted requests must not create memories.
+Enforce limits for clients, per-client queued work, in-flight storage operations, snapshot lifetime, inference tokens, batch size, response bytes, maintenance jobs, **and per-call aggregate scan rows** (`max_scan_rows`, §10.2a). Fairness must prevent an indexing rebuild from starving interactive recall, and a scan loop from decoding the store unboundedly per call. Backpressure is visible as a retryable busy/error state, not unbounded allocation.
 
 ## 8. Derived search lifecycle
 
@@ -365,11 +363,15 @@ Each stage exposes deterministic diagnostics for tests. No absolute cosine score
 
 ### 10.2 Scope and candidate completeness
 
-Use the same project/global, type, date and lifecycle predicate for both retrieval legs and graph expansion. Exact-identifier handling is distinct from stemming/tokenization. Include tests for underscores, punctuation, paths, flags, case and French accents.
+Use the same project/global, type, date and lifecycle predicate for retrieval legs, graph expansion, **and aggregate read tools** (audit, library, conflict scan, proactive analysis, project analytics). A stable identity sees its own rows plus attached legacy and global rows in every aggregate; foreign stable rows never surface in counts, pairs, suggestions or overviews. Relation edges aggregate only when both endpoints are visible. Guides carry no project binding: under a stable identity only guides referenced by visible memories surface; unattributed calls keep list-all behavior.
 
 Frequently mutable eligibility such as `minConfidence` requires a correct plan: pass an allowed-ID set from canonical state where practical, or overfetch/revalidate with bounded backfill and report limits. Filtering only the first ten hits and returning two as "the best two" is not sufficient.
 
 An empty query follows upstream list/priority behavior. A nonempty no-match query may legitimately return nothing. Establish no-answer thresholds using held-out labels, not a universal cosine threshold copied across models.
+
+### 10.2a Aggregate scan budget and snapshot cache
+
+Per-call scan cost is bounded independently of connection concurrency: `max_scan_rows` (default 10,000) caps the canonical rows one aggregate call may decode. Over-budget scans refuse with a retryable busy naming the bound, never truncate silently, and are never cached. The aggregate snapshot is a single-entry `(live generation, export)` cache: hits serve repeated scans without re-decode; any committed mutation invalidates; a restore generation change misses structurally, never serving the pre-restore store. Tests: `scan_budget_gate_trips_over_limit`, `memory_audit_sees_write_between_calls`, plus per-tool foreign-row exclusion tests.
 
 ### 10.3 Scoring correction
 
@@ -478,12 +480,12 @@ Import into staging. Preserve all supported fields/IDs, record every unsupported
 | Decision | Current state | Evidence that closes it |
 |---|---|---|
 | AD-01 Canonical backend A or B | DECIDED: Option B (Fjall + Lance) — see plans/AD-01_canonical_backend.md | WP-02 hard gates and Part III traces |
-| AD-02 Exact crate/feature/toolchain lock | OPEN | Reproducible local CPU build and dependency report |
-| AD-03 Legacy contract baseline | Version/commit identified; wire capture OPEN | WP-00 generated snapshot and upstream transcripts |
-| AD-04 Default Candle recipe | E5-small candidate | Reference equivalence and retrieval quality suite |
-| AD-05 Score/abstention thresholds | Initial normalized design only | Development tuning plus frozen held-out evaluation |
-| AD-06 FTS freshness/null-vector behavior | OPEN for pinned Lance build | Local create/update/delete/search capability probes |
-| AD-07 Host/platform support | Linux-first target; Windows 11 Pro x86_64 certified 2026-10-08 alongside Linux (MSVC toolchain 1.99.0, protoc 36.0, NTFS, no mold/wild) | Versioned host/OS matrix |
+| AD-02 Exact crate/feature/toolchain lock | CLOSED (WP-00): toolchain 1.99.0 (`rust-toolchain.toml:4`); resolved fjall 3.1.12, lance 13.0.0, lancedb 0.40.0, candle-core 0.11.0, tokenizers 0.22.2, rmcp 3.7.0 | Reproducible local CPU build and dependency report |
+| AD-03 Legacy contract baseline | CLOSED (WP-00): Lemma 0.21.0 @ d30a816; 29-tool static inventory + wire captures in `baseline/lemma-0.21.0/` | WP-00 generated snapshot and upstream transcripts |
+| AD-04 Default Candle recipe | CLOSED: E5-small qualified recipe — 384-dim, 512-token window, `query: `/`passage: ` prefixes, MaskedMean + L2 pooling, greedy-unit chunking (`crates/embeddings/src/manifest.rs:78-90`; tests `recipe_matches_manifest_identity`, `recipe_is_the_e5_small_reference`) | Reference equivalence and retrieval quality suite |
+| AD-05 Score/abstention thresholds | CLOSED (frozen): Jaccard dedup >= 0.80 + autolink band 0.25..0.95 (`crates/search/src/similarity.rs:27-30`; test `jaccard_recipe_basics`) | Development tuning plus frozen held-out evaluation |
+| AD-06 FTS freshness/null-vector behavior | CLOSED: `SearchState` Complete/Partial/Unavailable (`crates/search/src/search/backend.rs:194-203`); nullable lexical rows + NULL probe/backfill (`backfill_null_vectors` workers.rs:385; test `backfill_requeues_lexical_null_vector_rows`; `null_vector_row_round_trips_and_filters`) | Local create/update/delete/search capability probes |
+| AD-07 Host/platform support | Linux-first; Windows 11 Pro x86_64 certified 2026-10-08 alongside Linux (MSVC toolchain 1.99.0, protoc 36.0, NTFS, no mold/wild) — see `plans/traceability.json: windows_certification_2026_10_08` | Versioned host/OS matrix |
 
 No runtime code should depend on an unclosed decision without a failing test and explicit experimental label.
 
