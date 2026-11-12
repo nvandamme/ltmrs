@@ -5,7 +5,13 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — fix: omp-compat P1 redaction hardening (all text-bearing fields scanned)
+## 2026-11-12 — feat: omp-compat P2/P3 + WP-12 per-op CPU/fsync
+
+- omp-compat P2 `memory_edit` tri-op native tool (5th native, 31 served): `ToolArgs::MemoryEdit` + `exec_memory_edit` (update→memory_update, forget→memory_forget, invalidate→forget(invalidate)); importance-only/unknown-op/unknown-id reject loudly; route + parse + allowlist + `served_tools_match_frozen_schema` (26+5) + notify parity (31) + `mutates_store` pins; scope+retry+straggler cells executed (daemon memory_edit 10/10); T-MEMOEDIT-01 + RQ-15; matrix 31/31 scope+retry.
+- omp-compat P3 status/stats/diagnose/queue markdown renderers (`skills/memory_status.rs`, 4 golden tests); 02 WP-10 task.
+- WP-12 per-op CPU/fsync: `HistoryRecord.cpu_micros` (thread-CPU delta) + `fsync_micros` (timed `durability_barrier`, 0 for reads); means in `OpStats`; serde-default backfill; 48 bench tests green. Remaining 26 legacy_oracle not_run audited as provisioned-live-upstream-gated.
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; workspace clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - Detection spans fragment+title+description+evidence.snippet (omp redactMemoryTextFields parity); generated fallbacks from redacted fragment; evidence sha over redacted bytes.
 - RED-first: title/description stored raw pre-fix; GREEN post-fix. JWT pin: already covered.

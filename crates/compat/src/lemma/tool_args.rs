@@ -46,6 +46,7 @@ pub enum ToolName {
     BackupPreview,
     BackupRestore,
     BackupImportLemma,
+    MemoryEdit,
 }
 
 impl ToolName {
@@ -82,6 +83,7 @@ impl ToolName {
             Self::BackupPreview => "backup_preview",
             Self::BackupRestore => "backup_restore",
             Self::BackupImportLemma => "backup_import_lemma",
+            Self::MemoryEdit => "memory_edit",
         }
     }
 
@@ -118,6 +120,7 @@ impl ToolName {
             "backup_preview" => Self::BackupPreview,
             "backup_restore" => Self::BackupRestore,
             "backup_import_lemma" => Self::BackupImportLemma,
+            "memory_edit" => Self::MemoryEdit,
             _ => return None,
         })
     }
@@ -301,6 +304,18 @@ pub struct BackupImportLemmaArgs {
     pub confirm: Option<bool>,
 }
 
+/// memory_edit arguments (ltmrs-native omp-compat tool; mirrors omp
+/// `memory_edit` tri-op: update | forget | invalidate; importance-only
+/// updates refuse loudly — ltmrs confidence is earned, never set).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryEditArgs {
+    pub op: String,
+    pub id: String,
+    pub content: Option<String>,
+    pub importance: Option<f64>,
+    pub replacement_id: Option<String>,
+}
+
 /// semantic_search arguments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticSearchArgs {
@@ -482,6 +497,7 @@ pub enum ToolArgs {
     BackupPreview(BackupPreviewArgs),
     BackupRestore(BackupRestoreArgs),
     BackupImportLemma(BackupImportLemmaArgs),
+    MemoryEdit(MemoryEditArgs),
 }
 
 impl ToolArgs {
@@ -518,6 +534,7 @@ impl ToolArgs {
             Self::BackupPreview(_) => ToolName::BackupPreview,
             Self::BackupRestore(_) => ToolName::BackupRestore,
             Self::BackupImportLemma(_) => ToolName::BackupImportLemma,
+            Self::MemoryEdit(_) => ToolName::MemoryEdit,
         }
     }
 
@@ -560,7 +577,8 @@ impl ToolArgs {
             | Self::SessionEnd(_)
             | Self::SuggestionRespond(_)
             | Self::BackupRestore(_)
-            | Self::BackupImportLemma(_) => true,
+            | Self::BackupImportLemma(_)
+            | Self::MemoryEdit(_) => true,
         }
     }
 }
@@ -651,6 +669,17 @@ mod tests {
             ToolArgs::MemoryRead(MemoryReadArgs {
                 query: Some("q".to_string()),
                 ..Default::default()
+            })
+            .mutates_store()
+        );
+        // memory_edit mutates through its mapped op (update/forget/invalidate).
+        assert!(
+            ToolArgs::MemoryEdit(super::MemoryEditArgs {
+                op: "update".to_string(),
+                id: "m1".to_string(),
+                content: Some("x".to_string()),
+                importance: None,
+                replacement_id: None,
             })
             .mutates_store()
         );

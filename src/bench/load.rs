@@ -87,6 +87,10 @@ pub struct MeasuredOp {
     pub retries: u64,
     /// Storage write-transaction conflicts observed before success/exhaustion.
     pub conflicts: u64,
+    /// Per-op CPU time (thread-CPU delta around the measured region).
+    pub cpu_micros: u64,
+    /// Per-op fsync-cost attribution (barrier time; 0 for reads).
+    pub fsync_micros: u64,
 }
 
 /// Outcome of one storage op: elapsed micros, success flag, human detail,
@@ -99,6 +103,10 @@ pub struct OpOutcome {
     pub detail: String,
     pub retries: u64,
     pub conflicts: u64,
+    /// Per-op CPU time (thread-CPU delta around the measured region).
+    pub cpu_micros: u64,
+    /// Per-op fsync-cost attribution (barrier time; 0 for reads).
+    pub fsync_micros: u64,
 }
 
 /// Execute one put/get/RMW storage op (shared by every runner). Search ops
@@ -199,8 +207,42 @@ impl RmwIssuer {
 }
 
 /// Counted executor: same behavior as [`execute_storage_op`] plus
-/// conflict/retry counters; RMW ops route through `issuer`.
+/// conflict/retry counters; RMW ops route through `issuer`. The wrapper
+/// adds the WP-12 per-op resource sample (thread-CPU delta + one timed
+/// barrier on the same store state for writes).
 pub fn execute_storage_op_counted(
+    repo: &CanonicalRepository,
+    op: &WorkloadOp,
+    issuer: &RmwIssuer,
+) -> OpOutcome {
+    use crate::bench::experiment::current_thread_cpu_micros;
+    let cpu_start = current_thread_cpu_micros();
+    let mut outcome = execute_storage_op_counted_inner(repo, op, issuer);
+    // CPU delta around the whole measured region (attempt sleeps consume
+    // no CPU, so backoff rides along honestly).
+    outcome.cpu_micros = match (cpu_start, current_thread_cpu_micros()) {
+        (Some(b), Some(a)) => a.saturating_sub(b),
+        _ => 0,
+    };
+    // fsync attribution: one extra barrier on the same store state costs
+    // what the op's own barrier cost (same journal depth class). Reads
+    // issue no barrier, so they sample 0 — never a fabricated share.
+    // A failed probe records 0 (declared absence, not a fast barrier).
+    outcome.fsync_micros = match op {
+        WorkloadOp::Put { .. } | WorkloadOp::Rmw { .. } if outcome.ok => {
+            let start = Instant::now();
+            match repo.durability_barrier() {
+                Ok(()) => start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                Err(_) => 0,
+            }
+        }
+        _ => 0,
+    };
+    outcome
+}
+
+/// Inner executor (wall-clock + conflict/retry telemetry).
+fn execute_storage_op_counted_inner(
     repo: &CanonicalRepository,
     op: &WorkloadOp,
     issuer: &RmwIssuer,
@@ -219,6 +261,8 @@ pub fn execute_storage_op_counted(
         detail: msg,
         retries: 0,
         conflicts: 0,
+        cpu_micros: 0,
+        fsync_micros: 0,
     };
     let prepared = match op {
         WorkloadOp::Put { key, bytes } => Prepared::Put(Box::new(workload_memory(*key, *bytes))),
@@ -256,6 +300,8 @@ pub fn execute_storage_op_counted(
                             detail: "written".to_string(),
                             retries: 0,
                             conflicts,
+                            cpu_micros: 0,
+                            fsync_micros: 0,
                         };
                     }
                     Err(e) => {
@@ -276,6 +322,8 @@ pub fn execute_storage_op_counted(
                 detail: format!("runner retry exhausted: {}", last.unwrap_or_default()),
                 retries: 0,
                 conflicts,
+                cpu_micros: 0,
+                fsync_micros: 0,
             }
         }
         Prepared::Get(id) => match repo.get_memories(&[id]) {
@@ -285,6 +333,8 @@ pub fn execute_storage_op_counted(
                 detail: format!("found={}", found.len()),
                 retries: 0,
                 conflicts: 0,
+                cpu_micros: 0,
+                fsync_micros: 0,
             },
             Err(e) => fail(elapsed(), e.message.clone()),
         },
@@ -324,6 +374,8 @@ fn execute_rmw(
                     detail: e.message.clone(),
                     retries,
                     conflicts,
+                    cpu_micros: 0,
+                    fsync_micros: 0,
                 };
             }
         };
@@ -364,6 +416,8 @@ fn execute_rmw(
                     detail: format!("rmw ok retries={retries}"),
                     retries,
                     conflicts,
+                    cpu_micros: 0,
+                    fsync_micros: 0,
                 };
             }
             Err(e)
@@ -384,6 +438,8 @@ fn execute_rmw(
                         detail: format!("rmw retry exhausted: {}", e.message),
                         retries,
                         conflicts,
+                        cpu_micros: 0,
+                        fsync_micros: 0,
                     };
                 }
                 std::thread::sleep(Duration::from_micros(50));
@@ -395,6 +451,8 @@ fn execute_rmw(
                     detail: e.message.clone(),
                     retries,
                     conflicts,
+                    cpu_micros: 0,
+                    fsync_micros: 0,
                 };
             }
         }
@@ -405,6 +463,8 @@ fn execute_rmw(
         detail: "rmw retry exhausted".to_string(),
         retries,
         conflicts,
+        cpu_micros: 0,
+        fsync_micros: 0,
     }
 }
 
@@ -455,6 +515,8 @@ pub fn run_closed_loop_counted(
                         detail: outcome.detail,
                         retries: outcome.retries,
                         conflicts: outcome.conflicts,
+                        cpu_micros: outcome.cpu_micros,
+                        fsync_micros: outcome.fsync_micros,
                     });
                     index += workers;
                 }
@@ -530,6 +592,8 @@ pub fn run_open_loop(
                             detail: outcome.detail,
                             retries: outcome.retries,
                             conflicts: outcome.conflicts,
+                            cpu_micros: outcome.cpu_micros,
+                            fsync_micros: outcome.fsync_micros,
                         })
                         .expect("collector alive");
                 }
@@ -573,6 +637,8 @@ pub fn record_measured(
             &m.detail,
             m.retries,
             m.conflicts,
+            m.cpu_micros,
+            m.fsync_micros,
         )?;
     }
     Ok(())

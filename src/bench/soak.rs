@@ -189,6 +189,8 @@ fn run_soak_segment(
             &m.detail,
             m.retries,
             m.conflicts,
+            m.cpu_micros,
+            m.fsync_micros,
         )?;
     }
     recorder.flush()?;
@@ -244,6 +246,8 @@ fn run_segment_ops(
                             detail: "search covered by projection leg".to_string(),
                             retries: 0,
                             conflicts: 0,
+                            cpu_micros: 0,
+                            fsync_micros: 0,
                         });
                     } else {
                         let outcome = execute_storage_op_counted(repo, &ops[index], &issuer);
@@ -256,6 +260,8 @@ fn run_segment_ops(
                             detail: outcome.detail,
                             retries: outcome.retries,
                             conflicts: outcome.conflicts,
+                            cpu_micros: outcome.cpu_micros,
+                            fsync_micros: outcome.fsync_micros,
                         });
                     }
                     index += workers;

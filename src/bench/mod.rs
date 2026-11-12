@@ -245,6 +245,16 @@ pub struct HistoryRecord {
     /// load as 0 (serde default).
     #[serde(default)]
     pub conflicts: u64,
+    /// Per-op CPU time (thread-CPU delta around the measured region;
+    /// Linux `CLOCK_THREAD_CPUTIME_ID`, otherwise 0).
+    /// Old histories without this column load as 0 (serde default).
+    #[serde(default)]
+    pub cpu_micros: u64,
+    /// Per-op fsync-cost attribution (SyncAll barrier time inside the
+    /// measured boundary; 0 for reads, which issue no barrier).
+    /// Old histories without this column load as 0 (serde default).
+    #[serde(default)]
+    pub fsync_micros: u64,
 }
 
 /// Append-only JSONL history recorder.
@@ -268,7 +278,7 @@ impl HistoryRecorder {
         ok: bool,
         detail: &str,
     ) -> std::io::Result<()> {
-        self.record_full(op, elapsed_micros, 0, ok, detail, 0, 0)
+        self.record_full(op, elapsed_micros, 0, ok, detail, 0, 0, 0, 0)
     }
 
     /// Record with an explicit queue-time component (open-loop runners).
@@ -280,11 +290,12 @@ impl HistoryRecorder {
         ok: bool,
         detail: &str,
     ) -> std::io::Result<()> {
-        self.record_full(op, elapsed_micros, queued_micros, ok, detail, 0, 0)
+        self.record_full(op, elapsed_micros, queued_micros, ok, detail, 0, 0, 0, 0)
     }
 
-    /// Full record path for contention legs: queue time plus the
-    /// conflict/retry counters observed inside the measured boundary.
+    /// Full record path for contention legs plus the WP-12 resource sample:
+    /// queue time, conflict/retry counters, and the per-op CPU + fsync
+    /// deltas observed inside the measured boundary.
     #[allow(clippy::too_many_arguments)]
     pub fn record_full(
         &mut self,
@@ -295,6 +306,8 @@ impl HistoryRecorder {
         detail: &str,
         retries: u64,
         conflicts: u64,
+        cpu_micros: u64,
+        fsync_micros: u64,
     ) -> std::io::Result<()> {
         let record = HistoryRecord {
             seq: self.seq,
@@ -305,6 +318,8 @@ impl HistoryRecorder {
             queued_micros,
             retries,
             conflicts,
+            cpu_micros,
+            fsync_micros,
         };
         self.seq += 1;
         let mut line = serde_json::to_string(&record)
@@ -703,7 +718,42 @@ mod tests {
             "positional digest must match the uniform full-config digest"
         );
     }
-
+    /// Resource columns round-trip through `record_full` (RED for WP-12
+    /// per-op CPU/fsync-cost: fails until `record_full` accepts the
+    /// resource sample).
+    #[test]
+    fn record_full_captures_resource_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resource.jsonl");
+        let mut rec = HistoryRecorder::create(&path).unwrap();
+        rec.record_full(
+            WorkloadOp::Put { key: 1, bytes: 4 },
+            41,
+            0,
+            true,
+            "written",
+            0,
+            0,
+            17,
+            3,
+        )
+        .unwrap();
+        rec.flush().unwrap();
+        let back = read_history(&path).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!((back[0].cpu_micros, back[0].fsync_micros), (17, 3));
+        // Old-format line (no resource columns) loads as zero.
+        let legacy = serde_json::json!({
+            "seq": 0,
+            "op": {"Put": {"key": 1, "bytes": 4}},
+            "elapsed_micros": 11,
+            "ok": true,
+            "detail": "written",
+            "queued_micros": 0,
+        });
+        let record: HistoryRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!((record.cpu_micros, record.fsync_micros), (0, 0));
+    }
     /// Contention counters round-trip through the history (old histories
     /// without the columns load as 0 via serde defaults).
     #[test]
@@ -719,6 +769,8 @@ mod tests {
             "rmw ok",
             2,
             3,
+            0,
+            0,
         )
         .unwrap();
         rec.flush().unwrap();

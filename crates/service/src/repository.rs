@@ -565,7 +565,10 @@ impl CanonicalRepository {
     pub(crate) fn restore_read_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
         self.restore_lock.read().unwrap()
     }
-    pub(crate) fn durability_barrier(&self) -> DomainResult<()> {
+    /// Benchmark/clock boundary (WP-12): extra calls are always safe (the
+    /// barrier is an idempotent flush, never a mutation), so runners may
+    /// time one call per write op as the fsync-cost sample.
+    pub fn durability_barrier(&self) -> DomainResult<()> {
         self.persist_barrier()
     }
     pub(crate) fn clock_now(&self) -> u64 {

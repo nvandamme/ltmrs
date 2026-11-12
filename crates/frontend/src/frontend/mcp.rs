@@ -50,9 +50,9 @@ use parse_guides::{
     parse_guide_merge, parse_guide_practice, parse_guide_update,
 };
 use parse_memory::{
-    parse_memory_add, parse_memory_audit, parse_memory_feedback, parse_memory_forget,
-    parse_memory_library, parse_memory_merge, parse_memory_read, parse_memory_relate,
-    parse_memory_stats, parse_memory_update, parse_semantic_search,
+    parse_memory_add, parse_memory_audit, parse_memory_edit, parse_memory_feedback,
+    parse_memory_forget, parse_memory_library, parse_memory_merge, parse_memory_read,
+    parse_memory_relate, parse_memory_stats, parse_memory_update, parse_semantic_search,
 };
 use parse_sessions::{
     parse_backup_create, parse_backup_import_lemma, parse_backup_preview, parse_backup_restore,
@@ -754,6 +754,7 @@ impl LtmrsFrontend {
         tools.push(native_backup_preview_tool());
         tools.push(native_backup_restore_tool());
         tools.push(native_backup_import_lemma_tool());
+        tools.push(native_memory_edit_tool());
         tools
     }
 
@@ -916,6 +917,7 @@ pub fn route_tool(
         "memory_read" => ToolArgs::MemoryRead(parse_memory_read(&args)?),
         "memory_add" => ToolArgs::MemoryAdd(parse_memory_add(&args)?),
         "memory_update" => ToolArgs::MemoryUpdate(parse_memory_update(&args)?),
+        "memory_edit" => ToolArgs::MemoryEdit(parse_memory_edit(&args)?),
         "memory_feedback" => ToolArgs::MemoryFeedback(parse_memory_feedback(&args)?),
         "memory_forget" => ToolArgs::MemoryForget(parse_memory_forget(&args)?),
         "memory_merge" => ToolArgs::MemoryMerge(parse_memory_merge(&args)?),
@@ -1043,6 +1045,21 @@ fn native_backup_import_lemma_tool() -> Tool {
     )
 }
 
+/// Native memory_edit definition (omp-compat tri-op).
+fn native_memory_edit_tool() -> Tool {
+    native_tool(
+        "memory_edit",
+        "Edit one memory by id (omp-compat tri-op). NATIVE ltmrs tool: op=update patches fragment/title via memory_update; op=forget hard-deletes via memory_forget; op=invalidate archives via memory_forget invalidate=true. Importance-only updates refuse loudly (ltmrs confidence is earned, never set). Unknown ops and ids error loudly.",
+        serde_json::json!({
+            "op": {"type": "string", "description": "One of: update | forget | invalidate."},
+            "id": {"type": "string", "description": "Memory id from recall output."},
+            "content": {"type": "string", "description": "Replacement fragment for op=update."},
+            "importance": {"type": "number", "description": "Rejected: importance is earned in ltmrs, never set."},
+            "replacement_id": {"type": "string", "description": "Accepted but informational for op=invalidate (tombstone, never delete)."},
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::handler::is_mutating_tool;
@@ -1055,8 +1072,8 @@ mod tests {
         let tools = LtmrsFrontend::tools();
         assert_eq!(
             tools.len(),
-            30,
-            "26 frozen-verbatim + 4 native (backup_create/preview/restore/import_lemma)"
+            31,
+            "26 frozen-verbatim + 5 native (backup_create/preview/restore/import_lemma + memory_edit)"
         );
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert!(names.contains(&"memory_read".to_string()));
@@ -1101,7 +1118,8 @@ mod tests {
                 "backup_create",
                 "backup_preview",
                 "backup_restore",
-                "backup_import_lemma"
+                "backup_import_lemma",
+                "memory_edit"
             ]
         );
         let served = &served[..frozen.len()];
@@ -1217,8 +1235,9 @@ mod tests {
             "backup_preview",
             "backup_restore",
             "backup_import_lemma",
+            "memory_edit",
         ];
-        assert_eq!(names.len(), 30, "all 30 served tools covered");
+        assert_eq!(names.len(), 31, "all 31 served tools covered");
         for n in names {
             let parsed = ToolName::parse(n).unwrap_or_else(|| panic!("{n} must parse"));
             assert_eq!(parsed.as_str(), n, "round-trip");
@@ -1249,6 +1268,7 @@ mod tests {
             "suggestion_respond",
             "backup_restore",
             "backup_import_lemma",
+            "memory_edit",
         ] {
             assert!(is_mutating_tool(t), "{t} must be mutating");
         }

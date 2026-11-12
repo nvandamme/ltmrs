@@ -51,7 +51,7 @@
       }
     ]
   },
-  "expected_tool_count": 30,
+  "expected_tool_count": 31,
   "tools": [
     {
       "name": "memory_read",
@@ -537,6 +537,22 @@
       },
       "owner_workpackage": "WP-11",
       "notes": "Scope 2026-11-11: backup_restore channel+fenced (existing: restore_write_guard notes); preview characterization backup_preview_serves_under_stable_id (daemon, 2026-11-11) Scope 2026-11-11: backup_restore_executes_under_stable_id (store-level replace, token binds channel+generation; daemon). Enhancement 2026-11-11: ledger DEV-010 (baseline/lemma-0.21.0/deviations.json; DEV-016 proposed-pending-owner-signoff)."
+    },
+    {
+      "name": "memory_edit",
+      "family": "memory",
+      "checks": {
+        "name_and_schema": "executed_passed",
+        "defaults_and_validation": "executed_passed",
+        "output_and_errors": "executed_passed",
+        "state_transitions": "executed_passed",
+        "scope_and_concurrency": "executed_passed",
+        "retry_and_restart": "executed_passed",
+        "legacy_oracle": "specified_not_executed",
+        "enhancement_ledger": "executed_passed"
+      },
+      "owner_workpackage": "WP-10",
+      "notes": "Native omp-compat tri-op (P2): update maps to memory_update (fragment patch), forget to memory_forget, invalidate to memory_forget invalidate=true. Scope 2026-11-12: edit_update_excludes_foreign_stable_row + edit_forget_excludes_foreign_stable_row (daemon, inherit canonical isolation). Retry 2026-11-12: edit_update_same_envelope_replays_recorded (daemon, byte-identical replay). Stragglers 2026-11-12: edit_arms_map_to_distinct_executor_paths + edit_update_without_content_rejects (daemon). No upstream oracle (greenfield tool, no Lemma 0.21.0 counterpart): legacy_oracle stays specified_not_executed by construction."
     }
   ]
 }

@@ -6,9 +6,12 @@
 //!   no frontend. Backend identity and workload digest ride the report so
 //!   comparisons stay apples-to-apples (T-BENCH-01).
 //! - Durability mode (declared, not equated): each put commits one canonical
-//!   write transaction (durable ACK per op, no group commit). fsync/barrier
-//!   costs are not separately instrumented; a matched T-BENCH-01 comparison
-//!   must equate this mode explicitly rather than assume it.
+//!   write transaction (durable ACK per op, no group commit). Per-op CPU
+//!   (thread-CPU delta) and fsync cost (one timed barrier on the same
+//!   store state for writes; 0 for reads) ride `HistoryRecord` as
+//!   `cpu_micros`/`fsync_micros` with means in `OpStats`; a matched
+//!   T-BENCH-01 comparison must equate this mode explicitly rather than
+//!   assume it.
 //! - Every op is timed and recorded to the raw history with its outcome;
 //!   summaries derive from the history file, never from live counters.
 //! - A missed point read is a successful read with `found=0`, not a
@@ -48,6 +51,14 @@ pub struct OpStats {
     pub p95_micros: u64,
     pub p99_micros: u64,
     pub mean_micros: f64,
+    /// Mean thread-CPU micros per op (WP-12; 0 when the sampler reported
+    /// absence — honestly no attribution, never a fabricated share).
+    #[serde(default)]
+    pub mean_cpu_micros: f64,
+    /// Mean fsync micros per op (WP-12; timed barrier sample on writes,
+    /// 0 on reads which issue no barrier).
+    #[serde(default)]
+    pub mean_fsync_micros: f64,
     /// Tail-sufficiency marker: tail percentiles rest on few observations
     /// at small n (plan acceptance: insufficient tail samples are marked
     /// insufficient evidence, never silently reported).
@@ -105,6 +116,32 @@ pub fn rss_delta_kb(before: Option<u64>, after: Option<u64>) -> Option<i64> {
     match (before, after) {
         (Some(b), Some(a)) => Some(a.saturating_sub(b) as i64),
         _ => None,
+    }
+}
+
+/// Current thread CPU time in micros (Linux `CLOCK_THREAD_CPUTIME_ID` via
+/// libc, already a direct root edge — no new crates). `None` off-Linux or
+/// on any clock failure — the per-op sample records 0, honestly no CPU
+/// attribution, never a fabricated distribution.
+pub fn current_thread_cpu_micros() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: clock_gettime with a valid clock id and a live out-pointer
+        // neither reads nor writes caller memory beyond the timespec.
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let ts = unsafe { ts.assume_init() };
+        u64::try_from(ts.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000)?
+            .checked_add((ts.tv_nsec as u64) / 1_000)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -283,12 +320,16 @@ pub fn op_name(op: &WorkloadOp) -> &'static str {
 pub fn summarize(records: &[HistoryRecord]) -> BTreeMap<String, OpStats> {
     let mut latencies: BTreeMap<String, Histogram> = BTreeMap::new();
     let mut failures: BTreeMap<String, u64> = BTreeMap::new();
+    let mut cpu_sums: BTreeMap<String, u64> = BTreeMap::new();
+    let mut fsync_sums: BTreeMap<String, u64> = BTreeMap::new();
     for record in records {
         let name = op_name(&record.op).to_string();
         latencies
             .entry(name.clone())
             .or_default()
             .push(record.elapsed_micros);
+        *cpu_sums.entry(name.clone()).or_default() += record.cpu_micros;
+        *fsync_sums.entry(name.clone()).or_default() += record.fsync_micros;
         if !record.ok {
             *failures.entry(name).or_default() += 1;
         }
@@ -304,6 +345,10 @@ pub fn summarize(records: &[HistoryRecord]) -> BTreeMap<String, OpStats> {
                 p95_micros: histogram.percentile(95.0).unwrap_or(0),
                 p99_micros: histogram.percentile(99.0).unwrap_or(0),
                 mean_micros: histogram.mean().unwrap_or(0.0),
+                mean_cpu_micros: cpu_sums.get(&name).copied().unwrap_or(0) as f64
+                    / count.max(1) as f64,
+                mean_fsync_micros: fsync_sums.get(&name).copied().unwrap_or(0) as f64
+                    / count.max(1) as f64,
                 note: if count < TAIL_SAMPLE_FLOOR {
                     format!("tail percentiles indicative only (n={count} < {TAIL_SAMPLE_FLOOR})")
                 } else {
@@ -413,14 +458,19 @@ pub async fn run_search(
     }
     let mut executed = 0u64;
     for (probe, terms, top_k) in queries {
+        let cpu_start = current_thread_cpu_micros();
         let start = Instant::now();
         let outcome = table.fts_query(terms, *top_k, None).await;
         let elapsed = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let cpu_micros = match (cpu_start, current_thread_cpu_micros()) {
+            (Some(b), Some(a)) => a.saturating_sub(b),
+            _ => 0,
+        };
         let (ok, detail) = match outcome {
             Ok(rows) => (true, format!("found={}", rows.len())),
             Err(e) => (false, e.message.clone()),
         };
-        record_search_outcome(recorder, *probe, *top_k, elapsed, ok, &detail)?;
+        record_search_outcome_cpu(recorder, *probe, *top_k, elapsed, ok, &detail, cpu_micros)?;
         executed += 1;
     }
     Ok(executed)
@@ -436,11 +486,30 @@ pub fn record_search_outcome(
     ok: bool,
     detail: &str,
 ) -> std::io::Result<()> {
-    recorder.record(
+    record_search_outcome_cpu(recorder, probe, top_k, elapsed_micros, ok, detail, 0)
+}
+
+/// Search record path with a measured thread-CPU sample (fsync stays 0:
+/// reads issue no barrier).
+pub fn record_search_outcome_cpu(
+    recorder: &mut HistoryRecorder,
+    probe: u64,
+    top_k: usize,
+    elapsed_micros: u64,
+    ok: bool,
+    detail: &str,
+    cpu_micros: u64,
+) -> std::io::Result<()> {
+    recorder.record_full(
         WorkloadOp::Search { probe, top_k },
         elapsed_micros,
+        0,
         ok,
         detail,
+        0,
+        0,
+        cpu_micros,
+        0,
     )
 }
 
@@ -497,10 +566,15 @@ pub fn run_search_threaded(
                         let mut index = worker;
                         while index < queries.len() {
                             let (probe, terms, top_k) = &queries[index];
+                            let cpu_start = current_thread_cpu_micros();
                             let start = std::time::Instant::now();
                             let outcome = runtime.block_on(table.fts_query(terms, *top_k, None));
                             let elapsed =
                                 start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                            let cpu_micros = match (cpu_start, current_thread_cpu_micros()) {
+                                (Some(b), Some(a)) => a.saturating_sub(b),
+                                _ => 0,
+                            };
                             let (ok, detail) = match outcome {
                                 Ok(rows) => (true, format!("found={}", rows.len())),
                                 Err(e) => (false, e.message.clone()),
@@ -517,6 +591,8 @@ pub fn run_search_threaded(
                                 detail,
                                 retries: 0,
                                 conflicts: 0,
+                                cpu_micros,
+                                fsync_micros: 0,
                             });
                             index += workers;
                         }
@@ -575,6 +651,8 @@ mod tests {
             queued_micros: 0,
             retries: 0,
             conflicts: 0,
+            cpu_micros: 0,
+            fsync_micros: 0,
         }
     }
 
@@ -595,6 +673,9 @@ mod tests {
             (20, 30, 30)
         );
         assert!((put.mean_micros - 20.0).abs() < 1e-9);
+        // WP-12: zero resource samples average to zero (no fabricated share).
+        assert!((put.mean_cpu_micros).abs() < 1e-9);
+        assert!((put.mean_fsync_micros).abs() < 1e-9);
         let get = &stats["get"];
         assert_eq!((get.count, get.failures), (1, 1));
     }

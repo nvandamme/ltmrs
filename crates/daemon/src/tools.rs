@@ -34,6 +34,7 @@ mod memory_add;
 #[cfg(test)]
 mod memory_add_tests;
 mod memory_audit;
+mod memory_edit;
 mod memory_feedback;
 #[cfg(test)]
 mod memory_feedback_tests;
@@ -137,6 +138,9 @@ pub fn execute_tool(
         }
         ToolArgs::MemoryForget(args) => {
             memory_forget::exec_memory_forget(disp, envelope, adm(), args, &resolved)
+        }
+        ToolArgs::MemoryEdit(args) => {
+            memory_edit::exec_memory_edit(disp, envelope, adm(), args, &resolved)
         }
         ToolArgs::MemoryMerge(args) => {
             memory_merge::exec_memory_merge(disp, envelope, adm(), args, &resolved)

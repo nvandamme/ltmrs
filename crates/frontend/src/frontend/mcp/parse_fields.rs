@@ -29,6 +29,16 @@ static ALLOWED_ARGUMENTS: std::sync::LazyLock<std::collections::HashMap<String, 
             "backup_import_lemma".to_string(),
             vec!["path".to_string(), "confirm".to_string()],
         );
+        map.insert(
+            "memory_edit".to_string(),
+            vec![
+                "op".to_string(),
+                "id".to_string(),
+                "content".to_string(),
+                "importance".to_string(),
+                "replacement_id".to_string(),
+            ],
+        );
         map
     });
 

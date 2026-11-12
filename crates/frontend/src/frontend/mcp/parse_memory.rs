@@ -8,9 +8,9 @@ use super::parse_fields::{
     str_field, usize_field,
 };
 use ltmrs_compat::lemma::tool_args::{
-    MemoryAddArgs, MemoryAuditArgs, MemoryFeedbackArgs, MemoryForgetArgs, MemoryLibraryArgs,
-    MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs, MemoryUpdateArgs,
-    SemanticSearchArgs,
+    MemoryAddArgs, MemoryAuditArgs, MemoryEditArgs, MemoryFeedbackArgs, MemoryForgetArgs,
+    MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs,
+    MemoryUpdateArgs, SemanticSearchArgs,
 };
 
 pub(crate) fn parse_memory_read(args: &Map<String, Value>) -> Result<MemoryReadArgs, McpError> {
@@ -148,6 +148,16 @@ pub(crate) fn parse_memory_forget(args: &Map<String, Value>) -> Result<MemoryFor
         id: require_str(args, "id")?,
         consolidate: bool_field(args, "consolidate")?,
         invalidate: bool_field(args, "invalidate")?,
+    })
+}
+
+pub(crate) fn parse_memory_edit(args: &Map<String, Value>) -> Result<MemoryEditArgs, McpError> {
+    Ok(MemoryEditArgs {
+        op: require_str(args, "op")?,
+        id: require_str(args, "id")?,
+        content: str_field(args, "content")?.map(|s| s.to_string()),
+        importance: f64_field(args, "importance")?,
+        replacement_id: str_field(args, "replacement_id")?.map(|s| s.to_string()),
     })
 }
 

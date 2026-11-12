@@ -161,6 +161,33 @@ fn semantic_search_requires_query() {
 fn unknown_tool_rejected() {
     assert!(route_tool("nonexistent", &None).is_err());
 }
+/// P2 RED: memory_edit routes by op (unknown op/unknown tool shape fails).
+#[test]
+fn memory_edit_routes_by_op() {
+    use serde_json::{Map, Value};
+    fn args(m: Value) -> Option<Map<String, Value>> {
+        m.as_object().cloned()
+    }
+    // update with content routes.
+    let t = route_tool(
+        "memory_edit",
+        &args(serde_json::json!({"op": "update", "id": "m1", "content": "new"})),
+    )
+    .unwrap();
+    assert!(matches!(
+        t,
+        ltmrs_daemon::envelope::DomainRequest::ToolCall { .. }
+    ));
+    // Unknown op parses at the route boundary (shape check only);
+    // exec rejects it loudly (covered in daemon memory_edit tests).
+    assert!(
+        route_tool(
+            "memory_edit",
+            &args(serde_json::json!({"op": "vaporize", "id": "m1"}))
+        )
+        .is_ok()
+    );
+}
 
 /// Project arguments normalize at the parse boundary (trim, basename,
 /// lowercase): reads and writes meet on the canonical form.
