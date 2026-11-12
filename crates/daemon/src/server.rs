@@ -103,8 +103,9 @@ pub struct DaemonConfig {
     pub scheduler: SchedulerConfig,
     /// Maintenance schedule + explicit budgets for optimization/retention.
     pub maintenance: MaintenanceConfig,
+    /// Hindsight bridge (Slice A, opt-in). None disables the bridge.
+    pub hindsight: Option<ltmrs_interchange::hindsight::HindsightConfig>,
 }
-
 /// Error from the daemon.
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -287,6 +288,24 @@ impl Daemon {
                 )
             }
         };
+        // Slice A bridge (opt-in): build the handle from config and late-attach.
+        // Disabled/misconfigured means no handle — tools behave byte-identically.
+        // Span bridge I/O outside the ACK path via the background worker.
+        if let Some(cfg) = config.hindsight.filter(|c| c.enabled) {
+            let bearer: Option<String> = None;
+            let client =
+                ltmrs_interchange::hindsight::client::HindsightClient::new(cfg.clone(), bearer);
+            let (handle, _bg) = crate::hindsight::BridgeHandle::spawn(
+                client,
+                cfg.bank.clone(),
+                cfg.default_tags.clone(),
+                cfg.max_queue,
+            );
+            // Intentionally detached: the worker lives as long as the daemon.
+            std::mem::forget(_bg);
+            dispatcher.set_hindsight(handle);
+            eprintln!("ltmrs: hindsight bridge enabled (bank {})", cfg.bank);
+        }
         // Eager durability (P1): session mutations persist before ack.
         dispatcher.set_sessions_path(sessions_path.clone());
         // P2-1 wake-up: every committed mutation wakes the projection

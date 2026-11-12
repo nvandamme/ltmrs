@@ -443,6 +443,10 @@ A `.ltmrs-backup` is not a `.lemma-backup`. The compatibility release includes a
 ### 11.6 Magic Context bridge (Slice C, read-only import)
 
 A Magic Context import is never a merge into canonical semantics: it stages a private read-only copy (source hash-checked before/after), refuses version skew and WAL-mode sources fail-closed, maps rows with loss accounting (no coerced quality, no fake memories for commits), and confirms additively via existing `memory_add` (deterministic ids + server Jaccard dedup = safe reruns). The `rusqlite` edge lives in an excluded cdylib crate, mirroring the lemma-import isolation. CLI-first: no new MCP tool, no daemon/compat change.
+
+### 11.7 Hindsight bridge (Slice A, opt-in live dual-write + scoped recall)
+
+ltmrs stays authoritative: canonical commits succeed/fail identically with the bridge on or off; Hindsight is best-effort additive only (post-commit fire-and-forget via a bounded drop-newest worker, never on the ACK path; N/A → `BridgeError::Unavailable`, never silent). Recall fans out on read tools with a short timeout; Hindsight hits append under a labeled section, never into native ranking (protects RQ-11 calibration); down/disabled → local-only + hint. `document_id = "ltmrs:{collection}:{entity_uuid}"` (idempotent upserts; forgets send tombstones, never deletes). Privacy §12.1 holds: always post-redaction (confirm=true verbatim excluded unless the bank is loopback — owner call).
 ## 12. Safety, backup and lifecycle
 
 ### 12.1 Privacy and integrity

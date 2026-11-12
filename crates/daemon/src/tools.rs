@@ -24,6 +24,8 @@ mod guide_merge;
 mod guide_practice;
 mod guide_render;
 mod guide_update;
+#[cfg(test)]
+mod hindsight_tests;
 mod ids;
 mod intelligence;
 #[cfg(test)]
@@ -189,6 +191,50 @@ pub fn execute_tool(
     // invalidate (the cache exists for them).
     if tool.mutates_store() {
         disp.invalidate_scan_cache();
+    }
+    // Slice A bridge (opt-in, best-effort): fan out a post-commit retain.
+    // No-op when unconfigured or outside the fan-out set; never fails the
+    // tool, never touches receipts or the cache beyond the invalidation
+    // above. Reads the payload text for feedback/relate/distill bodies.
+    if let DomainPayload::ToolResult {
+        text,
+        is_error: false,
+        ..
+    } = &payload
+    {
+        disp.enqueue_bridge_retain(tool, text, &resolved);
+    }
+    // Slice A recall (opt-in, best-effort): scoped Hindsight recall runs
+    // after canonical retrieval; hits append under a labeled section, never
+    // into native ranking. Unconfigured/down/timeout yields "" (no-op).
+    let recall_query = match tool {
+        ToolArgs::MemoryRead(a) => a.query.clone().filter(|q| !q.trim().is_empty()),
+        ToolArgs::SemanticSearch(a) => Some(a.query.clone()),
+        ToolArgs::GuideGet(a) => a.guide.clone().filter(|g| !g.trim().is_empty()),
+        _ => None,
+    };
+    if let (
+        Some(query),
+        DomainPayload::ToolResult {
+            text,
+            is_error: false,
+            ..
+        },
+    ) = (recall_query, &payload)
+    {
+        let section = disp.bridge_recall_section(
+            &query,
+            "",
+            &crate::hindsight::tags_for_retain(&resolved),
+            text,
+            100,
+            300,
+        );
+        if !section.is_empty()
+            && let DomainPayload::ToolResult { text, .. } = &mut payload
+        {
+            text.push_str(&format!("\n\n{section}"));
+        }
     }
     // Proceed-with-warning (Wave A3b shadow matrix): the resolution note
     // rides the human-readable text; the frozen structured shape is

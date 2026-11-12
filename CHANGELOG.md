@@ -5,7 +5,18 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: Slice C Magic Context read-only import bridge
+## 2026-11-12 — feat: Slice A Hindsight bridge (opt-in dual-write + scoped recall)
+
+- A0 wire table frozen from omp precedent; A1 types/config (`document_id`, tag derivation, env parsing).
+- A2 mockable client + bounded worker (native async traits; reqwest json; tokio dev-only).
+- A3 daemon wiring (Mutex-held handle, late attach in `Daemon::start`, Fan-out post-commit; env plumbing both serve paths).
+- A4 recall fusion (content-dedup labeled section, timeout-bound, local-only fallback).
+- A5 plan-authority one-review (Part I §11.7, WP-10 task, T-HINDSIGHT-01, RQ-15); fixed gate-caught tracker regression (restored T-SHAPE-01/T-HOST-01).
+- Proof: interchange 47/47, daemon 359/359, frontend 164/164; fmt clean; workspace clippy clean; gate-audit 13/13.
+
+---
+
+## a774859 (2026-11-12) — feat: Slice C Magic Context read-only import bridge
 
 - C1+C2: excluded `crates/mc-import` cdylib; version fence v95, WAL refusal, source-unchanged; scope mapping with closed harness vocabulary and git-root canonicalization.
 - C3: loss-accounted row mapping (deterministic ids, opaque embeddings, non-active refuses).

@@ -79,8 +79,12 @@ pub struct Dispatcher {
     /// daemon's configured `ResourceLimits` at construction; tests use
     /// `with_scan_budget` for tight caps.
     max_scan_rows: usize,
+    /// Hindsight bridge handle (Slice A, opt-in). None disables the bridge:
+    /// fan-out is a no-op and every tool behaves byte-identically.
+    /// Mutex for late attach in `Daemon::start` (config is read after the
+    /// dispatcher is built at all three construction sites).
+    hindsight: Mutex<Option<crate::hindsight::BridgeHandle>>,
 }
-
 impl Dispatcher {
     pub fn new(
         repo: Arc<CanonicalRepository>,
@@ -99,6 +103,7 @@ impl Dispatcher {
             similarity_gate: std::sync::Mutex::new(()),
             scan_cache: Mutex::new(None),
             max_scan_rows: crate::limits::ResourceLimits::default().max_scan_rows,
+            hindsight: Mutex::new(None),
         }
     }
 
@@ -106,6 +111,57 @@ impl Dispatcher {
     pub fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
         self.max_scan_rows = max_scan_rows;
         self
+    }
+
+    /// Attach the Hindsight bridge handle (Slice A, opt-in). Tests inject
+    /// a mock-transport handle; production wires it in `Daemon::start`.
+    pub fn with_hindsight(self, handle: crate::hindsight::BridgeHandle) -> Self {
+        *self.hindsight.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self
+    }
+
+    /// Late attach (production path: `Daemon::start` reads bridge config
+    /// after dispatcher construction).
+    pub fn set_hindsight(&self, handle: crate::hindsight::BridgeHandle) {
+        *self.hindsight.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Enqueue a post-commit bridge retain (best-effort, never fails).
+    /// Returns false when the bridge is disabled or the tool is outside
+    /// the fan-out set — the caller never branches on this.
+    pub fn enqueue_bridge_retain(
+        &self,
+        tool: &ltmrs_compat::lemma::tool_args::ToolArgs,
+        payload_text: &str,
+        resolved: &ltmrs_service::projects::ResolvedScope,
+    ) -> bool {
+        let guard = self.hindsight.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = guard.as_ref() else {
+            return false;
+        };
+        let Some(mut doc) = crate::hindsight::retain_doc_for(tool, payload_text) else {
+            return false;
+        };
+        doc.tags = crate::hindsight::tags_for_retain(resolved);
+        handle.enqueue_retain(doc)
+    }
+
+    /// Bridge recall section (A4): scoped Hindsight recall + fusion.
+    /// "" when disabled/unreachable/timed-out. Never fails the caller.
+    pub fn bridge_recall_section(
+        &self,
+        query: &str,
+        bank: &str,
+        tags: &[String],
+        canonical_text: &str,
+        max_tokens: u32,
+        timeout_ms: u64,
+    ) -> String {
+        let guard = self.hindsight.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = guard.as_ref() else {
+            return String::new();
+        };
+        handle.recall_section(query, bank, tags, canonical_text, max_tokens, timeout_ms)
     }
 
     /// Cached canonical export for aggregate scans, keyed on the live

@@ -35,11 +35,20 @@ pub fn daemon_socket_path(layout: &StdioLayout) -> PathBuf {
 pub async fn start_local_daemon(layout: &StdioLayout) -> Result<(Daemon, IpcClient), CliError> {
     let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
     let embedding = resolve_daemon_embedding(layout);
+    let hindsight = match ltmrs_interchange::hindsight::hindsight_config_from_env() {
+        Ok(cfg) if cfg.enabled => Some(cfg),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("ltmrs: hindsight bridge disabled ({e})");
+            None
+        }
+    };
     let config = DaemonConfig {
         store_path: layout.store_path.clone(),
         sessions_path: layout.sessions_path.clone(),
         search_path: layout.search_path.clone(),
         embedding,
+        hindsight,
         ..Default::default()
     };
     let daemon = Daemon::start(&paths, config)
@@ -405,12 +414,21 @@ pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result
         .map_err(|e| CliError::Runtime(format!("cannot watch for shutdown signal: {e}")))?;
     let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
     let embedding = resolve_daemon_embedding(layout);
+    let hindsight = match ltmrs_interchange::hindsight::hindsight_config_from_env() {
+        Ok(cfg) if cfg.enabled => Some(cfg),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("ltmrs: hindsight bridge disabled ({e})");
+            None
+        }
+    };
     let config = DaemonConfig {
         store_path: layout.store_path.clone(),
         sessions_path: layout.sessions_path.clone(),
         search_path: layout.search_path.clone(),
         embedding,
         idle_timeout_millis: idle_ms,
+        hindsight,
         ..Default::default()
     };
     let mut daemon = Daemon::start(&paths, config)

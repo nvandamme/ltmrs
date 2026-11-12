@@ -8,9 +8,11 @@ ltmrs-domain = { path = "../domain" }
 ltmrs-service = { path = "../service" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 thiserror = "2.0"
 
 [dev-dependencies]
 tempfile = "3.0"
+tokio = { version = "1.0", features = ["rt", "macros", "sync", "time"] }
 sha2 = "0.11"

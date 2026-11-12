@@ -5,6 +5,7 @@ pub mod client;
 pub mod dispatcher;
 pub mod envelope;
 pub mod health;
+pub mod hindsight;
 pub mod idle;
 pub mod lemma_import;
 pub mod limits;

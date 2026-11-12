@@ -2,13 +2,11 @@
 
 Work completed on the current unreleased commit.
 Content before `---` is instructions — do not modify. Add entries after `## Unreleased Commit`
-
----
-## Unreleased Commit
-- Slice C Magic Context bridge (read-only import, TDD RED-first):
-- C1 reader + version fence: excluded `crates/mc-import` (own workspace, cdylib, own rusqlite edge); `open_readonly_copy` (tempfile copy, magic+WAL check, query_only, source-unchanged); `MAX(version)` fence v95 (matches upstream `LATEST_SUPPORTED_VERSION`); fixture builder. Tests: supported/newer-refuses/WAL-refuses/unchanged (4/4).
-- C2 scope mapping: `scope.rs` reads `session_projects`; closed harness vocabulary (opencode/opencode2/pi/omp/claude-code); absolute-path + `..` + non-repo + symlink-escape refusals; git-root canonicalization; same-path-different-roots differ. Tests: 4/4 (11/11 mc-import total with C1+C3).
-- C3 row mapping: `map.rs` McMemory->Memory (external_alias `mc:{id}`, UUIDv5 deterministic ids, tags `mc-category:*`, loss for importance/scope/seen/retrieval; non-active refuses loudly; embeddings opaque).
-- C4 CLI + atomic publish: `skills/mc_import.rs` dlopen loader (candidate paths + env override, mirrors lemma_import); preview (staging JSON -> counts/digest/loss/scopes); `confirm`/`confirm_staged` (digest-bound, memory_add fan-out, rerun-safe); `mc-import preview|confirm` CLI verbs + dispatch + help; hermetic tests (pure parse, candidate error, live confirm 2-applied + rerun-0).
-- C5 plan-authority one-review: Part I §11.6, WP-10 task, T-MCIMPORT-01, RQ-16 evidence+test; no daemon/compat change (CLI-first per OQ-C4).
-- Proof: mc-import 11/11, frontend lib 164/164, daemon lib 355/355; fmt clean; workspace clippy -D warnings clean.
+- Slice A Hindsight bridge B1 (opt-in live dual-write + scoped recall, TDD RED-first):
+- A0 precedent freeze (no code): omp client.ts wire table frozen into `interchange::hindsight::precedent` (retain/recall/reflect paths, snake_case fields, timeouts, Bearer auth, localhost:8888 default).
+- A1 types + config: `RetainDoc`/`RecallHit`/`document_id` (ltmrs:{collection}:{uuid})/`tags_for_scope`/`hindsight_config_from_env` (LTMRS_HINDSIGHT_*); 6 tests.
+- A2 client + worker: mockable `HttpTransport` (native async traits, no new dep; reqwest json feature + tokio dev-only), `HindsightClient` (retain/recall/reflect), `BridgeHandle` bounded drop-newest worker; 4 mock tests. Real finding: repo-wide env-var test race -> serializing Mutex guard.
+- A3 daemon wiring: `Dispatcher.hindsight` (Mutex for late attach) + `with_hindsight`/`set_hindsight`/`enqueue_bridge_retain`/`tags_for_retain`; execute_tool post-commit fan-out; `DaemonConfig.hindsight` + `Daemon::start` build + `LTMRS_HINDSIGHT_*` env plumbing in both serve paths. Real findings: stale-parallel-list drift avoided via single `retain_doc_for`; `frontend_mismatch` avoided by unifying handshake/envelope ids (B pattern reused).
+- A4 recall + fusion: `merge_hindsight_hits` (content dedup vs canonical text, repeat dedup, labeled section, never into ranking); `BridgeHandle::recall_section` (block_in_place+timeout, local-only without runtime); execute_tool hook for memory_read/semantic_search/guide_get. Tests: fusion 3 + live recall (canonical first, section appended) green.
+- A5 plan-authority one-review: Part I §11.7, WP-10 task, T-HINDSIGHT-01, RQ-15 evidence+test; gate caught + fixed a real tracker regression (C edit had dropped T-SHAPE-01/T-HOST-01 rows — restored, 13/13 PASS).
+- Proof: interchange 47/47, daemon 359/359, frontend 164/164; fmt clean; workspace clippy clean; gate-audit 13/13.

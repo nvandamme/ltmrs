@@ -9,6 +9,7 @@ ltmrs-service = { path = "../service" }
 ltmrs-compat = { path = "../compat" }
 ltmrs-daemon = { path = "../daemon" }
 ltmrs-embeddings = { path = "../embeddings" }
+ltmrs-interchange = { path = "../interchange" }
 # MCP protocol (stdio boundary). server feature gives the stdio/async-rw
 # transports; avoid auth/reqwest (C code).
 rmcp = { version = "3.5", default-features = false, features = ["server", "transport-async-rw", "transport-io"] }
