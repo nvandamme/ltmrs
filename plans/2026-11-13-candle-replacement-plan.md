@@ -6,7 +6,7 @@
 
 **Architecture:** The `SyncEmbedder` trait boundary (`crates/embeddings/src/worker.rs:23`) is the seam: `E5SmallAdapter` keeps its recipe/tokenizer/chunking code, but the BertModel tensor core is re-implemented on the chosen backend. Callers (`EmbeddingService`, projector `Embedder`, search backend) see no signature changes. Candle leaves the tree entirely, including dev-dependencies and the `cuda` feature.
 
-**Tech Stack:** Rust (edition 2024); candidate backends in preference order — (1) Burn with CubeCL (Burn `0.23` + CubeCL `0.12` release lines — verify `fallback-dynamic-loading` in the release manifests at pin time, as the 0.22.1/0.11.2 pre-release check did), (2) pure-CUDA NVRTC via cudarc `dynamic-loading` for specific kernels ONLY where perf proves largely better than the CubeCL port (never for models; models run through Burn only, may require Burn ports), (3) Burn Flex CPU as the guaranteed portable fallback. Prebuilt CUDA v13 wheel libraries for version-pinned testing/stability (host floor: CUDA 13.4).
+**Tech Stack:** Rust (edition 2024); candidate backends in preference order — (1) Burn with CubeCL (Burn `0.22` + CubeCL `0.11` stable lines — `fallback-dynamic-loading` verified in the vendored 0.22.1/0.11.2 manifests; 0.23/0.12 are pre-release (`-pre.2`) and unpinnable per repo rules (X.Y only, never prerelease), (2) pure-CUDA NVRTC via cudarc `dynamic-loading` for specific kernels ONLY where perf proves largely better than the CubeCL port (never for models; models run through Burn only, may require Burn ports), (3) Burn Flex CPU as the guaranteed portable fallback. Prebuilt CUDA v13 wheel libraries for version-pinned testing/stability (host floor: CUDA 13.4).
 
 ## Global Constraints
 
@@ -26,7 +26,7 @@
 - Modify: none (read-only)
 
 **Interfaces:**
-- Consumes: `crates/embeddings/Cargo.toml:27` (`cuda` feature), vendored `candle-core 0.11.0` manifest, vendored `cudarc 0.19.10` `build.rs`, vendored `cubecl-cuda 0.12` + `burn-cuda 0.23` manifests at pin time (controls; pre-release check ran on 0.11.2/0.22.1)
+- Consumes: `crates/embeddings/Cargo.toml:27` (`cuda` feature), vendored `candle-core 0.11.0` manifest, vendored `cudarc 0.19.10` `build.rs`, vendored `cubecl-cuda 0.11.2` + `burn-cuda 0.22.1` manifests (controls; 0.23/0.12 are pre-release and unpinnable)
 - Produces: committed baseline record in the Task 6 gate script header (exact `DT_NEEDED` lines + manifest line refs)
 
 **Steps:**
@@ -42,7 +42,7 @@ Expected: `dynamic-linking` under `[dependencies.cudarc]` features with no `fall
 - [ ] **Step 2: Record the controls (CubeCL/Burn load dynamically)**
 
 ```bash
-grep -n "fallback-dynamic-loading" /home/nvand/.cargo/registry/src/*/cubecl-cuda-0.12/Cargo.toml | head -3
+grep -n "fallback-dynamic-loading" /home/nvand/.cargo/registry/src/*/cubecl-cuda-0.11/Cargo.toml | head -3
 ```
 
 Expected: present in both `[dependencies.cudarc]` and `[build-dependencies.cudarc]`, no `dynamic-linking`. This is the mechanism the replacement inherits — verified, not assumed.
@@ -62,7 +62,7 @@ Expected: `libcuda.so.1`, `libcurand`, `libcublas`, `libcudart` listed. Paste fu
 - [ ] **Step 4: Verify no replacement candidate links**
 
 ```bash
-grep -rn "dynamic-linking\|static-linking" /home/nvand/.cargo/registry/src/*/cubecl-cuda-0.12/Cargo.toml /home/nvand/.cargo/registry/src/*/burn-cuda-0.23/Cargo.toml 2>/dev/null | head
+grep -rn "dynamic-linking\|static-linking" /home/nvand/.cargo/registry/src/*/cubecl-cuda-0.11/Cargo.toml /home/nvand/.cargo/registry/src/*/burn-cuda-0.22/Cargo.toml 2>/dev/null | head
 ```
 
 Expected: no output. If any replacement candidate forces link mode, STOP — the plan's backend ranking is wrong and needs owner review before proceeding.
