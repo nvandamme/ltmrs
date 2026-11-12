@@ -47,6 +47,8 @@ pub enum ToolName {
     BackupRestore,
     BackupImportLemma,
     MemoryEdit,
+    Learn,
+    Reflect,
 }
 
 impl ToolName {
@@ -84,6 +86,8 @@ impl ToolName {
             Self::BackupRestore => "backup_restore",
             Self::BackupImportLemma => "backup_import_lemma",
             Self::MemoryEdit => "memory_edit",
+            Self::Learn => "learn",
+            Self::Reflect => "reflect",
         }
     }
 
@@ -121,6 +125,8 @@ impl ToolName {
             "backup_restore" => Self::BackupRestore,
             "backup_import_lemma" => Self::BackupImportLemma,
             "memory_edit" => Self::MemoryEdit,
+            "learn" => Self::Learn,
+            "reflect" => Self::Reflect,
             _ => return None,
         })
     }
@@ -316,6 +322,27 @@ pub struct MemoryEditArgs {
     pub replacement_id: Option<String>,
 }
 
+/// learn arguments (ltmrs-native omp-compat tool; mirrors omp `learn`:
+/// durable lesson + optional managed skill; lesson persists first, skill
+/// failure is a partial outcome, never a rollback).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LearnArgs {
+    pub memory: String,
+    pub context: Option<String>,
+    pub guide: Option<String>,
+    pub guide_description: Option<String>,
+    pub guide_body: Option<String>,
+}
+
+/// reflect arguments (ltmrs-native omp-compat tool; mirrors omp `reflect`:
+/// server-side synthesis over the Hindsight bank; read-only, best-effort —
+/// empty when the bridge is disabled or down, never a failure).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReflectArgs {
+    pub query: String,
+    pub context: Option<String>,
+}
+
 /// semantic_search arguments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticSearchArgs {
@@ -498,6 +525,8 @@ pub enum ToolArgs {
     BackupRestore(BackupRestoreArgs),
     BackupImportLemma(BackupImportLemmaArgs),
     MemoryEdit(MemoryEditArgs),
+    Learn(LearnArgs),
+    Reflect(ReflectArgs),
 }
 
 impl ToolArgs {
@@ -535,6 +564,8 @@ impl ToolArgs {
             Self::BackupRestore(_) => ToolName::BackupRestore,
             Self::BackupImportLemma(_) => ToolName::BackupImportLemma,
             Self::MemoryEdit(_) => ToolName::MemoryEdit,
+            Self::Learn(_) => ToolName::Learn,
+            Self::Reflect(_) => ToolName::Reflect,
         }
     }
 
@@ -558,7 +589,8 @@ impl ToolArgs {
             | Self::ProactiveAnalysis(_)
             | Self::ProjectAnalytics(_)
             | Self::BackupCreate(_)
-            | Self::BackupPreview(_) => false,
+            | Self::BackupPreview(_)
+            | Self::Reflect(_) => false, // read-only bridge synthesis: notifies, never gates
             Self::MemoryRead(_)
             | Self::MemoryAdd(_)
             | Self::MemoryUpdate(_)
@@ -578,7 +610,8 @@ impl ToolArgs {
             | Self::SuggestionRespond(_)
             | Self::BackupRestore(_)
             | Self::BackupImportLemma(_)
-            | Self::MemoryEdit(_) => true,
+            | Self::MemoryEdit(_)
+            | Self::Learn(_) => true,
         }
     }
 }
@@ -680,6 +713,14 @@ mod tests {
                 content: Some("x".to_string()),
                 importance: None,
                 replacement_id: None,
+            })
+            .mutates_store()
+        );
+        // learn stores a lesson (and optionally a guide): a mutation.
+        assert!(
+            ToolArgs::Learn(super::LearnArgs {
+                memory: "x".to_string(),
+                ..Default::default()
             })
             .mutates_store()
         );

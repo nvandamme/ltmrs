@@ -8,9 +8,9 @@ use super::parse_fields::{
     str_field, usize_field,
 };
 use ltmrs_compat::lemma::tool_args::{
-    MemoryAddArgs, MemoryAuditArgs, MemoryEditArgs, MemoryFeedbackArgs, MemoryForgetArgs,
-    MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs, MemoryStatsArgs,
-    MemoryUpdateArgs, SemanticSearchArgs,
+    LearnArgs, MemoryAddArgs, MemoryAuditArgs, MemoryEditArgs, MemoryFeedbackArgs,
+    MemoryForgetArgs, MemoryLibraryArgs, MemoryMergeArgs, MemoryReadArgs, MemoryRelateArgs,
+    MemoryStatsArgs, MemoryUpdateArgs, ReflectArgs, SemanticSearchArgs,
 };
 
 pub(crate) fn parse_memory_read(args: &Map<String, Value>) -> Result<MemoryReadArgs, McpError> {
@@ -158,6 +158,23 @@ pub(crate) fn parse_memory_edit(args: &Map<String, Value>) -> Result<MemoryEditA
         content: str_field(args, "content")?.map(|s| s.to_string()),
         importance: f64_field(args, "importance")?,
         replacement_id: str_field(args, "replacement_id")?.map(|s| s.to_string()),
+    })
+}
+
+pub(crate) fn parse_learn(args: &Map<String, Value>) -> Result<LearnArgs, McpError> {
+    Ok(LearnArgs {
+        memory: require_str(args, "memory")?,
+        context: str_field(args, "context")?.map(|s| s.to_string()),
+        guide: str_field(args, "guide")?.map(|s| s.to_string()),
+        guide_description: str_field(args, "guide_description")?.map(|s| s.to_string()),
+        guide_body: str_field(args, "guide_body")?.map(|s| s.to_string()),
+    })
+}
+
+pub(crate) fn parse_reflect(args: &Map<String, Value>) -> Result<ReflectArgs, McpError> {
+    Ok(ReflectArgs {
+        query: require_str(args, "query")?,
+        context: str_field(args, "context")?.map(|s| s.to_string()),
     })
 }
 

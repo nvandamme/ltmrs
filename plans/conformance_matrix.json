@@ -51,7 +51,7 @@
       }
     ]
   },
-  "expected_tool_count": 31,
+  "expected_tool_count": 33,
   "tools": [
     {
       "name": "memory_read",
@@ -553,6 +553,38 @@
       },
       "owner_workpackage": "WP-10",
       "notes": "Native omp-compat tri-op (P2): update maps to memory_update (fragment patch), forget to memory_forget, invalidate to memory_forget invalidate=true. Scope 2026-11-12: edit_update_excludes_foreign_stable_row + edit_forget_excludes_foreign_stable_row (daemon, inherit canonical isolation). Retry 2026-11-12: edit_update_same_envelope_replays_recorded (daemon, byte-identical replay). Stragglers 2026-11-12: edit_arms_map_to_distinct_executor_paths + edit_update_without_content_rejects (daemon). No upstream oracle (greenfield tool, no Lemma 0.21.0 counterpart): legacy_oracle stays specified_not_executed by construction."
-    }
+    },
+      {
+        "name": "learn",
+        "family": "memory",
+        "checks": {
+          "name_and_schema": "executed_passed",
+          "defaults_and_validation": "executed_passed",
+          "output_and_errors": "executed_passed",
+          "state_transitions": "executed_passed",
+          "scope_and_concurrency": "executed_passed",
+          "retry_and_restart": "executed_passed",
+          "legacy_oracle": "specified_not_executed",
+          "enhancement_ledger": "executed_passed"
+        },
+        "owner_workpackage": "WP-10",
+        "notes": "Native omp-compat lesson capture + optional guide (Slice G3, 2026-11-12): memory (+context) persists first as lesson-typed memory_add; guide/guide_body creates the managed guide second (partial, never rollback). Empty lessons reject loudly. Tests: learn_stores_lesson + learn_empty_memory_rejects + learn_with_guide_stores_both (daemon 3/3) + learn_routes_with_memory (frontend) + mutates_store pin (compat). Route + parse + allowlist + served pin 33 + notify parity. No upstream oracle (greenfield omp tool, no Lemma 0.21.0 counterpart): legacy_oracle stays specified_not_executed by construction."
+      },
+      {
+        "name": "reflect",
+        "family": "intelligence",
+        "checks": {
+          "name_and_schema": "executed_passed",
+          "defaults_and_validation": "executed_passed",
+          "output_and_errors": "executed_passed",
+          "state_transitions": "executed_passed",
+          "scope_and_concurrency": "executed_passed",
+          "retry_and_restart": "executed_passed",
+          "legacy_oracle": "specified_not_executed",
+          "enhancement_ledger": "executed_passed"
+        },
+        "owner_workpackage": "WP-10",
+        "notes": "Native omp-compat server-side synthesis (Slice G1b, 2026-11-12): query (+context) over the Hindsight bank through the bridge; scoped bank + tag filter (G1a modes); read-only (mutates_store false, notifies). Empty synthesis when disabled/down (never a failure); empty query rejects loudly. Tests: reflect_empty_query_rejects + reflect_without_bridge_degrades_honestly (daemon 2/2) + reflect_routes_with_query (frontend). Route + parse + allowlist + served pin 33 + parity. No upstream oracle (greenfield omp tool): legacy_oracle stays specified_not_executed by construction."
+      }
   ]
 }

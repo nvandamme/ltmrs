@@ -295,11 +295,13 @@ impl Daemon {
             let bearer: Option<String> = None;
             let client =
                 ltmrs_interchange::hindsight::client::HindsightClient::new(cfg.clone(), bearer);
-            let (handle, _bg) = crate::hindsight::BridgeHandle::spawn(
+            let (handle, _bg) = crate::hindsight::BridgeHandle::spawn_scoped_outbox(
                 client,
                 cfg.bank.clone(),
                 cfg.default_tags.clone(),
                 cfg.max_queue,
+                cfg.scoping,
+                cfg.outbox_dir.clone(),
             );
             // Intentionally detached: the worker lives as long as the daemon.
             std::mem::forget(_bg);

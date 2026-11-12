@@ -164,6 +164,34 @@ impl Dispatcher {
         handle.recall_section(query, bank, tags, canonical_text, max_tokens, timeout_ms)
     }
 
+    /// Bridge reflect (G1b): server-side synthesis, "" when disabled/down.
+    /// Never fails the caller.
+    pub fn bridge_reflect(
+        &self,
+        query: &str,
+        bank: &str,
+        tags: &[String],
+        timeout_ms: u64,
+    ) -> String {
+        let guard = self.hindsight.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = guard.as_ref() else {
+            return String::new();
+        };
+        handle.reflect(query, bank, tags, timeout_ms)
+    }
+
+    /// Scoped bridge reflect (G1b): bank + tag filter derived from the
+    /// project scope (G1a modes). "" when disabled/down. Never fails.
+    pub fn bridge_reflect_scoped(&self, query: &str, project: Option<&str>) -> String {
+        let guard = self.hindsight.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = guard.as_ref() else {
+            return String::new();
+        };
+        let bank = handle.bank_for_project(project);
+        let tags = handle.recall_tags_for(project);
+        handle.reflect(query, &bank, &tags, 30_000)
+    }
+
     /// Cached canonical export for aggregate scans, keyed on the live
     /// store generation. Miss (empty or generation change) re-decodes
     /// from the repository and stores the fresh entry.

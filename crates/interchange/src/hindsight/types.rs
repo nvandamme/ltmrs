@@ -12,6 +12,15 @@ pub struct HindsightConfig {
     pub default_tags: Vec<String>,
     pub timeout_ms: u64,
     pub max_queue: usize,
+    /// Bank scoping (omp `hindsight.scoping` parity; default tagged).
+    pub scoping: super::Scoping,
+    /// Untagged every-project writes (omp `hindsight.globalScope`, default off).
+    pub global_scope: bool,
+    /// Durable outbox root (G1d; omp outbox parity). `None` = in-memory
+    /// only (current behavior): failed retains drop with the process.
+    /// Set = each retain persists to disk before the worker sends it, and
+    /// failures stay for retry instead of dropping.
+    pub outbox_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for HindsightConfig {
@@ -23,6 +32,9 @@ impl Default for HindsightConfig {
             default_tags: Vec::new(),
             timeout_ms: 1500,
             max_queue: 256,
+            scoping: super::Scoping::PerProjectTagged,
+            global_scope: false,
+            outbox_dir: None,
         }
     }
 }
@@ -63,6 +75,29 @@ pub fn hindsight_config_from_env() -> Result<HindsightConfig, String> {
             .map_err(|_| format!("bad LTMRS_HINDSIGHT_TIMEOUT_MS={s:?}"))?,
         Err(_) => 1500,
     };
+    let scoping = match std::env::var("LTMRS_HINDSIGHT_SCOPING").as_deref() {
+        Ok("global") => super::Scoping::Global,
+        Ok("per-project") => super::Scoping::PerProject,
+        Ok("per-project-tagged") | Err(_) => super::Scoping::PerProjectTagged,
+        Ok(other) => {
+            return Err(format!(
+                "bad LTMRS_HINDSIGHT_SCOPING={other:?} (want global|per-project|per-project-tagged)"
+            ));
+        }
+    };
+    let global_scope = match std::env::var("LTMRS_HINDSIGHT_GLOBAL_SCOPE").as_deref() {
+        Ok("1") | Ok("true") => true,
+        Ok("0") | Ok("false") | Err(_) => false,
+        Ok(other) => {
+            return Err(format!(
+                "bad LTMRS_HINDSIGHT_GLOBAL_SCOPE={other:?} (want 0/1/true/false)"
+            ));
+        }
+    };
+    let outbox_dir = match std::env::var("LTMRS_HINDSIGHT_OUTBOX").as_deref() {
+        Ok(s) if !s.trim().is_empty() => Some(std::path::PathBuf::from(s)),
+        Ok(_) | Err(_) => None,
+    };
     Ok(HindsightConfig {
         enabled,
         base_url,
@@ -70,6 +105,9 @@ pub fn hindsight_config_from_env() -> Result<HindsightConfig, String> {
         default_tags,
         timeout_ms,
         max_queue: 256,
+        scoping,
+        global_scope,
+        outbox_dir,
     })
 }
 

@@ -4,9 +4,18 @@
 //! See `precedent.rs` for the frozen wire table.
 
 pub mod client;
+pub mod mental;
+pub mod outbox;
 pub mod precedent;
 pub mod types;
 
+pub use mental::{
+    MENTAL_SEEDS, MentalSeed, render_mental_block, render_mental_models, seeds_for_scope,
+};
+pub use outbox::{
+    dest_dir, event_filename, outbox_expiry_millis, outbox_root, quarantine_cutoff_millis,
+    quarantine_dir, write_event,
+};
 pub use types::{
     BridgeError, HindsightConfig, RecallHit, RetainDoc, document_id, hindsight_config_from_env,
 };
@@ -27,6 +36,54 @@ pub fn tags_for_scope(
     tags.sort();
     tags.dedup();
     tags
+}
+
+/// Bank scoping mode (omp `hindsight.scoping` parity; default tagged).
+/// Pure and total: every mode × project combination yields a bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scoping {
+    Global,
+    PerProject,
+    PerProjectTagged,
+}
+
+/// Project label: lowercase basename (omp parity: git primary-checkout-root
+/// basename, cwd basename outside a repo). Pure: the caller resolves the dir.
+pub fn project_label(dir_basename: &str) -> String {
+    dir_basename.trim().to_lowercase()
+}
+
+/// Bank for a scope: shared base for global/tagged, base + label for
+/// per-project. Empty/absent labels never yield a trailing dash.
+pub fn bank_for_scope(base: &HindsightConfig, mode: &Scoping, project: Option<&str>) -> String {
+    if *mode != Scoping::PerProject {
+        return base.bank.clone();
+    }
+    let label = project.map(project_label).unwrap_or_default();
+    if label.is_empty() {
+        return base.bank.clone();
+    }
+    format!("{}-{label}", base.bank)
+}
+
+/// Recall tag filter for a scope: tagged mode filters on the project label,
+/// global/per-project read the bank itself (no tag filter). Pure.
+pub fn tags_for_recall(mode: &Scoping, project: Option<&str>) -> Vec<String> {
+    if *mode != Scoping::PerProjectTagged {
+        return Vec::new();
+    }
+    let label = project.map(project_label).unwrap_or_default();
+    if label.is_empty() {
+        return Vec::new();
+    }
+    vec![format!("project:{label}")]
+}
+
+/// Global (untagged, every-project) writes need the explicit `globalScope`
+/// flag AND a bank every project recalls (shared or tagged). Per-project
+/// banks can never receive a global write — fail loud at the boundary.
+pub fn global_retain_allowed(global_scope: bool, mode: &Scoping) -> bool {
+    global_scope && *mode != Scoping::PerProject
 }
 
 /// Retain request paths (precedent-frozen; see `precedent.rs`).
@@ -66,6 +123,9 @@ mod tests {
             default_tags: vec!["team".into(), "project:shop".into()],
             timeout_ms: 1500,
             max_queue: 8,
+            scoping: Scoping::PerProjectTagged,
+            global_scope: false,
+            outbox_dir: None,
         };
         let tags = tags_for_scope(&cfg, Some("shop"), Some("ch1"));
         assert!(tags.contains(&"team".to_string()));
@@ -83,6 +143,58 @@ mod tests {
         assert_eq!(retain_path("b"), "/v1/default/banks/b/memories");
         assert_eq!(recall_path("b"), "/v1/default/banks/b/memories/recall");
         assert_eq!(reflect_path("b"), "/v1/default/banks/b/reflect");
+    }
+
+    /// G1a RED: bank derivation per scoping mode (global / per-project /
+    /// per-project-tagged). Fails until `bank_for_scope` exists.
+    #[test]
+    fn bank_derivation_follows_scoping_mode() {
+        let base = HindsightConfig {
+            bank: "team".to_string(),
+            ..HindsightConfig::default()
+        };
+        assert_eq!(
+            bank_for_scope(&base, &Scoping::Global, Some("Shop")),
+            "team"
+        );
+        assert_eq!(
+            bank_for_scope(&base, &Scoping::PerProject, Some("Shop")),
+            "team-shop"
+        );
+        assert_eq!(
+            bank_for_scope(&base, &Scoping::PerProjectTagged, Some("Shop")),
+            "team"
+        );
+        // Empty/absent project never yields a trailing dash.
+        assert_eq!(bank_for_scope(&base, &Scoping::PerProject, None), "team");
+    }
+
+    /// G1a RED: tag filter per scoping mode. Fails until `tags_for_recall` exists.
+    #[test]
+    fn recall_tags_follow_scoping_mode() {
+        assert_eq!(
+            tags_for_recall(&Scoping::Global, Some("shop")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            tags_for_recall(&Scoping::PerProjectTagged, Some("Shop")),
+            vec!["project:shop".to_string()]
+        );
+        assert_eq!(
+            tags_for_recall(&Scoping::PerProjectTagged, None),
+            Vec::<String>::new()
+        );
+    }
+
+    /// G1a RED: global writes allowed only with globalScope + tagged/global
+    /// mode. Fails until `global_retain_allowed` exists.
+    #[test]
+    fn global_retain_needs_flag_and_mode() {
+        assert!(global_retain_allowed(true, &Scoping::PerProjectTagged));
+        assert!(global_retain_allowed(true, &Scoping::Global));
+        assert!(!global_retain_allowed(false, &Scoping::PerProjectTagged));
+        assert!(!global_retain_allowed(true, &Scoping::PerProject));
+        assert!(!global_retain_allowed(false, &Scoping::Global));
     }
 }
 

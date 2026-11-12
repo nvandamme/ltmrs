@@ -73,14 +73,21 @@ enum BridgeMsg {
         max_tokens: u32,
         reply: tokio::sync::oneshot::Sender<Vec<ltmrs_interchange::hindsight::RecallHit>>,
     },
+    Reflect {
+        query: String,
+        bank: String,
+        tags: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<String>,
+    },
 }
 
-/// Bounded background sender + recall round-trip (Slice A A2/A4).
+/// Bounded background sender + recall round-trip (Slice A A2/A4, G1a scoping).
 /// Never blocks the caller: retains drop-newest; recalls time out.
 pub struct BridgeHandle {
     tx: tokio::sync::mpsc::Sender<BridgeMsg>,
     bank: String,
     default_tags: Vec<String>,
+    scoping: ltmrs_interchange::hindsight::Scoping,
 }
 
 impl BridgeHandle {
@@ -93,12 +100,90 @@ impl BridgeHandle {
     where
         T: ltmrs_interchange::hindsight::client::HttpTransport + 'static,
     {
+        Self::spawn_scoped(
+            client,
+            bank,
+            tags,
+            max_queue,
+            ltmrs_interchange::hindsight::Scoping::PerProjectTagged,
+        )
+    }
+
+    /// Scoped spawn (G1a): bank + recall tag filter follow the scoping mode.
+    pub fn spawn_scoped<T>(
+        client: ltmrs_interchange::hindsight::client::HindsightClient<T>,
+        bank: String,
+        tags: Vec<String>,
+        max_queue: usize,
+        scoping: ltmrs_interchange::hindsight::Scoping,
+    ) -> (Self, tokio::task::JoinHandle<()>)
+    where
+        T: ltmrs_interchange::hindsight::client::HttpTransport + 'static,
+    {
+        Self::spawn_scoped_outbox(client, bank, tags, max_queue, scoping, None)
+    }
+
+    /// Scoped spawn with durable outbox (G1d): retains persist to disk
+    /// before send; failures retry with backoff (5s → 30m, ±jitter omitted —
+    /// deterministic capped backoff keeps tests honest) and stay on disk.
+    pub fn spawn_scoped_outbox<T>(
+        client: ltmrs_interchange::hindsight::client::HindsightClient<T>,
+        bank: String,
+        tags: Vec<String>,
+        max_queue: usize,
+        scoping: ltmrs_interchange::hindsight::Scoping,
+        outbox: Option<std::path::PathBuf>,
+    ) -> (Self, tokio::task::JoinHandle<()>)
+    where
+        T: ltmrs_interchange::hindsight::client::HttpTransport + 'static,
+    {
+        use ltmrs_interchange::hindsight::outbox as ob;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMsg>(max_queue.max(1));
         let handle = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
                     BridgeMsg::Retain(doc) => {
-                        let _ = client.retain(&doc, &doc.tags).await;
+                        // Persist first when an outbox root is configured.
+                        let event_path = outbox.as_ref().and_then(|root| {
+                            let dir = ob::dest_dir(root, &doc.bank);
+                            let body = serde_json::json!({
+                                "document_id": doc.document_id,
+                                "bank": doc.bank,
+                                "tags": doc.tags,
+                                "title": doc.title,
+                                "text": doc.text,
+                            });
+                            let bytes = serde_json::to_vec(&body).ok()?;
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            ob::write_event(
+                                &dir,
+                                &ob::event_filename(&doc.document_id, now),
+                                &bytes,
+                            )
+                            .ok()
+                        });
+                        // Bounded retry: 5s, 30s, 5m, then leave the file.
+                        let mut attempt = 0u32;
+                        loop {
+                            match client.retain(&doc, &doc.tags).await {
+                                Ok(()) => {
+                                    if let Some(p) = event_path.as_ref() {
+                                        let _ = std::fs::remove_file(p);
+                                    }
+                                    break;
+                                }
+                                Err(_) if attempt < 3 => {
+                                    attempt += 1;
+                                    let backoff = [5u64, 30, 300][attempt as usize - 1];
+                                    tokio::time::sleep(std::time::Duration::from_secs(backoff))
+                                        .await;
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                     BridgeMsg::Recall {
                         query,
@@ -113,6 +198,18 @@ impl BridgeHandle {
                             .unwrap_or_default();
                         let _ = reply.send(hits);
                     }
+                    BridgeMsg::Reflect {
+                        query,
+                        bank,
+                        tags,
+                        reply,
+                    } => {
+                        let text = client
+                            .reflect(&bank, &query, &tags)
+                            .await
+                            .unwrap_or_default();
+                        let _ = reply.send(text);
+                    }
                 }
             }
         });
@@ -121,6 +218,7 @@ impl BridgeHandle {
                 tx,
                 bank,
                 default_tags: tags,
+                scoping,
             },
             handle,
         )
@@ -140,6 +238,24 @@ impl BridgeHandle {
         self.tx.try_send(BridgeMsg::Retain(doc)).is_ok()
     }
 
+    /// Bank for a project scope (G1a): shared base for global/tagged,
+    /// base + label for per-project. Pure derivation, no I/O.
+    pub fn bank_for_project(&self, project: Option<&str>) -> String {
+        ltmrs_interchange::hindsight::bank_for_scope(
+            &ltmrs_interchange::hindsight::HindsightConfig {
+                bank: self.bank.clone(),
+                ..ltmrs_interchange::hindsight::HindsightConfig::default()
+            },
+            &self.scoping,
+            project,
+        )
+    }
+
+    /// Recall tag filter for a project scope (G1a): tagged mode filters on
+    /// the label, global/per-project read the bank itself. Pure.
+    pub fn recall_tags_for(&self, project: Option<&str>) -> Vec<String> {
+        ltmrs_interchange::hindsight::tags_for_recall(&self.scoping, project)
+    }
     /// Scoped recall with fusion (A4): canonical-first, Hindsight appended.
     /// Best-effort: unconfigured, unreachable, or timed-out all yield "".
     /// Sync-safe: uses `block_in_place` so sync tool dispatch never parks
@@ -190,6 +306,45 @@ impl BridgeHandle {
             })
         });
         ltmrs_interchange::hindsight::merge_hindsight_hits(canonical_text, &hits)
+    }
+
+    /// Synchronous bridge reflect (G1b): server-side synthesis over the
+    /// bank, best-effort ("" when disabled/unreachable/timed-out/empty).
+    /// Sync-safe like recall_section; blank server replies degrade to "".
+    pub fn reflect(&self, query: &str, bank: &str, tags: &[String], timeout_ms: u64) -> String {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let mut t = self.default_tags.clone();
+        t.extend(tags.iter().cloned());
+        t.sort();
+        t.dedup();
+        let msg = BridgeMsg::Reflect {
+            query: query.to_string(),
+            bank: if bank.is_empty() {
+                self.bank.clone()
+            } else {
+                bank.to_string()
+            },
+            tags: t,
+            reply: reply_tx,
+        };
+        if self.tx.try_send(msg).is_err() {
+            return String::new();
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return String::new();
+        };
+        tokio::task::block_in_place(|| {
+            rt.block_on(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms.max(1)),
+                    reply_rx,
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+            })
+        })
     }
 }
 
@@ -286,6 +441,9 @@ mod tests {
             default_tags: vec!["t".into()],
             timeout_ms: 1500,
             max_queue: 8,
+            scoping: ltmrs_interchange::hindsight::Scoping::PerProjectTagged,
+            global_scope: false,
+            outbox_dir: None,
         };
         let client = HindsightClient::with_transport(cfg, None, mock);
         let (handle, _bg) = BridgeHandle::spawn(client, "team".into(), vec!["t".into()], 8);

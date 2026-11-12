@@ -30,6 +30,7 @@ mod ids;
 mod intelligence;
 #[cfg(test)]
 mod intelligence_tests;
+mod learn;
 mod memory_add;
 #[cfg(test)]
 mod memory_add_tests;
@@ -52,6 +53,7 @@ mod memory_update;
 #[cfg(test)]
 mod memory_update_tests;
 mod recall;
+mod reflect;
 mod replay;
 #[cfg(test)]
 mod replay_tests;
@@ -142,6 +144,8 @@ pub fn execute_tool(
         ToolArgs::MemoryEdit(args) => {
             memory_edit::exec_memory_edit(disp, envelope, adm(), args, &resolved)
         }
+        ToolArgs::Learn(args) => learn::exec_learn(disp, envelope, adm(), args, &resolved),
+        ToolArgs::Reflect(args) => reflect::exec_reflect(disp, envelope, args, &resolved),
         ToolArgs::MemoryMerge(args) => {
             memory_merge::exec_memory_merge(disp, envelope, adm(), args, &resolved)
         }

@@ -36,6 +36,9 @@ async fn recall_appends_hindsight_section() {
         default_tags: vec![],
         timeout_ms: 1500,
         max_queue: 8,
+        scoping: ltmrs_interchange::hindsight::Scoping::PerProjectTagged,
+        global_scope: false,
+        outbox_dir: None,
     };
     let client = HindsightClient::with_transport(cfg, None, Mock::default());
     let (handle, _bg) = BridgeHandle::spawn(client, "team".into(), vec![], 8);

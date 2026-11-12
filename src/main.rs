@@ -13,9 +13,9 @@ mod visualizer;
 use crate::visualizer::run_visualize;
 use ltmrs_frontend::cli::{
     CliError, Command, help_text, install_hooks_command, install_shim_command,
-    install_skill_command, mc_import_confirm_command, mc_import_preview_command, parse_args,
-    project_adopt_command, project_bind_command, project_status_command, provision_models_command,
-    run_library, version_text,
+    install_skill_command, mc_import_confirm_command, mc_import_preview_command,
+    memory_sync_dispatch, mm_command, parse_args, project_adopt_command, project_bind_command,
+    project_status_command, provision_models_command, run_library, version_text,
 };
 use ltmrs_frontend::frontend::serve::daemon::{
     daemon_idle_ms, daemon_socket_path, ensure_daemon_process, run_daemon_foreground, serve_stdio,
@@ -129,6 +129,20 @@ async fn main() {
             Err(e) => fail(&e),
         },
         Ok(Command::McImportPreview { path }) => match mc_import_preview_command(path) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => fail(&e),
+        },
+        Ok(Command::Memory { action }) => match memory_sync_dispatch(home_dir(), &action) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => fail(&e),
+        },
+        Ok(Command::Mm { action, name }) => match mm_command(&action, name) {
             Ok(text) => {
                 println!("{text}");
                 0

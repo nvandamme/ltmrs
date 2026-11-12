@@ -152,6 +152,34 @@ pub fn cosine(a: Option<&[f32]>, b: Option<&[f32]>) -> f64 {
     (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
 }
 
+/// Fact voice (G6a; omp polyphonic parity): facts before non-facts,
+/// ties broken by id (deterministic). Returns (id, one-based rank) pairs.
+pub fn fact_voice_rank(
+    facts: &[(ltmrs_domain::id::EntityId, bool)],
+) -> Vec<(ltmrs_domain::id::EntityId, usize)> {
+    let mut sorted: Vec<_> = facts.to_vec();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sorted
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, _))| (id, i + 1))
+        .collect()
+}
+
+/// Temporal voice (G6a; omp polyphonic parity): newest `updated_at` first,
+/// ties broken by id (deterministic). Returns (id, one-based rank) pairs.
+pub fn temporal_voice_rank(
+    stamps: &[(ltmrs_domain::id::EntityId, u64)],
+) -> Vec<(ltmrs_domain::id::EntityId, usize)> {
+    let mut sorted: Vec<_> = stamps.to_vec();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    sorted
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, _))| (id, i + 1))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +343,36 @@ mod tests {
         let c = vec![0.0f32, 1.0];
         assert!((cosine(Some(&a), Some(&b)) - 1.0).abs() < 1e-12);
         assert!((cosine(Some(&a), Some(&c)) - 0.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+    use ltmrs_domain::id::EntityId;
+    use uuid::Uuid;
+
+    fn eid(n: u64) -> EntityId {
+        EntityId::new(Uuid::from_u128(n as u128))
+    }
+
+    /// G6a RED: fact voice ranks facts before non-facts (stable by id).
+    /// Fails until `fact_voice_rank` exists.
+    #[test]
+    fn fact_voice_ranks_facts_first() {
+        let order = fact_voice_rank(&[(eid(3), false), (eid(1), true), (eid(2), true)]);
+        let ids: Vec<EntityId> = order.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![eid(1), eid(2), eid(3)]);
+        assert_eq!(order[0].1, 1);
+        assert_eq!(order[2].1, 3);
+    }
+
+    /// G6a RED: temporal voice ranks newest first (stable by id on ties).
+    /// Fails until `temporal_voice_rank` exists.
+    #[test]
+    fn temporal_voice_ranks_newest_first() {
+        let order = temporal_voice_rank(&[(eid(1), 100), (eid(2), 300), (eid(3), 200)]);
+        let ids: Vec<EntityId> = order.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![eid(2), eid(3), eid(1)]);
     }
 }

@@ -43,11 +43,18 @@ API/workflow surface with documented retrieval enhancements*, not byte-identical
 behavioral equivalence — pending the WP-13 gates (approvals + checklist). Known deviations are tracked in an explicit ledger
 (`baseline/lemma-0.21.0/deviations.json`; all 12 owner-approved).
 
+Beyond Lemma, ltmrs speaks the [oh-my-pi](https://github.com/can1357/oh-my-pi)
+memory dialect: `memory_edit` tri-op, `learn` lesson capture, `reflect`
+server-side synthesis, Hindsight bridge scoping, mental-model seeds,
+`memory`/`mm` CLI groups, curated decision files and polyphonic recall
+voices. The [gap table](#omp-gap-table) below maps every omp surface to its
+ltmrs counterpart; deliberate divergences are ledgered, not hidden.
+
 ## Quick Start
 
 Point an MCP host at the built binary over stdio (config file and key
-names differ per host — Claude Desktop, Claude Code and opencode each
-use their own shape; the server identifies as `ltmrs`):
+names differ per host — Claude Desktop, Claude Code and opencode each use
+their own shape; the server identifies as `ltmrs`):
 
 ```json
 {
@@ -60,12 +67,13 @@ use their own shape; the server identifies as `ltmrs`):
 ```
 
 Then ask your assistant to remember something. It saves findings with
-`memory_add`, recalls with `memory_read` / `semantic_search`, and
+`memory_add`, recalls with `memory_read` / `semantic_search`, captures
+lessons with `learn`, synthesizes with `reflect` (bridge-backed), and
 follows the skill workflow (recall → act → persist) when the managed
 skill is installed. No terminal command is needed for daily use; the
 CLI surface below is for setup, snapshots and maintenance.
 
-## Architecture (planned)
+## Architecture
 
 ```text
 MCP host A -> ltmrs stdio frontend --+
@@ -73,7 +81,7 @@ MCP host B -> ltmrs stdio frontend --+-> private local IPC -> ltmrs daemon
 CLI / visualizer client -----------+                         |
                                                domain commands and snapshots
                                                              |
-                                               selected canonical repository
+                                              selected canonical repository
                                                              |
                                           versioned lexical/vector projection
                                                              |
@@ -87,6 +95,8 @@ CLI / visualizer client -----------+                         |
 - Canonical backend is **B** Fjall + LanceDB (decided, AD-01
   `plans/AD-01_canonical_backend.md`, gated on hard correctness/atomicity
   tests — not on feature lists or throughput scores).
+- Optional Hindsight bridge: best-effort dual-write + scoped recall fusion
+  (never blocks or fails tools; local-first when disabled or down).
 
 ## How It Works
 
@@ -99,9 +109,19 @@ types: `fact`, `pattern`, `lesson`, `warning`, `context`.
 
 Saving is active, not archival: `memory_add` auto-redacts detected
 secrets (pass `confirm: true` to store verbatim), flags distill
-candidates, and auto-links topic overlaps. Explanations (`explain:
-true` on `memory_read` / `semantic_search`) report the effective
-mode, readiness and partial flags behind each answer.
+candidates, and auto-links topic overlaps. Lessons land lesson-typed
+(`learn` captures them durably; optional `guide` creates a managed
+guide second — lesson-first, skill failure is partial, never a
+rollback). Explanations (`explain: true` on `memory_read` /
+`semantic_search`) report the effective mode, readiness and partial
+flags behind each answer.
+
+Recall blends lexical + dense + fact + temporal voices through
+reciprocal-rank fusion (advisory fact/temporal legs at half weight;
+text-similarity legs stay primary), with a generation-keyed result
+cache (5-minute TTL; writes bump the generation, so hits are never
+stale). `reflect` synthesizes over the Hindsight bank when the bridge
+is configured; without it, it degrades honestly instead of failing.
 
 ## Dense retrieval (E5)
 
@@ -146,6 +166,10 @@ All state lives under the managed home `$HOME/.ltmrs`:
 | `sessions.json` | Frontend session registry (persisted on shutdown) |
 | `search/` | Lance projection (derived, rebuildable) |
 | `models/` | Verified E5 artifacts (`--provision-models` target) |
+| `hindsight-outbox/` | Durable bridge retain outbox (when `LTMRS_HINDSIGHT_OUTBOX` set) |
+| `sharpshooter/<bank>/` | Curated decision files (`architecture/product/style.md` + pending queues) |
+| `memories/<bank>/` | Curated lesson files (`learned.md` + pending queue) |
+| `managed-skills/` | Host-managed skills (installer-guarded, 64k cap) — under the agent home |
 
 There is no config file; behavior comes from flags plus `$HOME`.
 `ltmrs --help` is authoritative for flags. Commands:
@@ -160,10 +184,18 @@ There is no config file; behavior comes from flags plus `$HOME`.
 | `--install-skill` | Install/update the managed agent skill |
 | `--install-shim` | Install the opt-in legacy `lemma` executable shim |
 | `--provision-models` | Fetch + verify E5 artifacts (only step using the network) |
+| `memory view\|stats\|diagnose\|queue` | Render backend status surfaces (bridge-disabled labels when local-only) |
+| `memory sync\|enqueue\|rebuild` | Consolidate pending curation queues into curated files (honest counts) |
+| `memory clear\|reset` | Refuse loudly (canonical store is never wiped from a CLI verb) |
+| `mm list\|show\|refresh\|seed\|delete\|reload [name]` | Hindsight mental-model maintenance (frozen 3-seed catalog) |
+| `hook-inject` / `hook-extract` | Budget-capped recall / transcript finding extraction (host hooks, stdin JSON, fail-open) |
+| `install-hooks` | Install opt-in host hook snippets + enable hooks |
+| `mc-import preview\|confirm <path>` | Preview/confirm a Magic Context import (additive fan-out) |
 | `-h/--help`, `-V/--version` | Help text (authoritative flag reference), version |
 
-Install locations: skill → `~/.agents/skills/ltmrs/SKILL.md`
-(idempotent, versioned, refuses foreign or user-modified files
+Install locations: skill → `~/.agents/skills/ltmrs/SKILL.md`;
+managed skills → `~/.agents/managed-skills/<name>/SKILL.md`
+(idempotent, versioned, refuse foreign or user-modified files
 instead of overwriting); shim → `~/.local/bin/lemma` symlink
 (refuses non-managed paths, warns on PATH collisions).
 
@@ -182,12 +214,41 @@ logical exports from a consistent canonical snapshot; model weights
 and derived indexes are excluded by default. Restore replaces —
 never merges — under a staged-generation switch.
 
+### Hindsight bridge
+
+Opt-in via `LTMRS_HINDSIGHT_*` env (`ENABLED/URL/BANK/TAGS/TIMEOUT_MS`,
+plus `SCOPING` global|per-project|per-project-tagged, `GLOBAL_SCOPE`
+0/1, `OUTBOX` dir). Disabled by default: tools behave byte-identically.
+
+- Dual-write fan-out post-commit (never blocks/fails tools); scoped
+  recall fusion appended after canonical results, never into ranking.
+- Bank derivation per mode (shared base for global/tagged, base-label
+  for per-project); recall tag filters for tagged mode; global
+  (untagged) writes need `GLOBAL_SCOPE=1` + a non-isolated mode.
+- `reflect` synthesizes over the bank (30s timeout, "" when down).
+- Durable outbox (when `OUTBOX` set): each retain persists to disk
+  before send; failures retry 5s→30s→5m then stay on disk; 7-day
+  expiry → quarantine, 30-day quarantine delete.
+- Mental-model seeds: `user-preferences` (untagged, all banks),
+  `project-conventions`, `project-decisions` (tagged); `mm` CLI
+  lists and resolves them; synthesis runs server-side.
+
+### Curated files ( Sharpshooter + local pipeline)
+
+The daemon never calls a model. Hosts (or `hook-extract`) enqueue
+extracted deltas; `memory sync` (or the next scheduled pass)
+redacts, dedups and consolidates them into curated files:
+
+- `sharpshooter/<bank>/{architecture,product,style}.md` (+ `.pending.jsonl` queues).
+- `memories/<bank>/learned.md` (newest-first, 100-cap, secret-redacted).
+
 ## Constraints
 
 - Rust-native core. The production CPU profile must not require Node, Python,
   ONNX Runtime or a C++ database engine (feature-resolved audit, not a blanket
   "100% Rust" claim).
 - Local operation only. No remote database, cloud sync or hidden model calls.
+  The Hindsight bridge is the single explicit exception, opt-in and best-effort.
 - OSI-approved dependencies; model weights and tokenizer licenses audited
   separately.
 - First supported target: local Linux x86_64 CPU. CUDA is an optional,
@@ -204,6 +265,7 @@ The specification is the source of truth for implementation:
 | [Part III — Quality, tests, benchmarks, conformance](plans/03_quality_tests_benchmarks_conformance.md) | Hard gates, test catalog, recovery/security suites, benchmark strategy, release checklist |
 | [traceability.json](plans/traceability.json) | Machine-readable requirements → work packages → tests mapping |
 | [conformance_matrix.json](plans/conformance_matrix.json) | Per-tool conformance inventory (all `not_run` until executed) |
+| [omp gap closure](.kilo/specs/2026-11-12-omp-memory-gap-closure.md) | omp ↔ ltmrs gap analysis + closure plan (local-only, not committed) |
 
 Implementation starts with **WP-00** (freeze upstream baseline, resolve the CPU
 dependency lock) and **WP-01** (domain model + reference interpreter). Do not
@@ -243,7 +305,8 @@ Point an MCP host at the binary over stdio (exact key names are
 host-configured — Claude Code, OpenCode and Codex each use their own
 config shape — with the command pointing at your built binary).
 Then, from the host: save findings with `memory_add`, recall with
-`memory_read` / `semantic_search`, and follow the skill workflow
+`memory_read` / `semantic_search`, capture lessons with `learn`,
+synthesize with `reflect` (bridge-backed), and follow the skill workflow
 (recall → act → persist) if installed.
 
 Beyond the host loop:
@@ -253,6 +316,9 @@ ltmrs --help                                   # authoritative flag reference
 ltmrs -lib --store $HOME/.ltmrs/store          # knowledge-base snapshot
 ltmrs -vis --fg                                # library visualizer (prints its token URL)
 ltmrs --socket PATH                            # attach stdio to a running daemon
+ltmrs memory view                              # backend status surfaces
+ltmrs memory sync                              # consolidate curation queues
+ltmrs mm list                                  # mental-model seed catalog
 ```
 
 Backups run through the MCP tools (`backup_create` to a
@@ -261,19 +327,21 @@ see Operations above. Verification gates: `cargo test` (664 lib +
 2 smoke suites), `cargo fmt -- --check`, `cargo clippy
 --all-targets -- -D warnings`.
 
-## Tools (30)
+## Tools (33)
 
-Short MCP names (`memory_read`, `memory_add`, `session_start`);
-hosts may display them namespaced (e.g. `mcp_ltmrs_memory_add`).
-Tool schemas are frozen from the Lemma 0.21.0 capture; behavior
-deviations are ledgered (see Compatibility target).
+Short MCP names (`memory_read`, `memory_add`, `learn`, `reflect`,
+`session_start`); hosts may display them namespaced (e.g.
+`mcp_ltmrs_memory_add`). Tool schemas are frozen from the Lemma
+0.21.0 capture; behavior deviations are ledgered (see Compatibility
+target).
 
 | Family | Tools |
 |---|---|
 | Memory (10) | `memory_read`, `memory_add`, `memory_update`, `memory_feedback`, `memory_forget`, `memory_merge`, `memory_relate`, `memory_stats`, `memory_audit`, `memory_library` |
 | Guides (7) | `guide_get`, `guide_practice`, `guide_create`, `guide_distill`, `guide_update`, `guide_forget`, `guide_merge` |
 | Sessions (5) | `session_start`, `session_attempt`, `session_end`, `session_stats`, `suggestion_respond` |
-| Intelligence (4) | `conflict_scan`, `proactive_analysis`, `project_analytics`, `semantic_search` |
+| Intelligence (5) | `conflict_scan`, `proactive_analysis`, `project_analytics`, `semantic_search`, `reflect` |
+| omp-compat, native (2) | `memory_edit` (tri-op alias), `learn` (lesson + optional guide) |
 | Backup, native (4) | `backup_create`, `backup_preview`, `backup_restore`, `backup_import_lemma` |
 
 Back up by asking: *"Back up my memory to this folder."* The
@@ -285,6 +353,33 @@ open, preview again). `backup_restore` with token + `confirm: true`
 replaces the store — never merges — after writing a verified safety
 backup first; restoring the safety file undoes a restore.
 
+Capture a lesson by asking: *"Learn this: always quote SQL identifiers."*
+The assistant stores a lesson-typed memory first, then (if asked with
+a guide name) creates the managed guide second — skill failure is
+partial, never a rollback. Empty lessons reject loudly.
+
+## omp gap table
+
+| omp surface | ltmrs counterpart | Notes |
+|---|---|---|
+| `recall` / `retain` / `reflect` tools | `memory_read`+`semantic_search` / `memory_add` / `reflect` | `reflect` needs the bridge; otherwise honest empty synthesis |
+| `memory_edit` tri-op + importance clamp | `memory_edit` native tool | importance-only rejects (confidence is earned); fact rows editable by design |
+| `learn` + optional skill | `learn` native tool (lesson + `guide_create` second) | 2000/400 caps + 100-cap + dedup + redaction live in the add path |
+| `manage_skill` CRUD | `learn --guide` + installer guards | No MCP tool: the daemon never writes host files; host uses CLI/lib |
+| `/memory view\|stats\|diagnose\|queue` | P3 renderers + `memory` CLI | Bridge-disabled labels, never fabricated data |
+| `/memory sync\|enqueue\|rebuild` | `memory sync` (real consolidation) | Drains queues + consolidates; bridge flush runs in the daemon |
+| `/memory clear\|reset` | Refuses loudly | Canonical store is never wiped from a CLI verb |
+| `/memory mm …` | `mm` CLI (frozen 3-seed catalog) | Synthesis runs server-side via the bridge |
+| `memory://` URLs | `memory_library` + `-lib` snapshot | Host-side scheme; server exposes the snapshot, not the protocol |
+| `local` backend pipeline | Curated files (`memories/`, `sharpshooter/`) | Daemon never calls a model; hosts enqueue deltas, daemon consolidates |
+| `sharpshooter` decision files | `sharpshooter/<bank>/*.md` + pending queues | Same mechanism; extraction stays host-side |
+| `hindsight` backend | Opt-in bridge (dual-write + scoped recall + reflect) | 6→28 env keys; scoping/globalScope/outbox/mental models landed |
+| `mnemopi` backend | Canonical Fjall store (no separate SQLite mode) | One store, not two; no `noEmbeddings` toggle needed (lexical fallback is automatic) |
+| auto-recall / auto-retain | `session_start` preload + `hook-extract` | No silent background writes from the server; host opts in |
+| polyphonic / enhanced recall / proactive linking | RRF fact+temporal voices + generation-keyed cache | Graph voice blocked (no relation edges); cache drops on generation bump |
+| hook event bus | Slice B CLI hooks (`hook-inject`/`extract`) | Different layer (CLI entry points, not in-process events) |
+| bank scoping global/per-project/tagged | G1a `Scoping` + bank derivation + tag filters | Project label = lowercase basename (omp parity) |
+
 ## Security
 
 Local-first: everything stays under `$HOME/.ltmrs`; serving makes
@@ -294,6 +389,8 @@ redacted unless `confirm: true` stores them verbatim. The visualizer
 binds `127.0.0.1` only and gates `/` and `/api/library` behind its
 per-boot token (403 without it). Backups are unencrypted — keep
 them in trusted storage, never on the disk being formatted.
+Curated files redact the same secret patterns before write; refused
+bridge payloads never touch the canonical store.
 
 ## License
 

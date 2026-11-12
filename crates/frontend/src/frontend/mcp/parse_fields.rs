@@ -30,6 +30,20 @@ static ALLOWED_ARGUMENTS: std::sync::LazyLock<std::collections::HashMap<String, 
             vec!["path".to_string(), "confirm".to_string()],
         );
         map.insert(
+            "reflect".to_string(),
+            vec!["query".to_string(), "context".to_string()],
+        );
+        map.insert(
+            "learn".to_string(),
+            vec![
+                "memory".to_string(),
+                "context".to_string(),
+                "guide".to_string(),
+                "guide_description".to_string(),
+                "guide_body".to_string(),
+            ],
+        );
+        map.insert(
             "memory_edit".to_string(),
             vec![
                 "op".to_string(),

@@ -236,6 +236,9 @@ mod tests {
             default_tags: vec![],
             timeout_ms: 1500,
             max_queue: 8,
+            scoping: crate::hindsight::Scoping::PerProjectTagged,
+            global_scope: false,
+            outbox_dir: None,
         }
     }
 

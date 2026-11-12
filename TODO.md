@@ -20,8 +20,9 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [x] WP-10 — CLI, managed skills, hosts and visualizer (S6)
 - [x] WP-11 — Import, legacy interchange, backup and restore (S7)
 - [x] omp-compat P1 — Redaction hardening (detection spans fragment+title+description+evidence.snippet; generated fallbacks from redacted fragment; JWT pin). RED-first, RQ-20.
-- [x] omp-compat P2 — memory_edit tri-op alias (ToolArgs::MemoryEdit + exec_memory_edit: update→memory_update, forget→memory_forget, invalidate→forget(invalidate); importance-only/unknown-op reject loudly; 5th native, 31 served; scope+retry+straggler cells executed_passed). RED-first, RQ-15/T-MEMOEDIT-01.
-- [x] omp-compat P3 — status/stats/diagnose/queue markdown renderers (`skills/memory_status.rs`, 4 golden tests; plan §11.7). Hosts call existing tools, format locally.
+- [x] omp-compat P2 — memory_edit tri-op alias (ToolArgs::MemoryEdit + exec_memory_edit; 5th native, 31 served; scope+retry+straggler cells executed_passed). RED-first, RQ-15/T-MEMOEDIT-01.
+- [x] omp-compat P3 — status/stats/diagnose/queue markdown renderers (`skills/memory_status.rs`, 4 golden tests). Hosts call existing tools, format locally.
+- [x] omp gap closure Slices 1–5 (G1–G7, 2026-11-12) — 7th+8th native tools `learn` + `reflect` (33 served); Hindsight scoping/globalScope/outbox/mental-models/`mm`; `memory` CLI; `manage_skill` lib; curated-file pipeline; RRF voices + recall cache. Spec `.kilo/specs/2026-11-12-omp-memory-gap-closure.md`. RED-first throughout.
 - [x] Slice B — Silent-capture hooks (opt-in `hook-inject`/`hook-extract`/`install-hooks`, fail-open, budget reuse; 0e21ce6)
 - [x] Slice D — Defer-scheduler recall shaping (byte-identical renderer, defer/replay, tiers, compartments, single-flight; presentation-only; ee684f1)
 - [x] Slice C — Magic Context read-only import bridge (excluded cdylib, version fence, loss accounting, CLI-first preview/confirm; a774859)
@@ -29,7 +30,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ## Open — qualification and release (S8)
 
-- [ ] WP-12 — Qualification, quality and performance (S8; matrix 220/248 executed_passed 2026-11-12 (scope+retry 31/31; remaining: 26 legacy_oracle needing provisioned live upstream — no checkout on this machine, fixtures cover read-path only — + 2 greenfield specified_not_executed); per-op CPU/fsync landed (`cpu_micros` thread-CPU + `fsync_micros` timed barrier, means in OpStats); Part III §11 open items tracked in-plan)
+- [ ] WP-12 — Qualification, quality and performance (S8; matrix 234/264 executed_passed 2026-11-12 (scope+retry 33/33; remaining: 26 legacy_oracle needing provisioned live upstream — no checkout on this machine, fixtures cover read-path only — + 4 greenfield specified_not_executed); per-op CPU/fsync landed (`cpu_micros` thread-CPU + `fsync_micros` timed barrier, means in OpStats); Part III §11 open items tracked in-plan)
 - [ ] WP-13 — Release, documentation and evidence closure (S8; evidence bundle exit 0 on clean checkout; publish needs owner approval)
 - [ ] DEV-008 follow-up — Upstream instructional UX (seed fragments,
   coaching blocks, technology autodetect, distill suggestion).

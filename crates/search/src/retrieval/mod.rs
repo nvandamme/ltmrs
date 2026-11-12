@@ -13,6 +13,7 @@
 //! - Context budgeting and explanation
 
 pub mod bundles;
+pub mod cache;
 pub mod context;
 pub mod engine;
 pub mod explain;

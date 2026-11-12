@@ -100,6 +100,115 @@ pub fn skill_path(home: &Path, name: &str) -> PathBuf {
         .join("SKILL.md")
 }
 
+/// Managed-skill name rules (omp `manage-skill` parity): trimmed + lowercased
+/// by the caller, then `[a-z0-9][a-z0-9-]{0,63}`. Pure: no I/O.
+pub fn validate_managed_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(format!(
+            "invalid managed skill name {name:?} (want 1..64 chars)"
+        ));
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => {
+            return Err(format!(
+                "invalid managed skill name {name:?} (must start [a-z0-9])"
+            ));
+        }
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "invalid managed skill name {name:?} (want [a-z0-9-])"
+        ));
+    }
+    Ok(())
+}
+
+/// Isolated managed skill create/update/delete (G7; omp `manage-skill`
+/// parity over `<home>/.agents/managed-skills/`).
+///
+/// - create: exclusive (`wx` semantics — existing file fails, never clobbers).
+/// - update: overwrites an existing managed file; missing target fails.
+/// - delete: removes the skill dir; missing target fails.
+/// - Bodies cap at 64_000 UTF-8 bytes including frontmatter.
+///
+/// Guard clauses first (Law 1); fail loud, never silent (Law 4).
+pub fn manage_skill(
+    home: &Path,
+    action: &str,
+    raw_name: &str,
+    description: &str,
+    body: &str,
+) -> Result<String, String> {
+    let name = raw_name.trim().to_lowercase();
+    validate_managed_name(&name)?;
+    if !matches!(action, "create" | "update" | "delete") {
+        return Err(format!(
+            "unknown manage_skill action {action:?} (want create|update|delete)"
+        ));
+    }
+    let path = managed_skill_path(home, &name);
+    if action == "delete" {
+        if !path.is_file() {
+            return Err(format!("managed skill {name:?} does not exist"));
+        }
+        std::fs::remove_dir_all(path.parent().unwrap())
+            .map_err(|e| format!("cannot delete managed skill {name:?}: {e}"))?;
+        return Ok(format!("Deleted managed skill {name:?}."));
+    }
+    if description.trim().is_empty() || body.trim().is_empty() {
+        return Err(format!("{action} needs both description and body"));
+    }
+    let frontmatter = format!(
+        "---\nname: {name}\ndescription: {}\n---\n",
+        sanitize_line(description)
+    );
+    let content = format!("{frontmatter}{}", body.trim());
+    if content.len() > 64_000 {
+        return Err(format!(
+            "managed skill is {} bytes; the limit is 64000",
+            content.len()
+        ));
+    }
+    if action == "create" && path.is_file() {
+        return Err(format!(
+            "managed skill {name:?} already exists (update it instead)"
+        ));
+    }
+    if action == "update" && !path.is_file() {
+        return Err(format!(
+            "managed skill {name:?} does not exist (create it first)"
+        ));
+    }
+    write_atomic(&path, &content).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}d managed skill {name:?}.",
+        if action == "create" {
+            "Create"
+        } else {
+            "Update"
+        }
+    ))
+}
+
+/// One-line description: collapse whitespace, strip control/format chars.
+fn sanitize_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Managed-skill root: `<home>/.agents/managed-skills/<name>/SKILL.md`
+/// (omp `managed-skills` parity; isolated from the static installs above).
+pub fn managed_skill_path(home: &Path, name: &str) -> PathBuf {
+    home.join(".agents")
+        .join("managed-skills")
+        .join(name)
+        .join("SKILL.md")
+}
+
 /// Render the ownership marker line for an asset.
 fn marker_line(asset: &SkillAsset) -> String {
     format!(
@@ -267,6 +376,69 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), InstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G7 RED: managed-skill name validation (kebab, 1..64 chars).
+    /// Fails until `validate_managed_name` exists.
+    #[test]
+    fn managed_name_validation_rejects_garbage() {
+        assert!(validate_managed_name("sql-quoting").is_ok());
+        assert!(validate_managed_name("a").is_ok());
+        assert!(validate_managed_name("").is_err());
+        assert!(validate_managed_name("UPPER").is_err());
+        assert!(validate_managed_name("has space").is_err());
+        assert!(validate_managed_name("../escape").is_err());
+        assert!(validate_managed_name(&"x".repeat(65)).is_err());
+    }
+
+    /// G7 RED: managed skill create/update/delete round-trip.
+    /// Fails until `manage_skill` exists.
+    #[test]
+    fn managed_skill_crud_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "# SQL quoting\n\nAlways quote.\n";
+        assert!(
+            manage_skill(
+                &dir.path().join("home"),
+                "create",
+                "sql-quoting",
+                "Quote SQL",
+                body
+            )
+            .is_ok()
+        );
+        // create twice fails (exclusive create, omp parity).
+        assert!(
+            manage_skill(
+                &dir.path().join("home"),
+                "create",
+                "sql-quoting",
+                "Quote SQL",
+                body
+            )
+            .is_err()
+        );
+        assert!(
+            manage_skill(
+                &dir.path().join("home"),
+                "update",
+                "sql-quoting",
+                "Quote SQL v2",
+                body
+            )
+            .is_ok()
+        );
+        assert!(manage_skill(&dir.path().join("home"), "delete", "sql-quoting", "", "").is_ok());
+        // delete twice fails (missing target).
+        assert!(manage_skill(&dir.path().join("home"), "delete", "sql-quoting", "", "").is_err());
+    }
+
+    /// G7 RED: oversized bodies refuse loudly (64k cap, omp parity).
+    #[test]
+    fn managed_skill_caps_body_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "x".repeat(65_000);
+        assert!(manage_skill(&dir.path().join("home"), "create", "big", "Big", &big).is_err());
+    }
 
     fn asset() -> SkillAsset {
         SkillAsset {

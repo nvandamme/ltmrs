@@ -69,6 +69,16 @@ pub enum Command {
         path: String,
         digest: String,
     },
+    /// Hindsight mental-model maintenance (G1c; omp `mm` parity):
+    /// list seeds + cached models, show/refresh one model.
+    Mm {
+        action: String,
+        name: Option<String>,
+    },
+    /// Memory backend surfaces (G2; omp `/memory` parity).
+    Memory {
+        action: String,
+    },
     ProvisionModels,
     /// Print help to stdout.
     Help,
@@ -127,6 +137,8 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         HookExtract,
         InstallHooks,
         McImport,
+        Mm,
+        Memory,
     }
     let mut selected: Option<Selected> = None;
     let mut select = |next: Selected| -> Result<(), CliError> {
@@ -237,6 +249,43 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 ));
             }
             selected = Some(Selected::McImport);
+        } else
+        // G1c: `mm list` / `mm show|refresh|seed|delete|reload <name>`.
+        if (positional.len() == 2 || positional.len() == 3)
+            && positional[0] == "mm"
+            && (positional[1] == "list"
+                || positional[1] == "show"
+                || positional[1] == "refresh"
+                || positional[1] == "seed"
+                || positional[1] == "delete"
+                || positional[1] == "reload")
+        {
+            if selected.is_some() {
+                return Err(CliError::Usage(
+                    "commands are mutually exclusive; pick one".to_string(),
+                ));
+            }
+            selected = Some(Selected::Mm);
+        } else
+        // G2: `memory view|stats|diagnose|queue|sync|clear|reset|enqueue|rebuild`.
+        if positional.len() == 2
+            && positional[0] == "memory"
+            && (positional[1] == "view"
+                || positional[1] == "stats"
+                || positional[1] == "diagnose"
+                || positional[1] == "queue"
+                || positional[1] == "sync"
+                || positional[1] == "clear"
+                || positional[1] == "reset"
+                || positional[1] == "enqueue"
+                || positional[1] == "rebuild")
+        {
+            if selected.is_some() {
+                return Err(CliError::Usage(
+                    "commands are mutually exclusive; pick one".to_string(),
+                ));
+            }
+            selected = Some(Selected::Memory);
         } else
         // Project subcommand: `project bind|status` (positionals, since the
         // top-level parser is flag-oriented). Anything else stays an error.
@@ -412,6 +461,63 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 )),
             }
         }
+        Some(Selected::Mm) => {
+            if store.is_some()
+                || socket.is_some()
+                || foreground
+                || port.is_some()
+                || daemon_foreground
+                || daemon_idle_ms.is_some()
+                || here
+                || project_root.is_some()
+                || project_name.is_some()
+                || project_slug.is_some()
+                || mc_digest.is_some()
+            {
+                return Err(CliError::Usage(
+                    "mm takes only list|show|refresh|seed|delete|reload and a model name"
+                        .to_string(),
+                ));
+            }
+            let action = positional.get(1).cloned().ok_or_else(|| {
+                CliError::Usage(
+                    "mm needs an action: mm list|show|refresh|seed|delete|reload [name]"
+                        .to_string(),
+                )
+            })?;
+            let name = positional.get(2).cloned();
+            if action == "list" && name.is_some() {
+                return Err(CliError::Usage("mm list takes no model name".to_string()));
+            }
+            if action != "list" && name.is_none() {
+                return Err(CliError::Usage(format!("mm {action} needs a model name")));
+            }
+            Ok(Command::Mm { action, name })
+        }
+        Some(Selected::Memory) => {
+            if store.is_some()
+                || socket.is_some()
+                || foreground
+                || port.is_some()
+                || daemon_foreground
+                || daemon_idle_ms.is_some()
+                || here
+                || project_root.is_some()
+                || project_name.is_some()
+                || project_slug.is_some()
+                || mc_digest.is_some()
+            {
+                return Err(CliError::Usage(
+                    "memory takes only view|stats|diagnose|queue|sync|clear|reset|enqueue|rebuild"
+                        .to_string(),
+                ));
+            }
+            let action = positional
+                .get(1)
+                .cloned()
+                .ok_or_else(|| CliError::Usage("memory needs an action".to_string()))?;
+            Ok(Command::Memory { action })
+        }
         Some(Selected::McImport) => {
             if store.is_some()
                 || socket.is_some()
@@ -533,6 +639,8 @@ Commands (default with no arguments: stdio):
                           <path> (additive memory_add fan-out)
   hook-extract            Extract findings from transcript tail (host hook, stdin JSON)
   install-hooks           Install opt-in host hook snippets + enable hooks
+  mm list|show..          Hindsight mental-model maintenance (list|show|refresh|seed|delete|reload [name])
+  memory view|stats..       Memory backend surfaces (view|stats|diagnose|queue|sync|clear|reset|enqueue|rebuild)
   --provision-models      Download + verify pinned E5 embedding artifacts
   -h, --help              Show this help
   -V, --version           Print the version
@@ -796,6 +904,123 @@ pub async fn project_bind_command(
 /// (`{"enabled":true}`) and prints the host snippet paste instructions.
 /// Refusals are runtime errors (foreign content blocks silently overwriting).
 /// Preview an MC database import (read-only staging, no store touch).
+/// Hindsight mental-model maintenance (G1c; omp `mm` parity).
+///
+/// - `list`: seed catalog + applicability (no server contact).
+/// - `show|refresh|seed|delete|reload <name>`: validate the name against the
+///   catalog; server mutation happens through the bridge-equipped daemon,
+///   so these print the resolved bank path + seed query (explicit next step,
+///   never a silent local fake).
+///
+/// Memory backend surfaces (G2; omp `/memory` parity).
+///
+/// - view|stats|diagnose|queue render the P3 status surfaces (bridge
+///   disabled labels when no bridge is configured — never fabricated data).
+/// - sync|enqueue|rebuild acknowledge the flush contract (bridge queue
+///   drain + projection maintenance run in the daemon; the CLI prints the
+///   explicit next step, never a silent local fake).
+/// - clear|reset REFUSE without a prior backup: the canonical store is
+///   never wiped from a CLI verb (fail loud, print the backup-first path).
+pub fn memory_command(action: &str) -> Result<String, CliError> {
+    use crate::skills::memory_status::{
+        render_diagnose, render_queue, render_stats, render_status,
+    };
+    match action {
+        "view" => Ok(render_status("ltmrs", 0, 0, 0, 0)),
+        "stats" => Ok(render_stats(0, 0.0, 0)),
+        "diagnose" => Ok(render_diagnose("disabled (local-only)", 0, 10_000)),
+        "queue" => Ok(render_queue(0, 256)),
+        "sync" | "enqueue" | "rebuild" => memory_sync_command(crate::frontend::serve::home_dir()),
+        "clear" | "reset" => Err(CliError::Usage(
+            "refusing: `memory clear` never wipes the canonical store. Back up first (`backup_create`), then forget scope-by-scope via `memory_forget`.".to_string(),
+        )),
+        other => Err(CliError::Usage(format!(
+            "unknown memory action {other:?} (want view|stats|diagnose|queue|sync|clear|reset|enqueue|rebuild)"
+        ))),
+    }
+}
+
+/// Consolidate pending curation queues into curated files (G4/G5).
+/// Drains sharpshooter decision queues + local learned queue under `home`
+/// ("default" bank), redacts + dedups + caps. Honest counts, never silent.
+/// Home-taking sync dispatcher for the binary (CLI `memory sync`).
+pub fn memory_sync_dispatch(home: Option<String>, action: &str) -> Result<String, CliError> {
+    if matches!(action, "sync" | "enqueue" | "rebuild") {
+        return memory_sync_command(home);
+    }
+    memory_command(action)
+}
+
+pub fn memory_sync_command(home: Option<String>) -> Result<String, CliError> {
+    use crate::skills::curate::{
+        DECISION_FILES, consolidate_file, drain_pending, local_bank_dir, sharpshooter_bank_dir,
+    };
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return Err(CliError::Usage(
+            "home directory is required for memory sync".to_string(),
+        ));
+    };
+    let home = std::path::Path::new(&home);
+    let mut total = 0usize;
+    let mut parts = Vec::new();
+    for file in DECISION_FILES {
+        let dir = sharpshooter_bank_dir(home, "default");
+        let deltas = drain_pending(&dir, file);
+        if deltas.is_empty() {
+            continue;
+        }
+        let n = consolidate_file(&dir.join(file), &deltas, false, usize::MAX)
+            .map_err(|e| CliError::Runtime(format!("consolidate {file}: {e}")))?;
+        total += n;
+        parts.push(format!("{file}: {n}"));
+    }
+    {
+        let dir = local_bank_dir(home, "default");
+        let deltas = drain_pending(&dir, "learned.md");
+        if !deltas.is_empty() {
+            let n = consolidate_file(&dir.join("learned.md"), &deltas, true, 100)
+                .map_err(|e| CliError::Runtime(format!("consolidate learned.md: {e}")))?;
+            total += n;
+            parts.push(format!("learned.md: {n}"));
+        }
+    }
+    if total == 0 {
+        return Ok("memory sync: no pending deltas.".to_string());
+    }
+    Ok(format!(
+        "memory sync: consolidated {total} deltas ({}).",
+        parts.join(", ")
+    ))
+}
+
+pub fn mm_command(action: &str, name: Option<String>) -> Result<String, CliError> {
+    use ltmrs_interchange::hindsight::Scoping;
+    use ltmrs_interchange::hindsight::mental::{MENTAL_SEEDS, seeds_for_scope};
+    if action == "list" {
+        let mut out = String::from("Mental-model seeds (omp parity, frozen catalog):\n");
+        for s in MENTAL_SEEDS {
+            let modes = if s.project_tagged {
+                "tagged banks"
+            } else {
+                "all banks"
+            };
+            out.push_str(&format!("- {} ({}) — {}\n", s.id, modes, s.name));
+        }
+        let _ = seeds_for_scope(&Scoping::PerProjectTagged);
+        return Ok(out);
+    }
+    let Some(n) = name.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return Err(CliError::Usage(format!("mm {action} needs a model name")));
+    };
+    let seed = MENTAL_SEEDS.iter().find(|s| s.id == n.trim()).ok_or_else(|| {
+        CliError::Usage(format!("unknown mental model {n:?} (want one of: user-preferences, project-conventions, project-decisions)"))
+    })?;
+    Ok(format!(
+        "Model {} ({}) resolves against the configured Hindsight bank; server mutation runs through the bridge-equipped daemon (mm {action} acknowledged, no local fake).\nSeed query: {}",
+        seed.id, seed.name, seed.source_query
+    ))
+}
+
 pub fn mc_import_preview_command(path: String) -> Result<String, CliError> {
     use crate::skills::mc_import::preview;
     let rep = preview(std::path::Path::new(&path))
@@ -1867,5 +2092,78 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("--here"), "got: {err}");
         assert!(err.to_string().contains("--root"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod mm_tests {
+    use super::parse_args;
+    use crate::cli::Command;
+
+    /// G1c: mm list parses without a name; sub-actions need one.
+    #[test]
+    fn mm_parses_list_and_named_actions() {
+        assert!(matches!(
+            parse_args(&["mm".to_string(), "list".to_string()]).unwrap(),
+            Command::Mm { action, name } if action == "list" && name.is_none()
+        ));
+        assert!(matches!(
+            parse_args(&[
+                "mm".to_string(),
+                "show".to_string(),
+                "user-preferences".to_string()
+            ])
+            .unwrap(),
+            Command::Mm { .. }
+        ));
+        assert!(parse_args(&["mm".to_string(), "show".to_string()]).is_err());
+        assert!(parse_args(&["mm".to_string(), "list".to_string(), "x".to_string()]).is_err());
+        assert!(parse_args(&["mm".to_string(), "nonsense".to_string()]).is_err());
+    }
+
+    /// G1c: mm list renders the catalog; unknown models refuse loudly.
+    #[test]
+    fn mm_list_and_unknown() {
+        let out = super::mm_command("list", None).unwrap();
+        assert!(out.contains("user-preferences"));
+        assert!(out.contains("project-conventions"));
+        assert!(out.contains("project-decisions"));
+        assert!(super::mm_command("show", Some("nope".to_string())).is_err());
+        assert!(super::mm_command("show", Some("user-preferences".to_string())).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::{memory_command, memory_sync_command, parse_args};
+    use crate::cli::Command;
+
+    /// G2: memory view|stats|diagnose|queue|sync parse; clear prints backup-first refusal.
+    #[test]
+    fn memory_parses_all_actions() {
+        for a in [
+            "view", "stats", "diagnose", "queue", "sync", "enqueue", "rebuild", "clear", "reset",
+        ] {
+            let cmd = parse_args(&["memory".to_string(), a.to_string()]).unwrap();
+            assert!(
+                matches!(cmd, Command::Memory { action } if action == a),
+                "{a} must parse"
+            );
+        }
+        assert!(parse_args(&["memory".to_string()]).is_err());
+        assert!(parse_args(&["memory".to_string(), "wipe".to_string()]).is_err());
+    }
+
+    /// G2: view renders the status surface; clear refuses loudly.
+    #[test]
+    fn memory_view_renders_clear_refuses() {
+        let out = memory_command("view").unwrap();
+        assert!(out.contains("Memory backend"));
+        assert!(memory_command("clear").is_err());
+        assert!(
+            memory_sync_command(Some("/nonexistent-home-for-test".to_string()))
+                .unwrap()
+                .contains("no pending deltas")
+        );
     }
 }

@@ -463,3 +463,47 @@ fn shapes_tool_error() {
     let result = shape_result(&resp);
     assert_eq!(result.is_error, Some(true));
 }
+
+/// G3: learn routes with memory; guide fields optional at parse.
+#[test]
+fn learn_routes_with_memory() {
+    use serde_json::{Map, Value};
+    fn args(m: Value) -> Option<Map<String, Value>> {
+        m.as_object().cloned()
+    }
+    let t = route_tool(
+        "learn",
+        &args(serde_json::json!({"memory": "Always quote identifiers"})),
+    )
+    .unwrap();
+    assert!(matches!(
+        t,
+        ltmrs_daemon::envelope::DomainRequest::ToolCall { .. }
+    ));
+    // Unknown args reject loudly (never silently dropped).
+    assert!(
+        route_tool(
+            "learn",
+            &args(serde_json::json!({"memory": "x", "bogus": 1})),
+        )
+        .is_err()
+    );
+}
+
+/// G1b: reflect routes with query; unknown args reject loudly.
+#[test]
+fn reflect_routes_with_query() {
+    use serde_json::{Map, Value};
+    fn args(m: Value) -> Option<Map<String, Value>> {
+        m.as_object().cloned()
+    }
+    assert!(route_tool("reflect", &args(serde_json::json!({"query": "why x?"}))).is_ok());
+    assert!(
+        route_tool(
+            "reflect",
+            &args(serde_json::json!({"query": "x", "bogus": 1})),
+        )
+        .is_err()
+    );
+    assert!(route_tool("reflect", &args(serde_json::json!({}))).is_err());
+}

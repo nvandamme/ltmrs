@@ -50,9 +50,10 @@ use parse_guides::{
     parse_guide_merge, parse_guide_practice, parse_guide_update,
 };
 use parse_memory::{
-    parse_memory_add, parse_memory_audit, parse_memory_edit, parse_memory_feedback,
+    parse_learn, parse_memory_add, parse_memory_audit, parse_memory_edit, parse_memory_feedback,
     parse_memory_forget, parse_memory_library, parse_memory_merge, parse_memory_read,
-    parse_memory_relate, parse_memory_stats, parse_memory_update, parse_semantic_search,
+    parse_memory_relate, parse_memory_stats, parse_memory_update, parse_reflect,
+    parse_semantic_search,
 };
 use parse_sessions::{
     parse_backup_create, parse_backup_import_lemma, parse_backup_preview, parse_backup_restore,
@@ -755,6 +756,8 @@ impl LtmrsFrontend {
         tools.push(native_backup_restore_tool());
         tools.push(native_backup_import_lemma_tool());
         tools.push(native_memory_edit_tool());
+        tools.push(native_learn_tool());
+        tools.push(native_reflect_tool());
         tools
     }
 
@@ -918,6 +921,8 @@ pub fn route_tool(
         "memory_add" => ToolArgs::MemoryAdd(parse_memory_add(&args)?),
         "memory_update" => ToolArgs::MemoryUpdate(parse_memory_update(&args)?),
         "memory_edit" => ToolArgs::MemoryEdit(parse_memory_edit(&args)?),
+        "learn" => ToolArgs::Learn(parse_learn(&args)?),
+        "reflect" => ToolArgs::Reflect(parse_reflect(&args)?),
         "memory_feedback" => ToolArgs::MemoryFeedback(parse_memory_feedback(&args)?),
         "memory_forget" => ToolArgs::MemoryForget(parse_memory_forget(&args)?),
         "memory_merge" => ToolArgs::MemoryMerge(parse_memory_merge(&args)?),
@@ -1060,6 +1065,33 @@ fn native_memory_edit_tool() -> Tool {
     )
 }
 
+/// Native learn definition (omp-compat lesson capture + optional managed skill).
+fn native_learn_tool() -> Tool {
+    native_tool(
+        "learn",
+        "Capture a reusable lesson (omp-compat). NATIVE ltmrs tool: lesson persists first as a lesson-typed memory_add; optional guide/guide_body creates a managed guide second (skill failure is partial, never rolls back the lesson). Empty lessons reject loudly.",
+        serde_json::json!({
+            "memory": {"type": "string", "description": "Durable self-contained lesson: what, when, why."},
+            "context": {"type": "string", "description": "Optional source context for the lesson."},
+            "guide": {"type": "string", "description": "Optional managed guide name to create from the lesson."},
+            "guide_description": {"type": "string", "description": "One-line guide description (defaults to lesson-captured procedure)."},
+            "guide_body": {"type": "string", "description": "Guide body markdown (required with guide)."},
+        }),
+    )
+}
+
+/// Native reflect definition (omp-compat server-side synthesis).
+fn native_reflect_tool() -> Tool {
+    native_tool(
+        "reflect",
+        "Synthesize an answer over the Hindsight bank (omp-compat). NATIVE ltmrs tool: read-only synthesis through the bridge; empty synthesis when the bridge is disabled or unreachable (never a failure). Empty queries reject loudly.",
+        serde_json::json!({
+            "query": {"type": "string", "description": "Question to answer from long-term memory."},
+            "context": {"type": "string", "description": "Optional extra guidance for the synthesis."},
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::handler::is_mutating_tool;
@@ -1072,8 +1104,8 @@ mod tests {
         let tools = LtmrsFrontend::tools();
         assert_eq!(
             tools.len(),
-            31,
-            "26 frozen-verbatim + 5 native (backup_create/preview/restore/import_lemma + memory_edit)"
+            33,
+            "26 frozen-verbatim + 7 native (backup_create/preview/restore/import_lemma + memory_edit + learn + reflect)"
         );
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         assert!(names.contains(&"memory_read".to_string()));
@@ -1119,7 +1151,9 @@ mod tests {
                 "backup_preview",
                 "backup_restore",
                 "backup_import_lemma",
-                "memory_edit"
+                "memory_edit",
+                "learn",
+                "reflect"
             ]
         );
         let served = &served[..frozen.len()];
@@ -1236,8 +1270,10 @@ mod tests {
             "backup_restore",
             "backup_import_lemma",
             "memory_edit",
+            "learn",
+            "reflect",
         ];
-        assert_eq!(names.len(), 31, "all 31 served tools covered");
+        assert_eq!(names.len(), 33, "all 33 served tools covered");
         for n in names {
             let parsed = ToolName::parse(n).unwrap_or_else(|| panic!("{n} must parse"));
             assert_eq!(parsed.as_str(), n, "round-trip");
@@ -1269,9 +1305,13 @@ mod tests {
             "backup_restore",
             "backup_import_lemma",
             "memory_edit",
+            "learn",
         ] {
             assert!(is_mutating_tool(t), "{t} must be mutating");
         }
+        // reflect is read-only synthesis: notifies (not in the silent
+        // 12) but never gates a namespace.
+        assert!(!ToolArgs::Reflect(Default::default()).mutates_store());
         for t in [
             "memory_read",
             "semantic_search",

@@ -5,7 +5,17 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: omp-compat P2/P3 + WP-12 per-op CPU/fsync
+## 2026-11-12 — feat: omp gap closure Slices 1–5 (G1–G7) + FULL README
+
+- Slice 1 (G1a+G3+G7): Hindsight scoping modes + globalScope; `learn` native tool (7th native, 32 served); `manage_skill` installer lib (no MCP tool — daemon never writes host files).
+- Slice 2 (G1b+G1c): `reflect` native tool (8th native, 33 served); mental-model seed catalog + `mm` CLI.
+- Slice 3 (G1d+G2): durable outbox (persist-before-send, bounded retry) + `LTMRS_HINDSIGHT_OUTBOX`; `memory` CLI group (real sync consolidation, clear refuses).
+- Slice 4 (G6): fact+temporal RRF voices at 0.25 (quarter-weight invariant) + generation-keyed recall cache.
+- Slice 5 (G4+G5): curated-file pipeline (`curate.rs`; daemon never calls a model) + `memory sync` consolidation.
+- FULL README rewrite (33 tools, bridge, curation, omp gap table).
+- Matrix 31→33 rows (scope+retry 33/33); T-LEARN-01/T-REFLECT-01/T-MM-01/T-MEMORYCLI-01/T-MSKILL-01/T-CURATE-01/T-RRF-01/T-RCACHE-01; RQ-15.
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - omp-compat P2 `memory_edit` tri-op native tool (5th native, 31 served): `ToolArgs::MemoryEdit` + `exec_memory_edit` (update→memory_update, forget→memory_forget, invalidate→forget(invalidate)); importance-only/unknown-op/unknown-id reject loudly; route + parse + allowlist + `served_tools_match_frozen_schema` (26+5) + notify parity (31) + `mutates_store` pins; scope+retry+straggler cells executed (daemon memory_edit 10/10); T-MEMOEDIT-01 + RQ-15; matrix 31/31 scope+retry.
 - omp-compat P3 status/stats/diagnose/queue markdown renderers (`skills/memory_status.rs`, 4 golden tests); 02 WP-10 task.

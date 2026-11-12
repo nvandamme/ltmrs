@@ -172,6 +172,10 @@ pub struct RetrievalResult {
 pub struct Engine {
     repo: std::sync::Arc<ltmrs_service::repository::CanonicalRepository>,
     table: SearchTable,
+    /// Recall cache (G6b; omp enhancedRecall parity): ranked-id lists
+    /// keyed on (query, scope, generation, limits). Generation in the key
+    /// makes writes self-invalidating; TTL bounds staleness otherwise.
+    cache: std::sync::Mutex<super::cache::RecallCache<RetrievalResult>>,
 }
 
 impl Engine {
@@ -179,7 +183,11 @@ impl Engine {
         repo: std::sync::Arc<ltmrs_service::repository::CanonicalRepository>,
         table: SearchTable,
     ) -> Self {
-        Self { repo, table }
+        Self {
+            repo,
+            table,
+            cache: std::sync::Mutex::new(super::cache::RecallCache::<RetrievalResult>::new()),
+        }
     }
 
     /// Execute a retrieval request end-to-end.
@@ -309,10 +317,9 @@ impl Engine {
                 union.push(*id);
             }
         }
-        let eligible: BTreeSet<EntityId> = self
-            .repo
-            .get_memories(&union)?
-            .into_iter()
+        let hydrated: Vec<Memory> = self.repo.get_memories(&union)?;
+        let eligible: BTreeSet<EntityId> = hydrated
+            .iter()
             .filter(|m| scope.is_eligible(m))
             .map(|m| m.id)
             .collect();
@@ -328,6 +335,9 @@ impl Engine {
             .collect();
 
         // Stage 6: rank fusion (one-based RRF over the eligible legs).
+        // G6a voices: fact + temporal legs join lexical + dense at quarter
+        // weight each (advisory: combined 0.5 can never outvote a single
+        // primary leg at 1.0; dense-only recalls keep their winner).
         let mut legs = Vec::new();
         if !lexical_ids.is_empty() {
             legs.push(RankedList {
@@ -351,7 +361,49 @@ impl Engine {
                     .collect(),
             });
         }
+        {
+            use ltmrs_domain::memory::FragmentType;
+            let facts: Vec<(EntityId, bool)> = hydrated
+                .iter()
+                .filter(|m| eligible.contains(&m.id))
+                .map(|m| (m.id, m.fragment_type == FragmentType::Fact))
+                .collect();
+            let entries = ranking::fact_voice_rank(&facts);
+            if !entries.is_empty() {
+                legs.push(RankedList {
+                    leg: "fact",
+                    weight: 0.25,
+                    entries,
+                });
+            }
+            let stamps: Vec<(EntityId, u64)> = hydrated
+                .iter()
+                .filter(|m| eligible.contains(&m.id))
+                .map(|m| (m.id, m.updated_at.0))
+                .collect();
+            let entries = ranking::temporal_voice_rank(&stamps);
+            if !entries.is_empty() {
+                legs.push(RankedList {
+                    leg: "temporal",
+                    weight: 0.25,
+                    entries,
+                });
+            }
+        }
 
+        // G6b: full-result cache hit short-circuits the legs (same
+        // generation + scope in the key — a write bumps the generation,
+        // so hits are never stale). Results are deterministic given the
+        // order, so caching the whole result is sound.
+        let cache_key = super::cache::RecallCacheKey {
+            query: req.query.clone(),
+            scope_digest: format!("{:?}", req.scope),
+            store_generation: store_gen.as_u64(),
+            result_limit: req.result_limit,
+        };
+        if let Some(cached) = self.cache.lock().ok().and_then(|c| c.get(&cache_key)) {
+            return Ok(cached);
+        }
         let rrf = ranking::rrf_fuse(&legs);
         let mut rrf_order: Vec<EntityId> = rrf.scores.keys().copied().collect();
         rrf_order.sort_by(|a, b| {
@@ -535,12 +587,16 @@ impl Engine {
             || dense_failed
             || !readiness.fts_ready;
 
-        Ok(RetrievalResult {
+        let result = RetrievalResult {
             results,
             context,
             explanation,
             total,
             pool_truncated,
-        })
+        };
+        if let Ok(mut c) = self.cache.lock() {
+            c.put(cache_key, result.clone());
+        }
+        Ok(result)
     }
 }
