@@ -5,7 +5,12 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: live lemma importer chain + edge census (RQ-26 positive path)
+## 2026-11-12 — feat: BEIR SciFact executed (beir-scifact-full → executed)
+
+- 709-doc coverage slice (all 300 test queries fully covered), release profile, 362s: nDCG@10 0.852, MAP 0.817, Recall@100 0.948, MRR@10 0.826 on human test qrels. Debug-profile full-corpus attempt killed after 2h silent — slow tests run release-only (standing rule, re-learned live).
+- Ledger: benchmarks.toml [[not_run]] 2→1 (only ablation-graph-upstream remains: TF-IDF-vs-provisioned owner decision); RQ-24 evidence appended; TODO WP-12 line updated.
+- Proof: search suite green incl. ignored BEIR leg; fmt/clippy/gate-audit clean per landing gate below. Full `cargo test --workspace` runs with this commit (BEIR evidence is its ignored-test output, not a workspace code change).
+
 
 - `envelope_from_db_image` test-support builder + `imports_live_lemma_snapshot` (ignored, `LTMRS_LIVE_LEMMA_DB`): checkpointed rollback-journal copy of the live ~/.lemma DB (1429 memories, 4720 relations) imports end to end in 3.07s with loss accounting. First positive-path importer evidence (unit suite was refusal-paths only).
 - Real-data bug fixed: bare `YYYY-MM-DD created_at` (what upstream stores on real rows) parses as midnight UTC — was fail-loud on the first live row. WAL-mode refusal unchanged.

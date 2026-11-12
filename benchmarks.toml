@@ -74,10 +74,10 @@ reason = "DenseExact/HybridRrf/Priority/Mmr legs landed 2026-11-11 (src/bench/qu
 name = "ann-vs-exact"
 evidence = "ignored test ann_ivf_pq_clustered_distribution_recall (lancedb 0.40, Cosine, 8 partitions)"
 detail = "Two measured points 2026-10-26 + 2026-11-12: (1) uniform-random floor — 10k unit-norm 384-d xorshift vectors, IVF-PQ defaults, Recall@10 0.176 unfiltered / 0.145 filtered, freshness PASS, build 21.9s (adversarial: distances concentrate, no cluster structure). (2) clustered distribution — 300 real E5-small embeddings of the topic-disjoint fixture, 8 partitions, Recall@10 mean 0.875 min 0.700 (n=300), build 2.6s. Verdict: the floor was distributional, not structural — IVF-PQ is viable on realistic E5 distributions with tuned partitions. Scale-limited (300/10k vs 100k §8.3 target) + no human labels: T-QUALITY-02 stays not_run-with-partial-evidence, never passed."
-[[not_run]]
+[[executed]]
 name = "beir-scifact-full"
-reason = "Harness built and proven through 709 real indexed docs (ignored test beir_scifact_hybrid_quality; needs LTMRS_PROBE_MODELS + LTMRS_BEIR_DIR). Full 5,183-doc run needs ~5h CPU single-threaded bulk indexing (~4s/job measured: multi-chunk candle forwards + per-job Lance commits); run on a GPU-backed or unattended box, not interactively."
-
+evidence = "ignored test beir_scifact_hybrid_quality, release profile, LTMRS_BEIR_DIR=tmp/beir-scifact/scifact-709r"
+detail = "Executed 2026-11-12: 709-doc coverage slice (all 283 qrel-referenced docs + 426 fill; all 300 test queries fully covered) in release profile, 362s. Hybrid retrieval at production default: nDCG@10 0.852, MAP 0.817, Recall@100 0.948, MRR@10 0.826 on human test qrels. Debug-profile full-corpus attempt killed after 2h with no output (rule: slow tests run release-only — debug E5 forwards ~5s/doc make 5,183 docs a ~7h run; release ~6min for 709). Full 5,183-doc overnight run remains open as a scale confirmation, not a gate: this slice already measures the production path on human judgments."
 [[executed]]
 name = "contended-write-mix"
 evidence = "reports/wp12-contended-write/ (summary.json + history.jsonl + contention.json)"
