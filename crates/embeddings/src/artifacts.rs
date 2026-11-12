@@ -28,8 +28,6 @@ pub enum ArtifactError {
     OfflineMissing { file: String },
     #[error("artifact download failed for '{0}': {1}")]
     Download(String, String),
-    #[error("inference error: {0}")]
-    Inference(#[from] candle_core::Error),
     /// Backend-neutral inference failure (Task 4 migrates call sites here
     /// as the Candle tensor core is replaced; new code must use this,
     /// never a backend-typed variant).

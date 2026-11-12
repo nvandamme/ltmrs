@@ -731,3 +731,68 @@ fn e5_adapter_is_shareable() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<E5SmallAdapter>();
 }
+
+/// Task 4 RED: the Burn backend must reproduce the frozen fixture vectors
+/// within the parity envelope (max-abs ≤1e-6). Fails — no Burn backend exists yet.
+#[test]
+fn burn_backend_matches_frozen_fixtures() {
+    let fixture = load_fixture();
+    let cases = fixture["cases"]
+        .as_object()
+        .expect("cases map")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    // query_long_fact exceeds the window by design (adapter rejects);
+    // every other frozen case must reproduce within the envelope.
+    let mut checked = 0usize;
+    let mut worst = 0.0f32;
+    for name in &cases {
+        if name == "query_long_fact" {
+            continue;
+        }
+        let case = &fixture["cases"][name];
+        if let Some(texts) = case.get("texts") {
+            let vecs = case["vectors"].as_array().unwrap();
+            assert_eq!(texts.as_array().unwrap().len(), vecs.len());
+            for (row, expected_v) in vecs.iter().enumerate() {
+                let expected: Vec<f32> = serde_json::from_value(expected_v.clone()).unwrap();
+                let got = crate::e5_burn::embed_frozen_case_row(name, row)
+                    .expect("burn backend embeds row");
+                assert_eq!(
+                    got.len(),
+                    expected.len(),
+                    "dim must match for {name}[{row}]"
+                );
+                let case_max: f32 = got
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                worst = worst.max(case_max);
+                assert!(
+                    case_max <= 1e-6,
+                    "parity envelope violated for {name}[{row}]: max-abs {case_max}"
+                );
+                checked += 1;
+            }
+            continue;
+        }
+        let expected: Vec<f32> = serde_json::from_value(case["vector"].clone()).unwrap();
+        let got = crate::e5_burn::embed_frozen_case(name).expect("burn backend embeds");
+        assert_eq!(got.len(), expected.len(), "dim must match for {name}");
+        let case_max: f32 = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        worst = worst.max(case_max);
+        assert!(
+            case_max <= 1e-6,
+            "parity envelope violated for {name}: max-abs {case_max}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 4, "must cover the frozen cases, got {checked}");
+    eprintln!("burn parity: {checked} cases, worst max-abs {worst:.2e}");
+}

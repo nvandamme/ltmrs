@@ -1,8 +1,8 @@
 //! CUDA/GPU inference profile (RQ-09/RQ-10, WP-06 CUDA leg).
 //!
 //! Device-selection choice (documented per task): the production default
-//! stays CPU — `E5SmallAdapter::load_verified` is frozen on `Device::Cpu`
-//! and byte-identical with or without the `cuda` feature. The GPU path is
+//! stays CPU — `E5SmallAdapter::load_verified` is frozen on the Flex CPU
+//! device and byte-identical with or without the `cuda` feature. The GPU path is
 //! reachable ONLY via the explicit `load_verified_on_device` constructor
 //! (no env-var implicit switching: an explicit `Device` argument is
 //! unambiguous at the call site and cannot leak into daemon defaults).
@@ -20,17 +20,23 @@ use super::e5_tests::{populate_cache, test_cache};
 use super::{E5SmallAdapter, EmbedInput};
 use crate::manifest::e5_small_artifact;
 use crate::recipe::Role;
-use candle_core::Device;
+use burn_tensor::Device;
 
-/// LOUD device acquisition: panics when no CUDA device is present instead
-/// of skipping, so `--features cuda` on a GPU-less box cannot go green.
+/// LOUD device acquisition: the CubeCL CUDA device constructs lazily, so
+/// probe it by running one tiny op — a GPU-less box (or missing CUDA
+/// loader) panics here instead of silently skipping, so `--features cuda`
+/// on a CUDA-less host cannot go green.
 fn cuda_device_or_fail() -> Device {
-    Device::new_cuda(0).unwrap_or_else(|e| {
-        panic!(
-            "CUDA device required for --features cuda GPU tests (Device::new_cuda(0) failed: {e}); \
-             run these tests on a CUDA host or drop the `cuda` feature"
-        )
-    })
+    let device = Device::new(burn_dispatch::device::DispatchDevice::Cube(
+        burn_cubecl::cubecl::Device::Cuda(Default::default()),
+    ));
+    // Probe: one f32 add forces loader + device init.
+    let probe = burn_tensor::Tensor::<1>::from_data(
+        burn_tensor::TensorData::new(vec![1.0f32], [1]),
+        &device,
+    );
+    let _ = (probe.clone() + probe).into_data();
+    device
 }
 
 /// Load the same verified artifacts onto CPU and CUDA for comparison.
@@ -63,7 +69,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// (a) Reference-vector equivalence CPU-vs-GPU on fixed texts.
 ///
 /// Envelope rationale (measured 2026-10-26, RTX 5090 sm_120, CUDA 13.4,
-/// candle 0.11.0 F32; per-row values printed by this test): largest observed
+/// Burn Flex/Cube F32; per-row values printed by this test): largest observed
 /// max-abs diff M = 1.31e-7 (empty-string passage case), smallest observed
 /// cosine C = 0.99999982. The committed envelope is `MAX_ABS_DIFF = 1e-6`
 /// (~8x the largest observed M: headroom for kernel/clock nondeterminism
@@ -172,9 +178,7 @@ fn cuda_rank_equivalence_spot_check() {
 #[test]
 fn cuda_device_reports() {
     let cuda = cuda_device_or_fail();
-    assert!(
-        matches!(cuda, Device::Cuda(_)),
-        "expected a CUDA device, got {cuda:?}"
-    );
-    eprintln!("device under test: {cuda:?}");
+    let dbg = format!("{cuda:?}");
+    assert!(dbg.contains("Cuda"), "expected a CUDA device, got {dbg}");
+    eprintln!("device under test: {dbg}");
 }

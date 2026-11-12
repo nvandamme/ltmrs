@@ -793,10 +793,14 @@ mod tests {
     /// RED: fails if any seam file imports candle types.
     #[test]
     fn seam_files_name_no_candle() {
-        // Task 3 scope: the trait boundary owners. artifacts.rs keeps
-        // its #[from] candle_core::Error until Task 4 rewrites the ~40
-        // tensor call sites (tracked there, not waived here).
-        for rel in ["src/worker.rs", "src/service.rs", "src/recipe.rs"] {
+        // Task 4: backend-neutral seam — no seam file may name candle
+        // (artifacts.rs lost its #[from] candle_core::Error with bert_impl).
+        for rel in [
+            "src/worker.rs",
+            "src/service.rs",
+            "src/recipe.rs",
+            "src/artifacts.rs",
+        ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
             let text = std::fs::read_to_string(&path).unwrap();
             // `candle::` paths and `candle_*` idents only (the word

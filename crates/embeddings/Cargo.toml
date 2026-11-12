@@ -5,8 +5,16 @@ edition = "2024"
 
 [dependencies]
 ltmrs-domain = { path = "../domain" }
-candle-core = { version = "0.11" }
-candle-nn = { version = "0.11" }
+burn-tensor = { version = "0.22" }
+burn-nn = { version = "0.22" }
+burn-core = { version = "0.22" }
+burn-dispatch = { version = "0.22", features = ["flex"] }
+# CubeCL CUDA runtime (dynamic loading only via fallback-dynamic-loading;
+# zero link-time CUDA — Task 6 gates this). Enabled only under `cuda`.
+burn-cubecl = { version = "0.22", optional = true }
+burn-flex = { version = "0.22" }
+safetensors = { version = "0.4" }
+half = { version = "2.7", default-features = false }
 tokenizers = { version = "0.22" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1.0", features = ["rt-multi-thread", "rt", "macros", "sync", "time"] }
@@ -23,5 +31,5 @@ ltmrs-search = { path = "../search" }
 # RQ-09/RQ-10 GPU leg (WP-06): opt-in CUDA inference. Production default
 # stays CPU (see E5SmallAdapter::load_verified); the CUDA path is only
 # reachable via the explicit load_verified_on_device constructor below.
-# Mirrors the existing candle pins exactly (0.11, caret style).
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Burn CubeCL CUDA runtime (dynamic loading only via fallback-dynamic-loading).
+cuda = ["burn-dispatch/cuda", "burn-cubecl/cuda", "dep:burn-cubecl"]

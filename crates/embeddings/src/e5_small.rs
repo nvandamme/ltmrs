@@ -1,4 +1,4 @@
-//! The qualified E5-small Candle adapter (WP-06 tasks 2, 3, 10).
+//! The qualified E5-small Burn adapter (WP-06 tasks 2, 3, 10; Task 4 port).
 //!
 //! Implements the pinned reference recipe exactly: XLM-RoBERTa tokenizer,
 //! BertModel backbone, query/passage prefixes, attention-mask-aware mean
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer;
 
-use crate::bert_impl::BertModel;
+use crate::e5_burn::BurnBertModel;
 use crate::manifest::ModelRecipe;
 use crate::recipe::Role;
 use ltmrs_domain::id::ModelFingerprint;
@@ -60,11 +60,13 @@ pub struct Chunk {
     pub token_count: usize,
 }
 
-/// The E5-small adapter. Synchronous CPU inference over `&self` (reads
-/// weights, mutates nothing), so one adapter fans out across threads —
-/// never called from Tokio I/O threads directly (design §9).
+/// The E5-small adapter. Synchronous inference over `&self` (reads
+/// weights, mutates nothing) on the device chosen at load, so one adapter
+/// fans out across threads — never called from Tokio I/O threads directly
+/// (design §9).
 pub struct E5SmallAdapter {
     recipe: ModelRecipe,
     tokenizer: Arc<Tokenizer>,
-    model: BertModel,
+    model: BurnBertModel,
+    device: burn_tensor::Device,
 }

@@ -223,7 +223,7 @@ impl Daemon {
     /// excludes them explicitly). Idempotent. Each tick rebuilds the
     /// projector at the repo's current generation (a cutover can never
     /// strand it refusing publishes) and drives pending jobs off the Tokio
-    /// I/O workers via `spawn_blocking` (candle inference is synchronous
+    /// I/O workers via `spawn_blocking` (Burn inference is synchronous
     /// CPU; the single outer bridge contains no nested blocking). Embed
     /// failures stay pending and retry next tick; lexical rows publish
     /// regardless. A commit wake drives the new job immediately (P2-1); the

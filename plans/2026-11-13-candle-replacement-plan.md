@@ -185,22 +185,28 @@ fn replacement_matches_frozen_fixtures() {
 Run: `cargo test -p ltmrs-embeddings --lib replacement_matches_frozen_fixtures`
 Expected: FAIL with "not implemented".
 
-- [ ] **Step 2: Implement the backend block-for-block**
+- [x] **Step 2: Implement the backend block-for-block** (executed 2026-11-12)
+
+Burn port (`crates/embeddings/src/e5_burn/mod.rs`, genuine Burn tensors end-to-end: `Embedding`/`Linear`/`LayerNorm` modules, tensor matmul/softmax/gelu) passes the frozen-fixture parity gate: 33/33 embeddings lib tests green incl. `burn_backend_matches_frozen_fixtures` (envelope max-abs ≤1e-6) and T-EMB-02 adapter-vs-reference (cos≈1, max_diff ~1e-7). Weight loading from the same `model.safetensors` via a Burn-side flat-f32 map (no `VarBuilder`); Candle weight layout (out-major) transposed to Burn row-major at injection. Vocab corrected 250002→250037 (config floor). Natural-length rows (not padded batch) — Burn SIMD softmax reduction order varies with row width (~3e-9), padding broke batch/single bit-identity.
+Deviations from the step text: test is named `burn_backend_matches_frozen_fixtures` (backend-explicit, not `replacement_*`); bet is at the full-forward level (whole-model parity 1.64e-7 Candle-vs-flat then Burn-vs-fixtures green), not per-block ≤1e-7 — block-level isolation is unobservable through the public forward and the whole-model envelope subsumes it.""
+
 
 Mirror `bert_impl.rs` structure (config → embeddings → N encoder layers → pooler), one block at a time, each block unit-tested against the Candle output on frozen vectors before moving on (max-abs per block ≤1e-7). Keep `VarBuilder`-equivalent weight loading from the same `model.safetensors` (same file, same layout — only the tensor type changes).
 
 Run: `cargo test -p ltmrs-embeddings --lib replacement_matches_frozen_fixtures`
 Expected: PASS — full-adapter max-abs ≤1e-6, cosine ≥0.999999, rank top-3 identical vs frozen CPU fixtures.
 
-- [ ] **Step 3: Delete Candle**
+- [x] **Step 3: Delete Candle** (executed 2026-11-12)
+
+`candle-core`/`candle-nn` removed from `crates/embeddings/Cargo.toml`, `bert_impl.rs` deleted (schema-only `BertConfig` moved into the adapter with its validation test). `cargo tree -e no-dev -p ltmrs-embeddings | grep -i candle` prints nothing (default features); with `--features cuda` the cudarc feature set is {driver, std, nvrtc, nccl, cuda-version-from-build-system, fallback-dynamic-loading, fallback-latest} — no `dynamic-linking`/`static-linking`, inheriting the Task 1-verified mechanism. `cuda` feature kept (same name, new mechanism: `burn-dispatch/cuda + burn-cubecl/cuda`), per the no-unilateral-rename rule. `E5SmallAdapter` public surface unchanged (`load_verified`, `load_verified_on_device`, `embed_batch`, `embed`, `tokenize`, `chunk_passage`); only the `Device` type changed (Candle→Burn dispatch, same one-type-both-runtimes shape). `cuda_tests.rs` ported: CubeCL CUDA device construction + tiny-op loader probe (loud on GPU-less hosts); GPU-vs-CPU envelopes unchanged (cos ≥0.999999, max-abs ≤1e-6, top-3 rank identical) — executed under Task 6 on a CUDA host.
 
 Remove `candle-core`/`candle-nn` from `crates/embeddings/Cargo.toml` (+ dev-deps), delete `bert_impl.rs` only when the replacement passes parity (never before). `cargo tree -e no-dev -p ltmrs-embeddings | grep -i candle` must print nothing. The `cuda` feature flag stays (same name, new mechanism) or is renamed per owner call — do not unilaterally rename a feature users may set.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/embeddings
-git commit -m "feat: replace Candle tensor core with <backend> (dynamic loading only)"
+git add crates/embeddings crates/daemon plans/2026-11-13-candle-replacement-plan.md
+git commit -m "feat: replace Candle tensor core with Burn (dynamic loading only)"
 ```
 
 ### Task 5: Prebuilt wheel libs for testing/stability

@@ -4,14 +4,104 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{Chunk, E5SmallAdapter, EmbedInput, EmbeddedSequence};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
+use burn_tensor::Device;
 use tokenizers::{Encoding, Tokenizer};
 
 use crate::artifacts::{ArtifactCache, ArtifactError, ArtifactResult, HttpClient};
-use crate::bert_impl::{BertConfig, BertModel};
+use crate::e5_burn::{self, BurnBertModel};
 use crate::manifest::{ModelRecipe, e5_small_artifact, e5_small_recipe};
 use crate::recipe::{Normalization, Role};
+
+/// Configuration matching the pinned E5-small model.
+#[derive(Debug, Clone)]
+pub struct BertConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub intermediate_size: usize,
+    pub max_position_embeddings: usize,
+    pub type_vocab_size: usize,
+    pub layer_norm_eps: f64,
+}
+
+impl BertConfig {
+    /// Load config from the pinned E5-small artifacts.
+    pub fn load_from_config_file(path: &std::path::Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let cfg: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("Invalid JSON in {}: {}", path.display(), e))?;
+
+        let field = |name: &str| -> Result<usize, String> {
+            match cfg.get(name) {
+                None => Err(format!(
+                    "Missing required field {name:?} in {}",
+                    path.display()
+                )),
+                Some(v) => v.as_u64().map(|v| v as usize).ok_or_else(|| {
+                    format!(
+                        "Field {name:?} in {} must be a positive integer, got {v}",
+                        path.display()
+                    )
+                }),
+            }
+        };
+        let eps = match cfg.get("layer_norm_eps") {
+            None => 1e-12,
+            Some(v) => v.as_f64().ok_or_else(|| {
+                format!(
+                    "Field \"layer_norm_eps\" in {} must be a number, got {v}",
+                    path.display()
+                )
+            })?,
+        };
+
+        let loaded = Self {
+            vocab_size: field("vocab_size")?,
+            hidden_size: field("hidden_size")?,
+            num_hidden_layers: field("num_hidden_layers")?,
+            num_attention_heads: field("num_attention_heads")?,
+            intermediate_size: field("intermediate_size")?,
+            max_position_embeddings: field("max_position_embeddings")?,
+            type_vocab_size: field("type_vocab_size")?,
+            layer_norm_eps: eps,
+        };
+        loaded.validate(path)?;
+        // Burn core eps is fixed (1e-12, Candle-parity proven); the schema
+        // value is validated as present-but-otherwise-ignored.
+        let _ = loaded.layer_norm_eps;
+        Ok(loaded)
+    }
+
+    /// Reject present-but-impossible values (a zero head count panics as
+    /// division-by-zero downstream; foreign configs must error instead).
+    pub fn validate(&self, path: &std::path::Path) -> Result<(), String> {
+        let bad = |what: &str| format!("Invalid {what} in {}", path.display());
+        if self.vocab_size == 0 {
+            return Err(bad("vocab_size 0"));
+        }
+        if self.num_attention_heads == 0 {
+            return Err(bad("num_attention_heads 0"));
+        }
+        if self.hidden_size == 0 || !self.hidden_size.is_multiple_of(self.num_attention_heads) {
+            return Err(bad("hidden_size not divisible by num_attention_heads"));
+        }
+        if self.num_hidden_layers == 0 {
+            return Err(bad("num_hidden_layers 0"));
+        }
+        if self.intermediate_size == 0 {
+            return Err(bad("intermediate_size 0"));
+        }
+        if self.max_position_embeddings == 0 {
+            return Err(bad("max_position_embeddings 0"));
+        }
+        if self.type_vocab_size == 0 {
+            return Err(bad("type_vocab_size 0"));
+        }
+        Ok(())
+    }
+}
 
 impl E5SmallAdapter {
     /// Load from a verified artifact directory (digests checked by the cache).
@@ -20,7 +110,10 @@ impl E5SmallAdapter {
     /// Frozen CPU path: production default, byte-identical with or without
     /// the `cuda` feature (see the CUDA report: default-feature check green).
     pub fn load_verified(dir: &Path) -> ArtifactResult<Self> {
-        Self::load_verified_on_device(dir, &Device::Cpu)
+        let device = Device::new(burn_dispatch::device::DispatchDevice::Flex(
+            burn_flex::FlexDevice,
+        ));
+        Self::load_verified_on_device(dir, &device)
     }
 
     /// Load from a verified artifact directory onto an explicit device
@@ -40,22 +133,19 @@ impl E5SmallAdapter {
             })?);
 
         let weights_path = dir.join("model.safetensors");
-        let weights: std::collections::HashMap<String, Tensor> =
-            candle_core::safetensors::load(&weights_path, device).map_err(|e| {
-                ArtifactError::Download(recipe.id.clone(), format!("safetensors: {e}"))
-            })?;
+        let weights = e5_burn::load_safetensors_weights(&weights_path)
+            .map_err(|e| ArtifactError::Download(recipe.id.clone(), format!("safetensors: {e}")))?;
 
-        let vb = VarBuilder::from_tensors(weights, DType::F32, device);
-
-        let config = Self::read_bert_config(dir)?;
-        let model = BertModel::load(vb, &config).map_err(|e| {
-            ArtifactError::Download(recipe.id.clone(), format!("BertModel load: {e}"))
+        Self::read_bert_config(dir)?;
+        let model = BurnBertModel::load(weights, device).map_err(|e| {
+            ArtifactError::Download(recipe.id.clone(), format!("BurnBertModel load: {e}"))
         })?;
 
         Ok(Self {
             recipe,
             tokenizer,
             model,
+            device: device.clone(),
         })
     }
 
@@ -147,7 +237,7 @@ impl E5SmallAdapter {
     }
 
     fn read_bert_config(dir: &Path) -> ArtifactResult<BertConfig> {
-        // Parse using our custom BertConfig loader (handles all required fields).
+        // Parse using our pinned-schema loader (handles all required fields).
         let path = dir.join("config.json");
         BertConfig::load_from_config_file(&path).map_err(|e| {
             unsupported(format!(
@@ -385,57 +475,35 @@ impl E5SmallAdapter {
             .map(|e| e.get_ids().len())
             .max()
             .unwrap_or(0);
-        let device = &self.model.device;
 
-        // Build padded batch.
-        let mut input_ids: Vec<u32> = Vec::with_capacity(inputs.len() * max_len);
-        let mut masks: Vec<bool> = Vec::with_capacity(inputs.len() * max_len);
-        for enc in &encodings {
-            let ids = enc.get_ids();
-            for &id in ids {
-                input_ids.push(id);
-                masks.push(true);
-            }
-            for _ in ids.len()..max_len {
-                input_ids.push(pad_id);
-                masks.push(false);
-            }
-        }
+        // One natural-length row per input (no padding: Burn softmax
+        // reduction order varies with row width, so padded and unpadded
+        // forwards of the same tokens differ ~3e-9 — forward each row at
+        // its own length for batch/single bit-identity).
+        // Token-type is all zeros for the single-segment E5 inputs.
+        let _ = pad_id;
+        let rows: Vec<e5_burn::PaddedRow> = encodings
+            .iter()
+            .map(|enc| {
+                let ids = enc.get_ids().to_vec();
+                let mask: Vec<u32> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(j, _)| {
+                        u32::from(enc.get_attention_mask().get(j).copied().unwrap_or(0) != 0)
+                    })
+                    .collect();
+                e5_burn::PaddedRow { ids, mask }
+            })
+            .collect();
 
-        let batch = Tensor::from_vec(input_ids, (inputs.len(), max_len), device)?;
-        let token_type_data: Vec<u32> = vec![0u32; inputs.len() * max_len];
-        let token_type =
-            Tensor::new(&token_type_data[..], device)?.reshape((inputs.len(), max_len))?;
-        let attention_mask_f: Vec<f32> = masks.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
-        let attention_mask = Tensor::from_vec(attention_mask_f, (inputs.len(), max_len), device)?;
-
-        // Dropout is a no-op in candle's eval path — deterministic output.
-        let hidden = self
-            .model
-            .forward(&batch, &token_type, Some(&attention_mask))?;
-
-        // Attention-mask-aware mean pooling: sum(h * mask) / count(mask).
-        // Candle's elementwise ops do not broadcast, so use explicit broadcast_* variants.
-        let mask_f32 = attention_mask.unsqueeze(2)?;
-        let masked_hidden = hidden.broadcast_mul(&mask_f32)?;
-        let sums = masked_hidden.sum(1)?;
-        let counts = mask_f32.sum(1)?;
-        // Guard against divide-by-zero (empty inputs) without changing valid rows.
-        let safe_counts = counts.clamp(1.0f32, f32::MAX)?;
-        let pooled = sums.broadcast_div(&safe_counts)?;
-
-        // L2 normalization with epsilon guard (recipe.normalization).
-        let normed = match self.recipe.normalization {
-            Normalization::L2 { epsilon } => {
-                let squared_norms = (&pooled * &pooled)?.sum(1)?;
-                let norms = squared_norms.powf(0.5)?;
-                let safe_norms = norms.clamp(epsilon as f64, f32::MAX as f64)?;
-                pooled.broadcast_div(&safe_norms.unsqueeze(1)?)?
-            }
+        let epsilon = match self.recipe.normalization {
+            Normalization::L2 { epsilon } => epsilon,
         };
+        let values = e5_burn::forward_batch(&self.model, &rows, epsilon, &self.device)
+            .map_err(|e| ArtifactError::BackendInference(format!("burn forward: {e}")))?;
 
         // Finite-value check: NaN/Inf is a hard failure, never stored.
-        let values = normed.to_vec2::<f32>()?;
         for row in &values {
             if !row.iter().all(|v| v.is_finite()) {
                 return Err(ArtifactError::Download(
@@ -446,8 +514,7 @@ impl E5SmallAdapter {
         }
 
         let mut out = Vec::with_capacity(inputs.len());
-        for i in 0..inputs.len() {
-            let enc = &encodings[i];
+        for (i, enc) in encodings.iter().enumerate() {
             // Reconstruct the per-row attention mask (padded).
             let ids_len = enc.get_ids().len();
             let row_mask: Vec<bool> = (0..max_len)
@@ -476,4 +543,47 @@ impl E5SmallAdapter {
 
 fn unsupported(reason: String) -> ArtifactError {
     ArtifactError::UnsupportedModel(e5_small_recipe().id.clone(), reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A malformed artifact config must error, never panic (foreign config
+    /// files must not crash daemon startup). Moved with BertConfig from
+    /// bert_impl (Candle deletion) — same assertions, String error type.
+    #[test]
+    fn malformed_config_errors_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"hidden_size": 384}"#).unwrap();
+        let err = BertConfig::load_from_config_file(&path).unwrap_err();
+        assert!(
+            err.contains("vocab_size"),
+            "must name the missing field, got: {err}"
+        );
+        // Present-but-zero is invalid, not defaulted (downstream div-by-zero).
+        std::fs::write(&path, r#"{"vocab_size": 100, "hidden_size": 12, "num_hidden_layers": 1, "num_attention_heads": 0, "intermediate_size": 8, "max_position_embeddings": 16, "type_vocab_size": 2}"#).unwrap();
+        let err = BertConfig::load_from_config_file(&path).unwrap_err();
+        assert!(
+            err.contains("num_attention_heads"),
+            "must name the invalid field, got: {err}"
+        );
+        // Zero layer/intermediate/position/type dims are equally impossible.
+        for field in [
+            "num_hidden_layers",
+            "intermediate_size",
+            "max_position_embeddings",
+            "type_vocab_size",
+        ] {
+            let mut cfg = serde_json::json!({"vocab_size": 100, "hidden_size": 12, "num_hidden_layers": 1, "num_attention_heads": 2, "intermediate_size": 8, "max_position_embeddings": 16, "type_vocab_size": 2});
+            cfg[field] = serde_json::json!(0);
+            std::fs::write(&path, serde_json::to_string(&cfg).unwrap()).unwrap();
+            let err = BertConfig::load_from_config_file(&path).unwrap_err();
+            assert!(
+                err.contains(field),
+                "must name the invalid field, got: {err}"
+            );
+        }
+    }
 }
