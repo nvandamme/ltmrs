@@ -3,4 +3,5 @@
 pub mod hooks;
 pub mod hosts;
 pub mod installer;
+pub mod mc_import;
 pub mod shim;

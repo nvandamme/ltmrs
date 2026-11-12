@@ -5,7 +5,17 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: Slice D defer-scheduler (presentation-only recall shaping)
+## 2026-11-12 — feat: Slice C Magic Context read-only import bridge
+
+- C1+C2: excluded `crates/mc-import` cdylib; version fence v95, WAL refusal, source-unchanged; scope mapping with closed harness vocabulary and git-root canonicalization.
+- C3: loss-accounted row mapping (deterministic ids, opaque embeddings, non-active refuses).
+- C4: dlopen loader + preview/confirm (digest-bound additive fan-out, rerun-safe); `mc-import preview|confirm` CLI verbs.
+- C5: plan-authority one-review (Part I §11.6, WP-10 task, T-MCIMPORT-01, RQ-16); zero daemon/compat changes.
+- Proof: mc-import 11/11, frontend 164/164, daemon 355/355; fmt clean; workspace clippy clean.
+
+---
+
+## ee684f1 (2026-11-12) — feat: Slice D defer-scheduler (presentation-only recall shaping)
 
 - D1 seam memo (no code): `build_instructions_index` (mcp.rs:136) is the single shaping seam; `shape_result` noted out-of-scope; forbidden-files list pinned.
 - D2 byte-identity: RED proved unstable sort tie order varies bytes; GREEN via confidence-desc/id-asc tiebreak; `defer.rs` (deterministic renderer, char-boundary `defer_key`, prefix-asserting `replay`, `RENDER_VERSION` skew refusal).

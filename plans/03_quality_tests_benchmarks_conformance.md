@@ -178,8 +178,7 @@ Schemas are compared semantically or through a narrowly documented canonicalizer
 | T-MCP-04 | Trace read/access/confidence/tagging, duplicate-add, feedback, session end and guide practice side effects. | Observable legacy effects are preserved or listed as explicit deviations; no hidden eventual-consistency change. |
 | T-CLI-01 | Exercise no-argument stdio, help/version, `-lib`/`--library`, `-vis`/`--visualize`, foreground/port options and install-skill behavior. | Correct alias behavior, exit status and clean protocol stdout; unsupported visualizer behavior is not advertised. |
 | T-HOOK-01 | Parse `hook-inject`/`hook-extract`/`install-hooks`; disabled-by-default gate; fail-open exit 0 on unreachable daemon; inject surfaces seeded titles; extract stores findings idempotently; secrets never stored; snippet renders for claude-code. | Passive recall/capture without changing the explicit-tools contract; no hook blocks a session; budget reuse holds. |
-| T-SHAPE-01 | Render same snapshot from shuffled inputs (byte-identical); defer/replay prefix identity + version-skew refusal + char-boundary safety; tier boundaries + monotonicity; single-flight coalescing; compartment order/budget/pinned pins; store-unchanged-after-render. | Recall shaping is deterministic, budget-capped, presentation-only; canonical state untouched. |
-| T-HOST-01 | Use each claimed host/version to discover tools/skill, invoke recall/write, reconnect and preserve session scope. | Record actual supported behavior; installation alone does not count as discovery or workflow activation. |
+| T-MCIMPORT-01 | Fence matrix (supported/newer/WAL/unchanged); scope matrix (unknown harness/traversal/non-repo/same-path-different-roots); row mapping (loss/active/refusal/determinism); preview/confirm via CLI (digest-bound, rerun-safe, secret-free). | Read-only import with zero silent drops; additive confirm is idempotent. |
 
 ### 5.3 Per-tool conformance matrix
 

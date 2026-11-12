@@ -68,4 +68,4 @@ members = [".", "crates/domain", "crates/service", "crates/compat", "crates/embe
 # crates/lemma-import is NOT a member: it owns the only rusqlite edge and
 # builds as a runtime-loaded cdylib, so it stays out of the main
 # dependency tree (Wave B5c; never a build-time dependency).
-exclude = ["crates/lemma-import"]
+exclude = ["crates/lemma-import", "crates/mc-import"]

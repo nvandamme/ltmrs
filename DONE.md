@@ -2,10 +2,13 @@
 
 Work completed on the current unreleased commit.
 Content before `---` is instructions — do not modify. Add entries after `## Unreleased Commit`
-- Slice D defer-scheduler (presentation-only recall shaping, TDD RED-first):
-- D1 seam memo (no code): shaping seam is `build_instructions_index` (mcp.rs:136, confidence sort + top-8/top-5 fixed format); secondary seam `shape_result` noted out-of-scope; forbidden-files list pinned in spec.
-- D2 byte-identity: RED proved unstable `sort_by` tie order varies bytes (A/B vs B/A); GREEN via confidence-desc/id-asc tiebreak; `defer.rs` (deterministic renderer, `defer_key` char-boundary safe, `replay` prefix-assert + `RENDER_VERSION` skew refusal); 7 defer + 3 index tests.
-- D3 tiers + single-flight: `tier.rs` (`recall_importance` = conf×0.7 + capped-access×0.3; Drop<0.2/<64B, stale>180d→≤Pointer, <256B→≤Pointer, ≥0.6 Full/≥0.35 Summary/Pointer; monotone pinned); `singleflight.rs` (tokio Mutex per codebase precedent; Send bounds; coalescing); 6 + 3 tests. Real bug found: std MutexGuard !Send across await → tokio Mutex.
-- D4 compartments: Pinned/RecentFull/Summarized/PointerOnly, order-preserving, budget-degrading (never drops pinned, never reorders), input-untouched; 4 tests.
-- D5 plan-authority one-review: Part I §11.4 shaping spec + §11.5 renumber, Part II WP-10 task, Part III T-SHAPE-01, RQ-15 evidence+test; spec at `plans/2026-11-12-slice-d-defer-scheduler-spec.md`.
-- Proof: frontend lib 158/158, daemon lib 355/355; fmt clean; workspace clippy -D warnings clean.
+
+---
+## Unreleased Commit
+- Slice C Magic Context bridge (read-only import, TDD RED-first):
+- C1 reader + version fence: excluded `crates/mc-import` (own workspace, cdylib, own rusqlite edge); `open_readonly_copy` (tempfile copy, magic+WAL check, query_only, source-unchanged); `MAX(version)` fence v95 (matches upstream `LATEST_SUPPORTED_VERSION`); fixture builder. Tests: supported/newer-refuses/WAL-refuses/unchanged (4/4).
+- C2 scope mapping: `scope.rs` reads `session_projects`; closed harness vocabulary (opencode/opencode2/pi/omp/claude-code); absolute-path + `..` + non-repo + symlink-escape refusals; git-root canonicalization; same-path-different-roots differ. Tests: 4/4 (11/11 mc-import total with C1+C3).
+- C3 row mapping: `map.rs` McMemory->Memory (external_alias `mc:{id}`, UUIDv5 deterministic ids, tags `mc-category:*`, loss for importance/scope/seen/retrieval; non-active refuses loudly; embeddings opaque).
+- C4 CLI + atomic publish: `skills/mc_import.rs` dlopen loader (candidate paths + env override, mirrors lemma_import); preview (staging JSON -> counts/digest/loss/scopes); `confirm`/`confirm_staged` (digest-bound, memory_add fan-out, rerun-safe); `mc-import preview|confirm` CLI verbs + dispatch + help; hermetic tests (pure parse, candidate error, live confirm 2-applied + rerun-0).
+- C5 plan-authority one-review: Part I §11.6, WP-10 task, T-MCIMPORT-01, RQ-16 evidence+test; no daemon/compat change (CLI-first per OQ-C4).
+- Proof: mc-import 11/11, frontend lib 164/164, daemon lib 355/355; fmt clean; workspace clippy -D warnings clean.

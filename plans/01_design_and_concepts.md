@@ -440,6 +440,9 @@ Recall shaping renders canonical state for prompts; it never mutates it. The sha
 
 A `.ltmrs-backup` is not a `.lemma-backup`. The compatibility release includes an actual reader for supported Lemma backup/schema versions and an explicit loss-accounted legacy export path. Native-only metadata is preserved in native exports and identified in the legacy export report. Do not rename the extension and call it interoperable.
 
+### 11.6 Magic Context bridge (Slice C, read-only import)
+
+A Magic Context import is never a merge into canonical semantics: it stages a private read-only copy (source hash-checked before/after), refuses version skew and WAL-mode sources fail-closed, maps rows with loss accounting (no coerced quality, no fake memories for commits), and confirms additively via existing `memory_add` (deterministic ids + server Jaccard dedup = safe reruns). The `rusqlite` edge lives in an excluded cdylib crate, mirroring the lemma-import isolation. CLI-first: no new MCP tool, no daemon/compat change.
 ## 12. Safety, backup and lifecycle
 
 ### 12.1 Privacy and integrity

@@ -60,6 +60,15 @@ pub enum Command {
     HookExtract,
     /// Install the opt-in hook snippets + enable hooks.json.
     InstallHooks,
+    /// Preview an MC database import (read-only staging, no store touch).
+    McImportPreview {
+        path: String,
+    },
+    /// Confirm an MC import (re-stage, bind digest, fan out memory_add).
+    McImportConfirm {
+        path: String,
+        digest: String,
+    },
     ProvisionModels,
     /// Print help to stdout.
     Help,
@@ -117,6 +126,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         HookInject,
         HookExtract,
         InstallHooks,
+        McImport,
     }
     let mut selected: Option<Selected> = None;
     let mut select = |next: Selected| -> Result<(), CliError> {
@@ -141,6 +151,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
     let mut project_name: Option<String> = None;
     let mut project_slug: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
+    let mut mc_digest: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -189,6 +200,12 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                     .ok_or_else(|| CliError::Usage("--name requires a value".to_string()))?;
                 project_name = Some(reject_flag_value("--name", raw)?);
             }
+            "--digest" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--digest requires a value".to_string()))?;
+                mc_digest = Some(reject_flag_value("--digest", raw)?);
+            }
             "--slug" => {
                 let raw = args
                     .next()
@@ -209,6 +226,18 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         }
     }
     if !positional.is_empty() {
+        // Slice C: `mc-import preview <path>` / `mc-import confirm <path>`.
+        if positional.len() == 3
+            && positional[0] == "mc-import"
+            && (positional[1] == "preview" || positional[1] == "confirm")
+        {
+            if selected.is_some() {
+                return Err(CliError::Usage(
+                    "commands are mutually exclusive; pick one".to_string(),
+                ));
+            }
+            selected = Some(Selected::McImport);
+        } else
         // Project subcommand: `project bind|status` (positionals, since the
         // top-level parser is flag-oriented). Anything else stays an error.
         if positional.len() == 2
@@ -383,6 +412,51 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 )),
             }
         }
+        Some(Selected::McImport) => {
+            if store.is_some()
+                || socket.is_some()
+                || foreground
+                || port.is_some()
+                || daemon_foreground
+                || daemon_idle_ms.is_some()
+                || here
+                || project_root.is_some()
+                || project_name.is_some()
+                || project_slug.is_some()
+            {
+                return Err(CliError::Usage(
+                    "mc-import takes only preview|confirm, a path and --digest (confirm)"
+                        .to_string(),
+                ));
+            }
+            let action = positional.get(1).map(|s| s.as_str());
+            let path = positional.get(2).cloned().ok_or_else(|| {
+                CliError::Usage(
+                    "mc-import needs a path: mc-import preview|confirm <path>".to_string(),
+                )
+            })?;
+            match action {
+                Some("preview") => {
+                    if mc_digest.is_some() {
+                        return Err(CliError::Usage(
+                            "--digest is for mc-import confirm, not preview".to_string(),
+                        ));
+                    }
+                    Ok(Command::McImportPreview { path })
+                }
+                Some("confirm") => {
+                    let digest = mc_digest.ok_or_else(|| {
+                        CliError::Usage(
+                            "mc-import confirm needs --digest <digest> from preview".to_string(),
+                        )
+                    })?;
+                    Ok(Command::McImportConfirm { path, digest })
+                }
+                _ => Err(CliError::Usage(
+                    "mc-import requires preview or confirm".to_string(),
+                )),
+            }
+        }
         None => {
             if store.is_some() {
                 return Err(CliError::Usage(
@@ -453,6 +527,10 @@ Commands (default with no arguments: stdio):
   --install-skill         Install/update the managed skill
   --install-shim          Install the opt-in legacy `lemma` shim
   hook-inject             Inject budget-capped recall (host session hook, stdin JSON)
+  mc-import preview       Preview a Magic Context import (read-only, no store touch)
+                          <path>
+  mc-import confirm       Confirm a previewed MC import [--digest DIGEST]
+                          <path> (additive memory_add fan-out)
   hook-extract            Extract findings from transcript tail (host hook, stdin JSON)
   install-hooks           Install opt-in host hook snippets + enable hooks
   --provision-models      Download + verify pinned E5 embedding artifacts
@@ -717,6 +795,68 @@ pub async fn project_bind_command(
 /// Install opt-in hook snippets: writes `<home>/.ltmrs/hooks.json`
 /// (`{"enabled":true}`) and prints the host snippet paste instructions.
 /// Refusals are runtime errors (foreign content blocks silently overwriting).
+/// Preview an MC database import (read-only staging, no store touch).
+pub fn mc_import_preview_command(path: String) -> Result<String, CliError> {
+    use crate::skills::mc_import::preview;
+    let rep = preview(std::path::Path::new(&path))
+        .map_err(|e| CliError::Runtime(format!("mc-import preview failed: {e}")))?;
+    let mut out = format!(
+        "MC import preview: {} memories, {} loss item(s), digest {}\nScopes:\n",
+        rep.memory_count, rep.loss_count, rep.digest
+    );
+    for (harness, root) in &rep.scopes {
+        out.push_str(&format!("  harness={harness} root={root}\n"));
+    }
+    out.push_str("Confirm imports a copy (never moves): call mc-import confirm with --digest.");
+    Ok(out)
+}
+
+/// Confirm an MC import: re-stage, bind digest, fan out memory_add.
+pub async fn mc_import_confirm_command(
+    home: Option<String>,
+    path: String,
+    digest: String,
+) -> Result<String, CliError> {
+    use crate::frontend::mcp::{FrontendIdentity, LtmrsFrontend};
+    use crate::frontend::serve::daemon::{connect_remote, daemon_socket_path};
+    use crate::frontend::serve::{resolve_home, stdio_layout};
+    use crate::skills::mc_import::confirm;
+    use ltmrs_daemon::envelope::{HandshakeRequest, PROTOCOL_VERSION};
+    use ltmrs_domain::id::{ChannelId, FrontendId, StoreGeneration};
+
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        CliError::Runtime(format!(
+            "{} is not set",
+            crate::frontend::serve::home_env_name()
+        ))
+    })?;
+    let base = resolve_home(Some(home)).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let layout = stdio_layout(&base);
+    let socket = daemon_socket_path(&layout);
+    let mut client = connect_remote(&socket.to_string_lossy())
+        .await
+        .map_err(|e| CliError::Runtime(format!("daemon unavailable: {e}")))?;
+    let frontend_id = FrontendId::new(uuid::Uuid::now_v7());
+    let channel_id = ChannelId::new(uuid::Uuid::now_v7());
+    client
+        .handshake(&HandshakeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            store_generation: StoreGeneration::FIRST,
+            frontend_id,
+            channel_id,
+            resume_retry_epoch: None,
+        })
+        .await
+        .map_err(|e| CliError::Runtime(format!("daemon handshake failed: {e}")))?;
+    let fe = LtmrsFrontend::new(FrontendIdentity::new(frontend_id, channel_id), client);
+    let (applied, rejected) = confirm(&fe, std::path::Path::new(&path), &digest)
+        .await
+        .map_err(|e| CliError::Runtime(format!("mc-import confirm failed: {e}")))?;
+    Ok(format!(
+        "MC import confirmed: {applied} applied, {rejected} rejected (reruns dedup via server Jaccard)."
+    ))
+}
+
 pub fn install_hooks_command(home: Option<String>) -> Result<String, CliError> {
     use crate::skills::hooks::{InstallOutcome, hook_snippet, hooks_config_path, install_hooks};
 
@@ -1339,6 +1479,25 @@ mod tests {
         ));
     }
 
+    /// mc-import parses preview/confirm with path; digest only for confirm.
+    #[test]
+    fn mc_import_parses() {
+        assert!(matches!(
+            parse(&["mc-import", "preview", "/tmp/x.db"]).unwrap(),
+            Command::McImportPreview { .. }
+        ));
+        assert!(matches!(
+            parse(&["mc-import", "confirm", "/tmp/x.db", "--digest", "abc"]).unwrap(),
+            Command::McImportConfirm { .. }
+        ));
+        // confirm without digest errors; preview with digest errors.
+        assert!(parse(&["mc-import", "confirm", "/tmp/x.db"]).is_err());
+        assert!(parse(&["mc-import", "preview", "/tmp/x.db", "--digest", "abc"]).is_err());
+        // wrong arity or verb errors.
+        assert!(parse(&["mc-import", "preview"]).is_err());
+        assert!(parse(&["mc-import", "frobnicate", "/tmp/x.db"]).is_err());
+    }
+
     /// Project needs a subcommand; selectors conflict; project conflicts
     /// with every other command.
     #[test]
@@ -1367,6 +1526,15 @@ mod tests {
             parse(&["install-hooks"]).unwrap(),
             Command::InstallHooks
         ));
+    }
+
+    /// Help documents the Slice C mc-import surface.
+    #[test]
+    fn help_documents_mc_import() {
+        let help = help_text();
+        for flag in ["mc-import", "preview", "confirm", "--digest"] {
+            assert!(help.contains(flag), "help must document {flag}");
+        }
     }
 
     /// Help documents the Slice B hook surface.

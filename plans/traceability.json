@@ -456,10 +456,11 @@
       "owner_workpackage": "WP-01",
       "tests": [
         "T-DATA-01",
-        "T-IMPORT-01"
+        "T-IMPORT-01",
+        "T-MCIMPORT-01"
       ],
       "status": "executed_partial",
-      "evidence": "T-DATA-01: domain model + serialization round-trip (domain tests pass). T-IMPORT-01 deferred to WP-11 importer. Wave B2 guide reciprocal (provenance): practice_guide_idempotent patches each participating memory related_guides in the SAME transaction as the guide mutation + GuideUsed link + idempotency log (fresh reads inside the tx, reusing the distill_memory_link cross-record pattern; missing aliases skip, deduped, entity-only revision). Test: guide_practice_patches_related_guides (validated_by still correct)."
+      "evidence": "T-DATA-01: domain model + serialization round-trip (domain tests pass). T-IMPORT-01 deferred to WP-11 importer. Wave B2 guide reciprocal (provenance): practice_guide_idempotent patches each participating memory related_guides in the SAME transaction as the guide mutation + GuideUsed link + idempotency log (fresh reads inside the tx, reusing the distill_memory_link cross-record pattern; missing aliases skip, deduped, entity-only revision). Test: guide_practice_patches_related_guides (validated_by still correct). Slice C (MC read-only import): excluded crates/mc-import cdylib (own rusqlite edge, C ABI, version fence v95, WAL refusal, source-unchanged); scope mapping via session_projects (closed harness vocabulary, git-root, traversal/symlink refusal); loss-accounted row mapping (McMemory->Memory, opaque embeddings, McLoss); CLI-first mc-import preview|confirm (digest-bound, additive, rerun-safe); T-MCIMPORT-01 gates."
     },
     {
       "id": "RQ-17",
