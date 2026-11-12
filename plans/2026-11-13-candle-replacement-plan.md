@@ -99,6 +99,12 @@ Expected: a one-paragraph decision with numbers. Default hypothesis: Burn+CubeCL
 
 Append the decision + numbers to this plan. `rm -rf` the spike dir. No spike code enters the repo.
 
+**Spike outcome (2026-11-12, executed):**
+- Burn Flex: matmul correct (`[7.0, 10.0, 15.0, 22.0]`), seconds to build, zero CUDA `DT_NEEDED`. Programming model confirmed on Burn 0.22 idiom (`Device::new(DispatchDevice::Flex(FlexDevice))`, `burn-dispatch/flex` feature).
+- NVRTC via cudarc `dynamic-loading`: axpy kernel compiled + launched on live RTX 5090, correct (`y[0]=5`), zero CUDA `DT_NEEDED`.
+- **Decision: Burn with CubeCL for models** (NVRTC kernel path proven viable but the "largely better" perf bar is not met by an axpy; a full BERT port in raw NVRTC is maximum work with no proven need). NVRTC stays scoped to future specific-kernel work only on measured wins.
+- Spike dirs removed.
+
 ### Task 3: Trait seam hardening (no behavior change)
 
 **Files:**

@@ -5,7 +5,12 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: Candle link-coupling baseline (migration Task 1)
+## 2026-11-12 — feat: Candle migration Tasks 2+3 (spike decision + seam hardening)
+
+- Task 2 spike executed: Burn Flex matmul correct, NVRTC axpy on live RTX 5090 correct, both zero CUDA `DT_NEEDED`. **Decision: Burn with CubeCL for models** (NVRTC viable but the "largely better" bar unmet by an axpy; models never go raw-NVRTC). Recorded in-plan; spike dirs removed.
+- Task 3 seam hardening (TDD RED→GREEN): `seam_files_name_no_candle` pins worker/service/recipe free of candle types; `BackendInference(String)` neutral error variant added (Task 4 migrates the ~40 tensor call sites; artifacts.rs `#[from]` stays until then, explicitly tracked).
+- Proof: embeddings suite 32/32 green; fmt clean; clippy `-D warnings` clean.
+
 
 - Probe binary instantiating `Device::new_cuda(0)` carries `DT_NEEDED` on libcuda/libcurand/libcublas/libcudart (readelf-proven, 66s build). Candle 0.11.0 forces `dynamic-linking` (manifest line 176); CubeCL 0.11.2 uses `fallback-dynamic-loading` (lines 123/183). Violation recorded as the Task 6 gate's inversion target.
 

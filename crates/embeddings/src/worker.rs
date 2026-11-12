@@ -787,4 +787,40 @@ mod tests {
             "drained requests must release their in-flight slots"
         );
     }
+
+    /// Candle-replacement seam pin: the worker/service seam must not name
+    /// candle — the tensor core lives behind `SyncEmbedder` only.
+    /// RED: fails if any seam file imports candle types.
+    #[test]
+    fn seam_files_name_no_candle() {
+        // Task 3 scope: the trait boundary owners. artifacts.rs keeps
+        // its #[from] candle_core::Error until Task 4 rewrites the ~40
+        // tensor call sites (tracked there, not waived here).
+        for rel in ["src/worker.rs", "src/service.rs", "src/recipe.rs"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let text = std::fs::read_to_string(&path).unwrap();
+            // `candle::` paths and `candle_*` idents only (the word
+            // appears in this very test's docs by necessity).
+            // Skip this test fn's own lines (it necessarily names the
+            // patterns it guards against); scan the rest of the file.
+            let in_test = text
+                .match_indices("fn seam_files_name_no_candle")
+                .map(|(i, _)| i)
+                .next()
+                .unwrap_or(usize::MAX);
+            let leaks = text
+                .lines()
+                .enumerate()
+                .filter(|(i, l)| {
+                    let off: usize = text.lines().take(*i).map(|l| l.len() + 1).sum();
+                    off < in_test && (l.contains("candle::") || l.contains("candle_"))
+                })
+                .map(|(i, _)| i + 1)
+                .collect::<Vec<_>>();
+            assert!(
+                leaks.is_empty(),
+                "seam file {rel} must not name candle types/idents (lines {leaks:?})"
+            );
+        }
+    }
 }
