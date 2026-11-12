@@ -2,10 +2,10 @@
 
 Work completed on the current unreleased commit.
 Content before `---` is instructions — do not modify. Add entries after `## Unreleased Commit`
-- Slice B silent-capture hooks (opt-in passive recall/capture, explicit-tools contract unchanged) — all 5 phases, TDD RED-first:
-- Phase 1: `hook-inject`/`hook-extract`/`install-hooks` CLI subcommands (mutually exclusive positional words); `help_text` documents all three; `skills/hooks.rs` gate (missing/unparseable config => disabled); main dispatch arms (Unimplemented until Phases 2-4 landed). Tests: `hook_subcommands_parse`, `help_documents_hooks`.
-- Phase 2: inject attaches to the RUNNING daemon over its socket (never spawns — singleton lock); handshake + frontend share ephemeral ids (fixes `frontend_mismatch` found RED); lexical `semantic_search` top-5, 5s timeout, 4k-char cap, fail-open. Test: `hook_inject_returns_matching_recall_live` (live seeded daemon).
-- Phase 3: extract tails transcript to 8KB, splits DECISION/LESSON/FACT/NOTE candidates (<=5), secret pre-filter, one `memory_add` each (`source: hook-extract`, server Jaccard dedups reruns). Tests: store + rerun-idempotent + secret-excluded.
-- Phase 4: `install_hooks` atomic write with version marker (`Installed`/`AlreadyCurrent`/`RefusedForeign`); `hook_snippet("claude-code")` template; `install_hooks_command` + main wiring + stdin-JSON helpers; skill doc opt-in paragraph (workflow list byte-identical, pins green). Tests: installer + snippet.
-- Phase 5: plan-authority one-review — Part I §11.3 hooks principle, Part II WP-10 task, Part III T-HOOK-01, RQ-25 evidence+test, spec at `plans/2026-11-12-slice-b-silent-capture-hooks-spec.md` (tracked; `.kilo/` rejected per user order).
-- Proof: frontend lib 137/137, daemon lib 355/355; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -D warnings` clean.
+- Slice D defer-scheduler (presentation-only recall shaping, TDD RED-first):
+- D1 seam memo (no code): shaping seam is `build_instructions_index` (mcp.rs:136, confidence sort + top-8/top-5 fixed format); secondary seam `shape_result` noted out-of-scope; forbidden-files list pinned in spec.
+- D2 byte-identity: RED proved unstable `sort_by` tie order varies bytes (A/B vs B/A); GREEN via confidence-desc/id-asc tiebreak; `defer.rs` (deterministic renderer, `defer_key` char-boundary safe, `replay` prefix-assert + `RENDER_VERSION` skew refusal); 7 defer + 3 index tests.
+- D3 tiers + single-flight: `tier.rs` (`recall_importance` = conf×0.7 + capped-access×0.3; Drop<0.2/<64B, stale>180d→≤Pointer, <256B→≤Pointer, ≥0.6 Full/≥0.35 Summary/Pointer; monotone pinned); `singleflight.rs` (tokio Mutex per codebase precedent; Send bounds; coalescing); 6 + 3 tests. Real bug found: std MutexGuard !Send across await → tokio Mutex.
+- D4 compartments: Pinned/RecentFull/Summarized/PointerOnly, order-preserving, budget-degrading (never drops pinned, never reorders), input-untouched; 4 tests.
+- D5 plan-authority one-review: Part I §11.4 shaping spec + §11.5 renumber, Part II WP-10 task, Part III T-SHAPE-01, RQ-15 evidence+test; spec at `plans/2026-11-12-slice-d-defer-scheduler-spec.md`.
+- Proof: frontend lib 158/158, daemon lib 355/355; fmt clean; workspace clippy -D warnings clean.

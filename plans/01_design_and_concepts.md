@@ -430,9 +430,13 @@ Ship a managed ltmrs skill and an explicit legacy-skill installation path. Recor
 
 Treat installation, host discovery, model activation and workflow behavior as four separate outcomes. Test host versions explicitly. No promise that every host reads `~/.agents/skills` identically. The native skill may describe multilingual recall; the legacy skill's English-only instruction must be preserved or listed as an intentional workflow enhancement. [S06]
 
-Opt-in host hooks (`hook-inject`/`hook-extract`, Slice B) close the passive-recall gap without changing the explicit-tools contract: disabled by default, fail-open always (exit 0, empty stdout on any failure), budget reuse via the existing per-call `scan_snapshot` bound (§10.2a) — never a new budget. `hook-extract` writes only via `memory_add` (server Jaccard dedups reruns; never update/forget/distill from a hook). Host snippets are install-time templates (claude-code verified; others documented-not-verified).
+Opt-in host hooks (`hook-inject`/`hook-extract`, Slice B) close the passive-recall gap without changing the explicit-tools contract: disabled by default, fail-open always (exit 0, empty stdout on any failure); budget reuse via the existing per-call `scan_snapshot` bound (§10.2a) — never a new budget. `hook-extract` writes only via `memory_add` (server Jaccard dedups reruns; never update/forget/distill from a hook). Host snippets are install-time templates (claude-code verified; others documented-not-verified).
 
-### 11.4 Data interchange
+### 11.4 Recall shaping (Slice D, presentation-only)
+
+Recall shaping renders canonical state for prompts; it never mutates it. The shaping seam is `build_instructions_index` (`crates/frontend/src/frontend/mcp.rs:136`): confidence-desc, id-asc deterministic order (D2 byte-identity pin), top-8 project + top-5 global rows. Defer/replay (`crates/frontend/src/frontend/defer.rs`): renderers are deterministic; `replay` asserts byte-prefix identity; a renderer change bumps `RENDER_VERSION` and old handles refuse. Tier function (`tier.rs`): `recall_importance` = confidence×0.7 + capped-access×0.3; `tier(age, importance, render_budget)` monotone (importance<0.2→Drop; age>180d→≤Pointer; budget<64B→Drop, <256B→≤Pointer; else ≥0.6 Full, ≥0.35 Summary, Pointer). Compartments (`compartments.rs`): Pinned/RecentFull/Summarized/PointerOnly, order-preserving, budget-degrading, pinned never dropped. Single-flight coalesces concurrent identical renders. Forbidden: dispatcher, domain command/receipt, service admission/budgets, scan-cache, `injection_score`/ranking, embedding/search pipelines. RV-17 holds: shaping persists no read side effects.
+
+### 11.5 Data interchange
 
 A `.ltmrs-backup` is not a `.lemma-backup`. The compatibility release includes an actual reader for supported Lemma backup/schema versions and an explicit loss-accounted legacy export path. Native-only metadata is preserved in native exports and identified in the legacy export report. Do not rename the extension and call it interoperable.
 

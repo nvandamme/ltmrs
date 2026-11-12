@@ -5,7 +5,18 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: Slice B silent-capture hooks (passive recall/capture, opt-in)
+## 2026-11-12 — feat: Slice D defer-scheduler (presentation-only recall shaping)
+
+- D1 seam memo (no code): `build_instructions_index` (mcp.rs:136) is the single shaping seam; `shape_result` noted out-of-scope; forbidden-files list pinned.
+- D2 byte-identity: RED proved unstable sort tie order varies bytes; GREEN via confidence-desc/id-asc tiebreak; `defer.rs` (deterministic renderer, char-boundary `defer_key`, prefix-asserting `replay`, `RENDER_VERSION` skew refusal).
+- D3 tiers + single-flight: `tier.rs` (monotone tiers, `recall_importance`); `singleflight.rs` (tokio Mutex, coalescing). Real bug: std MutexGuard !Send → tokio Mutex per precedent.
+- D4 compartments: Pinned/RecentFull/Summarized/PointerOnly, order-preserving, budget-degrading.
+- D5 plan-authority one-review (Part I §11.4, WP-10 task, T-SHAPE-01, RQ-15); specs for A/C/D staged in `plans/`.
+- Proof: frontend lib 158/158, daemon lib 355/355; fmt clean; workspace clippy -D warnings clean.
+
+---
+
+## 0e21ce6 (2026-11-12) — feat: Slice B silent-capture hooks (passive recall/capture, opt-in)
 
 - Phase 1: `hook-inject`/`hook-extract`/`install-hooks` CLI subcommands; `skills/hooks.rs` disabled-by-default gate; main dispatch arms.
 - Phase 2: inject attaches to the running daemon via socket (singleton-safe); shared handshake/envelope ids (fixes `frontend_mismatch`); lexical top-5 recall, 5s timeout, fail-open.

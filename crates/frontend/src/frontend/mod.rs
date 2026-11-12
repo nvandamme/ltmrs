@@ -5,6 +5,9 @@
 //! typed IPC envelope. This module wires the rmcp `ServerHandler` to the IPC
 //! client and keeps the routing logic testable.
 
+pub mod compartments;
+pub mod defer;
 pub mod mcp;
-
 pub mod serve;
+pub mod singleflight;
+pub mod tier;

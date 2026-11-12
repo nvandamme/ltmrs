@@ -152,10 +152,14 @@ fn build_instructions_index(memories: &[Memory], project: Option<&str>) -> Strin
     }
     if !proj.is_empty() {
         let mut proj = proj;
+        // Slice D D2: deterministic order — confidence desc, id asc
+        // tiebreak. `sort_by` is unstable: ties without a total order
+        // render input-order-dependent bytes, breaking defer/replay.
         proj.sort_by(|a, b| {
             b.confidence
                 .partial_cmp(&a.confidence)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
         });
         let name = project.unwrap_or("current");
         index.push_str(&format!("- Project \"{name}\": {} fragments\n", proj.len()));
@@ -177,6 +181,7 @@ fn build_instructions_index(memories: &[Memory], project: Option<&str>) -> Strin
             b.confidence
                 .partial_cmp(&a.confidence)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
         });
         index.push_str(&format!("- Global: {} fragments\n", global.len()));
         for f in global.iter().take(5) {
@@ -1117,6 +1122,35 @@ mod tests {
                 *has_os,
                 "output_schema presence drift: {name}"
             );
+        }
+    }
+
+    /// Slice D D2 RED: renderer is byte-identical regardless of input
+    /// order — ties broken deterministically (id), never by sort
+    /// instability. Fails while `sort_by` (unstable) is used.
+    #[test]
+    fn instructions_index_byte_identical_regardless_of_order() {
+        let a = vec![
+            mem(1, Some("proj"), 0.9, "Same A"),
+            mem(2, Some("proj"), 0.9, "Same B"),
+            mem(3, None, 0.8, "Same C"),
+            mem(4, None, 0.8, "Same D"),
+        ];
+        let b = vec![
+            mem(4, None, 0.8, "Same D"),
+            mem(2, Some("proj"), 0.9, "Same B"),
+            mem(1, Some("proj"), 0.9, "Same A"),
+            mem(3, None, 0.8, "Same C"),
+        ];
+        let ra = build_instructions_index(&a, Some("proj"));
+        let rb = build_instructions_index(&b, Some("proj"));
+        assert_eq!(ra, rb, "input order must not change bytes");
+        // Run several times: unstable sort may vary run to run.
+        for _ in 0..8 {
+            let ra2 = build_instructions_index(&a, Some("proj"));
+            let rb2 = build_instructions_index(&b, Some("proj"));
+            assert_eq!(ra2, rb2, "input order must not change bytes");
+            assert_eq!(ra, ra2, "same input must render identically");
         }
     }
 

@@ -614,7 +614,6 @@ mod tests {
         daemon.shutdown();
     }
 
-
     /// Slice B Phase 4 RED: install writes hooks.json; rerun is
     /// AlreadyCurrent; foreign content is refused.
     #[test]
