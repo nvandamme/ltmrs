@@ -149,11 +149,26 @@ impl E5SmallAdapter {
         ))
     }
 
-    /// CubeCL CUDA device, probed with one tiny op so a missing/broken
-    /// loader fails here — loudly — instead of mid-inference. The error
-    /// names the library family (`libcuda`) the loader could not resolve.
+    /// Non-initializing loader probe: true iff `libcuda` resolves right now.
+    /// cudarc's `is_culib_present` only `dlopen`-probes candidate sonames —
+    /// it never initializes a context, so a missing driver returns false
+    /// instead of the panic a real init raises.
+    #[cfg(feature = "cuda")]
+    fn cuda_loader_present() -> bool {
+        // SAFETY: probe only, no state, no init (cudarc documents this as
+        // the pre-check before any initializing call).
+        unsafe { cudarc::driver::sys::is_culib_present() }
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_device() -> Result<Device, String> {
+        if !Self::cuda_loader_present() {
+            return Err(
+                "CUDA inference requested but no CUDA driver library (libcuda.so.1) \
+                 resolves on this host; install the NVIDIA driver or use DeviceMode::Cpu"
+                    .into(),
+            );
+        }
         let device = Device::new(burn_dispatch::device::DispatchDevice::Cube(
             burn_cubecl::cubecl::Device::Cuda(Default::default()),
         ));

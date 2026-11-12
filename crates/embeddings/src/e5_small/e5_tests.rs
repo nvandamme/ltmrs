@@ -885,8 +885,10 @@ fn device_policy_cuda_without_feature_is_loud() {
     }
     #[cfg(feature = "cuda")]
     {
-        // On a CUDA host this loads a GPU adapter; the driverless-CI leg
-        // covers the loud-error branch.
+        // On a CUDA host this loads a GPU adapter; on a driverless box the
+        // loader pre-check returns a loud libcuda error (never a panic, never
+        // a silent CPU fallback). Both branches assert here so the test is
+        // meaningful on either host.
         let adapter = E5SmallAdapter::load_verified_auto(&dir, DeviceMode::Cuda);
         match adapter {
             Ok(a) => assert!(!a.is_cpu(), "Cuda mode on a CUDA host must not be CPU"),

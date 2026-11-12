@@ -6168,6 +6168,7 @@ dependencies = [
  "burn-flex",
  "burn-nn",
  "burn-tensor",
+ "cudarc",
  "half",
  "ltmrs-domain",
  "ltmrs-search",

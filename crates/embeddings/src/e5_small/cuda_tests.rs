@@ -23,10 +23,17 @@ use crate::recipe::Role;
 use burn_tensor::Device;
 
 /// LOUD device acquisition: the CubeCL CUDA device constructs lazily, so
-/// probe it by running one tiny op — a GPU-less box (or missing CUDA
-/// loader) panics here instead of silently skipping, so `--features cuda`
-/// on a CUDA-less host cannot go green.
+/// probe the loader first (non-initializing — returns false instead of the
+/// panic a real init raises on a driverless box), then run one tiny op.
+/// A GPU-less box (or missing CUDA loader) panics here instead of silently
+/// skipping, so `--features cuda` on a CUDA-less host cannot go green.
 fn cuda_device_or_fail() -> Device {
+    // SAFETY: dlopen-probe only, no init (cudarc pre-check API).
+    let present = unsafe { cudarc::driver::sys::is_culib_present() };
+    assert!(
+        present,
+        "CUDA device required for --features cuda GPU tests: no CUDA driver library          (libcuda.so.1) resolves on this host; run these tests on a CUDA host or drop the `cuda` feature"
+    );
     let device = Device::new(burn_dispatch::device::DispatchDevice::Cube(
         burn_cubecl::cubecl::Device::Cuda(Default::default()),
     ));

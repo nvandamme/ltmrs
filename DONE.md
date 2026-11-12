@@ -19,3 +19,9 @@
 - `tools/check_cuda_link.sh` (NEW): fails on any CUDA `DT_NEEDED`. Green on both builds: default `target/debug/ltmrs` AND `--features ltmrs-embeddings/cuda` root binary (no red baseline possible — migration already complete; both greens are the mechanism proof).
 - Explicit device policy: `DeviceMode::{Auto,Cpu,Cuda}` + `load_verified_auto` + `is_cpu()` (`e5_small/adapter.rs`); `Cuda` probes with a tiny op, loud `libcuda` error; `Cpu` never touches the loader; `Auto` probes and reports. 4 new policy tests green (default features); classifier pinned against Burn Debug-format drift.
 - GPU envelope re-baselined for Burn/CubeCL: `MAX_ABS_DIFF = 1e-6` → `1e-4` (measured worst 5.96e-5 case 0; worst cos 0.99999952 case 2), worst-over-cases tracking, rank top-3 identical. Release-profile re-run deferred to WP-13 evidence.
+
+### Deferred legs executed locally (no CI on this project — 2026-11-12)
+
+- Release-profile GPU parity: `cargo test --release -p ltmrs-embeddings --features cuda --lib cuda_` 4/4 green vs wheel dir (`LD_LIBRARY_PATH=/tmp/cudawheel`); worst cos=0.99999952 / max-abs=5.96e-5 — envelope (`1e-4`) unaffected by optimization.
+- Driverless simulation (userns + bind-masked `libcuda*/libnvidia-ptx*` + system-toolkit libs, `LD_LIBRARY_PATH` wheel-only): `Auto` resolves `cpu=true` and embeds (no panic); `Cuda` returns `Err` naming `libcuda.so.1` (loader pre-check via cudarc `is_culib_present` — a real init panics inside cudarc, found here); `cuda_` gate panics loud at its assert (no silent skip).
+- Fix from the sim: direct `cudarc` pin (`driver/std/fallback-dynamic-loading` only) for the non-initializing probe; `cuda_tests::cuda_device_or_fail` pre-checks the loader before the tiny-op probe. cudarc feature set stays link-free (driver/nvrtc/nccl/std + fallback-dynamic-loading + version probes only).

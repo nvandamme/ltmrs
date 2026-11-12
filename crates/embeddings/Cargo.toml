@@ -12,6 +12,14 @@ burn-dispatch = { version = "0.22", features = ["flex"] }
 # CubeCL CUDA runtime (dynamic loading only via fallback-dynamic-loading;
 # zero link-time CUDA — Task 6 gates this). Enabled only under `cuda`.
 burn-cubecl = { version = "0.22", optional = true }
+# Direct cudarc pin: runtime loader probe (`is_culib_present`) only.
+# Dynamic loading exclusively (fallback-dynamic-loading) — the Task 6 gate
+# and `cargo tree -e features` forbid dynamic-linking/static-linking.
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "driver",
+    "std",
+    "fallback-dynamic-loading",
+] }
 burn-flex = { version = "0.22" }
 safetensors = { version = "0.4" }
 half = { version = "2.7", default-features = false }
@@ -32,4 +40,4 @@ ltmrs-search = { path = "../search" }
 # stays CPU (see E5SmallAdapter::load_verified); the CUDA path is only
 # reachable via the explicit load_verified_on_device constructor below.
 # Burn CubeCL CUDA runtime (dynamic loading only via fallback-dynamic-loading).
-cuda = ["burn-dispatch/cuda", "burn-cubecl/cuda", "dep:burn-cubecl"]
+cuda = ["burn-dispatch/cuda", "burn-cubecl/cuda", "dep:burn-cubecl", "dep:cudarc"]
