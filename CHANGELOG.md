@@ -5,7 +5,12 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — fix: gate-visible wordlist salt + corrected lemma-salted verdict
+## 2026-11-12 — fix: contention-invariant in closed-loop bench (`all ok`, not zero conflicts)
+
+- Bug: `closed_loop_executes_every_op` flaked 1/15 under machine load at `conflicts == 0`. Root cause: every `put_memory_direct` bumps the shared `memory` op-seq key in-tx → strided workers genuinely abort (SSI) even on distinct keys; load widens the window past internal `MAX_RETRIES=8`. Store converges correctly; the invariant was wrong.
+- Fix: convergence invariant (`all ok` with failure detail) + conflicts as telemetry. A first attempt (`retries == conflicts`) was rejected mid-task: `retries` is RMW-loser-scoped (hardcoded 0 for puts). Verified 25/25 under CPU load.
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - Correction: the f9220bf salted run's numeric trailer was gate-invisible (constant words + length-1 digit filtered pre-score → 8/8=1.0 always). Upstream gate read from code: `findSimilarByText` (lemma `memory/core.js:778`) scores `overlap / |query len>1 words|`, refuses at ≥0.80.
 - Fix (TDD): `salt_words` 64-word list (xorshift taps) → `Salt {a} {b} {c}` trailer; RED test `salt_words_are_gate_visible` pre-fix; 3 salt tests green post-fix; old trailer assertions updated.
