@@ -285,6 +285,9 @@ pub struct MemoryLibraryArgs {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BackupCreateArgs {
     pub directory: Option<String>,
+    /// Optional per-call byte bound (overrides the 128 MiB default for
+    /// large tiers; must be positive when present).
+    pub max_bytes: Option<u64>,
 }
 
 /// backup_preview arguments (ltmrs-native tool).
@@ -308,6 +311,8 @@ pub struct BackupRestoreArgs {
 pub struct BackupImportLemmaArgs {
     pub path: Option<String>,
     pub confirm: Option<bool>,
+    /// Optional cdylib override (CLI-first `--import-lib`; replaces the env override).
+    pub import_lib: Option<String>,
 }
 
 /// memory_edit arguments (ltmrs-native omp-compat tool; mirrors omp
@@ -785,6 +790,7 @@ mod tests {
             ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
                 path: None,
                 confirm: None,
+                import_lib: None,
             })
             .mutates_store()
         );
@@ -792,6 +798,7 @@ mod tests {
             super::tool_project(&ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
                 path: None,
                 confirm: None,
+                import_lib: None,
             })),
             None
         );

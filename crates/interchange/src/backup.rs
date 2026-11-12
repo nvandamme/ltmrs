@@ -22,13 +22,11 @@ pub const BACKUP_EXTENSION: &str = "ltmrs-backup";
 /// enforced on read so a hostile file cannot exhaust memory).
 pub const MAX_BACKUP_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Effective backup byte bound: `LTMRS_MAX_BACKUP_BYTES` overrides the
-/// default when it parses as a positive u64 (100k-memory tiers need headroom
-/// the hostile-input default denies); unset or garbage falls back silently
-/// to `MAX_BACKUP_BYTES` — the safe direction, since a smaller bound only
-/// refuses oversized backups.
+/// Default backup byte bound (CLI-first: per-call `max_bytes` overrides it;
+/// no env switch). 128 MiB mirrors the upstream release cap; enforced on
+/// read so a hostile file cannot exhaust memory.
 pub fn backup_byte_limit() -> u64 {
-    backup_byte_limit_from(std::env::var("LTMRS_MAX_BACKUP_BYTES").ok())
+    MAX_BACKUP_BYTES
 }
 
 /// Pure precedence core (see `backup_byte_limit`).

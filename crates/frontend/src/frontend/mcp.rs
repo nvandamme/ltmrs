@@ -70,6 +70,8 @@ pub struct FrontendIdentity {
     pub frontend_id: FrontendId,
     pub channel_id: ChannelId,
     store_generation: std::sync::Mutex<StoreGeneration>,
+    /// CLI `--project-id` override (CLI-first; replaces the env override).
+    pub project_id_override: Option<String>,
 }
 
 impl FrontendIdentity {
@@ -78,6 +80,7 @@ impl FrontendIdentity {
             frontend_id,
             channel_id,
             store_generation: std::sync::Mutex::new(StoreGeneration::FIRST),
+            project_id_override: None,
         }
     }
 
@@ -96,6 +99,7 @@ impl Clone for FrontendIdentity {
             frontend_id: self.frontend_id,
             channel_id: self.channel_id,
             store_generation: std::sync::Mutex::new(self.generation()),
+            project_id_override: self.project_id_override.clone(),
         }
     }
 }
@@ -359,15 +363,15 @@ impl LtmrsFrontend {
         Ok(self.envelope_for(body, retry_epoch, identity))
     }
 
-    /// Project identity for one tool call (Wave A3b): env override, else
+    /// Project identity for one tool call (Wave A3b): CLI override, else
     /// the checkout bind file, plus the frontend-canonicalized root and the
-    /// wire legacy project. Malformed env values fail the call loudly.
+    /// wire legacy project. Malformed override values fail the call loudly.
     fn tool_identity(
         &self,
         body: &DomainRequest,
         legacy_explicit: bool,
     ) -> Result<ltmrs_daemon::envelope::EnvelopeIdentity, McpError> {
-        let (project_id, canonical_root) = Self::base_identity()?;
+        let (project_id, canonical_root) = self.base_identity()?;
         let legacy_project = match body {
             DomainRequest::ToolCall { tool } => ltmrs_compat::lemma::tool_args::tool_project(tool),
             _ => None,
@@ -380,14 +384,13 @@ impl LtmrsFrontend {
         })
     }
 
-    /// Shared env/bind/cwd identity resolution (Wave A3b + B4): the
+    /// Shared CLI/bind/cwd identity resolution (Wave A3b + B4): the
     /// stable id (if any) plus the canonicalized checkout root. The twin
     /// `resource_identity` below must stay in sync — resources carry no
     /// wire project, so they always resolve unattributed legacy.
-    fn base_identity() -> Result<(Option<String>, Option<String>), McpError> {
+    fn base_identity(&self) -> Result<(Option<String>, Option<String>), McpError> {
         let cwd = std::env::current_dir().ok();
-        let env_raw = std::env::var(crate::project::ENV_PROJECT_ID).ok();
-        let bound = crate::project::resolve_project_id(cwd.as_deref(), env_raw)
+        let bound = crate::project::resolve_project_id(cwd.as_deref(), self.identity_project_id())
             .map_err(|e| McpError::internal_error(e, None))?;
         Ok((
             bound.map(|b| b.project_id),
@@ -395,12 +398,18 @@ impl LtmrsFrontend {
         ))
     }
 
-    /// Identity for resource reads: same env/bind/cwd resolution as tools,
+    /// CLI `--project-id` override (CLI-first; replaces the env override).
+    /// Malformed values fail the call loudly via resolve_project_id.
+    fn identity_project_id(&self) -> Option<String> {
+        self.identity.project_id_override.clone()
+    }
+
+    /// Identity for resource reads: same CLI/bind/cwd resolution as tools,
     /// never a wire project (resources carry no args, so legacy stays
     /// unattributed). Reads inherit the tool path's admission + scope, so
     /// a stable identity sees exactly what the equivalent tool call sees.
     fn resource_identity(&self) -> Result<EnvelopeIdentity, McpError> {
-        let (project_id, canonical_root) = Self::base_identity()?;
+        let (project_id, canonical_root) = self.base_identity()?;
         Ok(EnvelopeIdentity {
             project_id,
             canonical_root,
@@ -995,6 +1004,7 @@ fn native_backup_create_tool() -> Tool {
                 "type": "string",
                 "description": "Destination directory for the .ltmrs-backup file (created when missing). Required: ltmrs invents no default backup location.",
             },
+            "max_bytes": {"type": "integer", "description": "Optional per-call byte bound (overrides the 128 MiB default; must be positive)."},
         }),
     )
 }
@@ -1045,6 +1055,10 @@ fn native_backup_import_lemma_tool() -> Tool {
             "confirm": {
                 "type": "boolean",
                 "description": "Must be true to execute: acknowledges replacement semantics.",
+            },
+            "import_lib": {
+                "type": "string",
+                "description": "Optional cdylib override path (CLI-first --import-lib; replaces the env override).",
             },
         }),
     )

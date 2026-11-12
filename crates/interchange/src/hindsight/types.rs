@@ -39,29 +39,52 @@ impl Default for HindsightConfig {
     }
 }
 
-/// Parse config from `LTMRS_HINDSIGHT_*` env (explicit wins, garbage fails loud).
-pub fn hindsight_config_from_env() -> Result<HindsightConfig, String> {
-    let enabled = match std::env::var("LTMRS_HINDSIGHT_ENABLED").as_deref() {
-        Ok("1") | Ok("true") => true,
-        Ok("0") | Ok("false") => false,
-        Ok(other) => {
-            return Err(format!(
-                "bad LTMRS_HINDSIGHT_ENABLED={other:?} (want 0/1/true/false)"
-            ));
+/// CLI-first flag set (mirrors the frontend `HindsightFlags`; no env reads).
+/// `url` + `bank` together enable the bridge; anything else alone is a
+/// usage error (never a silently half-configured bridge).
+#[derive(Debug, Clone, Default)]
+pub struct HindsightCliFlags {
+    pub url: Option<String>,
+    pub bank: Option<String>,
+    pub tags: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub scoping: Option<String>,
+    pub global_scope: bool,
+    pub outbox: Option<String>,
+}
+
+/// Build config from CLI flags (pure; no env, no I/O).
+/// `None` (all-absent) = bridge disabled. Partial (url xor bank) errors loud.
+pub fn hindsight_config_from_flags(
+    f: &HindsightCliFlags,
+) -> Result<Option<HindsightConfig>, String> {
+    match (&f.url, &f.bank) {
+        (None, None) => {
+            if f.tags.is_some()
+                || f.timeout_ms.is_some()
+                || f.scoping.is_some()
+                || f.global_scope
+                || f.outbox.is_some()
+            {
+                return Err(
+                    "hindsight options need --hindsight-url and --hindsight-bank together"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
         }
-        Err(_) => false,
-    };
-    if !enabled {
-        return Ok(HindsightConfig::default());
+        (Some(u), Some(b)) if !u.trim().is_empty() && !b.trim().is_empty() => {}
+        _ => {
+            return Err(
+                "hindsight needs both --hindsight-url and --hindsight-bank (non-empty)".to_string(),
+            );
+        }
     }
-    let base_url = std::env::var("LTMRS_HINDSIGHT_URL")
-        .map_err(|_| "LTMRS_HINDSIGHT_URL must be set when the bridge is enabled".to_string())?;
-    let bank = std::env::var("LTMRS_HINDSIGHT_BANK")
-        .map_err(|_| "LTMRS_HINDSIGHT_BANK must be set when the bridge is enabled".to_string())?;
-    if base_url.trim().is_empty() || bank.trim().is_empty() {
-        return Err("LTMRS_HINDSIGHT_URL/BANK must be non-empty".to_string());
-    }
-    let default_tags = std::env::var("LTMRS_HINDSIGHT_TAGS")
+    let url = f.url.clone().unwrap();
+    let bank = f.bank.clone().unwrap();
+    let default_tags = f
+        .tags
+        .as_deref()
         .map(|s| {
             s.split(',')
                 .map(|t| t.trim().to_string())
@@ -69,46 +92,31 @@ pub fn hindsight_config_from_env() -> Result<HindsightConfig, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let timeout_ms = match std::env::var("LTMRS_HINDSIGHT_TIMEOUT_MS") {
-        Ok(s) => s
-            .parse::<u64>()
-            .map_err(|_| format!("bad LTMRS_HINDSIGHT_TIMEOUT_MS={s:?}"))?,
-        Err(_) => 1500,
-    };
-    let scoping = match std::env::var("LTMRS_HINDSIGHT_SCOPING").as_deref() {
-        Ok("global") => super::Scoping::Global,
-        Ok("per-project") => super::Scoping::PerProject,
-        Ok("per-project-tagged") | Err(_) => super::Scoping::PerProjectTagged,
-        Ok(other) => {
+    let scoping = match f.scoping.as_deref() {
+        Some("global") => super::Scoping::Global,
+        Some("per-project") => super::Scoping::PerProject,
+        Some("per-project-tagged") | None => super::Scoping::PerProjectTagged,
+        Some(other) => {
             return Err(format!(
-                "bad LTMRS_HINDSIGHT_SCOPING={other:?} (want global|per-project|per-project-tagged)"
+                "bad --hindsight-scoping {other:?} (want global|per-project|per-project-tagged)"
             ));
         }
     };
-    let global_scope = match std::env::var("LTMRS_HINDSIGHT_GLOBAL_SCOPE").as_deref() {
-        Ok("1") | Ok("true") => true,
-        Ok("0") | Ok("false") | Err(_) => false,
-        Ok(other) => {
-            return Err(format!(
-                "bad LTMRS_HINDSIGHT_GLOBAL_SCOPE={other:?} (want 0/1/true/false)"
-            ));
-        }
-    };
-    let outbox_dir = match std::env::var("LTMRS_HINDSIGHT_OUTBOX").as_deref() {
-        Ok(s) if !s.trim().is_empty() => Some(std::path::PathBuf::from(s)),
-        Ok(_) | Err(_) => None,
-    };
-    Ok(HindsightConfig {
-        enabled,
-        base_url,
+    Ok(Some(HindsightConfig {
+        enabled: true,
+        base_url: url,
         bank,
         default_tags,
-        timeout_ms,
+        timeout_ms: f.timeout_ms.unwrap_or(1500),
         max_queue: 256,
         scoping,
-        global_scope,
-        outbox_dir,
-    })
+        global_scope: f.global_scope,
+        outbox_dir: f
+            .outbox
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from),
+    }))
 }
 
 /// A document to retain: stable id, tags, content.
@@ -147,73 +155,6 @@ pub enum BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Env-var tests mutate process-global state: serialize them.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_env_lock(f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Scrub bridge vars so tests never inherit ambient config.
-        for k in [
-            "LTMRS_HINDSIGHT_ENABLED",
-            "LTMRS_HINDSIGHT_URL",
-            "LTMRS_HINDSIGHT_BANK",
-            "LTMRS_HINDSIGHT_TAGS",
-            "LTMRS_HINDSIGHT_TIMEOUT_MS",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-        f();
-        for k in [
-            "LTMRS_HINDSIGHT_ENABLED",
-            "LTMRS_HINDSIGHT_URL",
-            "LTMRS_HINDSIGHT_BANK",
-            "LTMRS_HINDSIGHT_TAGS",
-            "LTMRS_HINDSIGHT_TIMEOUT_MS",
-        ] {
-            unsafe { std::env::remove_var(k) };
-        }
-    }
-
-    /// A1 RED: disabled by default (no env).
-    #[test]
-    fn disabled_by_default() {
-        let cfg = HindsightConfig::default();
-        assert!(!cfg.enabled);
-    }
-
-    /// A1: env parsing enables with required URL + bank.
-    #[test]
-    fn env_parsing_requires_url_and_bank() {
-        with_env_lock(|| {
-            unsafe {
-                std::env::set_var("LTMRS_HINDSIGHT_ENABLED", "1");
-                std::env::set_var("LTMRS_HINDSIGHT_URL", "http://127.0.0.1:8888");
-                std::env::set_var("LTMRS_HINDSIGHT_BANK", "team");
-                std::env::remove_var("LTMRS_HINDSIGHT_TAGS");
-                std::env::remove_var("LTMRS_HINDSIGHT_TIMEOUT_MS");
-            }
-            let cfg = hindsight_config_from_env().unwrap();
-            assert!(cfg.enabled);
-            assert_eq!(cfg.bank, "team");
-            assert_eq!(cfg.timeout_ms, 1500);
-            unsafe {
-                std::env::remove_var("LTMRS_HINDSIGHT_ENABLED");
-                std::env::remove_var("LTMRS_HINDSIGHT_URL");
-                std::env::remove_var("LTMRS_HINDSIGHT_BANK");
-            }
-        });
-    }
-
-    /// A1: garbage enabled flag fails loud.
-    #[test]
-    fn garbage_enabled_fails_loud() {
-        with_env_lock(|| {
-            unsafe { std::env::set_var("LTMRS_HINDSIGHT_ENABLED", "maybe") };
-            assert!(hindsight_config_from_env().is_err());
-        });
-    }
 
     /// A1: document ids are stable and namespaced.
     #[test]
@@ -224,5 +165,71 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.starts_with("ltmrs:memory:"));
         assert_ne!(a, document_id("guide", &id));
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    /// CLI-first: all-absent flags = disabled (None), never an error.
+    #[test]
+    fn all_absent_disables() {
+        assert!(
+            hindsight_config_from_flags(&HindsightCliFlags::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// CLI-first: url+bank enables with defaults; partial errors loudly.
+    #[test]
+    fn url_bank_enable_partial_rejects() {
+        let cfg = hindsight_config_from_flags(&HindsightCliFlags {
+            url: Some("http://x".into()),
+            bank: Some("team".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.bank, "team");
+        assert!(matches!(
+            cfg.scoping,
+            super::super::Scoping::PerProjectTagged
+        ));
+        let err = hindsight_config_from_flags(&HindsightCliFlags {
+            url: Some("http://x".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("both"));
+    }
+
+    /// CLI-first: scoping + globalScope + outbox parse.
+    #[test]
+    fn scoping_parses() {
+        let cfg = hindsight_config_from_flags(&HindsightCliFlags {
+            url: Some("http://x".into()),
+            bank: Some("t".into()),
+            scoping: Some("global".into()),
+            global_scope: true,
+            outbox: Some("/tmp/ob".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert!(matches!(cfg.scoping, super::super::Scoping::Global));
+        assert!(cfg.global_scope);
+        assert_eq!(cfg.outbox_dir, Some(std::path::PathBuf::from("/tmp/ob")));
+        assert!(
+            hindsight_config_from_flags(&HindsightCliFlags {
+                url: Some("http://x".into()),
+                bank: Some("t".into()),
+                scoping: Some("nonsense".into()),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 }

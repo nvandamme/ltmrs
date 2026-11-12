@@ -166,7 +166,7 @@ All state lives under the managed home `$HOME/.ltmrs`:
 | `sessions.json` | Frontend session registry (persisted on shutdown) |
 | `search/` | Lance projection (derived, rebuildable) |
 | `models/` | Verified E5 artifacts (`--provision-models` target) |
-| `hindsight-outbox/` | Durable bridge retain outbox (when `LTMRS_HINDSIGHT_OUTBOX` set) |
+| `hindsight-outbox/` | Durable bridge retain outbox (when `--hindsight-outbox` set) |
 | `sharpshooter/<bank>/` | Curated decision files (`architecture/product/style.md` + pending queues) |
 | `memories/<bank>/` | Curated lesson files (`learned.md` + pending queue) |
 | `managed-skills/` | Host-managed skills (installer-guarded, 64k cap) — under the agent home |
@@ -176,11 +176,12 @@ There is no config file; behavior comes from flags plus `$HOME`.
 
 | Command | Purpose |
 |---|---|
-| (no args) | Serve MCP over stdio (default; spawns the daemon on demand) |
-| `daemon [--foreground] [--daemon-idle-ms MS]` | Run the shared daemon (ensure-and-exit; foreground serves until idle/SIGTERM) |
+| (no args) | Serve MCP over stdio (default; spawns the daemon on demand) — accepts `--socket`, `--project-id`, `--daemon-idle-ms`, `--hindsight-*` for the spawn it performs |
+| `daemon [--foreground] [--daemon-idle-ms MS] [--hindsight-*]` | Run the shared daemon (ensure-and-exit; foreground serves inline). Hindsight: `--hindsight-url URL --hindsight-bank BANK` enable the bridge; optional `--hindsight-tags CSV`, `--hindsight-timeout-ms MS`, `--hindsight-scoping MODE`, `--hindsight-global-scope`, `--hindsight-outbox DIR` |
 | `--socket PATH` | Attach stdio to a running daemon instead of starting one |
+| `--project-id ID` | Stable identity override (with `project status|adopt`, default stdio) |
 | `-lib/--library --store PATH` | Print a knowledge-base snapshot (never creates stores) |
-| `-vis/--visualize [--fg] [-p PORT]` | Run the library visualizer (default port 18721) |
+| `-vis/--visualize [--fg] [-p PORT] [--vis-token T]` | Run the library visualizer (default port 18721; fresh token unless given) |
 | `--install-skill` | Install/update the managed agent skill |
 | `--install-shim` | Install the opt-in legacy `lemma` executable shim |
 | `--provision-models` | Fetch + verify E5 artifacts (only step using the network) |
@@ -188,9 +189,9 @@ There is no config file; behavior comes from flags plus `$HOME`.
 | `memory sync\|enqueue\|rebuild` | Consolidate pending curation queues into curated files (honest counts) |
 | `memory clear\|reset` | Refuse loudly (canonical store is never wiped from a CLI verb) |
 | `mm list\|show\|refresh\|seed\|delete\|reload [name]` | Hindsight mental-model maintenance (frozen 3-seed catalog) |
-| `hook-inject` / `hook-extract` | Budget-capped recall / transcript finding extraction (host hooks, stdin JSON, fail-open) |
+| `hook-inject` / `hook-extract` [`--no-hooks`] | Budget-capped recall / transcript finding extraction (host hooks, stdin JSON, fail-open; `--no-hooks` opts out per-invocation) |
 | `install-hooks` | Install opt-in host hook snippets + enable hooks |
-| `mc-import preview\|confirm <path>` | Preview/confirm a Magic Context import (additive fan-out) |
+| `mc-import preview\|confirm <path> [--import-lib P] [--digest D]` | Preview/confirm a Magic Context import (additive fan-out; `--import-lib` overrides the cdylib path) |
 | `-h/--help`, `-V/--version` | Help text (authoritative flag reference), version |
 
 Install locations: skill → `~/.agents/skills/ltmrs/SKILL.md`;
@@ -216,9 +217,13 @@ never merges — under a staged-generation switch.
 
 ### Hindsight bridge
 
-Opt-in via `LTMRS_HINDSIGHT_*` env (`ENABLED/URL/BANK/TAGS/TIMEOUT_MS`,
-plus `SCOPING` global|per-project|per-project-tagged, `GLOBAL_SCOPE`
-0/1, `OUTBOX` dir). Disabled by default: tools behave byte-identically.
+Opt-in via `daemon` flags (CLI-first; no env switches):
+`--hindsight-url URL --hindsight-bank BANK` enable the bridge;
+optional `--hindsight-tags CSV`, `--hindsight-timeout-ms MS`,
+`--hindsight-scoping global|per-project|per-project-tagged`,
+`--hindsight-global-scope`, `--hindsight-outbox DIR`.
+Disabled by default: tools behave byte-identically. Flags forward to
+spawned daemons explicitly (never inherited env).
 
 - Dual-write fan-out post-commit (never blocks/fails tools); scoped
   recall fusion appended after canonical results, never into ranking.
@@ -249,6 +254,11 @@ redacts, dedups and consolidates them into curated files:
   "100% Rust" claim).
 - Local operation only. No remote database, cloud sync or hidden model calls.
   The Hindsight bridge is the single explicit exception, opt-in and best-effort.
+- CLI-first configuration: every operator switch is a CLI flag (`--hindsight-*`,
+  `--daemon-idle-ms`, `--project-id`, `--vis-token`, `--no-hooks`, `--import-lib`,
+  `max_bytes` tool arg). No `LTMRS_*` env switches (platform `$HOME`/`USERPROFILE`
+  for home resolution and test-harness `LTMRS_BENCH_MACHINE`/`LTMRS_PROBE_MODELS`/
+  `LTMRS_BEIR_DIR` for `#[ignore]`d runs excepted — see `benchmarks.toml`).
 - OSI-approved dependencies; model weights and tokenizer licenses audited
   separately.
 - First supported target: local Linux x86_64 CPU. CUDA is an optional,
@@ -373,7 +383,7 @@ partial, never a rollback. Empty lessons reject loudly.
 | `memory://` URLs | `memory_library` + `-lib` snapshot | Host-side scheme; server exposes the snapshot, not the protocol |
 | `local` backend pipeline | Curated files (`memories/`, `sharpshooter/`) | Daemon never calls a model; hosts enqueue deltas, daemon consolidates |
 | `sharpshooter` decision files | `sharpshooter/<bank>/*.md` + pending queues | Same mechanism; extraction stays host-side |
-| `hindsight` backend | Opt-in bridge (dual-write + scoped recall + reflect) | 6→28 env keys; scoping/globalScope/outbox/mental models landed |
+| `hindsight` backend | Opt-in bridge (dual-write + scoped recall + reflect) | 7 CLI flags; scoping/globalScope/outbox/mental models landed |
 | `mnemopi` backend | Canonical Fjall store (no separate SQLite mode) | One store, not two; no `noEmbeddings` toggle needed (lexical fallback is automatic) |
 | auto-recall / auto-retain | `session_start` preload + `hook-extract` | No silent background writes from the server; host opts in |
 | polyphonic / enhanced recall / proactive linking | RRF fact+temporal voices + generation-keyed cache | Graph voice blocked (no relation edges); cache drops on generation bump |

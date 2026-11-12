@@ -36,15 +36,15 @@ struct Frontend {
 }
 
 impl Frontend {
-    fn spawn(home: &std::path::Path, extra_env: &[(&str, &str)]) -> Self {
+    fn spawn(home: &std::path::Path, extra_args: &[&str]) -> Self {
         let mut cmd = std::process::Command::new(bin());
         cmd.env(HOME_ENV, home)
             .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (k, v) in extra_env {
-            cmd.env(k, v);
+        for a in extra_args {
+            cmd.arg(a);
         }
         let mut child = cmd.spawn().expect("spawn ltmrs frontend");
         let stdin = child.stdin.take().expect("piped stdin");
@@ -177,7 +177,7 @@ fn wait_for_path(path: &std::path::Path, what: &str) {
 #[test]
 fn cold_start_frontend_spawns_daemon_and_serves() {
     let home = tempfile::tempdir().unwrap();
-    let mut front = Frontend::spawn(home.path(), &[("LTMRS_DAEMON_IDLE_MS", "1500")]);
+    let mut front = Frontend::spawn(home.path(), &["--daemon-idle-ms", "1500"]);
     front.initialize();
     front.memory_add("## Cold start\n\n### Context\nSpawned daemon serves.");
     // The daemon owns its store under the isolated HOME.
@@ -246,9 +246,9 @@ fn peer_survives_owner_sigkill() {
 #[test]
 fn simultaneous_cold_start_serves_both_frontends() {
     let home = tempfile::tempdir().unwrap();
-    let env = [("LTMRS_DAEMON_IDLE_MS", "1500")];
-    let mut first = Frontend::spawn(home.path(), &env);
-    let mut second = Frontend::spawn(home.path(), &env);
+    let args = ["--daemon-idle-ms", "1500"];
+    let mut first = Frontend::spawn(home.path(), &args);
+    let mut second = Frontend::spawn(home.path(), &args);
     // Initialize concurrently so both frontends race through daemon
     // startup (probe-miss, spawn, attach) at the same time.
     std::thread::scope(|s| {
@@ -272,8 +272,9 @@ fn bare_daemon_command_is_idempotent() {
         let out = std::process::Command::new(bin())
             .env(HOME_ENV, home.path())
             .env("HOME", home.path())
-            .env("LTMRS_DAEMON_IDLE_MS", "1500")
             .arg("daemon")
+            .arg("--daemon-idle-ms")
+            .arg("1500")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

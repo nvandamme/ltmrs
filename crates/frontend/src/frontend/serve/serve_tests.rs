@@ -87,7 +87,12 @@ fn stdio_layout_pins_subpaths() {
 async fn local_daemon_bridge_roundtrips_memory_add() {
     let dir = tempfile::tempdir().unwrap();
     let layout = stdio_layout(&dir.path().join(".ltmrs"));
-    let (mut daemon, mut client) = start_local_daemon(&layout).await.unwrap();
+    let (mut daemon, mut client) = start_local_daemon(
+        &layout,
+        &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+    )
+    .await
+    .unwrap();
     let id = test_identity();
     let hs = client
         .handshake(&HandshakeRequest {
@@ -161,7 +166,12 @@ async fn mismatched_handshake_retry_on_same_connection() {
 
     let dir = tempfile::tempdir().unwrap();
     let layout = stdio_layout(&dir.path().join(".ltmrs"));
-    let (mut daemon, mut client) = start_local_daemon(&layout).await.unwrap();
+    let (mut daemon, mut client) = start_local_daemon(
+        &layout,
+        &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+    )
+    .await
+    .unwrap();
     daemon
         .dispatcher_arc()
         .repo_arc()
@@ -272,7 +282,12 @@ async fn local_daemon_without_models_serves_lexical_engine() {
 
     let dir = tempfile::tempdir().unwrap();
     let layout = stdio_layout(&dir.path().join(".ltmrs"));
-    let (mut daemon, mut client) = start_local_daemon(&layout).await.unwrap();
+    let (mut daemon, mut client) = start_local_daemon(
+        &layout,
+        &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+    )
+    .await
+    .unwrap();
     // Deterministic convergence: the lexical worker builds the FTS
     // index asynchronously; ensure it here (retrying the worker's own
     // concurrent build) so the search below meets a converged
@@ -355,7 +370,12 @@ async fn local_daemon_without_models_serves_lexical_engine() {
 async fn socket_second_client_handshakes_after_spawn() {
     let dir = tempfile::tempdir().unwrap();
     let layout = stdio_layout(&dir.path().join(".ltmrs"));
-    let (mut daemon, _bridged) = start_local_daemon(&layout).await.unwrap();
+    let (mut daemon, _bridged) = start_local_daemon(
+        &layout,
+        &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+    )
+    .await
+    .unwrap();
     assert!(
         daemon.socket_server_running().await,
         "stdio daemon must serve its socket"
@@ -387,29 +407,14 @@ async fn socket_second_client_handshakes_after_spawn() {
     daemon.shutdown();
 }
 
-/// Idle resolution: explicit flag wins, then a valid env override,
-/// then the default; garbage env falls back loudly to the default.
+/// Idle resolution: explicit flag wins, otherwise the CLI default.
+/// No env switch (CLI-first).
 #[test]
-fn daemon_idle_ms_prefers_flag_then_env_then_default() {
+fn daemon_idle_ms_prefers_flag_then_default() {
     use crate::cli::DEFAULT_DAEMON_IDLE_MS;
-    assert_eq!(daemon_idle_ms(Some(1500), None), 1500);
-    assert_eq!(
-        daemon_idle_ms(Some(1500), Some("5".to_string())),
-        1500,
-        "flag wins over env"
-    );
-    assert_eq!(daemon_idle_ms(None, Some("2500".to_string())), 2500);
-    assert_eq!(
-        daemon_idle_ms(None, Some("  3000  ".to_string())),
-        3000,
-        "surrounding whitespace is tolerated"
-    );
-    assert_eq!(
-        daemon_idle_ms(None, Some("forever".to_string())),
-        DEFAULT_DAEMON_IDLE_MS
-    );
-    assert_eq!(daemon_idle_ms(None, None), DEFAULT_DAEMON_IDLE_MS);
-    assert_eq!(daemon_idle_ms(Some(0), None), 0, "0 serves forever");
+    assert_eq!(daemon_idle_ms(Some(1500)), 1500);
+    assert_eq!(daemon_idle_ms(None), DEFAULT_DAEMON_IDLE_MS);
+    assert_eq!(daemon_idle_ms(Some(0)), 0, "0 serves forever");
 }
 
 /// Windows shutdown handlers register successfully: Ctrl-C and

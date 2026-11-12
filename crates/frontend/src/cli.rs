@@ -6,6 +6,20 @@
 //! below. Arms whose execution lands in later slices fail explicitly
 //! (`Unimplemented`) — never a silent success.
 
+/// Hindsight bridge flags (CLI-first; no env switches).
+/// All-absent = bridge disabled (default, byte-identical tools).
+/// `--hindsight-url` + `--hindsight-bank` together enable it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HindsightFlags {
+    pub url: Option<String>,
+    pub bank: Option<String>,
+    pub tags: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub scoping: Option<String>,
+    pub global_scope: bool,
+    pub outbox: Option<String>,
+}
+
 /// A parsed command: what to do, not how. Execution lives in `main` (help,
 /// version, dispatch) except `run_library`, which is testable here.
 #[derive(Debug, Clone, PartialEq)]
@@ -13,12 +27,16 @@ pub enum Command {
     /// Serve MCP over stdio (default, no arguments).
     Stdio {
         socket: Option<String>,
+        project_id: Option<String>,
+        idle_ms: Option<u64>,
+        hindsight: HindsightFlags,
     },
     /// Run the shared daemon: bare form ensures it is serving and exits,
     /// `--foreground` serves inline until idle/SIGTERM (supervisors).
     Daemon {
         foreground: bool,
         idle_ms: Option<u64>,
+        hindsight: HindsightFlags,
     },
     /// Print a knowledge-base snapshot from a store.
     Library {
@@ -28,6 +46,7 @@ pub enum Command {
     Visualize {
         foreground: bool,
         port: Option<u16>,
+        vis_token: Option<String>,
     },
     /// Install/update the managed skill (wired in a later slice).
     InstallSkill,
@@ -38,9 +57,10 @@ pub enum Command {
         root: Option<String>,
         name: Option<String>,
     },
-    /// Show this checkout's bound identity (bind file + env override).
+    /// Show this checkout's bound identity (bind file + --project-id override).
     ProjectStatus {
         root: Option<String>,
+        project_id: Option<String>,
     },
     /// Attach a legacy bucket to this checkout's bound identity (Wave A3c):
     /// records `--slug` in the id's `legacy_slugs` (explicit intent, warns
@@ -49,25 +69,32 @@ pub enum Command {
         here: bool,
         root: Option<String>,
         slug: String,
+        project_id: Option<String>,
     },
     /// Install the opt-in legacy `lemma` executable shim.
     InstallShim,
     /// Hook: inject budget-capped recall into a host session start
     /// (Slice B; reads one JSON object on stdin, fail-open).
-    HookInject,
+    HookInject {
+        hooks_enabled: bool,
+    },
     /// Hook: extract durable findings from a transcript tail
     /// (Slice B; reads one JSON object on stdin, fail-open).
-    HookExtract,
+    HookExtract {
+        hooks_enabled: bool,
+    },
     /// Install the opt-in hook snippets + enable hooks.json.
     InstallHooks,
     /// Preview an MC database import (read-only staging, no store touch).
     McImportPreview {
         path: String,
+        import_lib: Option<String>,
     },
     /// Confirm an MC import (re-stage, bind digest, fan out memory_add).
     McImportConfirm {
         path: String,
         digest: String,
+        import_lib: Option<String>,
     },
     /// Hindsight mental-model maintenance (G1c; omp `mm` parity):
     /// list seeds + cached models, show/refresh one model.
@@ -155,15 +182,26 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
     let mut store: Option<String> = None;
     let mut socket: Option<String> = None;
     let mut foreground = false;
+    let mut no_hooks = false;
     let mut daemon_foreground = false;
     let mut daemon_idle_ms: Option<u64> = None;
+    let mut hindsight_url: Option<String> = None;
+    let mut hindsight_bank: Option<String> = None;
+    let mut hindsight_tags: Option<String> = None;
+    let mut hindsight_timeout_ms: Option<u64> = None;
+    let mut hindsight_scoping: Option<String> = None;
+    let mut hindsight_global_scope = false;
+    let mut hindsight_outbox: Option<String> = None;
     let mut port: Option<u16> = None;
+    let mut vis_token: Option<String> = None;
     let mut here = false;
     let mut project_root: Option<String> = None;
     let mut project_name: Option<String> = None;
     let mut project_slug: Option<String> = None;
+    let mut project_id: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut mc_digest: Option<String> = None;
+    let mut import_lib: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -180,12 +218,65 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 })?;
                 daemon_idle_ms = Some(parse_daemon_idle_ms(raw)?);
             }
+            "--hindsight-url" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--hindsight-url requires a URL".to_string()))?;
+                hindsight_url = Some(reject_flag_value("--hindsight-url", raw)?);
+            }
+            "--hindsight-bank" => {
+                let raw = args.next().ok_or_else(|| {
+                    CliError::Usage("--hindsight-bank requires a bank name".to_string())
+                })?;
+                hindsight_bank = Some(reject_flag_value("--hindsight-bank", raw)?);
+            }
+            "--hindsight-tags" => {
+                let raw = args.next().ok_or_else(|| {
+                    CliError::Usage("--hindsight-tags requires a comma-separated list".to_string())
+                })?;
+                hindsight_tags = Some(reject_flag_value("--hindsight-tags", raw)?);
+            }
+            "--hindsight-timeout-ms" => {
+                let raw = args.next().ok_or_else(|| {
+                    CliError::Usage("--hindsight-timeout-ms requires milliseconds".to_string())
+                })?;
+                hindsight_timeout_ms = Some(parse_daemon_idle_ms(raw)?);
+            }
+            "--hindsight-scoping" => {
+                let raw = args.next().ok_or_else(|| {
+                    CliError::Usage(
+                        "--hindsight-scoping requires global|per-project|per-project-tagged"
+                            .to_string(),
+                    )
+                })?;
+                let v = reject_flag_value("--hindsight-scoping", raw)?;
+                if !["global", "per-project", "per-project-tagged"].contains(&v.as_str()) {
+                    return Err(CliError::Usage(
+                        "bad --hindsight-scoping (want global|per-project|per-project-tagged)"
+                            .to_string(),
+                    ));
+                }
+                hindsight_scoping = Some(v);
+            }
+            "--hindsight-global-scope" => hindsight_global_scope = true,
+            "--hindsight-outbox" => {
+                let raw = args.next().ok_or_else(|| {
+                    CliError::Usage("--hindsight-outbox requires a directory path".to_string())
+                })?;
+                hindsight_outbox = Some(reject_flag_value("--hindsight-outbox", raw)?);
+            }
             "--fg" => foreground = true,
             "-p" | "--port" => {
                 let raw = args.next().ok_or_else(|| {
                     CliError::Usage("-p/--port requires a value (1-65535)".to_string())
                 })?;
                 port = Some(parse_port(raw)?);
+            }
+            "--vis-token" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--vis-token requires a value".to_string()))?;
+                vis_token = Some(reject_flag_value("--vis-token", raw)?);
             }
             "--store" => {
                 let raw = args
@@ -218,11 +309,23 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                     .ok_or_else(|| CliError::Usage("--digest requires a value".to_string()))?;
                 mc_digest = Some(reject_flag_value("--digest", raw)?);
             }
+            "--import-lib" => {
+                let raw = args.next().ok_or_else(|| {
+                    CliError::Usage("--import-lib requires a cdylib path".to_string())
+                })?;
+                import_lib = Some(reject_flag_value("--import-lib", raw)?);
+            }
             "--slug" => {
                 let raw = args
                     .next()
                     .ok_or_else(|| CliError::Usage("--slug requires a value".to_string()))?;
                 project_slug = Some(reject_flag_value("--slug", raw)?);
+            }
+            "--project-id" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--project-id requires a value".to_string()))?;
+                project_id = Some(reject_flag_value("--project-id", raw)?);
             }
             // Daemon subcommand (Part I §7): `ltmrs daemon [--foreground]`.
             "daemon" => select(Selected::Daemon)?,
@@ -230,6 +333,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             // (positional words, like `daemon` above).
             "hook-inject" => select(Selected::HookInject)?,
             "hook-extract" => select(Selected::HookExtract)?,
+            "--no-hooks" => no_hooks = true,
             "install-hooks" => select(Selected::InstallHooks)?,
             other if other.starts_with('-') => {
                 return Err(CliError::Usage(format!("unknown flag: {other}")));
@@ -306,11 +410,28 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             )));
         }
     }
+    let hindsight_given = hindsight_url.is_some()
+        || hindsight_bank.is_some()
+        || hindsight_tags.is_some()
+        || hindsight_timeout_ms.is_some()
+        || hindsight_scoping.is_some()
+        || hindsight_global_scope
+        || hindsight_outbox.is_some();
+    // --foreground stays daemon-only; idle + hindsight flags also ride
+    // default stdio (the spawn it performs).
     if selected.as_ref().is_some_and(|s| *s != Selected::Daemon)
-        && (daemon_foreground || daemon_idle_ms.is_some())
+        && daemon_foreground
     {
         return Err(CliError::Usage(
-            "--foreground/--daemon-idle-ms require daemon".to_string(),
+            "--foreground requires daemon".to_string(),
+        ));
+    }
+    if selected.is_some()
+        && (daemon_idle_ms.is_some() || hindsight_given)
+        && !matches!(selected, Some(Selected::Daemon))
+    {
+        return Err(CliError::Usage(
+            "--daemon-idle-ms/--hindsight-* require daemon or default stdio serving".to_string(),
         ));
     }
     if selected.as_ref().is_some_and(|s| *s != Selected::Project)
@@ -320,16 +441,33 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
             "--here/--root/--name/--slug require project bind/status/adopt".to_string(),
         ));
     }
+    // --project-id rides project subcommands AND default stdio (identity
+    // override for MCP calls); everywhere else it rejects loudly.
+    if project_id.is_some() && selected.is_some() && !matches!(selected, Some(Selected::Project)) {
+        return Err(CliError::Usage(
+            "--project-id requires project or default stdio serving".to_string(),
+        ));
+    }
     match selected {
         Some(Selected::Daemon) => {
             if store.is_some() || socket.is_some() || foreground || port.is_some() {
                 return Err(CliError::Usage(
-                    "daemon takes only --foreground and --daemon-idle-ms".to_string(),
+                    "daemon takes only --foreground, --daemon-idle-ms and --hindsight-*"
+                        .to_string(),
                 ));
             }
             Ok(Command::Daemon {
                 foreground: daemon_foreground,
                 idle_ms: daemon_idle_ms,
+                hindsight: HindsightFlags {
+                    url: hindsight_url,
+                    bank: hindsight_bank,
+                    tags: hindsight_tags,
+                    timeout_ms: hindsight_timeout_ms,
+                    scoping: hindsight_scoping,
+                    global_scope: hindsight_global_scope,
+                    outbox: hindsight_outbox,
+                },
             })
         }
         Some(Selected::Library) => {
@@ -341,10 +479,14 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         Some(Selected::Visualize) => {
             if store.is_some() || socket.is_some() {
                 return Err(CliError::Usage(
-                    "-vis takes only --fg and -p/--port".to_string(),
+                    "-vis takes only --fg, -p/--port and --vis-token".to_string(),
                 ));
             }
-            Ok(Command::Visualize { foreground, port })
+            Ok(Command::Visualize {
+                foreground,
+                port,
+                vis_token,
+            })
         }
         Some(Selected::InstallSkill) => {
             if store.is_some() || socket.is_some() || foreground || port.is_some() {
@@ -364,15 +506,23 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         }
         Some(Selected::HookInject) => {
             if store.is_some() || socket.is_some() || foreground || port.is_some() {
-                return Err(CliError::Usage("hook-inject takes no options".to_string()));
+                return Err(CliError::Usage(
+                    "hook-inject takes only --no-hooks".to_string(),
+                ));
             }
-            Ok(Command::HookInject)
+            Ok(Command::HookInject {
+                hooks_enabled: !no_hooks,
+            })
         }
         Some(Selected::HookExtract) => {
             if store.is_some() || socket.is_some() || foreground || port.is_some() {
-                return Err(CliError::Usage("hook-extract takes no options".to_string()));
+                return Err(CliError::Usage(
+                    "hook-extract takes only --no-hooks".to_string(),
+                ));
             }
-            Ok(Command::HookExtract)
+            Ok(Command::HookExtract {
+                hooks_enabled: !no_hooks,
+            })
         }
         Some(Selected::InstallHooks) => {
             if store.is_some() || socket.is_some() || foreground || port.is_some() {
@@ -419,6 +569,11 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                             "--slug is for project adopt, not bind".to_string(),
                         ));
                     }
+                    if project_id.is_some() {
+                        return Err(CliError::Usage(
+                            "--project-id is for project status/adopt, not bind".to_string(),
+                        ));
+                    }
                     Ok(Command::ProjectBind {
                         here,
                         root: project_root,
@@ -427,9 +582,14 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 }
                 Some("status") => {
                     if here || project_name.is_some() || project_slug.is_some() {
-                        return Err(CliError::Usage("status takes only --root".to_string()));
+                        return Err(CliError::Usage(
+                            "status takes only --root and --project-id".to_string(),
+                        ));
                     }
-                    Ok(Command::ProjectStatus { root: project_root })
+                    Ok(Command::ProjectStatus {
+                        root: project_root,
+                        project_id,
+                    })
                 }
                 Some("adopt") => {
                     let slug = project_slug.ok_or_else(|| {
@@ -454,6 +614,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                         here,
                         root: project_root,
                         slug,
+                        project_id,
                     })
                 }
                 _ => Err(CliError::Usage(
@@ -548,7 +709,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                             "--digest is for mc-import confirm, not preview".to_string(),
                         ));
                     }
-                    Ok(Command::McImportPreview { path })
+                    Ok(Command::McImportPreview { path, import_lib })
                 }
                 Some("confirm") => {
                     let digest = mc_digest.ok_or_else(|| {
@@ -556,7 +717,11 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                             "mc-import confirm needs --digest <digest> from preview".to_string(),
                         )
                     })?;
-                    Ok(Command::McImportConfirm { path, digest })
+                    Ok(Command::McImportConfirm {
+                        path,
+                        digest,
+                        import_lib,
+                    })
                 }
                 _ => Err(CliError::Usage(
                     "mc-import requires preview or confirm".to_string(),
@@ -574,7 +739,21 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                     "--fg/--port require -vis/--visualize".to_string(),
                 ));
             }
-            Ok(Command::Stdio { socket })
+            // Spawn-only flags are meaningless when attaching to a live daemon.
+            if socket.is_some() && (project_id.is_some() || daemon_idle_ms.is_some() || hindsight_given) {
+                return Err(CliError::Usage(
+                    "--project-id/--daemon-idle-ms/--hindsight-* need a spawned daemon (no --socket)".to_string(),
+                ));
+            }
+            Ok(Command::Stdio { socket, project_id, idle_ms: daemon_idle_ms, hindsight: HindsightFlags {
+                url: hindsight_url,
+                bank: hindsight_bank,
+                tags: hindsight_tags,
+                timeout_ms: hindsight_timeout_ms,
+                scoping: hindsight_scoping,
+                global_scope: hindsight_global_scope,
+                outbox: hindsight_outbox,
+            } })
         }
     }
 }
@@ -629,7 +808,7 @@ Commands (default with no arguments: stdio):
    project adopt           Attach a legacy bucket to this checkout's identity
                            [--here | --root DIR] --slug SLUG
   -lib, --library         Print a knowledge-base snapshot [--store PATH]
-  -vis, --visualize       Run the visualizer [--fg] [-p PORT | --port PORT]
+  -vis, --visualize       Run the visualizer [--fg] [-p PORT | --port PORT] [--vis-token TOKEN]
   --install-skill         Install/update the managed skill
   --install-shim          Install the opt-in legacy `lemma` shim
   hook-inject             Inject budget-capped recall (host session hook, stdin JSON)
@@ -655,8 +834,19 @@ Options:
    --root DIR              Bind the given checkout directory (with project bind/status/adopt)
    --name NAME             Project display name (with project bind; default: directory basename)
    --slug SLUG             Legacy bucket to attach (with project adopt)
+   --project-id ID        Stable identity override (with project status/adopt, default stdio)
   --fg                    Visualizer in foreground (with -vis)
   -p PORT, --port PORT    Visualizer port 1-65535 (with -vis)
+  --vis-token TOKEN       Visualizer access token (with -vis; default: fresh random)
+  --hindsight-url URL     Hindsight server URL (with daemon; enables bridge with --hindsight-bank)
+  --hindsight-bank BANK   Hindsight bank name (with daemon)
+  --hindsight-tags CSV    Extra retain tags, comma-separated (with daemon)
+  --hindsight-timeout-ms MS  Bridge timeout in ms (with daemon; default 1500)
+  --hindsight-scoping MODE  global|per-project|per-project-tagged (with daemon; default tagged)
+  --hindsight-global-scope  Allow untagged global writes (with daemon)
+  --hindsight-outbox DIR   Durable retain outbox root (with daemon)
+  --import-lib PATH       Importer cdylib override (with mc-import, backup_import_lemma)
+  --no-hooks              Disable host hooks for this invocation
 
 Exit codes: 0 success, 1 runtime failure, 2 usage error,
 3 parsed but not yet implemented.
@@ -1021,10 +1211,16 @@ pub fn mm_command(action: &str, name: Option<String>) -> Result<String, CliError
     ))
 }
 
-pub fn mc_import_preview_command(path: String) -> Result<String, CliError> {
-    use crate::skills::mc_import::preview;
-    let rep = preview(std::path::Path::new(&path))
-        .map_err(|e| CliError::Runtime(format!("mc-import preview failed: {e}")))?;
+pub fn mc_import_preview_command(
+    path: String,
+    import_lib: Option<String>,
+) -> Result<String, CliError> {
+    use crate::skills::mc_import::preview_with_lib;
+    let rep = preview_with_lib(
+        std::path::Path::new(&path),
+        import_lib.map(std::path::PathBuf::from),
+    )
+    .map_err(|e| CliError::Runtime(format!("mc-import preview failed: {e}")))?;
     let mut out = format!(
         "MC import preview: {} memories, {} loss item(s), digest {}\nScopes:\n",
         rep.memory_count, rep.loss_count, rep.digest
@@ -1041,11 +1237,12 @@ pub async fn mc_import_confirm_command(
     home: Option<String>,
     path: String,
     digest: String,
+    import_lib: Option<String>,
 ) -> Result<String, CliError> {
     use crate::frontend::mcp::{FrontendIdentity, LtmrsFrontend};
     use crate::frontend::serve::daemon::{connect_remote, daemon_socket_path};
     use crate::frontend::serve::{resolve_home, stdio_layout};
-    use crate::skills::mc_import::confirm;
+    use crate::skills::mc_import::confirm_with_lib;
     use ltmrs_daemon::envelope::{HandshakeRequest, PROTOCOL_VERSION};
     use ltmrs_domain::id::{ChannelId, FrontendId, StoreGeneration};
 
@@ -1074,9 +1271,14 @@ pub async fn mc_import_confirm_command(
         .await
         .map_err(|e| CliError::Runtime(format!("daemon handshake failed: {e}")))?;
     let fe = LtmrsFrontend::new(FrontendIdentity::new(frontend_id, channel_id), client);
-    let (applied, rejected) = confirm(&fe, std::path::Path::new(&path), &digest)
-        .await
-        .map_err(|e| CliError::Runtime(format!("mc-import confirm failed: {e}")))?;
+    let (applied, rejected) = confirm_with_lib(
+        &fe,
+        std::path::Path::new(&path),
+        &digest,
+        import_lib.map(std::path::PathBuf::from),
+    )
+    .await
+    .map_err(|e| CliError::Runtime(format!("mc-import confirm failed: {e}")))?;
     Ok(format!(
         "MC import confirmed: {applied} applied, {rejected} rejected (reruns dedup via server Jaccard)."
     ))
@@ -1118,10 +1320,10 @@ pub fn install_hooks_command(home: Option<String>) -> Result<String, CliError> {
 
 pub fn project_status_command(
     root: Option<String>,
-    env_override: Option<String>,
+    project_id: Option<String>,
     home: Option<String>,
 ) -> Result<String, CliError> {
-    use crate::project::{ENV_PROJECT_ID, read_bind};
+    use crate::project::read_bind;
     let checkout = match root {
         Some(r) => std::path::PathBuf::from(r),
         None => std::env::current_dir()
@@ -1136,17 +1338,16 @@ pub fn project_status_command(
         )),
         None => out.push_str("Bind file: none (unbound; writes are unattributed)\n"),
     }
-    let env = env_override.or_else(|| std::env::var(ENV_PROJECT_ID).ok());
-    let winning: Option<String> = match env.filter(|s| !s.trim().is_empty()) {
+    let winning: Option<String> = match project_id.filter(|s| !s.trim().is_empty()) {
         Some(v) => {
             out.push_str(&format!(
-                "{ENV_PROJECT_ID}: {} (wins over the bind file)\n",
+                "--project-id: {} (wins over the bind file)\n",
                 v.trim()
             ));
             Some(v.trim().to_string())
         }
         None => {
-            out.push_str(&format!("{ENV_PROJECT_ID}: unset\n"));
+            out.push_str("--project-id: unset\n");
             bound.map(|b| b.project_id)
         }
     };
@@ -1185,7 +1386,7 @@ fn attached_slugs_report(winning: Option<&str>, home: Option<String>) -> String 
 }
 
 /// Attach a legacy bucket to the checkout's bound identity (Wave A3c).
-/// Requires a bound identity (bind file or `LTMRS_PROJECT_ID` env);
+/// Requires a bound identity (bind file or `--project-id` flag);
 /// records the normalized slug in the id's `legacy_slugs` and reports the
 /// newly visible row count. Rows are never rewritten.
 pub async fn project_adopt_command(
@@ -1193,7 +1394,7 @@ pub async fn project_adopt_command(
     root: Option<&str>,
     slug: &str,
     home: Option<String>,
-    env_override: Option<String>,
+    project_id: Option<String>,
 ) -> Result<String, CliError> {
     use crate::project::{canonical_root, resolve_project_id};
     if here && root.is_some() {
@@ -1223,7 +1424,7 @@ pub async fn project_adopt_command(
             checkout.display()
         )));
     }
-    let binding = resolve_project_id(Some(&checkout), env_override)
+    let binding = resolve_project_id(Some(&checkout), project_id)
         .map_err(CliError::Runtime)?
         .ok_or_else(|| {
             CliError::Runtime(
@@ -1303,18 +1504,28 @@ mod tests {
     /// Visualizer combos: foreground flag and validated port.
     #[test]
     fn visualizer_combos() {
-        let Command::Visualize { foreground, port } = parse(&["-vis", "--fg"]).unwrap() else {
+        let Command::Visualize {
+            foreground,
+            port,
+            vis_token,
+        } = parse(&["-vis", "--fg"]).unwrap()
+        else {
             panic!("expected Visualize");
         };
         assert!(foreground);
         assert_eq!(port, None);
-        let Command::Visualize { foreground, port } =
-            parse(&["--visualize", "-p", "8080"]).unwrap()
+        assert_eq!(vis_token, None);
+        let Command::Visualize {
+            foreground,
+            port,
+            vis_token,
+        } = parse(&["--visualize", "-p", "8080"]).unwrap()
         else {
             panic!("expected Visualize");
         };
         assert!(!foreground);
         assert_eq!(port, Some(8080));
+        assert_eq!(vis_token, None);
         let Command::Visualize { port, .. } = parse(&["-vis", "--port", "1"]).unwrap() else {
             panic!("expected Visualize");
         };
@@ -1450,10 +1661,14 @@ mod tests {
             panic!("expected Library");
         };
         assert_eq!(store.as_deref(), Some("/tmp/s"));
-        let Command::Stdio { socket } = parse(&["--socket", "/tmp/d.sock"]).unwrap() else {
+        let Command::Stdio { socket, project_id, idle_ms, hindsight } = parse(&["--socket", "/tmp/d.sock"]).unwrap()
+        else {
             panic!("expected Stdio");
         };
         assert_eq!(socket.as_deref(), Some("/tmp/d.sock"));
+        assert_eq!(project_id, None);
+        assert_eq!(idle_ms, None);
+        assert_eq!(hindsight, HindsightFlags::default());
     }
 
     /// Help text documents every flag; version carries the package version.
@@ -1620,6 +1835,7 @@ mod tests {
         assert_eq!(
             parse(&["daemon"]).unwrap(),
             Command::Daemon {
+                hindsight: HindsightFlags::default(),
                 foreground: false,
                 idle_ms: None,
             }
@@ -1627,6 +1843,7 @@ mod tests {
         assert_eq!(
             parse(&["daemon", "--foreground"]).unwrap(),
             Command::Daemon {
+                hindsight: HindsightFlags::default(),
                 foreground: true,
                 idle_ms: None,
             }
@@ -1634,6 +1851,7 @@ mod tests {
         assert_eq!(
             parse(&["daemon", "--daemon-idle-ms", "1500"]).unwrap(),
             Command::Daemon {
+                hindsight: HindsightFlags::default(),
                 foreground: false,
                 idle_ms: Some(1500),
             }
@@ -1650,6 +1868,7 @@ mod tests {
         assert_eq!(
             parse(&["daemon", "--daemon-idle-ms", "0"]).unwrap(),
             Command::Daemon {
+                hindsight: HindsightFlags::default(),
                 foreground: false,
                 idle_ms: Some(0),
             }
@@ -1663,11 +1882,43 @@ mod tests {
         assert!(parse(&["daemon", "extra-positional"]).is_err());
     }
 
+    /// Hindsight flags parse on daemon + stdio; partial config rejects loudly.
+    #[test]
+    fn hindsight_flags_parse_and_gate() {
+        let Command::Daemon { hindsight, .. } = parse(&[
+            "daemon",
+            "--hindsight-url", "http://x",
+            "--hindsight-bank", "team",
+            "--hindsight-tags", "a,b",
+            "--hindsight-timeout-ms", "2000",
+            "--hindsight-scoping", "global",
+            "--hindsight-global-scope",
+            "--hindsight-outbox", "/tmp/ob",
+        ]).unwrap() else { panic!("expected Daemon") };
+        assert_eq!(hindsight.url.as_deref(), Some("http://x"));
+        assert_eq!(hindsight.bank.as_deref(), Some("team"));
+        assert!(hindsight.global_scope);
+        // partial (url without bank) parses (CLI is shape-only); the bridge
+        // constructor rejects it loudly (covered in interchange flag_tests).
+        let Command::Daemon { hindsight: partial, .. } = parse(&["daemon", "--hindsight-url", "http://x"]).unwrap() else { panic!("expected Daemon") };
+        assert_eq!(partial.url.as_deref(), Some("http://x"));
+        assert_eq!(partial.bank, None);
+        // stdio accepts them too (spawn forwarding)
+        assert!(matches!(parse(&["--hindsight-url", "http://x", "--hindsight-bank", "t"]).unwrap(), Command::Stdio { .. }));
+        // elsewhere rejects
+        assert!(parse(&["-lib", "--hindsight-url", "http://x"]).is_err());
+        // bad scoping rejects
+        assert!(parse(&["daemon", "--hindsight-scoping", "nonsense"]).is_err());
+        // project-id rides stdio + project, rejects elsewhere
+        assert!(matches!(parse(&["--project-id", "prj_x_abc"]).unwrap(), Command::Stdio { .. }));
+        assert!(parse(&["-lib", "--project-id", "x"]).is_err());
+    }
+
     /// Help documents the daemon surface.
     #[test]
     fn help_documents_daemon() {
         let help = help_text();
-        for flag in ["daemon", "--foreground", "--daemon-idle-ms"] {
+        for flag in ["daemon", "--foreground", "--daemon-idle-ms", "--hindsight-url", "--hindsight-bank", "--project-id", "--vis-token", "--no-hooks", "--import-lib"] {
             assert!(help.contains(flag), "help must document {flag}");
         }
     }
@@ -1741,11 +1992,27 @@ mod tests {
     fn hook_subcommands_parse() {
         assert!(matches!(
             parse(&["hook-inject"]).unwrap(),
-            Command::HookInject
+            Command::HookInject {
+                hooks_enabled: true
+            }
+        ));
+        assert!(matches!(
+            parse(&["hook-inject", "--no-hooks"]).unwrap(),
+            Command::HookInject {
+                hooks_enabled: false
+            }
         ));
         assert!(matches!(
             parse(&["hook-extract"]).unwrap(),
-            Command::HookExtract
+            Command::HookExtract {
+                hooks_enabled: true
+            }
+        ));
+        assert!(matches!(
+            parse(&["hook-extract", "--no-hooks"]).unwrap(),
+            Command::HookExtract {
+                hooks_enabled: false
+            }
         ));
         assert!(matches!(
             parse(&["install-hooks"]).unwrap(),
@@ -1839,6 +2106,7 @@ mod tests {
                 here: true,
                 root: None,
                 slug: "other".to_string(),
+                project_id: None,
             }
         );
         assert_eq!(
@@ -1847,6 +2115,7 @@ mod tests {
                 here: false,
                 root: Some("/tmp/x".to_string()),
                 slug: "other".to_string(),
+                project_id: None,
             }
         );
         for argv in [
@@ -2016,9 +2285,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_str().unwrap().to_string();
         let layout = crate::frontend::serve::stdio_layout(&dir.path().join(".ltmrs"));
-        let (mut daemon, _client) = crate::frontend::serve::daemon::start_local_daemon(&layout)
-            .await
-            .unwrap();
+        let (mut daemon, _client) = crate::frontend::serve::daemon::start_local_daemon(
+            &layout,
+            &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+        )
+        .await
+        .unwrap();
         add_legacy_row(daemon.dispatcher().repo(), 7, "other");
         let root = dir.path().join("shop");
         std::fs::create_dir_all(&root).unwrap();

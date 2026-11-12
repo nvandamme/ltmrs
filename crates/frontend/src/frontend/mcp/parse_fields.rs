@@ -19,7 +19,10 @@ static ALLOWED_ARGUMENTS: std::sync::LazyLock<std::collections::HashMap<String, 
                 .unwrap_or_default();
             map.insert(tool.name, keys);
         }
-        map.insert("backup_create".to_string(), vec!["directory".to_string()]);
+        map.insert(
+            "backup_create".to_string(),
+            vec!["directory".to_string(), "max_bytes".to_string()],
+        );
         map.insert("backup_preview".to_string(), vec!["path".to_string()]);
         map.insert(
             "backup_restore".to_string(),
@@ -27,7 +30,11 @@ static ALLOWED_ARGUMENTS: std::sync::LazyLock<std::collections::HashMap<String, 
         );
         map.insert(
             "backup_import_lemma".to_string(),
-            vec!["path".to_string(), "confirm".to_string()],
+            vec![
+                "path".to_string(),
+                "confirm".to_string(),
+                "import_lib".to_string(),
+            ],
         );
         map.insert(
             "reflect".to_string(),
@@ -111,6 +118,24 @@ pub(crate) fn usize_field(args: &Map<String, Value>, key: &str) -> Result<Option
         },
         Some(_) => Err(McpError::invalid_params(
             format!("{key} must be an integer"),
+            None,
+        )),
+    }
+}
+
+/// Optional u64 integer field (explicit nulls absent; wrong types error loudly).
+pub(crate) fn u64_field(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, McpError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(v) if v > 0 => Ok(Some(v)),
+            _ => Err(McpError::invalid_params(
+                format!("{key} must be a positive integer"),
+                None,
+            )),
+        },
+        Some(_) => Err(McpError::invalid_params(
+            format!("{key} must be a positive integer"),
             None,
         )),
     }

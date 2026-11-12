@@ -25,8 +25,6 @@ const LIB_HINT_EXT: &str = ".so";
 const LIB_HINT_EXT: &str = ".dll";
 /// Cargo package name of the importer (for the build-hint error).
 const IMPORTER_PACKAGE: &str = "ltmrs-lemma-import";
-/// Environment override for the cdylib path.
-pub const LIB_ENV_OVERRIDE: &str = "LTMRS_LEMMA_IMPORT_LIB";
 
 /// Load failure (missing library, missing symbol — never silent).
 #[derive(Debug)]
@@ -365,26 +363,35 @@ pub fn open_first(candidates: &[PathBuf]) -> Result<LemmaImportLib, LemmaImportE
         });
     }
     Err(LemmaImportError(format!(
-        "Lemma import library not found (tried: {}). Build it with `cargo build -p {IMPORTER_PACKAGE}` or set {LIB_ENV_OVERRIDE} to the built {LIB_HINT_EXT} path.",
+        "Lemma import library not found (tried: {}). Build it with `cargo build -p {IMPORTER_PACKAGE}` or pass import_lib (backup_import_lemma tool / --import-lib flag) with the built {LIB_HINT_EXT} path.",
         tried.join("; ")
     )))
 }
 
 /// Default candidates from the live process layout (exe dir + cwd).
 pub fn default_candidates() -> Vec<PathBuf> {
-    let env_override = std::env::var_os(LIB_ENV_OVERRIDE).map(PathBuf::from);
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
-    candidate_paths(env_override, &exe_dir, &cwd)
+    candidate_paths(None, &exe_dir, &cwd)
 }
 
 impl LemmaImportLib {
     /// Open with the default candidates.
     pub fn open_default() -> Result<Self, LemmaImportError> {
-        open_first(&default_candidates())
+        Self::open_with_override(None)
+    }
+
+    /// Open with an explicit cdylib override (CLI-first; replaces the env override).
+    pub fn open_with_override(lib_override: Option<PathBuf>) -> Result<Self, LemmaImportError> {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_default();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        open_first(&candidate_paths(lib_override, &exe_dir, &cwd))
     }
     /// Import a `.lemma-backup` file through the cdylib into staging JSON.
     /// The panic boundary is caught here as well (belt over the cdylib's
@@ -517,8 +524,8 @@ mod tests {
             "must tell how to build it, got: {text}"
         );
         assert!(
-            text.contains(LIB_ENV_OVERRIDE),
-            "must name the override, got: {text}"
+            text.contains("import_lib"),
+            "must name the CLI override, got: {text}"
         );
     }
 

@@ -30,12 +30,16 @@ pub(crate) fn exec_backup_create(
         }
     };
     let now = disp.clock().now_millis();
+    let bound = args
+        .max_bytes
+        .filter(|n| *n > 0)
+        .unwrap_or(ltmrs_interchange::backup::MAX_BACKUP_BYTES);
     let report = ltmrs_interchange::backup::export_backup_with_limit(
         disp.repo(),
         std::path::Path::new(&dir),
         "ltmrs",
         now,
-        ltmrs_interchange::backup::backup_byte_limit(),
+        bound,
     )
     .map_err(|e| {
         ltmrs_domain::command::DomainError::new(
@@ -347,12 +351,13 @@ pub(crate) fn exec_backup_restore(
     ))
 }
 
-fn load_lemma_staging(
+fn load_lemma_staging_with_lib(
     path: &std::path::Path,
+    lib_override: Option<std::path::PathBuf>,
 ) -> Result<crate::lemma_import::ParsedStaging, ltmrs_domain::command::DomainError> {
     use ltmrs_domain::command::{DomainError, DomainErrorCode};
     let fail = |message: String| DomainError::new(DomainErrorCode::Validation, message);
-    let lib = crate::lemma_import::LemmaImportLib::open_default()
+    let lib = crate::lemma_import::LemmaImportLib::open_with_override(lib_override)
         .map_err(|e| fail(format!("backup import failed: {e}")))?;
     let text = lib
         .import_json(path)
@@ -597,7 +602,12 @@ pub(crate) fn exec_backup_import_lemma(
     };
     let channel = envelope.channel_id.as_uuid().to_string();
     let source = std::path::Path::new(&path);
-    let staging = load_lemma_staging(source)?;
+    let lib_override = args
+        .import_lib
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    let staging = load_lemma_staging_with_lib(source, lib_override)?;
     if args.confirm == Some(true) {
         confirm_import_staging(disp, &channel, source, &staging)
     } else {

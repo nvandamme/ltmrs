@@ -17,7 +17,8 @@ pub use outbox::{
     quarantine_dir, write_event,
 };
 pub use types::{
-    BridgeError, HindsightConfig, RecallHit, RetainDoc, document_id, hindsight_config_from_env,
+    BridgeError, HindsightCliFlags, HindsightConfig, RecallHit, RetainDoc, document_id,
+    hindsight_config_from_flags,
 };
 /// Tags for one retained doc: configured defaults + per-doc scope tags.
 /// Pure (no I/O) so tag derivation is unit-testable without a server.

@@ -10,6 +10,14 @@
 
 harness_version = 3
 
+# Test-harness env (deliberately NOT CLI flags): these gate #[ignore]d
+# reference/evidence runs and report labels only — never production paths.
+# CLI-first applies to operator surfaces; test selection stays env-gated
+# (cargo convention: env selects ignored tests, flags would pollute help).
+# - LTMRS_BENCH_MACHINE: machine label in reference-run reports (default dev-box).
+# - LTMRS_PROBE_MODELS: provisioned models dir; gates quality/BEIR reference runs (SKIP without).
+# - LTMRS_BEIR_DIR: BEIR corpus dir; gates the full BEIR run with PROBE_MODELS.
+
 [[workload]]
 name = "wp12-storage-01"
 description = "Storage-only baseline: Fjall canonical put/get plus Lance FTS lexical search over embedding-free rows. No model inference inside the measured boundary."

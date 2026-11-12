@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use super::parse_fields::{
     opt_bool_field, project_field, require_str, response_format_field, str_array_field, str_field,
-    usize_field,
+    u64_field, usize_field,
 };
 use ltmrs_compat::lemma::tool_args::{
     BackupCreateArgs, BackupImportLemmaArgs, BackupPreviewArgs, BackupRestoreArgs,
@@ -93,6 +93,7 @@ pub(crate) fn parse_backup_import_lemma(
     Ok(BackupImportLemmaArgs {
         path: str_field(args, "path")?.map(|s| s.to_string()),
         confirm: opt_bool_field(args, "confirm")?,
+        import_lib: str_field(args, "import_lib")?.map(|s| s.to_string()),
     })
 }
 
@@ -120,5 +121,6 @@ pub(crate) fn parse_backup_restore(
 pub(crate) fn parse_backup_create(args: &Map<String, Value>) -> Result<BackupCreateArgs, McpError> {
     Ok(BackupCreateArgs {
         directory: str_field(args, "directory")?.map(|s| s.to_string()),
+        max_bytes: u64_field(args, "max_bytes")?,
     })
 }

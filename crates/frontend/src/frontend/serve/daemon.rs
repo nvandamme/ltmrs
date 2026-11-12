@@ -32,12 +32,15 @@ pub fn daemon_socket_path(layout: &StdioLayout) -> PathBuf {
 /// `semantic_search` answer carries its effective mode (`hybrid` vs
 /// `lexical-fallback`) with `dense_ready`, so callers never infer dense
 /// from a provisioned directory alone.
-pub async fn start_local_daemon(layout: &StdioLayout) -> Result<(Daemon, IpcClient), CliError> {
+pub async fn start_local_daemon(
+    layout: &StdioLayout,
+    hindsight_flags: &ltmrs_interchange::hindsight::HindsightCliFlags,
+) -> Result<(Daemon, IpcClient), CliError> {
     let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
     let embedding = resolve_daemon_embedding(layout);
-    let hindsight = match ltmrs_interchange::hindsight::hindsight_config_from_env() {
-        Ok(cfg) if cfg.enabled => Some(cfg),
-        Ok(_) => None,
+    let hindsight = match ltmrs_interchange::hindsight::hindsight_config_from_flags(hindsight_flags)
+    {
+        Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("ltmrs: hindsight bridge disabled ({e})");
             None
@@ -89,24 +92,11 @@ pub async fn connect_remote(socket: &str) -> Result<IpcClient, CliError> {
     Ok(client)
 }
 
-/// Resolve the daemon idle shutdown for a spawned or served daemon:
-/// explicit flag wins, then the `LTMRS_DAEMON_IDLE_MS` environment
-/// override (site-local default without flags; also what tests use to
-/// keep spawned daemons short-lived), then the CLI default. Garbage env
-/// values fall back loudly to the default rather than failing startup.
-pub fn daemon_idle_ms(flag: Option<u64>, env_raw: Option<String>) -> u64 {
-    if let Some(ms) = flag {
-        return ms;
-    }
-    if let Some(ref raw) = env_raw
-        && let Ok(ms) = raw.trim().parse::<u64>()
-    {
-        return ms;
-    }
-    if env_raw.is_some() {
-        eprintln!("ltmrs: ignoring invalid LTMRS_DAEMON_IDLE_MS; using default");
-    }
-    crate::cli::DEFAULT_DAEMON_IDLE_MS
+/// Resolve the daemon idle shutdown: explicit `--daemon-idle-ms` wins,
+/// otherwise the CLI default. No env switch (CLI-first: the flag is the
+/// single surface; tests pass short timeouts explicitly).
+pub fn daemon_idle_ms(flag: Option<u64>) -> u64 {
+    flag.unwrap_or(crate::cli::DEFAULT_DAEMON_IDLE_MS)
 }
 
 /// Spawn a detached daemon child (`exe daemon --foreground ...`) that
@@ -119,6 +109,7 @@ pub fn daemon_idle_ms(flag: Option<u64>, env_raw: Option<String>) -> u64 {
 pub fn spawn_daemon_child(
     exe: &Path,
     idle_ms: u64,
+    hindsight: &ltmrs_interchange::hindsight::HindsightCliFlags,
     log_path: &Path,
 ) -> Result<std::process::Child, CliError> {
     use std::process::Stdio;
@@ -136,7 +127,34 @@ pub fn spawn_daemon_child(
     cmd.arg("daemon")
         .arg("--foreground")
         .arg("--daemon-idle-ms")
-        .arg(idle_ms.to_string())
+        .arg(idle_ms.to_string());
+    // CLI-first: hindsight flags forward explicitly (never env inheritance).
+    if let Some(url) = hindsight.url.as_deref().filter(|s| !s.trim().is_empty()) {
+        cmd.arg("--hindsight-url").arg(url);
+    }
+    if let Some(bank) = hindsight.bank.as_deref().filter(|s| !s.trim().is_empty()) {
+        cmd.arg("--hindsight-bank").arg(bank);
+    }
+    if let Some(tags) = hindsight.tags.as_deref().filter(|s| !s.trim().is_empty()) {
+        cmd.arg("--hindsight-tags").arg(tags);
+    }
+    if let Some(ms) = hindsight.timeout_ms {
+        cmd.arg("--hindsight-timeout-ms").arg(ms.to_string());
+    }
+    if let Some(scoping) = hindsight
+        .scoping
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        cmd.arg("--hindsight-scoping").arg(scoping);
+    }
+    if hindsight.global_scope {
+        cmd.arg("--hindsight-global-scope");
+    }
+    if let Some(outbox) = hindsight.outbox.as_deref().filter(|s| !s.trim().is_empty()) {
+        cmd.arg("--hindsight-outbox").arg(outbox);
+    }
+    cmd.stdin(Stdio::null())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -211,6 +229,7 @@ pub async fn ensure_daemon_process(
     layout: &StdioLayout,
     exe: &Path,
     idle_ms: u64,
+    hindsight: &ltmrs_interchange::hindsight::HindsightCliFlags,
 ) -> Result<(), CliError> {
     use std::time::Duration;
 
@@ -227,8 +246,12 @@ pub async fn ensure_daemon_process(
     {
         return Ok(());
     }
-    let mut child: Option<std::process::Child> =
-        Some(spawn_daemon_child(exe, idle_ms, &daemon_log_path(layout))?);
+    let mut child: Option<std::process::Child> = Some(spawn_daemon_child(
+        exe,
+        idle_ms,
+        hindsight,
+        &daemon_log_path(layout),
+    )?);
     // Wait-ready: bounded verified attach. Refused dials poll cheaply
     // (covers slow first boot incl. model hashing); backlog-hung dials
     // burn a handshake timeout each, so cap consecutive silence — a
@@ -406,7 +429,11 @@ async fn probe_handshake_inner(
 /// Builds the managed-home config exactly like the spawned path (same
 /// store, sessions, search, embedding detection), serves the bound socket
 /// with maintenance and projection, persists on every shutdown path.
-pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result<(), CliError> {
+pub async fn run_daemon_foreground(
+    layout: &StdioLayout,
+    idle_ms: u64,
+    hindsight_flags: &ltmrs_interchange::hindsight::HindsightCliFlags,
+) -> Result<(), CliError> {
     // Arm the shutdown watchers BEFORE any slow startup work (socket bind
     // included): a SIGTERM arriving mid-startup must be caught, never
     // default-kill the process before the serve loop exists.
@@ -414,9 +441,9 @@ pub async fn run_daemon_foreground(layout: &StdioLayout, idle_ms: u64) -> Result
         .map_err(|e| CliError::Runtime(format!("cannot watch for shutdown signal: {e}")))?;
     let paths = RuntimePaths::resolve(&layout.runtime_base, RUNTIME_IDENTITY);
     let embedding = resolve_daemon_embedding(layout);
-    let hindsight = match ltmrs_interchange::hindsight::hindsight_config_from_env() {
-        Ok(cfg) if cfg.enabled => Some(cfg),
-        Ok(_) => None,
+    let hindsight = match ltmrs_interchange::hindsight::hindsight_config_from_flags(hindsight_flags)
+    {
+        Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("ltmrs: hindsight bridge disabled ({e})");
             None
@@ -533,7 +560,13 @@ pub async fn shutdown_signal() {
 /// to a running daemon. Runs until stdin closes, then exits — the daemon
 /// outlives every frontend by design (it idle-exits on its own), so a
 /// SIGKILLed first frontend can never stop service for the second.
-pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result<(), CliError> {
+pub async fn serve_stdio(
+    socket: Option<String>,
+    home: Option<String>,
+    project_id: Option<String>,
+    idle_ms: Option<u64>,
+    hindsight: &ltmrs_interchange::hindsight::HindsightCliFlags,
+) -> Result<(), CliError> {
     let identity = FrontendIdentity::new(
         FrontendId::new(Uuid::now_v7()),
         ChannelId::new(Uuid::now_v7()),
@@ -545,14 +578,17 @@ pub async fn serve_stdio(socket: Option<String>, home: Option<String>) -> Result
             let layout = stdio_layout(&base);
             let exe = std::env::current_exe()
                 .map_err(|e| CliError::Runtime(format!("cannot locate ltmrs binary: {e}")))?;
-            let idle = daemon_idle_ms(None, std::env::var("LTMRS_DAEMON_IDLE_MS").ok());
-            ensure_daemon_process(&layout, &exe, idle).await?;
+            let idle = daemon_idle_ms(idle_ms);
+            ensure_daemon_process(&layout, &exe, idle, hindsight)
+            .await?;
             // The daemon is verified serving; attach (bounded, for the
             // stop-start race where it died between ensure and dial).
             let sock = daemon_socket_path(&layout);
             connect_with_retry(&sock, 30, identity.frontend_id, identity.channel_id).await?
         }
     };
+    let mut identity = identity;
+    identity.project_id_override = project_id.filter(|s| !s.trim().is_empty());
     let frontend = LtmrsFrontend::new(identity, client);
     // Wave B1: prefetch the memory snapshot so the first `initialize`
     // carries a populated index. Best-effort: a failed prefetch degrades

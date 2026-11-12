@@ -616,6 +616,7 @@ fn replay_after_restore_is_refused_not_replayed() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(2, create.clone()), &create);
     let backup_path = result_structured(&result).unwrap()["path"]

@@ -5,7 +5,16 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: omp gap closure Slices 1–5 (G1–G7) + FULL README
+## 2026-11-12 — feat: CLI-first cutover (no LTMRS_* env switches)
+
+- Hindsight: `--hindsight-url/bank/tags/timeout-ms/scoping/global-scope/outbox` on `daemon` + default stdio (spawn forwarding); `HindsightCliFlags` + `hindsight_config_from_flags`; env reader deleted.
+- Lifecycle: flag-only `--daemon-idle-ms`; `--project-id` on project/stdio via identity override; `--vis-token` on `-vis`; `--no-hooks` opt-out.
+- Libs: `--import-lib` on mc-import + `import_lib` on backup_import_lemma; per-call `max_bytes` on backup_create (env defaults deleted).
+- Cold-start tests converted to argv (caught missing stdio→spawn forwarding, fixed).
+- Bench/test env kept + documented as harness (`benchmarks.toml`).
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
+## 236e7e8 (2026-11-12) — feat: omp gap closure Slices 1-5 (G1-G7) + FULL README
 
 - Slice 1 (G1a+G3+G7): Hindsight scoping modes + globalScope; `learn` native tool (7th native, 32 served); `manage_skill` installer lib (no MCP tool — daemon never writes host files).
 - Slice 2 (G1b+G1c): `reflect` native tool (8th native, 33 served); mental-model seed catalog + `mm` CLI.

@@ -11,9 +11,6 @@ use std::path::{Path, PathBuf};
 pub const BIND_DIR: &str = ".ltmrs";
 /// Bind file name inside [`BIND_DIR`].
 pub const BIND_FILE: &str = "project.json";
-/// Env override for the stable project id (wins over the bind file).
-pub const ENV_PROJECT_ID: &str = "LTMRS_PROJECT_ID";
-
 /// The checkout's bound identity, as stored in `project.json`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Binding {
@@ -96,12 +93,12 @@ pub fn canonical_root(path: &Path) -> Option<String> {
 /// Malformed env values fail loudly (silent misattribution is worse).
 pub fn resolve_project_id(
     cwd: Option<&Path>,
-    env_override: Option<String>,
+    project_id_override: Option<String>,
 ) -> Result<Option<Binding>, String> {
-    if let Some(raw) = env_override.filter(|s| !s.trim().is_empty()) {
+    if let Some(raw) = project_id_override.filter(|s| !s.trim().is_empty()) {
         let raw = raw.trim().to_string();
         let (name, _id) = ltmrs_domain::project_id::parse_project_id(&raw).ok_or_else(|| {
-            format!("{ENV_PROJECT_ID} is malformed (want prj_<name>_<26-char ULID>), got: {raw}")
+            format!("--project-id is malformed (want prj_<name>_<26-char ULID>), got: {raw}")
         })?;
         return Ok(Some(Binding {
             project_id: raw,
@@ -347,7 +344,7 @@ mod tests {
     fn malformed_env_fails_loudly() {
         let (_d, root) = checkout("shop");
         let err = resolve_project_id(Some(&root), Some("bogus".into())).unwrap_err();
-        assert!(err.contains("LTMRS_PROJECT_ID"), "got: {err}");
+        assert!(err.contains("--project-id"), "got: {err}");
     }
 
     #[test]

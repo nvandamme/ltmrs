@@ -121,10 +121,19 @@ pub fn load_hooks_config(home: &Path) -> HooksConfig {
 /// Never blocks a session: any failure (disabled, unreachable, budget,
 /// timeout) returns exit 0 with empty stdout plus one stderr line.
 pub async fn run_hook_inject(home: Option<String>, input: &HookInjectInput) -> HookOutput {
+    run_hook_inject_with(home, input, true).await
+}
+
+/// Inject with explicit enable flag (CLI-first; replaces the env kill-switch).
+pub async fn run_hook_inject_with(
+    home: Option<String>,
+    input: &HookInjectInput,
+    enabled: bool,
+) -> HookOutput {
     let Some(home) = home.filter(|h| !h.is_empty()) else {
         return HookOutput::empty();
     };
-    if std::env::var("LTMRS_HOOKS_ENABLED").as_deref() == Ok("0") {
+    if !enabled {
         return HookOutput::empty();
     }
     let config = load_hooks_config(Path::new(&home));
@@ -228,10 +237,19 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Run hook-extract: store transcript-tail findings, fail-open.
 /// Exit 0 always; stdout empty (hosts ignore it).
 pub async fn run_hook_extract(home: Option<String>, input: &HookExtractInput) -> HookOutput {
+    run_hook_extract_with(home, input, true).await
+}
+
+/// Extract with explicit enable flag (CLI-first; replaces the env kill-switch).
+pub async fn run_hook_extract_with(
+    home: Option<String>,
+    input: &HookExtractInput,
+    enabled: bool,
+) -> HookOutput {
     let Some(home) = home.filter(|h| !h.is_empty()) else {
         return HookOutput::empty();
     };
-    if std::env::var("LTMRS_HOOKS_ENABLED").as_deref() == Ok("0") {
+    if !enabled {
         return HookOutput::empty();
     }
     let config = load_hooks_config(Path::new(&home));
@@ -445,7 +463,12 @@ mod tests {
 
         let base = resolve_home(Some(home.clone())).unwrap();
         let layout = stdio_layout(&base);
-        let (mut daemon, _client) = start_local_daemon(&layout).await.unwrap();
+        let (mut daemon, _client) = start_local_daemon(
+            &layout,
+            &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+        )
+        .await
+        .unwrap();
 
         let transcript = [
             "## Session notes",
@@ -559,7 +582,12 @@ mod tests {
         // Seed one memory through a frontend bridged to a live daemon.
         let base = resolve_home(Some(home.clone())).unwrap();
         let layout = stdio_layout(&base);
-        let (mut daemon, client) = start_local_daemon(&layout).await.unwrap();
+        let (mut daemon, client) = start_local_daemon(
+            &layout,
+            &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+        )
+        .await
+        .unwrap();
         let fe = LtmrsFrontend::new(
             FrontendIdentity::new(
                 FrontendId::new(Uuid::from_u128(21)),

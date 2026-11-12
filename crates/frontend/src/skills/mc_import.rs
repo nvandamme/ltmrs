@@ -16,8 +16,6 @@ const LIB_FILE_NAME: &str = "libltmrs_mc_import.so";
 /// Well-known cdylib file name on Windows.
 #[cfg(windows)]
 const LIB_FILE_NAME: &str = "ltmrs_mc_import.dll";
-/// Environment override for the cdylib path.
-pub const LIB_ENV_OVERRIDE: &str = "LTMRS_MC_IMPORT_LIB";
 
 /// Load/staging failure (never silent).
 #[derive(Debug)]
@@ -199,14 +197,22 @@ fn open_first(candidates: &[PathBuf]) -> Result<McImportLib, McLoadError> {
         }
     }
     Err(McLoadError(format!(
-        "MC import library not found (tried: {}). Build it with `cargo build --manifest-path crates/mc-import/Cargo.toml` or set {LIB_ENV_OVERRIDE}.",
+        "MC import library not found (tried: {}). Build it with `cargo build --manifest-path crates/mc-import/Cargo.toml` or pass import_lib (mc-import --import-lib flag).",
         tried.join("; ")
     )))
 }
 
 /// Stage an MC database file into JSON via the cdylib (read-only).
 pub fn stage_to_json(path: &Path) -> Result<String, McLoadError> {
-    let env_override = std::env::var_os(LIB_ENV_OVERRIDE).map(PathBuf::from);
+    stage_to_json_with_lib(path, None)
+}
+
+/// Stage with an explicit cdylib override (CLI-first; replaces the env override).
+pub fn stage_to_json_with_lib(
+    path: &Path,
+    lib_override: Option<PathBuf>,
+) -> Result<String, McLoadError> {
+    let env_override = lib_override;
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -242,7 +248,15 @@ pub struct McPreview {
 
 /// Preview: stage read-only, report counts/digest/loss/scopes. No store touch.
 pub fn preview(path: &Path) -> Result<McPreview, McLoadError> {
-    let text = stage_to_json(path)?;
+    preview_with_lib(path, None)
+}
+
+/// Preview with an explicit cdylib override (CLI-first ).
+pub fn preview_with_lib(
+    path: &Path,
+    lib_override: Option<PathBuf>,
+) -> Result<McPreview, McLoadError> {
+    let text = stage_to_json_with_lib(path, lib_override)?;
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| McLoadError(format!("bad staging JSON: {e}")))?;
     if v.get("ok") != Some(&serde_json::Value::Bool(true)) {
@@ -395,7 +409,17 @@ pub async fn confirm(
     path: &Path,
     digest: &str,
 ) -> Result<(usize, usize), McLoadError> {
-    let text = stage_to_json(path)?;
+    confirm_with_lib(fe, path, digest, None).await
+}
+
+/// Confirm with an explicit cdylib override (CLI-first ).
+pub async fn confirm_with_lib(
+    fe: &crate::frontend::mcp::LtmrsFrontend,
+    path: &Path,
+    digest: &str,
+    lib_override: Option<PathBuf>,
+) -> Result<(usize, usize), McLoadError> {
+    let text = stage_to_json_with_lib(path, lib_override)?;
     confirm_staged(fe, &text, digest).await
 }
 
@@ -439,7 +463,12 @@ mod tests {
         let home = dir.path().to_str().unwrap().to_string();
         let base = resolve_home(Some(home)).unwrap();
         let layout = stdio_layout(&base);
-        let (mut daemon, client) = start_local_daemon(&layout).await.unwrap();
+        let (mut daemon, client) = start_local_daemon(
+            &layout,
+            &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+        )
+        .await
+        .unwrap();
         let fe = LtmrsFrontend::new(
             FrontendIdentity::new(
                 FrontendId::new(Uuid::from_u128(41)),
@@ -470,7 +499,12 @@ mod tests {
         let home = dir.path().to_str().unwrap().to_string();
         let base = resolve_home(Some(home)).unwrap();
         let layout = stdio_layout(&base);
-        let (mut daemon, client) = start_local_daemon(&layout).await.unwrap();
+        let (mut daemon, client) = start_local_daemon(
+            &layout,
+            &ltmrs_interchange::hindsight::HindsightCliFlags::default(),
+        )
+        .await
+        .unwrap();
         let fe = LtmrsFrontend::new(
             FrontendIdentity::new(
                 FrontendId::new(Uuid::from_u128(51)),

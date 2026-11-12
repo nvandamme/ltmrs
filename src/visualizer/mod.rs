@@ -289,15 +289,21 @@ fn respond_extra(
 }
 
 /// Serve in the foreground until Ctrl-C; returns a farewell message.
-pub async fn run_foreground(port: Option<u16>, store: &str) -> Result<String, CliError> {
+pub async fn run_foreground(
+    port: Option<u16>,
+    store: &str,
+    token: Option<String>,
+) -> Result<String, CliError> {
     let port = resolve_port(port);
     let listener = TcpListener::bind((LOOPBACK, port))
         .await
         .map_err(|e| CliError::Runtime(format!("cannot bind 127.0.0.1:{port}: {e}")))?;
     // The access token is per-boot: a background parent passes its own via
-    // LTMRS_VIS_TOKEN so the printed URL matches the serving child;
+    // --vis-token so the printed URL matches the serving child;
     // foreground use generates (and prints) a fresh one.
-    let token = std::env::var("LTMRS_VIS_TOKEN").unwrap_or_else(|_| access_token());
+    let token = token
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(access_token);
     println!("serving at http://127.0.0.1:{port}/?token={token}");
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -342,7 +348,8 @@ pub async fn run_background(port: Option<u16>) -> Result<String, CliError> {
         .arg("--fg")
         .arg("-p")
         .arg(port.to_string())
-        .env("LTMRS_VIS_TOKEN", &token)
+        .arg("--vis-token")
+        .arg(&token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
@@ -443,6 +450,7 @@ pub async fn run_visualize(
     foreground: bool,
     port: Option<u16>,
     home: Option<String>,
+    token: Option<String>,
 ) -> Result<String, CliError> {
     let base = ltmrs_frontend::frontend::serve::resolve_home(home)?;
     let store = ltmrs_frontend::frontend::serve::stdio_layout(&base).store_path;
@@ -450,7 +458,7 @@ pub async fn run_visualize(
         return Err(CliError::Usage(format!("no store at {store}")));
     }
     if foreground {
-        run_foreground(port, &store).await
+        run_foreground(port, &store, token).await
     } else {
         run_background(port).await
     }

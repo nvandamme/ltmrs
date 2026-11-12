@@ -21,6 +21,7 @@ fn backup_preview_reports_ready_with_token() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(2, create.clone()), &create);
     assert!(!result_is_error(&result));
@@ -70,6 +71,7 @@ fn backup_restore_executes_under_stable_id() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let r = run(
         &disp,
@@ -130,6 +132,7 @@ fn backup_preview_serves_under_stable_id() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let env = tool_call_with(
         2,
@@ -171,6 +174,7 @@ fn backup_create_preview_same_envelope_replays_identical() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let env = tool_call(2, create.clone());
     let first = run(&disp, &env, &create);
@@ -241,6 +245,7 @@ fn backup_preview_ignores_dead_channels() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(2, create.clone()), &create);
     assert!(!result_is_error(&result));
@@ -275,6 +280,7 @@ fn backup_preview_and_restore_report_unknown_keys() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(2, create.clone()), &create);
     assert!(!result_is_error(&result));
@@ -358,6 +364,7 @@ fn backup_restore_never_loses_acknowledged_writes() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(2, create.clone()), &create);
     assert!(!result_is_error(&result));
@@ -481,6 +488,7 @@ fn backup_restore_end_to_end_with_rollback() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(2, create.clone()), &create);
     let backup_path = result_structured(&result).unwrap()["path"]
@@ -605,6 +613,7 @@ fn backup_restore_requires_confirmation() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(2, create.clone()), &create);
     let path = result_structured(&result).unwrap()["path"]
@@ -652,6 +661,7 @@ fn backup_create_tool_backs_up_and_verifies() {
     let out = tempfile::tempdir().unwrap();
     let args = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let env = tool_call(3, args.clone());
     let result = run(&disp, &env, &args);
@@ -672,7 +682,10 @@ fn backup_create_tool_backs_up_and_verifies() {
     assert_eq!(verified.counts["memories"], 2);
 
     // Missing directory fails explicitly.
-    let missing = ToolArgs::BackupCreate(BackupCreateArgs { directory: None });
+    let missing = ToolArgs::BackupCreate(BackupCreateArgs {
+        directory: None,
+        max_bytes: None,
+    });
     let env = tool_call(4, missing.clone());
     let result = run(&disp, &env, &missing);
     assert!(result_is_error(&result));
@@ -702,6 +715,7 @@ fn restore_clears_channel_bindings() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(3, create.clone()), &create);
     let path = result_structured(&result).unwrap()["path"]
@@ -754,6 +768,7 @@ fn restore_persists_cleared_bindings() {
     let out = tempfile::tempdir().unwrap();
     let create = ToolArgs::BackupCreate(BackupCreateArgs {
         directory: Some(out.path().to_str().unwrap().to_string()),
+        max_bytes: None,
     });
     let result = run(&disp, &tool_call(3, create.clone()), &create);
     let path = result_structured(&result).unwrap()["path"]
@@ -840,6 +855,7 @@ fn backup_import_lemma_requires_path() {
     let tool = ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
         path: None,
         confirm: None,
+        import_lib: None,
     });
     let result = run(&disp, &tool_call(1, tool.clone()), &tool);
     assert!(result_is_error(&result));

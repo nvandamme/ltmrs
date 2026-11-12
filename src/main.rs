@@ -42,37 +42,62 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::Stdio { socket }) => match serve_stdio(socket, home_dir()).await {
-            Ok(()) => 0,
-            Err(e) => fail(&e),
-        },
+        Ok(Command::Stdio { socket, project_id, idle_ms, hindsight }) => {
+            let hindsight_flags = ltmrs_interchange::hindsight::HindsightCliFlags {
+                url: hindsight.url,
+                bank: hindsight.bank,
+                tags: hindsight.tags,
+                timeout_ms: hindsight.timeout_ms,
+                scoping: hindsight.scoping,
+                global_scope: hindsight.global_scope,
+                outbox: hindsight.outbox,
+            };
+            match serve_stdio(socket, home_dir(), project_id, idle_ms, &hindsight_flags).await {
+                Ok(()) => 0,
+                Err(e) => fail(&e),
+            }
+        }
         Ok(Command::Daemon {
             foreground,
             idle_ms,
+            hindsight,
         }) => {
             let home = home_dir();
-            let idle = daemon_idle_ms(idle_ms, std::env::var("LTMRS_DAEMON_IDLE_MS").ok());
+            let idle = daemon_idle_ms(idle_ms);
+            let hindsight_flags = ltmrs_interchange::hindsight::HindsightCliFlags {
+                url: hindsight.url,
+                bank: hindsight.bank,
+                tags: hindsight.tags,
+                timeout_ms: hindsight.timeout_ms,
+                scoping: hindsight.scoping,
+                global_scope: hindsight.global_scope,
+                outbox: hindsight.outbox,
+            };
             match resolve_home(home).map(|base| stdio_layout(&base)) {
                 Err(e) => fail(&e),
                 Ok(layout) => {
                     if foreground {
-                        match run_daemon_foreground(&layout, idle).await {
+                        match run_daemon_foreground(&layout, idle, &hindsight_flags).await {
                             Ok(()) => 0,
                             Err(e) => fail(&e),
                         }
                     } else {
                         let exe = std::env::current_exe();
                         let result = match exe {
-                            Ok(exe) => match ensure_daemon_process(&layout, &exe, idle).await {
-                                Ok(()) => {
-                                    println!(
-                                        "daemon serving at {}",
-                                        daemon_socket_path(&layout).display()
-                                    );
-                                    Ok(())
+                            Ok(exe) => {
+                                match ensure_daemon_process(&layout, &exe, idle, &hindsight_flags)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        println!(
+                                            "daemon serving at {}",
+                                            daemon_socket_path(&layout).display()
+                                        );
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e),
                                 }
-                                Err(e) => Err(e),
-                            },
+                            }
                             Err(e) => Err(CliError::Runtime(format!(
                                 "cannot locate ltmrs binary: {e}"
                             ))),
@@ -85,15 +110,17 @@ async fn main() {
                 }
             }
         }
-        Ok(Command::Visualize { foreground, port }) => {
-            match run_visualize(foreground, port, home_dir()).await {
-                Ok(text) => {
-                    println!("{text}");
-                    0
-                }
-                Err(e) => fail(&e),
+        Ok(Command::Visualize {
+            foreground,
+            port,
+            vis_token,
+        }) => match run_visualize(foreground, port, home_dir(), vis_token).await {
+            Ok(text) => {
+                println!("{text}");
+                0
             }
-        }
+            Err(e) => fail(&e),
+        },
         Ok(Command::InstallSkill) => match install_skill_command(home_dir()) {
             Ok(text) => {
                 println!("{text}");
@@ -109,15 +136,15 @@ async fn main() {
             Err(e) => fail(&e),
         },
         // Slice B hooks: read one JSON object on stdin, fail open.
-        Ok(Command::HookInject) => {
+        Ok(Command::HookInject { hooks_enabled }) => {
             let input = read_hook_stdin();
-            let out = run_hook_inject_blocking(input).await;
+            let out = run_hook_inject_blocking(input, hooks_enabled).await;
             print!("{}", out.stdout);
             out.exit_code
         }
-        Ok(Command::HookExtract) => {
+        Ok(Command::HookExtract { hooks_enabled }) => {
             let input = read_hook_stdin();
-            let out = run_hook_extract_blocking(input).await;
+            let out = run_hook_extract_blocking(input, hooks_enabled).await;
             print!("{}", out.stdout);
             out.exit_code
         }
@@ -128,13 +155,15 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::McImportPreview { path }) => match mc_import_preview_command(path) {
-            Ok(text) => {
-                println!("{text}");
-                0
+        Ok(Command::McImportPreview { path, import_lib }) => {
+            match mc_import_preview_command(path, import_lib) {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(e) => fail(&e),
             }
-            Err(e) => fail(&e),
-        },
+        }
         Ok(Command::Memory { action }) => match memory_sync_dispatch(home_dir(), &action) {
             Ok(text) => {
                 println!("{text}");
@@ -149,15 +178,17 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::McImportConfirm { path, digest }) => {
-            match mc_import_confirm_command(home_dir(), path, digest).await {
-                Ok(text) => {
-                    println!("{text}");
-                    0
-                }
-                Err(e) => fail(&e),
+        Ok(Command::McImportConfirm {
+            path,
+            digest,
+            import_lib,
+        }) => match mc_import_confirm_command(home_dir(), path, digest, import_lib).await {
+            Ok(text) => {
+                println!("{text}");
+                0
             }
-        }
+            Err(e) => fail(&e),
+        },
         Ok(Command::ProvisionModels) => match provision_models_command(home_dir()).await {
             Ok(text) => {
                 println!("{text}");
@@ -181,12 +212,8 @@ async fn main() {
                 Err(e) => fail(&e),
             }
         }
-        Ok(Command::ProjectStatus { root }) => {
-            match project_status_command(
-                root,
-                std::env::var("LTMRS_PROJECT_ID").ok(),
-                std::env::var("HOME").ok(),
-            ) {
+        Ok(Command::ProjectStatus { root, project_id }) => {
+            match project_status_command(root, project_id, std::env::var("HOME").ok()) {
                 Ok(text) => {
                     println!("{text}");
                     0
@@ -194,13 +221,18 @@ async fn main() {
                 Err(e) => fail(&e),
             }
         }
-        Ok(Command::ProjectAdopt { here, root, slug }) => {
+        Ok(Command::ProjectAdopt {
+            here,
+            root,
+            slug,
+            project_id,
+        }) => {
             match project_adopt_command(
                 here,
                 root.as_deref(),
                 &slug,
                 std::env::var("HOME").ok(),
-                std::env::var("LTMRS_PROJECT_ID").ok(),
+                project_id,
             )
             .await
             {
@@ -226,8 +258,11 @@ fn read_hook_stdin() -> String {
 }
 
 /// Parse stdin JSON into HookInjectInput, run inject (main is async).
-async fn run_hook_inject_blocking(raw: String) -> ltmrs_frontend::skills::hooks::HookOutput {
-    use ltmrs_frontend::skills::hooks::run_hook_inject;
+async fn run_hook_inject_blocking(
+    raw: String,
+    enabled: bool,
+) -> ltmrs_frontend::skills::hooks::HookOutput {
+    use ltmrs_frontend::skills::hooks::run_hook_inject_with;
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
     let input = HookInjectInput {
         query_hint: v
@@ -241,12 +276,15 @@ async fn run_hook_inject_blocking(raw: String) -> ltmrs_frontend::skills::hooks:
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
     };
-    run_hook_inject(home_dir(), &input).await
+    run_hook_inject_with(home_dir(), &input, enabled).await
 }
 
 /// Parse stdin JSON into HookExtractInput, run extract (main is async).
-async fn run_hook_extract_blocking(raw: String) -> ltmrs_frontend::skills::hooks::HookOutput {
-    use ltmrs_frontend::skills::hooks::run_hook_extract;
+async fn run_hook_extract_blocking(
+    raw: String,
+    enabled: bool,
+) -> ltmrs_frontend::skills::hooks::HookOutput {
+    use ltmrs_frontend::skills::hooks::run_hook_extract_with;
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
     let input = HookExtractInput {
         transcript_tail: v
@@ -260,7 +298,7 @@ async fn run_hook_extract_blocking(raw: String) -> ltmrs_frontend::skills::hooks
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
     };
-    run_hook_extract(home_dir(), &input).await
+    run_hook_extract_with(home_dir(), &input, enabled).await
 }
 
 fn fail(e: &CliError) -> i32 {
