@@ -75,6 +75,76 @@ fn memory_add_redacts_secrets_by_default() {
     assert!(!mems[0].fragment.contains("sk_abc1234567890"));
 }
 
+/// P3 RED: title/description are redacted like the fragment (omp
+/// redactMemoryTextFields parity: every text-bearing field, not content).
+#[test]
+fn memory_add_redacts_title_and_description() {
+    let (disp, _dir) = test_dispatcher();
+    let id = ident(None, None, None, false);
+    let secret_title = "Deploy key ghp_abcdefghijklmnopqrstuvwx in title";
+    let secret_desc = "Connects with deploy token ghp_zyxwvutsrqponmlkjihgfed in description here";
+    let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+        fragment: "## Clean\n\n### Context\nNothing sensitive here at all.".to_string(),
+        title: Some(secret_title.to_string()),
+        description: Some(secret_desc.to_string()),
+        ..Default::default()
+    });
+    let out = run(&disp, &tool_call_with(1, tool.clone(), id), &tool);
+    assert!(!result_is_error(&out), "add failed: {}", result_text(&out));
+    let stored = disp
+        .repo()
+        .get_memories(&[disp
+            .repo()
+            .resolve_id(result_structured(&out).unwrap()["id"].as_str().unwrap())
+            .unwrap()])
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        stored.title.contains("[REDACTED]"),
+        "title must redact, got: {}",
+        stored.title
+    );
+    assert!(
+        !stored.title.contains("ghp_abcdefghijklmnopqrstuvwx"),
+        "title leaks: {}",
+        stored.title
+    );
+    assert!(
+        stored.description.contains("[REDACTED]"),
+        "description must redact, got: {}",
+        stored.description
+    );
+}
+
+/// P3 RED: JWT-shaped tokens are detected (omp redactJwts parity).
+#[test]
+fn memory_add_redacts_jwt_shaped_tokens() {
+    let (disp, _dir) = test_dispatcher();
+    let id = ident(None, None, None, false);
+    // Synthetic header.payload.signature (not a real credential).
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dummy-signature-part-here-ok";
+    let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+        fragment: format!("## Token\n\n### Context\nBearer {jwt} for api use."),
+        ..Default::default()
+    });
+    let out = run(&disp, &tool_call_with(2, tool.clone(), id), &tool);
+    assert!(!result_is_error(&out), "add failed: {}", result_text(&out));
+    let stored = disp
+        .repo()
+        .get_memories(&[disp
+            .repo()
+            .resolve_id(result_structured(&out).unwrap()["id"].as_str().unwrap())
+            .unwrap()])
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        !stored.fragment.contains(jwt),
+        "JWT-shaped token must redact"
+    );
+}
+
 #[test]
 fn memory_add_confirm_stores_verbatim() {
     let (disp, _dir) = test_dispatcher();

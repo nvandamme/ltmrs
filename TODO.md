@@ -19,6 +19,9 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [x] WP-09 — Guides, sessions and intelligence (S6, 29-tool surface live)
 - [x] WP-10 — CLI, managed skills, hosts and visualizer (S6)
 - [x] WP-11 — Import, legacy interchange, backup and restore (S7)
+- [x] omp-compat P1 — Redaction hardening (detection spans fragment+title+description+evidence.snippet; generated fallbacks from redacted fragment; JWT pin). RED-first, RQ-20.
+- [ ] omp-compat P2 — memory_edit tri-op alias + global-scope write mapping (spec done, implementation open)
+- [ ] omp-compat P3 — status/stats/diagnose markdown surfaces for backend compat (spec done, implementation open)
 - [x] Slice B — Silent-capture hooks (opt-in `hook-inject`/`hook-extract`/`install-hooks`, fail-open, budget reuse; 0e21ce6)
 - [x] Slice D — Defer-scheduler recall shaping (byte-identical renderer, defer/replay, tiers, compartments, single-flight; presentation-only; ee684f1)
 - [x] Slice C — Magic Context read-only import bridge (excluded cdylib, version fence, loss accounting, CLI-first preview/confirm; a774859)

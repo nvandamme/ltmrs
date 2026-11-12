@@ -5,6 +5,16 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2026-11-12 — fix: omp-compat P1 redaction hardening (all text-bearing fields scanned)
+
+- Detection spans fragment+title+description+evidence.snippet (omp redactMemoryTextFields parity); generated fallbacks from redacted fragment; evidence sha over redacted bytes.
+- RED-first: title/description stored raw pre-fix; GREEN post-fix. JWT pin: already covered.
+- Scout: full omp memory map (backend trait, agent tools, mnemopi 25 tools, sharpshooter, hindsight scoping); P2/P3 spec staged.
+- WP-12: RQ-20 evidence + TODO lines (P1 done, P2/P3 open).
+- Proof: daemon 26/26 memory_add, compat 46/46; clippy/fmt clean; gate-audit 13/13.
+
+---
+
 ## 1b00bae (2026-11-12) — feat: Slice A Hindsight bridge (opt-in dual-write + scoped recall)
 
 - A0 wire table frozen from omp precedent; A1 types/config (`document_id`, tag derivation, env parsing).

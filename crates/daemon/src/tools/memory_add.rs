@@ -42,8 +42,26 @@ pub(crate) fn exec_memory_add(
 
     // Privacy: redact secrets unless confirm=true (design 12.1, DEV-002).
     // Critical secrets (irrevocable credentials) are always redacted.
-    let has_secrets = privacy::contains_secret(&args.fragment);
-    let has_critical = privacy::contains_critical_secret(&args.fragment);
+    // Detection spans every text-bearing field (omp redactMemoryTextFields
+    // parity): a clean fragment with a dirty title must still redact.
+    let joined_for_detection = {
+        let mut s = args.fragment.clone();
+        if let Some(t) = args.title.as_deref() {
+            s.push('\n');
+            s.push_str(t);
+        }
+        if let Some(d) = args.description.as_deref() {
+            s.push('\n');
+            s.push_str(d);
+        }
+        if let Some(e) = args.evidence.as_ref() {
+            s.push('\n');
+            s.push_str(&e.snippet);
+        }
+        s
+    };
+    let has_secrets = privacy::contains_secret(&joined_for_detection);
+    let has_critical = privacy::contains_critical_secret(&joined_for_detection);
     let should_redact = has_critical || (has_secrets && !args.confirm);
     let final_fragment = if should_redact {
         privacy::redact(&args.fragment)
@@ -174,26 +192,43 @@ pub(crate) fn exec_memory_add(
         .or(resolved.name.clone())
         .or(resolved.legacy.clone());
 
-    // Generate title and description.
-    let title = args
-        .title
-        .clone()
-        .unwrap_or_else(|| generate_title(&final_fragment));
-    let description = args
-        .description
-        .clone()
-        .unwrap_or_else(|| generate_description(&final_fragment));
+    // Generate title and description, then redact all text-bearing
+    // fields (omp redactMemoryTextFields parity: fragment alone is not
+    // enough — titles/descriptions/snippets reach prompts verbatim).
+    // Generated fallbacks derive from the already-redacted fragment.
+    let redact_text = |s: String| {
+        if should_redact {
+            privacy::redact(&s)
+        } else {
+            s
+        }
+    };
+    let title = redact_text(
+        args.title
+            .clone()
+            .unwrap_or_else(|| generate_title(&final_fragment)),
+    );
+    let description = redact_text(
+        args.description
+            .clone()
+            .unwrap_or_else(|| generate_description(&final_fragment)),
+    );
 
-    // Build evidence.
+    // Build evidence (snippet redacted like every other text field).
     let evidence = args
         .evidence
         .as_ref()
         .map(|e| {
+            let snippet = if should_redact {
+                privacy::redact(&e.snippet)
+            } else {
+                e.snippet.clone()
+            };
             vec![Evidence {
                 file: e.file.clone(),
                 symbol: e.symbol.clone(),
-                snippet: e.snippet.clone(),
-                snippet_sha256: sha256_hex(&e.snippet),
+                snippet: snippet.clone(),
+                snippet_sha256: sha256_hex(&snippet),
             }]
         })
         .unwrap_or_default();
