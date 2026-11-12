@@ -66,10 +66,10 @@ detail = "Executed 2026-11-12: ignored runner soak_reference_run (seed 21, 400/3
 name = "quality-corpus-300"
 superseded_by = "beir-scifact-full"
 reason = "Owner decision 2026-11-12: the human-reviewed 300-case target (§8.1) is met by BEIR SciFact human test qrels (300/340 judged queries over 5,183 real docs) instead of a bespoke review effort. The synthetic 300-case corpus (experiments/quality/retrieval-calibration.json) stays as the dev/heldout calibration instrument (threshold sweeps, ANN distribution probes); BEIR is the quality gate. A derived corpus mined from live session feedback was considered and rejected — it would manufacture ground truth."
-[[not_run]]
+[[executed]]
 name = "ablation-graph-upstream"
-reason = "DenseExact/HybridRrf/Priority/Mmr legs landed 2026-11-11 (src/bench/quality/ablation.rs + ablation_tests.rs, 14/14 quality green, zero leakage on frozen corpus). Graph leg blocked: frozen corpus carries no relation edges and synthesizing them would leak answers. UpstreamReference blocked on owner decision (TF-IDF port vs provisioned upstream). Neither zero-filled."
-
+evidence = "ignored test graph_snapshot_expansion_lift (lancedb-free, real staged edges from tmp/live-lemma/graph-probe.json)"
+detail = "Graph half executed 2026-11-12: `snapshot_expansion_lift` loads 4720 real staged edges (uuid5-mapped from the live lemma snapshot, no synthesis) and runs the production `expand` from the 20 highest-degree hubs under the default policy — mean 17.8 nodes reached vs 1.0 relation-agnostic, 100% truncation (default budget binds on every real hub: max_nodes 24 caps genuine fanout, a tuning signal not a failure). Machinery comparison on real edge distributions, never a recall claim (no query cases with known answers). Frozen-corpus Graph leg stays unlanded by design (no edges to ablate over); UpstreamReference stays blocked on the owner TF-IDF-vs-provisioned decision."
 [[executed]]
 name = "ann-vs-exact"
 evidence = "ignored test ann_ivf_pq_clustered_distribution_recall (lancedb 0.40, Cosine, 8 partitions)"

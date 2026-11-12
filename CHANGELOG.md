@@ -5,7 +5,13 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: BEIR SciFact executed (beir-scifact-full → executed)
+## 2026-11-12 — feat: graph expansion lift over live snapshot (ablation-graph-upstream → executed)
+
+- `snapshot_expansion_lift` test-support loader (#[cfg(test)], no new prod deps) + `graph_snapshot_expansion_lift` (ignored, `LTMRS_GRAPH_PROBE`): 4720 real staged edges drive the production `expand` from the 20 highest-degree hubs — mean 17.8 nodes reached vs 1.0 relation-agnostic, 100% truncation (default max_nodes 24 binds on real hubs: tuning signal, not failure).
+- Machinery comparison on real edge distributions, never a recall claim (no query cases with known answers). Frozen-corpus Graph leg stays unlanded by design; UpstreamReference stays owner-blocked (TF-IDF-vs-provisioned).
+- Ledger: benchmarks.toml [[not_run]] 1→0; RQ-12 evidence appended; TODO WP-12 line updated.
+- Proof: search suite green incl. ignored graph leg; fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS. Full `cargo test --workspace` runs with this commit.
+
 
 - 709-doc coverage slice (all 300 test queries fully covered), release profile, 362s: nDCG@10 0.852, MAP 0.817, Recall@100 0.948, MRR@10 0.826 on human test qrels. Debug-profile full-corpus attempt killed after 2h silent — slow tests run release-only (standing rule, re-learned live).
 - Ledger: benchmarks.toml [[not_run]] 2→1 (only ablation-graph-upstream remains: TF-IDF-vs-provisioned owner decision); RQ-24 evidence appended; TODO WP-12 line updated.
