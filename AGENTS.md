@@ -198,3 +198,7 @@ When preparing a commit that includes work tracked in `DONE.md`:
 - Reserve `experiments/` (tracked) for experiment work worth preserving in git history;
   keep bulky generated artifacts there out of version control via an in-directory `.gitignore`.
 - Generated reports go to `reports/` (gitignored); release evidence is archived separately.
+
+## Shell Discipline (Linux)
+
+- Prefer event waits over polling loops: `wait`/`wait -n` for child lifecycle (never `kill -0` + `sleep` spins), readiness output on piped stdout awaited as an event, `inotifywait` for one-shot filesystem events. Where no event source exists (e.g. detached daemon socket), poll bounded with a deadline and document why. See `~/.omp/agent/RULES.md` (global standing rule).

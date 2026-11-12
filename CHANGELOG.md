@@ -5,7 +5,10 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — refactor: event-driven visualizer spawn (no readiness polling)
+## 2026-11-12 — docs: shell-discipline rules (event waits over polling)
+
+- Global `~/.omp/agent/RULES.md` gains a shell-discipline section (`wait`/`wait -n`, piped-stdout readiness, `inotifywait`; bounded poll + documented reason where no event source exists). `AGENTS.md` gains a Linux-gated mirror citing the detached daemon socket as the documented exception.
+
 
 - `run_background` no longer polls connect/50ms: awaits the child's `serving at ...` line on piped stdout (`wait_ready_from_stdout`, extracted for testability; chatter skipped, EOF-with-live-child vs clean exit vs deadline distinct). New `detach_child_tokio` twin for `tokio::process::Command`.
 - Regression test with shell stub child (test binary cannot serve under `cargo test`) green in 0.00s. Daemon `ensure_daemon_process` poll kept deliberately — each dial IS the readiness check and the detached daemon announces nothing (no file-watch dep for a CLI wait loop); documented at the loop.
