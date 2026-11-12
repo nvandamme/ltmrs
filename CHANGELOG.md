@@ -5,7 +5,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: Slice A Hindsight bridge (opt-in dual-write + scoped recall)
+## 1b00bae (2026-11-12) — feat: Slice A Hindsight bridge (opt-in dual-write + scoped recall)
 
 - A0 wire table frozen from omp precedent; A1 types/config (`document_id`, tag derivation, env parsing).
 - A2 mockable client + bounded worker (native async traits; reqwest json; tokio dev-only).

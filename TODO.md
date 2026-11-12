@@ -19,6 +19,10 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [x] WP-09 — Guides, sessions and intelligence (S6, 29-tool surface live)
 - [x] WP-10 — CLI, managed skills, hosts and visualizer (S6)
 - [x] WP-11 — Import, legacy interchange, backup and restore (S7)
+- [x] Slice B — Silent-capture hooks (opt-in `hook-inject`/`hook-extract`/`install-hooks`, fail-open, budget reuse; 0e21ce6)
+- [x] Slice D — Defer-scheduler recall shaping (byte-identical renderer, defer/replay, tiers, compartments, single-flight; presentation-only; ee684f1)
+- [x] Slice C — Magic Context read-only import bridge (excluded cdylib, version fence, loss accounting, CLI-first preview/confirm; a774859)
+- [x] Slice A — Hindsight bridge B1 (opt-in dual-write + scoped recall, A0 wire table frozen; 1b00bae)
 
 ## Open — qualification and release (S8)
 
