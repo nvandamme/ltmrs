@@ -5,7 +5,11 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — docs: CUDA dynamic-loading migration plan (no code)
+## 2026-11-12 — docs: Candle replacement plan (dynamic loading only, no Candle)
+
+- Replaces the prior plan file outright (deleted — it kept Candle and worked around it, contradicting the directive). plans/2026-11-13-candle-replacement-plan.md: 6 tasks — DT_NEEDED-proven link baseline, time-boxed backend spike (CubeCL/pure-NVRTC/Burn, stop conditions if none qualify), seam pinning, full tensor-core port, pinned wheel libs, link+runtime+parity gates.
+- Candle (core/nn, all features, dev-deps) leaves the tree entirely; only `dynamic-loading`/`fallback-dynamic-loading` cudarc modes permitted anywhere in the resolved graph. Frozen recipe + fingerprint discipline carried; no Burn/CubeCL port pre-decided (spike decides with weights).
+
 
 - plans/2026-11-13-cuda-dynamic-loading-plan.md (owner directive): 7 tasks from link-coupling baseline (DT_NEEDED-proven on pinned closure) through isolated loader crate, pinned wheel libs, explicit auto/CPU/CUDA policy, CI link+runtime gates, to parity + failure qualification. Keeps Candle, replaces only the loading mechanism; no Burn/CubeCL port.
 - Also ledgers the Hindsight outbox startup replay (`collect_pending`/`collect_from_root`, `BridgeHandle::replay_pending`, daemon wiring at startup) which rode along unmentioned in 83e4654: rescan + resend through the normal retain path, expiry quarantines, file deletes on re-enqueue.
