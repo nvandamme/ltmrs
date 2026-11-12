@@ -5,7 +5,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — docs: Candle replacement plan (dynamic loading only, no Candle)
+## 1e3f1b8 (2026-11-12) — docs: Candle replacement plan (dynamic loading only, no Candle)
 
 - Replaces the prior plan file outright (deleted — it kept Candle and worked around it, contradicting the directive). plans/2026-11-13-candle-replacement-plan.md: 6 tasks — DT_NEEDED-proven link baseline, time-boxed backend spike (CubeCL/pure-NVRTC/Burn, stop conditions if none qualify), seam pinning, full tensor-core port, pinned wheel libs, link+runtime+parity gates.
 - Candle (core/nn, all features, dev-deps) leaves the tree entirely; only `dynamic-loading`/`fallback-dynamic-loading` cudarc modes permitted anywhere in the resolved graph. Frozen recipe + fingerprint discipline carried; no Burn/CubeCL port pre-decided (spike decides with weights).
