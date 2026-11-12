@@ -30,3 +30,7 @@
 /.ai/
 /.idea/
 /.omp/last-session-id.md
+
+# Pinned CUDA wheel binaries (Task 5): hundreds of MB, digests live in wheel-libs/README.md
+crates/embeddings/wheel-libs/*.whl
+crates/embeddings/wheel-libs/*.so*
