@@ -5,7 +5,10 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — docs: shell-discipline rules (event waits over polling)
+## 2026-11-12 — docs: detached-wait discipline (verbatim, no external pointers)
+
+- Global `RULES.md` gains `Detached-wait discipline (STRICT)`: never `sleep`-poll detached runs; `tail --pid` / `wait` for exit, pre-launch `inotifywait` for progress, exit code + log tail, no duplicate runs. `AGENTS.md` Linux section carries the same text verbatim (pointer replaced).
+
 
 - Global `~/.omp/agent/RULES.md` gains a shell-discipline section (`wait`/`wait -n`, piped-stdout readiness, `inotifywait`; bounded poll + documented reason where no event source exists). `AGENTS.md` gains a Linux-gated mirror citing the detached daemon socket as the documented exception.
 

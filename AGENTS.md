@@ -201,4 +201,5 @@ When preparing a commit that includes work tracked in `DONE.md`:
 
 ## Shell Discipline (Linux)
 
-- Prefer event waits over polling loops: `wait`/`wait -n` for child lifecycle (never `kill -0` + `sleep` spins), readiness output on piped stdout awaited as an event, `inotifywait` for one-shot filesystem events. Where no event source exists (e.g. detached daemon socket), poll bounded with a deadline and document why. See `~/.omp/agent/RULES.md` (global standing rule).
+- Prefer event waits over polling loops: `wait`/`wait -n` for child lifecycle (never `kill -0` + `sleep` spins), readiness output on piped stdout awaited as an event, `inotifywait` for one-shot filesystem events. Where no event source exists (e.g. detached daemon socket), poll bounded with a deadline and document why.
+- Detached-wait discipline (STRICT): NEVER `sleep`-poll a detached run. `tail --pid=$PID -f /dev/null` wakes in-kernel the millisecond the PID exits (safe on already-dead PIDs); shell-owned children use the `wait` builtin. Mid-run progress markers use `inotifywait -e modify` on the log, established BEFORE launching the producer (inotify only fires post-watch, unlike `tail --pid` which state-checks first). Report exit code + log tail once; inspect pending runs before starting duplicates — never launch a second run of the same workload while one is live.
