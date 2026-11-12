@@ -5,7 +5,13 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: WP-12 salted upstream comparison + soak-skeleton reference
+## 2026-11-12 — fix: gate-visible wordlist salt + corrected lemma-salted verdict
+
+- Correction: the f9220bf salted run's numeric trailer was gate-invisible (constant words + length-1 digit filtered pre-score → 8/8=1.0 always). Upstream gate read from code: `findSimilarByText` (lemma `memory/core.js:778`) scores `overlap / |query len>1 words|`, refuses at ≥0.80.
+- Fix (TDD): `salt_words` 64-word list (xorshift taps) → `Salt {a} {b} {c}` trailer; RED test `salt_words_are_gate_visible` pre-fix; 3 salt tests green post-fix; old trailer assertions updated.
+- Re-run vs pinned upstream: puts-ok 448→742, 475 refused (18%→51% by quartile as the 500-key corpus densifies — gate doing its documented job); all 185 get failures unmapped-cascade. comparison.json + benchmarks.toml detail rewritten; verdict family unchanged (put NOT COMPARABLE).
+- Proof: full `cargo test --workspace` green (0 failures, incl. re-run after a contention-flaked `closed_loop_executes_every_op` that passes 5/5 alone and in-bin-suite); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - `export_salted_reference_stream` ignored test (seed-7 shape, 2000 ops: 1217 salted puts / 397 gets / 386 searches) + driver `rmw`→`memory_update` mapping in tools/bench_against_lemma.mjs (tracked-id update, unmapped-loud; RED `unknown op kind` pre-fix, 2-op + 3-op live probes green incl. id stability).
 - Live run vs pinned upstream lemma-mcp@0.21.0 (13.2s): 769/1217 puts refused ('A similar memory already exists') — refusal is similarity-based, not byte-identity; salt hypothesis falsified, put NOT COMPARABLE. Evidence in reports/wp12-lemma-salted/ (comparison.json + transcript).

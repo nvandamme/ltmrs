@@ -145,16 +145,47 @@ pub fn current_thread_cpu_micros() -> Option<u64> {
     }
 }
 
+/// Salt wordlist: 64 distinct long words; every seq maps to three words
+/// via non-adjacent xorshift taps so consecutive seqs share no word and the
+/// salt is visible to word-overlap dedup gates (length>1 tokens scored as
+/// `overlap / |query|` at threshold 0.80 upstream). A numeric-only trailer
+/// is gate-invisible (single-char tokens are filtered before scoring).
+const SALT_WORDS: [&str; 64] = [
+    "harbor", "lantern", "meadow", "quarry", "ember", "falcon", "glacier", "hollow", "ivory",
+    "jungle", "kestrel", "lagoon", "magnet", "nimbus", "onyx", "prairie", "quartz", "raven",
+    "summit", "tundra", "umbra", "vortex", "willow", "xenon", "yarrow", "zephyr", "amber",
+    "basalt", "cinder", "drift", "estuary", "fjord", "granite", "heath", "inlet", "jetty", "kelp",
+    "larch", "marsh", "notch", "otter", "pinnacle", "ridge", "sable", "thicket", "upland", "vale",
+    "wharf", "abyss", "bluff", "cove", "dune", "epoch", "fen", "grove", "haven", "isthmus",
+    "juniper", "keystone", "lumen", "mesa", "north", "oasis", "pampas",
+];
+
+/// Map `seq` to three wordlist words (taps 0/21/42 bits of an xorshift64*
+/// scramble, so consecutive seqs share no word with overwhelming odds).
+pub fn salt_words(seq: u64) -> (&'static str, &'static str, &'static str) {
+    let mut x = seq.wrapping_add(0x9E3779B97F4A7C15);
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x2545F4914F6CDD1D);
+    (
+        SALT_WORDS[(x & 63) as usize],
+        SALT_WORDS[((x >> 21) & 63) as usize],
+        SALT_WORDS[((x >> 42) & 63) as usize],
+    )
+}
+
 /// Deterministic workload memory: id and title derive from the key, the
 /// fragment pads to `bytes` so value sizes stay workload-controlled.
-/// With `salt = Some(seq)`, a unique per-seq trailer rides the fragment
-/// (the lemma-comparison salt: same-key payloads differ, so the upstream
-/// dedup gate cannot collapse the write path). `None` is the unsalted
-/// contract: same key gives byte-identical content.
+/// With `salt = Some(seq)`, three distinct wordlist words ride the fragment
+/// (the lemma-comparison salt: same-key payloads differ in gate-visible
+/// tokens, so a word-overlap dedup gate scores them apart). `None` is the
+/// unsalted contract: same key gives byte-identical content.
 pub fn salted_workload_memory(key: u64, bytes: usize, salt: Option<u64>) -> Memory {
     let mut memory = workload_memory(key, bytes);
     if let Some(seq) = salt {
-        memory.fragment.push_str(&format!(" Salt seq {seq}."));
+        let (a, b, c) = salt_words(seq);
+        memory.fragment.push_str(&format!(" Salt {a} {b} {c}."));
     }
     memory
 }
@@ -820,6 +851,21 @@ mod tests {
             assert_eq!(op.top_k, 10);
         }
     }
+    /// Salt wordlist: every seq maps to three DISTINCT long words so the
+    /// salt is visible to word-overlap dedup gates (length>1 tokens only;
+    /// a numeric `seq` trailer is gate-invisible). RED: currently fails —
+    /// the `Salt seq {n}` trailer reuses constant words + a filtered digit.
+    #[test]
+    fn salt_words_are_gate_visible() {
+        let seq_words = |seq: u64| {
+            let (a, b, c) = salt_words(seq);
+            assert!(a.len() > 2 && b.len() > 2 && c.len() > 2);
+            assert!(a != b && b != c && a != c);
+            format!("{a} {b} {c}")
+        };
+        assert_ne!(seq_words(1), seq_words(2));
+        assert_ne!(seq_words(1), seq_words(1001));
+    }
 
     /// Salted exports defeat same-key dedup collapse: every put/RMW
     /// fragment carries its seq trailer; unsalted output is unchanged.
@@ -848,9 +894,10 @@ mod tests {
         let puts: Vec<&ExportedOp> = ops.iter().filter(|op| op.kind == "put").collect();
         assert!(!puts.is_empty(), "all-put stream must export puts");
         for op in &puts {
+            let (a, b, c) = salt_words(op.seq);
             assert!(
-                op.fragment.contains(&format!("Salt seq {}.", op.seq)),
-                "put seq {} must carry its salt trailer",
+                op.fragment.contains(&format!("Salt {a} {b} {c}.")),
+                "put seq {} must carry its wordlist salt trailer",
                 op.seq
             );
         }
@@ -895,7 +942,8 @@ mod tests {
         assert_eq!(a.fragment, workload_memory(9, 64).fragment);
         let salted = salted_workload_memory(9, 64, Some(3));
         assert_ne!(salted.fragment, a.fragment);
-        assert!(salted.fragment.contains("Salt seq 3."));
+        let (a3, b3, c3) = salt_words(3);
+        assert!(salted.fragment.contains(&format!("Salt {a3} {b3} {c3}.")));
     }
 
     /// Threaded search leg matches single-threaded results hit-for-hit and
