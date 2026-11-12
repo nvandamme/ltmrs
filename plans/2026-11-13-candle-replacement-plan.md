@@ -31,7 +31,7 @@
 
 **Steps:**
 
-- [ ] **Step 1: Record Candle's forced link mode**
+- [x] **Step 1: Record Candle's forced link mode** (executed 2026-11-12, commit 12b5640: `dynamic-linking` under `[dependencies.cudarc]`, candle-core 0.11.0 manifest line 176, no `fallback-dynamic-loading` alternative)
 
 ```bash
 grep -n "dynamic-linking" /home/nvand/.cargo/registry/src/*/candle-core-0.11.0/Cargo.toml
@@ -39,7 +39,7 @@ grep -n "dynamic-linking" /home/nvand/.cargo/registry/src/*/candle-core-0.11.0/C
 
 Expected: `dynamic-linking` under `[dependencies.cudarc]` features with no `fallback-dynamic-loading` alternative. Record section + line numbers.
 
-- [ ] **Step 2: Record the controls (CubeCL/Burn load dynamically)**
+- [x] **Step 2: Record the controls (CubeCL/Burn load dynamically)** (executed 2026-11-12, commit 12b5640: `fallback-dynamic-loading` in deps + build-deps, cubecl-cuda 0.11.2 manifest lines 123/183, no `dynamic-linking`)
 
 ```bash
 grep -n "fallback-dynamic-loading" /home/nvand/.cargo/registry/src/*/cubecl-cuda-0.11/Cargo.toml | head -3
@@ -47,7 +47,7 @@ grep -n "fallback-dynamic-loading" /home/nvand/.cargo/registry/src/*/cubecl-cuda
 
 Expected: present in both `[dependencies.cudarc]` and `[build-dependencies.cudarc]`, no `dynamic-linking`. This is the mechanism the replacement inherits — verified, not assumed.
 
-- [ ] **Step 3: Prove the coupling on a binary**
+- [x] **Step 3: Prove the coupling on a binary** (executed 2026-11-12, commit 12b5640: probe `Device::new_cuda(0)` carried `DT_NEEDED` on libcuda/libcurand/libcublas/libcudart, readelf-proven, scratch removed)
 
 ```bash
 mkdir -p /tmp/cudalink-probe/src && cd /tmp/cudalink-probe
@@ -59,7 +59,7 @@ readelf -d target/debug/cudalink-probe | grep -E "NEEDED.*(libcuda|libcublas|lib
 
 Expected: `libcuda.so.1`, `libcurand`, `libcublas`, `libcudart` listed. Paste full lines into the baseline note, then `rm -rf /tmp/cudalink-probe`.
 
-- [ ] **Step 4: Verify no replacement candidate links**
+- [x] **Step 4: Verify no replacement candidate links** (executed 2026-11-12, commit 12b5640: grep over cubecl-cuda-0.11 + burn-cuda-0.22 manifests printed nothing; re-verified post-port via `cargo tree -e features` — no link modes; the one later `DT_NEEDED` hit was a stale pre-migration fossil)
 
 ```bash
 grep -rn "dynamic-linking\|static-linking" /home/nvand/.cargo/registry/src/*/cubecl-cuda-0.11/Cargo.toml /home/nvand/.cargo/registry/src/*/burn-cuda-0.22/Cargo.toml 2>/dev/null | head
@@ -79,11 +79,11 @@ Expected: no output. If any replacement candidate forces link mode, STOP — the
 
 **Steps:**
 
-- [ ] **Step 1: Spike the smallest BERT op on each candidate**
+- [x] **Step 1: Spike the smallest BERT op on each candidate** (executed 2026-11-12, commit 78b399d: Burn Flex matmul + NVRTC axpy on live RTX 5090, both correct, zero CUDA `DT_NEEDED`)
 
 Matmul + layernorm + softmax + gelu_erf on 384-dim test vectors, one tiny binary per candidate backend (Burn/CubeCL model path + NVRTC kernel path). Measure: build time, binary `DT_NEEDED`, output vs CPU reference (max-abs), and NVRTC-vs-CubeCL kernel perf delta — NVRTC advances only on a large proven win.
 
-- [ ] **Step 2: Score and decide**
+- [x] **Step 2: Score and decide** (executed 2026-11-12, commit 78b399d: mandatory bars met by Burn+CubeCL; decision Burn with CubeCL for models)
 
 | Criterion | Weight |
 |---|---|
@@ -95,7 +95,7 @@ Matmul + layernorm + softmax + gelu_erf on 384-dim test vectors, one tiny binary
 
 Expected: a one-paragraph decision with numbers. Default hypothesis: Burn+CubeCL wins on expressiveness; pure-NVRTC wins on closure size. If neither meets the mandatory bars, STOP and return to the owner — do not invent a fourth backend.
 
-- [ ] **Step 3: File the decision, delete the spike**
+- [x] **Step 3: File the decision, delete the spike** (executed 2026-11-12, commit 78b399d: decision + numbers in-plan §Task 2 outcome; spike dirs removed)
 
 Append the decision + numbers to this plan. `rm -rf` the spike dir. No spike code enters the repo.
 
@@ -118,7 +118,7 @@ Append the decision + numbers to this plan. `rm -rf` the spike dir. No spike cod
 
 **Steps:**
 
-- [ ] **Step 1: Pin the seam with a structural test**
+- [x] **Step 1: Pin the seam with a structural test** (executed 2026-11-12, commit 78b399d: RED `seam_files_name_no_candle` written first per TDD)
 
 ```rust
 #[test]
@@ -132,7 +132,7 @@ fn embedder_seam_is_trait_only() {
 Run: `cargo test -p ltmrs-embeddings --lib embedder_seam_is_trait_only`
 Expected: FAIL with "implement".
 
-- [ ] **Step 2: Implement the grep pin**
+- [x] **Step 2: Implement the grep pin** (executed 2026-11-12, commit 78b399d: pins worker/service/recipe; extended to artifacts.rs in Task 4)
 
 ```rust
 #[test]
@@ -150,7 +150,7 @@ fn embedder_seam_is_trait_only() {
 Run: `cargo test -p ltmrs-embeddings --lib embedder_seam_is_trait_only`
 Expected: PASS — documents exactly which files the replacement must not touch.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit** (executed 2026-11-12 as 78b399d)
 
 ```bash
 git add crates/embeddings/src/worker.rs
@@ -173,7 +173,7 @@ git commit -m "test: pin SyncEmbedder as the Candle-replacement seam"
 
 **Steps:**
 
-- [ ] **Step 1: Write the failing parity test**
+- [x] **Step 1: Write the failing parity test** (executed 2026-11-12, commit 2ccf544: RED `burn_backend_matches_frozen_fixtures` failed `not implemented` before the port, GREEN after)
 
 ```rust
 #[test]
@@ -202,7 +202,7 @@ Expected: PASS — full-adapter max-abs ≤1e-6, cosine ≥0.999999, rank top-3 
 
 Remove `candle-core`/`candle-nn` from `crates/embeddings/Cargo.toml` (+ dev-deps), delete `bert_impl.rs` only when the replacement passes parity (never before). `cargo tree -e no-dev -p ltmrs-embeddings | grep -i candle` must print nothing. The `cuda` feature flag stays (same name, new mechanism) or is renamed per owner call — do not unilaterally rename a feature users may set.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit** (executed 2026-11-12 as 2ccf544)
 
 ```bash
 git add crates/embeddings crates/daemon plans/2026-11-13-candle-replacement-plan.md
@@ -237,7 +237,7 @@ LTMRS_CUDA_WHEEL_DIR=<dir> cargo test -p ltmrs-embeddings --features cuda --lib 
 
 Expected: GPU tests that previously needed system CUDA now pass against the wheel dir alone (with `LD_LIBRARY_PATH` scrubbed of system CUDA to prove it).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit** (executed 2026-11-12 as 54eb0b7)
 
 ```bash
 git add crates/embeddings/wheel-libs/README.md
@@ -293,7 +293,7 @@ GPU envelope re-baselined for the backend change (the Candle 1e-6 envelope does 
 
 max-abs ≤1e-6, cosine ≥0.999999, rank top-3 identical, on a CUDA host against the wheel libs. Record in the release evidence bundle.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit** (executed 2026-11-12 as a5f2495; deferred legs in ddc8cec)
 
 ```bash
 git add tools/check_cuda_link.sh

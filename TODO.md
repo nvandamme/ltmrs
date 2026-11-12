@@ -14,6 +14,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 - [x] WP-04 — Singleton daemon, IPC and session routing (S2)
 - [x] WP-05 — Versioned Lance search projection (S3)
 - [x] WP-06 — Candle embedding service and model qualification (S4)
+- [x] Candle migration Tasks 1–6 + deferred legs (2026-11-12) — Burn tensor core replaces Candle (parity green, tree Candle-free both feature sets, cudarc dynamic-loading only); pinned CUDA wheel libs (`wheel-libs/README.md`); link gate green both binaries; `DeviceMode` policy + GPU envelope re-baselined (1e-4); release-profile `cuda_` 4/4 + driverless legs executed locally. Commits 2ccf544/54eb0b7/a5f2495/ddc8cec.
 - [x] WP-07 — Retrieval, graph context and explanations (S5)
 - [x] WP-08 — Complete memory MCP contract (S2/S6) — 11 tool handlers + read side effects + instructions + notifications; differential harness live (02:340 byte-for-byte, 02:367 8-step replay)
 - [x] WP-09 — Guides, sessions and intelligence (S6, 29-tool surface live)
