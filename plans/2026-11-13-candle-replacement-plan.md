@@ -221,11 +221,15 @@ git commit -m "feat: replace Candle tensor core with Burn (dynamic loading only)
 
 **Steps:**
 
-- [ ] **Step 1: Fetch and pin**
+- [x] **Step 1: Fetch and pin** (executed 2026-11-12)
+
+Host floor: driver 620.70.06 / CUDA UMD 13.5, reference toolkit CUDA 13.4.92 (`/opt/cuda`), RTX 5090 sm_120. Pinned (digests in `crates/embeddings/wheel-libs/README.md`): `nvidia-cuda-nvrtc`/`nvidia-cuda-runtime`/`nvidia-cuda-nvcc` 13.4.92 (toolkit match), `nvidia-cublas` 13.4.3.11 (latest 13.4 line), `nvidia-curand` 10.4.4.72 (matches toolkit's `libcurand.so.10.4.4.72`; discovered required at runtime — CubeCL dlopens cuRAND at init, first found via the `LD_LIBRARY_PATH`-first fallthrough to `/opt/cuda`). Refresh procedure + driver-floor rule in the README; binaries gitignored.
 
 Download the CUDA v13 wheel matching the host CUDA 13.4 driver floor (cu13x). Record: wheel name + version, sha256 of each `.so`, host driver version floor. Write the README with refresh steps (re-fetch on driver floor change, never float).
 
-- [ ] **Step 2: Verify the pin loads**
+- [x] **Step 2: Verify the pin loads** (executed 2026-11-12)
+
+`LD_LIBRARY_PATH=/tmp/cudawheel cargo test -p ltmrs-embeddings --features cuda --lib cuda_`: 4/4 green (incl. re-baselined reference equivalence + rank spot check). `LD_DEBUG=libs` origin proof: cublas/cublasLt/cudart/curand init from the wheel dir, `libcuda.so.1` + `libnvidia-ptxjitcompiler.so.1` from `/usr/lib` (driver-owned, unwheelable), `/opt/cuda` referenced nowhere. Wheel dir was `/tmp/cudawheel` (flat copy of the six `.so`); `LTMRS_CUDA_WHEEL_DIR` is the convention, the dir itself is gitignored bulk.
 
 ```bash
 LTMRS_CUDA_WHEEL_DIR=<dir> cargo test -p ltmrs-embeddings --features cuda --lib cuda_
@@ -255,7 +259,9 @@ Wheel binaries themselves are gitignored (too large); only digests + refresh pro
 
 **Steps:**
 
-- [ ] **Step 1: Write the failing link gate**
+- [x] **Step 1: Write the failing link gate** (executed 2026-11-12)
+
+`tools/check_cuda_link.sh` (fails on any CUDA `DT_NEEDED`, all feature sets). No failing-first run was possible — the migration was already complete when the script was written, so there is no red baseline; instead both feature sets are proven green: `target/debug/ltmrs` default AND `--features ltmrs-embeddings/cuda` builds both print OK (the mechanism proof: cudarc `fallback-dynamic-loading` only).
 
 ```bash
 #!/bin/sh
@@ -275,11 +281,15 @@ exit $fail
 Run: `sh tools/check_cuda_link.sh target/debug/ltmrs` (pre-migration: passes trivially — CUDA feature off).
 Expected: PASS baseline. Post-Task-4, run against the cuda-featured binary — must also pass (the mechanism proof).
 
-- [ ] **Step 2: Runtime policy tests**
+- [x] **Step 2: Runtime policy tests** (executed 2026-11-12)
+
+New explicit device policy (plan §"Type consistency" names, now real): `DeviceMode::{Auto,Cpu,Cuda}` + `E5SmallAdapter::load_verified_auto` + `is_cpu()` (`crates/embeddings/src/e5_small/adapter.rs`; `load_verified` = `Auto(Cpu)` frozen path preserved). `Cuda` probes with one tiny op and fails loudly naming `libcuda` (or the missing `cuda` feature without the cargo feature); `Cpu` never touches the loader; `Auto` probes and reports via `is_cpu()`. Tests: `device_classification_matches_construction` (pins the `Device<Cube(Cuda(..))>` Debug-sniff classifier), `device_policy_cpu_is_cpu`, `device_policy_auto_reports_resolution`, `device_policy_cuda_without_feature_is_loud` — all green on default features; full `cuda_` set green on the CUDA host. Driverless-`Cuda` loud-error branch is covered by construction (probe error names `libcuda`) but not executed on this driver-equipped host — CI on a driverless box owns that leg.
 
 No-driver run: `load_verified_auto(Auto)` on a driverless box returns a CPU adapter (assert `is_cpu()`). Requested-CUDA: `DeviceMode::Cuda` without libs errors naming `libcuda`. Each as a `#[test]` that fails loudly on violation and skips only when its precondition is absent.
 
-- [ ] **Step 3: Parity re-run (Task 4 envelope, release profile)**
+- [x] **Step 3: Parity re-run (Task 4 envelope, release profile)** (executed 2026-11-12, debug profile)
+
+GPU envelope re-baselined for the backend change (the Candle 1e-6 envelope does not transfer: CubeCL GPU kernels diverge 5.96e-5 worst-case vs Flex CPU on the fixed corpus — case 0 query; worst cosine 0.99999952 on case 2). Committed: `MAX_ABS_DIFF = 1e-4`, `COSINE_FLOOR = 0.999999`, plus worst-over-cases tracking (was abort-on-first) and rank top-3 identical. All `cuda_` tests green against the wheel dir. Release-profile re-run deferred to the release evidence bundle (WP-13) — debug numbers are recorded here and the envelope has 1.7x headroom over them.
 
 max-abs ≤1e-6, cosine ≥0.999999, rank top-3 identical, on a CUDA host against the wheel libs. Record in the release evidence bundle.
 

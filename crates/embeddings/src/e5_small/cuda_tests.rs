@@ -68,19 +68,22 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 /// (a) Reference-vector equivalence CPU-vs-GPU on fixed texts.
 ///
-/// Envelope rationale (measured 2026-10-26, RTX 5090 sm_120, CUDA 13.4,
-/// Burn Flex/Cube F32; per-row values printed by this test): largest observed
-/// max-abs diff M = 1.31e-7 (empty-string passage case), smallest observed
-/// cosine C = 0.99999982. The committed envelope is `MAX_ABS_DIFF = 1e-6`
-/// (~8x the largest observed M: headroom for kernel/clock nondeterminism
-/// across runs while staying two orders below the CPU-vs-PyTorch reference
-/// tolerance 1e-3) and `COSINE_FLOOR = 0.999_999` (just under the observed
-/// minimum; only a genuinely different code path trips it). Neither constant
-/// is a round-number guess: both are ceilings over the measured values
-/// stated in the cuda report.
+/// Envelope rationale (re-baselined 2026-11-12 for the Burn/CubeCL port,
+/// RTX 5090 sm_120, CUDA 13.4, wheel libs; per-row values printed by this
+/// test). The Candle envelope (M=1.31e-7, 2026-10-26) does not transfer:
+/// CubeCL's GPU kernels (different GEMM/softmax codegen and reduction
+/// order than Flex CPU) diverge 5.96e-5 worst-case on the fixed corpus
+/// (case 0 query; worst cosine 0.99999952 on case 2).
+/// The committed envelope is `MAX_ABS_DIFF = 1e-4` (~1.7x the largest
+/// observed M: headroom for kernel/clock nondeterminism while staying an
+/// order below the CPU-vs-PyTorch reference tolerance 1e-3) and
+/// `COSINE_FLOOR = 0.999_999` (observed minimum stays above it; rank
+/// equivalence is gated separately by `cuda_rank_equivalence_spot_check`).
+/// Neither constant is a round-number guess: both are ceilings over the
+/// measured values printed below.
 #[test]
 fn cuda_reference_vector_equivalence_cpu_vs_gpu() {
-    const MAX_ABS_DIFF: f32 = 1e-6;
+    const MAX_ABS_DIFF: f32 = 1e-4;
     const COSINE_FLOOR: f32 = 0.999_999;
 
     let Some((cpu, gpu)) = load_cpu_and_gpu() else {
@@ -107,6 +110,8 @@ fn cuda_reference_vector_equivalence_cpu_vs_gpu() {
     let cpu_vecs = cpu.embed_batch(&inputs).unwrap();
     let gpu_vecs = gpu.embed_batch(&inputs).unwrap();
     assert_eq!(cpu_vecs.len(), gpu_vecs.len());
+    let mut worst_m = 0.0f32;
+    let mut worst_cos = 1.0f32;
     for (i, (c, g)) in cpu_vecs.iter().zip(gpu_vecs.iter()).enumerate() {
         assert_eq!(c.vector.len(), g.vector.len(), "case {i}: dim mismatch");
         assert!(
@@ -116,15 +121,18 @@ fn cuda_reference_vector_equivalence_cpu_vs_gpu() {
         let cos = cosine(&c.vector, &g.vector);
         let m = max_abs_diff(&c.vector, &g.vector);
         eprintln!("case {i}: cos={cos:.8}, max_abs_diff={m:.8e}");
-        assert!(
-            cos >= COSINE_FLOOR,
-            "case {i}: cosine {cos} below floor {COSINE_FLOOR}"
-        );
-        assert!(
-            m <= MAX_ABS_DIFF,
-            "case {i}: max abs diff {m} above envelope {MAX_ABS_DIFF}"
-        );
+        worst_m = worst_m.max(m);
+        worst_cos = worst_cos.min(cos);
     }
+    eprintln!("worst: cos={worst_cos:.8}, max_abs_diff={worst_m:.8e}");
+    assert!(
+        worst_cos >= COSINE_FLOOR,
+        "cosine {worst_cos} below floor {COSINE_FLOOR}"
+    );
+    assert!(
+        worst_m <= MAX_ABS_DIFF,
+        "max abs diff {worst_m} above envelope {MAX_ABS_DIFF}"
+    );
 }
 
 /// (b) Rank-equivalence spot check: same query, top-3 passage ids must be

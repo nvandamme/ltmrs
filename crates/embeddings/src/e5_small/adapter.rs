@@ -103,6 +103,17 @@ impl BertConfig {
     }
 }
 
+/// Explicit device policy (Candle-replacement plan, global constraints).
+/// `Auto` probes the CUDA loader and takes CUDA when usable, else CPU;
+/// the resolution is observable via `is_cpu` (a probe, not a silent
+/// fallback — the caller asked for best-available). `Cuda` fails loudly
+/// naming the missing library. `Cpu` never touches the loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMode {
+    Auto,
+    Cpu,
+    Cuda,
+}
 impl E5SmallAdapter {
     /// Load from a verified artifact directory (digests checked by the cache).
     /// Returns an actionable error for unsupported recipes instead of trying.
@@ -110,10 +121,73 @@ impl E5SmallAdapter {
     /// Frozen CPU path: production default, byte-identical with or without
     /// the `cuda` feature (see the CUDA report: default-feature check green).
     pub fn load_verified(dir: &Path) -> ArtifactResult<Self> {
-        let device = Device::new(burn_dispatch::device::DispatchDevice::Flex(
+        Self::load_verified_auto(dir, DeviceMode::Cpu)
+    }
+
+    /// Load from a verified artifact directory under an explicit device
+    /// policy (Task 6 runtime gates).
+    pub fn load_verified_auto(dir: &Path, mode: DeviceMode) -> ArtifactResult<Self> {
+        let device = match mode {
+            DeviceMode::Cpu => Self::cpu_device(),
+            DeviceMode::Cuda => Self::cuda_device().map_err(ArtifactError::BackendInference)?,
+            DeviceMode::Auto => Self::cuda_device().unwrap_or_else(|_| Self::cpu_device()),
+        };
+        let mut adapter = Self::load_verified_on_device(dir, &device)?;
+        adapter.on_cuda = Self::device_is_cuda(&device);
+        Ok(adapter)
+    }
+
+    /// True when this adapter runs on CPU (Flex). The Auto resolution and
+    /// the explicit constructors are both observable here.
+    pub fn is_cpu(&self) -> bool {
+        !self.on_cuda
+    }
+
+    fn cpu_device() -> Device {
+        Device::new(burn_dispatch::device::DispatchDevice::Flex(
             burn_flex::FlexDevice,
+        ))
+    }
+
+    /// CubeCL CUDA device, probed with one tiny op so a missing/broken
+    /// loader fails here — loudly — instead of mid-inference. The error
+    /// names the library family (`libcuda`) the loader could not resolve.
+    #[cfg(feature = "cuda")]
+    fn cuda_device() -> Result<Device, String> {
+        let device = Device::new(burn_dispatch::device::DispatchDevice::Cube(
+            burn_cubecl::cubecl::Device::Cuda(Default::default()),
         ));
-        Self::load_verified_on_device(dir, &device)
+        let probe = burn_tensor::Tensor::<1>::from_data(
+            burn_tensor::TensorData::new(vec![1.0f32], [1]),
+            &device,
+        );
+        let _ = (probe.clone() + probe)
+            .into_data()
+            .as_slice::<f32>()
+            .map(<[f32]>::to_vec)
+            .map_err(|e| {
+                format!("CUDA inference requested but the CUDA loader failed (libcuda/libnvrtc unresolved on this host): {e:?}")
+            })?;
+        Ok(device)
+    }
+
+    /// Without the `cuda` feature no CUDA runtime exists in the binary;
+    /// requesting it is a loud configuration error, never a silent CPU run.
+    #[cfg(not(feature = "cuda"))]
+    fn cuda_device() -> Result<Device, String> {
+        Err("CUDA inference requested but this binary was built without the `cuda` feature".into())
+    }
+
+    /// Classify a device from its Debug form (`Device<Cube(Cuda(..))>` vs
+    /// `Device<Flex(..)>`). Pinned by `device_classification_matches_probe`
+    /// so a Burn Debug-format change fails loudly instead of misrouting.
+    #[cfg(test)]
+    pub(crate) fn device_is_cuda_for_test(device: &Device) -> bool {
+        Self::device_is_cuda(device)
+    }
+
+    fn device_is_cuda(device: &Device) -> bool {
+        format!("{device:?}").contains("Cuda")
     }
 
     /// Load from a verified artifact directory onto an explicit device
@@ -146,6 +220,7 @@ impl E5SmallAdapter {
             tokenizer,
             model,
             device: device.clone(),
+            on_cuda: Self::device_is_cuda(device),
         })
     }
 

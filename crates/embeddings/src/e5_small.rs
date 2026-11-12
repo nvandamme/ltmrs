@@ -15,6 +15,7 @@ use crate::recipe::Role;
 use ltmrs_domain::id::ModelFingerprint;
 
 mod adapter;
+pub use adapter::DeviceMode;
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests;
 #[cfg(test)]
@@ -69,4 +70,5 @@ pub struct E5SmallAdapter {
     tokenizer: Arc<Tokenizer>,
     model: BurnBertModel,
     device: burn_tensor::Device,
+    on_cuda: bool,
 }

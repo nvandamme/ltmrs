@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{E5SmallAdapter, EmbedInput};
+use super::{DeviceMode, E5SmallAdapter, EmbedInput};
 use crate::artifacts::{ArtifactCache, ArtifactError};
 use crate::manifest::{e5_small_artifact, e5_small_recipe};
 use crate::recipe::Role;
@@ -794,5 +794,106 @@ fn burn_backend_matches_frozen_fixtures() {
         checked += 1;
     }
     assert!(checked >= 4, "must cover the frozen cases, got {checked}");
+
     eprintln!("burn parity: {checked} cases, worst max-abs {worst:.2e}");
+}
+
+/// Device classifier pin: `device_is_cuda` must agree with the actual
+/// construction site. If Burn ever changes its `Device` Debug format, this
+/// fails loudly instead of letting adapters misreport `is_cpu`.
+#[test]
+fn device_classification_matches_construction() {
+    let cpu = burn_tensor::Device::new(burn_dispatch::device::DispatchDevice::Flex(
+        burn_flex::FlexDevice,
+    ));
+    assert!(
+        !E5SmallAdapter::device_is_cuda_for_test(&cpu),
+        "Flex device must classify as CPU, got {cpu:?}"
+    );
+    #[cfg(feature = "cuda")]
+    {
+        let cuda = burn_tensor::Device::new(burn_dispatch::device::DispatchDevice::Cube(
+            burn_cubecl::cubecl::Device::Cuda(Default::default()),
+        ));
+        assert!(
+            E5SmallAdapter::device_is_cuda_for_test(&cuda),
+            "Cube/Cuda device must classify as CUDA, got {cuda:?}"
+        );
+    }
+}
+
+/// Task 6 Step 2: explicit CPU policy loads a CPU adapter and never
+/// touches the loader. Fails loudly on violation; skips only when the
+/// pinned artifacts are absent.
+#[test]
+fn device_policy_cpu_is_cpu() {
+    let (cache, guard) = test_cache();
+    if !populate_cache(&cache, &guard) {
+        eprintln!("SKIP: artifacts not present");
+        return;
+    }
+    let dir = cache.load_cached(&e5_small_artifact()).unwrap();
+    let adapter = E5SmallAdapter::load_verified_auto(&dir, DeviceMode::Cpu).unwrap();
+    assert!(adapter.is_cpu(), "DeviceMode::Cpu must load a CPU adapter");
+}
+
+/// Task 6 Step 2: `Auto` resolves to a working adapter and reports its
+/// resolution honestly. On a CUDA host this must be a CUDA adapter; on a
+/// driverless box it must be CPU (no silent breakage either way — the
+/// assertion follows the probe, it does not assume it).
+#[test]
+fn device_policy_auto_reports_resolution() {
+    let (cache, guard) = test_cache();
+    if !populate_cache(&cache, &guard) {
+        eprintln!("SKIP: artifacts not present");
+        return;
+    }
+    let dir = cache.load_cached(&e5_small_artifact()).unwrap();
+    let adapter = E5SmallAdapter::load_verified_auto(&dir, DeviceMode::Auto).unwrap();
+    let vec = adapter
+        .embed("probe", crate::recipe::Role::Query)
+        .unwrap()
+        .vector;
+    assert!(vec.iter().all(|v| v.is_finite()), "auto adapter must infer");
+    eprintln!("Auto resolved to cpu={}", adapter.is_cpu());
+}
+
+/// Task 6 Step 2: requested CUDA without the `cuda` feature is a loud
+/// configuration error naming the feature, never a silent CPU run.
+/// (With the feature on a driverless box, `load_verified_auto(Cuda)`
+/// errors naming libcuda — exercised on driverless CI.)
+#[test]
+fn device_policy_cuda_without_feature_is_loud() {
+    let (cache, guard) = test_cache();
+    if !populate_cache(&cache, &guard) {
+        eprintln!("SKIP: artifacts not present");
+        return;
+    }
+    let dir = cache.load_cached(&e5_small_artifact()).unwrap();
+    #[cfg(not(feature = "cuda"))]
+    {
+        match E5SmallAdapter::load_verified_auto(&dir, DeviceMode::Cuda) {
+            Ok(_) => panic!("Cuda mode without the cuda feature must fail loudly"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("cuda"),
+                    "Cuda-mode error must name the cuda feature/libs, got: {msg}"
+                );
+            }
+        }
+    }
+    #[cfg(feature = "cuda")]
+    {
+        // On a CUDA host this loads a GPU adapter; the driverless-CI leg
+        // covers the loud-error branch.
+        let adapter = E5SmallAdapter::load_verified_auto(&dir, DeviceMode::Cuda);
+        match adapter {
+            Ok(a) => assert!(!a.is_cpu(), "Cuda mode on a CUDA host must not be CPU"),
+            Err(e) => assert!(
+                e.to_string().contains("libcuda"),
+                "Cuda-mode failure must name libcuda, got: {e}"
+            ),
+        }
+    }
 }
