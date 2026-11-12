@@ -88,6 +88,7 @@ pub struct BridgeHandle {
     bank: String,
     default_tags: Vec<String>,
     scoping: ltmrs_interchange::hindsight::Scoping,
+    outbox_root: Option<std::path::PathBuf>,
 }
 
 impl BridgeHandle {
@@ -139,6 +140,7 @@ impl BridgeHandle {
     {
         use ltmrs_interchange::hindsight::outbox as ob;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<BridgeMsg>(max_queue.max(1));
+        let outbox_root = outbox.clone();
         let handle = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
@@ -219,6 +221,7 @@ impl BridgeHandle {
                 bank,
                 default_tags: tags,
                 scoping,
+                outbox_root,
             },
             handle,
         )
@@ -236,6 +239,82 @@ impl BridgeHandle {
         tags.dedup();
         doc.tags = tags;
         self.tx.try_send(BridgeMsg::Retain(doc)).is_ok()
+    }
+
+    /// Startup replay (owner directive): rescan the outbox root for
+    /// pending events and re-enqueue them through the normal retain path.
+    /// Expired events quarantine inside the scan; replayed files delete
+    /// after successful re-enqueue (the persist-first path regenerates
+    /// them on next failure). Returns the resend count. No outbox
+    /// configured = 0, never an error — a fresh home has nothing.
+    pub fn replay_pending(&self) -> usize {
+        use ltmrs_interchange::hindsight::outbox as ob;
+        let Some(root) = self.outbox_root.as_deref() else {
+            return 0;
+        };
+        // The root contains per-bank dirs; quarantine lives beside them.
+        // collect_from_root expects the home whose child is the standard
+        // outbox dir name — our root may be custom, so pass a synthetic
+        // home only when the layout matches; otherwise scan directly.
+        // Simplest correct: the root IS the scan target; reuse the walk
+        // by treating root as home when it already holds bank dirs.
+        // (collect_from_root(root, home) quarantines into home/quarantine.)
+        // To keep quarantine beside the root, pass root as its own home
+        // only if `root/hindsight-outbox` does not exist; else use parent.
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Prefer the canonical layout (home/hindsight-outbox) when the
+        // root's file name matches; else scan the root as its own home
+        // and quarantine into root/quarantine via collect_from_root.
+        let pending = match ob::collect_from_root(root, root, now_millis) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        let mut resent = 0usize;
+        for event in pending {
+            let v: serde_json::Value = match serde_json::from_slice(&event.body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let doc = ltmrs_interchange::hindsight::RetainDoc {
+                document_id: v
+                    .get("document_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                bank: event.bank.clone(),
+                title: v
+                    .get("title")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                text: v
+                    .get("text")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                tags: v
+                    .get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                project: None,
+            };
+            if doc.document_id.is_empty() || doc.text.trim().is_empty() {
+                continue;
+            }
+            if self.enqueue_retain(doc) {
+                let _ = std::fs::remove_file(&event.path);
+                resent += 1;
+            }
+        }
+        resent
     }
 
     /// Bank for a project scope (G1a): shared base for global/tagged,
@@ -730,5 +809,99 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Startup replay (owner directive): a leftover outbox event resends
+    /// through the normal path and its file deletes. RED: fails — no
+    /// replay exists yet (now: replay_pending).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_pending_resends_and_cleans_up() {
+        use ltmrs_interchange::hindsight::client::{HindsightClient, HttpTransport};
+        use ltmrs_interchange::hindsight::outbox as ob;
+        use ltmrs_interchange::hindsight::{BridgeError, HindsightConfig, Scoping};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Mock {
+            pub calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        }
+        impl HttpTransport for Mock {
+            async fn post(
+                &self,
+                url: &str,
+                _bearer: Option<&str>,
+                body: serde_json::Value,
+            ) -> Result<serde_json::Value, BridgeError> {
+                self.calls.lock().unwrap().push((url.to_string(), body));
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
+        // Seed a leftover event the way the worker writes it.
+        let home = tempfile::tempdir().unwrap();
+        let root = ob::outbox_root(home.path());
+        let bank_dir = ob::dest_dir(home.path(), "team");
+        let body = serde_json::json!({
+            "document_id": "ltmrs:memory:replay1",
+            "bank": "team",
+            "tags": [],
+            "title": "",
+            "text": "leftover body",
+        });
+        ob::write_event(
+            &bank_dir,
+            &ob::event_filename("ltmrs:memory:replay1", 1),
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+
+        let mock = Mock::default();
+        let calls = Arc::clone(&mock.calls);
+        let cfg = HindsightConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:9999".into(),
+            bank: "team".into(),
+            default_tags: vec![],
+            timeout_ms: 1500,
+            max_queue: 8,
+            scoping: Scoping::PerProject,
+            global_scope: false,
+            outbox_dir: Some(root.clone()),
+        };
+        let client = HindsightClient::with_transport(cfg, None, mock);
+        let (handle, _bg) = super::BridgeHandle::spawn_scoped_outbox(
+            client,
+            "team".into(),
+            vec![],
+            8,
+            Scoping::PerProject,
+            Some(root),
+        );
+        assert_eq!(handle.replay_pending(), 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let guard = calls.lock().unwrap();
+                if !guard.is_empty() {
+                    let (url, body) = &guard[0];
+                    assert!(
+                        url.ends_with("/v1/default/banks/team/memories"),
+                        "got: {url}"
+                    );
+                    assert_eq!(
+                        body["items"][0]["document_id"].as_str().unwrap(),
+                        "ltmrs:memory:replay1"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replayed retain never delivered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Replayed file deletes; nothing left to replay.
+        assert_eq!(handle.replay_pending(), 0);
     }
 }

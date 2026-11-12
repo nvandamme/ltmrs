@@ -266,3 +266,106 @@ pub fn mmr_order(
         })
         .collect()
 }
+
+/// UpstreamReference leg via the live Lemma SQL shape (owner directive:
+/// use Lemma's implementation, no port). Builds a lemma-shaped SQLite
+/// store (memories + memory_fts) from the frozen safety corpus with the
+/// `sqlite3` CLI — no rusqlite edge, no reimplementation — then runs the
+/// upstream FTS query shape per case verbatim:
+/// `memory_fts MATCH ?` + `bm25(memory_fts)` + project filter, LIKE
+/// fallback on FTS error. Returns the dev+heldout `evaluate` reports.
+/// Reports retention, never gates (strategy comparison, not a quality bar).
+#[cfg(test)]
+pub fn upstream_reference_report() -> Vec<super::AblationReport> {
+    use super::{Ablation, Corpus, Split, evaluate};
+    use std::process::Command;
+    let raw = std::fs::read_to_string(
+        crate::bench::crate_root().join("experiments/quality/safety-cases.json"),
+    )
+    .expect("safety corpus reads");
+    let corpus: Corpus = serde_json::from_str(&raw).expect("safety corpus parses");
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let db = dir.path().join("upstream.db");
+    let sql_escape = |s: &str| s.replace('\'', "''");
+    // Standalone FTS table keyed by doc id (ranking math is what we
+    // compare, not schema fidelity).
+    let mut setup = String::from(
+        "CREATE TABLE memories(id TEXT PRIMARY KEY, project TEXT, title TEXT, fragment TEXT, confidence REAL);\
+         CREATE VIRTUAL TABLE memory_fts USING fts5(doc_id UNINDEXED, project, title, fragment);",
+    );
+    for doc in &corpus.documents {
+        setup.push_str(&format!(
+            "INSERT INTO memories VALUES('{}','{}','{}','{}',0.5);\
+             INSERT INTO memory_fts VALUES('{}','{}','{}','{}');",
+            sql_escape(&doc.id),
+            sql_escape(&doc.project),
+            sql_escape(&doc.id),
+            sql_escape(&doc.text),
+            sql_escape(&doc.id),
+            sql_escape(&doc.project.to_lowercase()),
+            sql_escape(&doc.id),
+            sql_escape(&doc.text),
+        ));
+    }
+    let status = Command::new("sqlite3")
+        .arg(&db)
+        .arg(&setup)
+        .status()
+        .expect("sqlite3 CLI builds the lemma-shaped store");
+    assert!(status.success(), "store build must succeed");
+    // Upstream FTS sanitize: their sanitizeFtsQuery strips operators down
+    // to plain terms; mirror the effect (alphanumeric + space runs).
+    let sanitize = |q: &str| {
+        q.split_whitespace()
+            .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let retrieve = |case: &QueryCase| -> Vec<String> {
+        let terms = sanitize(&case.query);
+        let fts_sql = format!(
+            "SELECT doc_id FROM memory_fts WHERE memory_fts MATCH '{}' AND project = '{}' ORDER BY bm25(memory_fts) LIMIT {};",
+            sql_escape(&terms),
+            sql_escape(&case.project.to_lowercase()),
+            case.top_k.max(1)
+        );
+        let out = Command::new("sqlite3")
+            .arg(&db)
+            .arg(&fts_sql)
+            .output()
+            .expect("sqlite3 CLI runs the upstream query");
+        if out.status.success() {
+            let rows: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if !rows.is_empty() {
+                return rows;
+            }
+        }
+        // LIKE fallback (their substring fallback, same shape).
+        let like = format!("%{}%", sql_escape(case.query.trim()));
+        let like_sql = format!(
+            "SELECT id FROM memories WHERE project = '{}' AND (title LIKE '{}' OR fragment LIKE '{}') ORDER BY confidence DESC LIMIT {};",
+            sql_escape(&case.project.to_lowercase()),
+            like,
+            like,
+            case.top_k.max(1)
+        );
+        let out = Command::new("sqlite3")
+            .arg(&db)
+            .arg(&like_sql)
+            .output()
+            .expect("sqlite3 CLI runs the fallback");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    };
+    [Split::Dev, Split::Heldout]
+        .iter()
+        .map(|split| evaluate(Ablation::UpstreamReference, &corpus, *split, &retrieve))
+        .collect()
+}

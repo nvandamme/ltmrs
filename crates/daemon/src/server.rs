@@ -306,7 +306,12 @@ impl Daemon {
             // Intentionally detached: the worker lives as long as the daemon.
             std::mem::forget(_bg);
             dispatcher.set_hindsight(handle);
-            eprintln!("ltmrs: hindsight bridge enabled (bank {})", cfg.bank);
+            // Startup replay: resend outbox events left over from an
+            // earlier crash/shutdown through the normal retain path.
+            let replayed = dispatcher.replay_bridge_outbox();
+            if replayed > 0 {
+                eprintln!("ltmrs: hindsight bridge replayed {replayed} pending retains");
+            }
         }
         // Eager durability (P1): session mutations persist before ack.
         dispatcher.set_sessions_path(sessions_path.clone());

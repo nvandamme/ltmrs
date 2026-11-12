@@ -126,6 +126,14 @@ impl Dispatcher {
         *self.hindsight.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
+    /// Startup replay for the bridge outbox (owner directive): resend
+    /// leftover events through the normal retain path. 0 when disabled
+    /// or nothing pending.
+    pub fn replay_bridge_outbox(&self) -> usize {
+        let guard = self.hindsight.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|h| h.replay_pending()).unwrap_or(0)
+    }
+
     /// Enqueue a post-commit bridge retain (best-effort, never fails).
     /// Returns false when the bridge is disabled or the tool is outside
     /// the fan-out set — the caller never branches on this.

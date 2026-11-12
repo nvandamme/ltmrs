@@ -72,6 +72,86 @@ pub fn write_event(dir: &Path, filename: &str, bytes: &[u8]) -> std::io::Result<
     Ok(dest)
 }
 
+/// One pending event for startup replay: the bank it was filed under plus
+/// the raw event bytes (the daemon re-parses and re-enqueues through the
+/// normal retain path, so replayed events get fresh filenames/retries).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingEvent {
+    pub bank: String,
+    pub body: Vec<u8>,
+    /// Source file: the replayer deletes it after successful re-enqueue
+    /// (the normal persist-first path regenerates it on next failure).
+    pub path: std::path::PathBuf,
+}
+
+/// Collect pending events for startup replay: scan every bank dir under
+/// the outbox root; events older than the 7-day expiry move to quarantine,
+/// the rest return for resend. Missing root = no pending work (Ok empty),
+/// never an error — a fresh home has nothing to replay.
+pub fn collect_pending(home: &Path, now_millis: u64) -> std::io::Result<Vec<PendingEvent>> {
+    collect_from_root(&outbox_root(home), home, now_millis)
+}
+
+/// Scan an explicit outbox root (the configured dir, not a home): same
+/// walk as [`collect_pending`], for daemons whose `outbox_dir` IS the root.
+pub fn collect_from_root(
+    root: &Path,
+    home: &Path,
+    now_millis: u64,
+) -> std::io::Result<Vec<PendingEvent>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let cutoff = outbox_expiry_millis(now_millis);
+    let mut pending = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || dir.file_name().map(|n| n == "quarantine").unwrap_or(false) {
+            continue;
+        }
+        let bank = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("default")
+            .to_string();
+        for event in std::fs::read_dir(&dir)?.flatten() {
+            let path = event.path();
+            if path.extension().map(|e| e != "json").unwrap_or(true) {
+                continue;
+            }
+            let mtime_millis: u64 = event
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if mtime_millis < cutoff {
+                let qdir = quarantine_dir(home);
+                let _ = std::fs::create_dir_all(&qdir);
+                let dest = qdir.join(format!(
+                    "{}-{}.json",
+                    bank,
+                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("event")
+                ));
+                let _ = std::fs::rename(&path, dest);
+                continue;
+            }
+            match std::fs::read(&path) {
+                Ok(body) => pending.push(PendingEvent {
+                    bank: bank.clone(),
+                    body,
+                    path: path.clone(),
+                }),
+                Err(_) => continue,
+            }
+        }
+    }
+    Ok(pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +187,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = write_event(dir.path(), "a.1.json", b"{}").unwrap();
         assert_eq!(std::fs::read(dest).unwrap(), b"{}");
+    }
+
+    /// Startup replay: pending events collect for resend; expired ones
+    /// (by file mtime vs the 7-day cutoff) move to quarantine. RED:
+    /// fails — no collect function exists yet.
+    #[test]
+    fn collect_pending_resends_fresh_quarantines_expired() {
+        let home = tempfile::tempdir().unwrap();
+        let bank_dir = dest_dir(home.path(), "team");
+        std::fs::create_dir_all(&bank_dir).unwrap();
+        // Fresh event: written now, must collect.
+        write_event(&bank_dir, "doc1.1.json", b"{\"a\":1}").unwrap();
+        // Expired event: backdate mtime 8 days.
+        let old_path = write_event(&bank_dir, "doc2.2.json", b"{\"b\":2}").unwrap();
+        let eight_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_modified(eight_days_ago)
+            .unwrap();
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let pending = collect_pending(home.path(), now_millis).unwrap();
+        assert_eq!(pending.len(), 1, "got: {pending:?}");
+        assert_eq!(pending[0].bank, "team");
+        assert!(quarantine_dir(home.path()).exists());
+        let quarantined: Vec<_> = std::fs::read_dir(quarantine_dir(home.path()))
+            .unwrap()
+            .collect();
+        assert_eq!(quarantined.len(), 1, "expired must quarantine");
     }
 }

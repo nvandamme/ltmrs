@@ -5,7 +5,12 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — fix: Hindsight bridge P0s (redaction bypass + project bank)
+## 2026-11-12 — feat: UpstreamReference via live Lemma SQL (no port)
+
+- `upstream_reference_report` (owner directive): builds a lemma-shaped store (memories + memory_fts) from the frozen safety corpus with the `sqlite3` CLI — no rusqlite edge, no reimplementation — and runs their exact FTS query shape (`memory_fts MATCH` + `bm25` + project filter, LIKE fallback). Safety Dev recall 0.750/ndcg 0.704 (8 cases), Heldout 1.000/1.000 (2 cases). Leakage reported, never gated.
+- Strategy comparison on their ranking math, not a quality bar. Ledger: ablation-graph-upstream fully executed; benchmarks.toml [[not_run]] 0; RQ-12 + TODO updated.
+- Proof: ignored probe green; fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS. Full `cargo test --workspace` runs with this commit.
+
 
 - Redaction bypass (review P0, verified): bridge forwarded raw request fragments while local stored redacted. `Dispatcher::bridge_doc_for` reads the committed row back by the deterministic add eid (shared `entity_id_for_add` in tools/ids.rs — one derivation, never two); miss falls back to old behavior. RED test with live-seeming secret pre-fix, green post-fix.
 - Per-project retain bank from the resolved scope via `bank_for_project` (was shared handle default); mock-transport URL test pins team-proj. Other modes derive the base bank (unchanged wire behavior).

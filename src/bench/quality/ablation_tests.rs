@@ -297,3 +297,28 @@ async fn mmr_selects_within_budget_deterministically() {
         assert_eq!(report.leakage_total, 0, "mmr leg leaked scope");
     }
 }
+
+/// UpstreamReference via the live Lemma SQL shape (ignored: shells out
+/// to the `sqlite3` CLI — no rusqlite edge, no port). Builds a
+/// lemma-shaped store (memories + memory_fts) from the frozen safety
+/// corpus, runs the upstream FTS query shape per case
+/// (`memory_fts MATCH ?` + `bm25(memory_fts)` + project filter, LIKE
+/// fallback on FTS error), and evaluates through the shared `evaluate`.
+/// RED: fails — no lemma-shaped store builder exists yet. Reports
+/// retention, never gates (strategy comparison, not a quality bar).
+#[test]
+#[ignore]
+fn upstream_reference_runs_lemma_sql() {
+    let reports = crate::bench::quality::ablation::upstream_reference_report();
+    assert!(!reports.is_empty(), "must evaluate splits");
+    for report in &reports {
+        assert!(report.cases > 0, "must evaluate cases");
+        // Leakage is REPORTED for the upstream leg, never gated: their
+        // query shape has no must_exclude concept, so forbidden hits are
+        // a strategy finding, not a probe bug.
+        eprintln!(
+            "upstream reference {:?}: {} cases, recall {:.3}, ndcg {:.3}",
+            report.split, report.cases, report.recall_at_k, report.ndcg_at_k
+        );
+    }
+}
