@@ -5,7 +5,11 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: UpstreamReference via live Lemma SQL (no port)
+## 2026-11-12 — docs: CUDA dynamic-loading migration plan (no code)
+
+- plans/2026-11-13-cuda-dynamic-loading-plan.md (owner directive): 7 tasks from link-coupling baseline (DT_NEEDED-proven on pinned closure) through isolated loader crate, pinned wheel libs, explicit auto/CPU/CUDA policy, CI link+runtime gates, to parity + failure qualification. Keeps Candle, replaces only the loading mechanism; no Burn/CubeCL port.
+- Also ledgers the Hindsight outbox startup replay (`collect_pending`/`collect_from_root`, `BridgeHandle::replay_pending`, daemon wiring at startup) which rode along unmentioned in 83e4654: rescan + resend through the normal retain path, expiry quarantines, file deletes on re-enqueue.
+
 
 - `upstream_reference_report` (owner directive): builds a lemma-shaped store (memories + memory_fts) from the frozen safety corpus with the `sqlite3` CLI — no rusqlite edge, no reimplementation — and runs their exact FTS query shape (`memory_fts MATCH` + `bm25` + project filter, LIKE fallback). Safety Dev recall 0.750/ndcg 0.704 (8 cases), Heldout 1.000/1.000 (2 cases). Leakage reported, never gated.
 - Strategy comparison on their ranking math, not a quality bar. Ledger: ablation-graph-upstream fully executed; benchmarks.toml [[not_run]] 0; RQ-12 + TODO updated.
