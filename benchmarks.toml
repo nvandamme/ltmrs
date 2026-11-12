@@ -70,9 +70,10 @@ reason = "Human-reviewed corpus target (§8.1, ≥300 cases) not built; a synthe
 name = "ablation-graph-upstream"
 reason = "DenseExact/HybridRrf/Priority/Mmr legs landed 2026-11-11 (src/bench/quality/ablation.rs + ablation_tests.rs, 14/14 quality green, zero leakage on frozen corpus). Graph leg blocked: frozen corpus carries no relation edges and synthesizing them would leak answers. UpstreamReference blocked on owner decision (TF-IDF port vs provisioned upstream). Neither zero-filled."
 
-[[not_run]]
+[[executed]]
 name = "ann-vs-exact"
-reason = "No ANN index configuration evaluated (§8.3 orders exact search first; T-QUALITY-02)."
+evidence = "ignored test ann_ivf_pq_clustered_distribution_recall (lancedb 0.40, Cosine, 8 partitions)"
+detail = "Two measured points 2026-10-26 + 2026-11-12: (1) uniform-random floor — 10k unit-norm 384-d xorshift vectors, IVF-PQ defaults, Recall@10 0.176 unfiltered / 0.145 filtered, freshness PASS, build 21.9s (adversarial: distances concentrate, no cluster structure). (2) clustered distribution — 300 real E5-small embeddings of the topic-disjoint fixture, 8 partitions, Recall@10 mean 0.875 min 0.700 (n=300), build 2.6s. Verdict: the floor was distributional, not structural — IVF-PQ is viable on realistic E5 distributions with tuned partitions. Scale-limited (300/10k vs 100k §8.3 target) + no human labels: T-QUALITY-02 stays not_run-with-partial-evidence, never passed."
 [[not_run]]
 name = "beir-scifact-full"
 reason = "Harness built and proven through 709 real indexed docs (ignored test beir_scifact_hybrid_quality; needs LTMRS_PROBE_MODELS + LTMRS_BEIR_DIR). Full 5,183-doc run needs ~5h CPU single-threaded bulk indexing (~4s/job measured: multi-chunk candle forwards + per-job Lance commits); run on a GPU-backed or unattended box, not interactively."

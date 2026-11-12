@@ -5,7 +5,12 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — docs: detached-wait discipline (verbatim, no external pointers)
+## 2026-11-12 — feat: clustered ANN probe (ann-vs-exact → executed)
+
+- `ann_ivf_pq_clustered_distribution_recall` (ignored, 300 real E5-small embeddings of the topic-disjoint fixture, IVF-PQ Cosine 8 partitions, 218.9s): Recall@10 mean 0.875 min 0.700 (n=300), build 2.6s. The 0.176 uniform-random floor (2026-10-26) was distributional — adversarial no-structure vectors — not structural.
+- T-QUALITY-02 stays not_run-with-partial-evidence (300 rows vs 100k §8.3 target + no human labels). Ledger: benchmarks.toml [[not_run]] 8→3; RQ-24 evidence appended; TODO WP-12 line updated.
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - Global `RULES.md` gains `Detached-wait discipline (STRICT)`: never `sleep`-poll detached runs; `tail --pid` / `wait` for exit, pre-launch `inotifywait` for progress, exit code + log tail, no duplicate runs. `AGENTS.md` Linux section carries the same text verbatim (pointer replaced).
 

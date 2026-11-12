@@ -246,6 +246,156 @@ async fn ann_ivf_pq_vs_exact_recall_and_freshness() {
         N_DOCS + N_FRESH
     );
 }
+/// Clustered-distribution ANN probe (ignored: needs the pinned E5
+/// artifacts + ~300 live embeds). Gate: `LTMRS_PROBE_MODELS` (same
+/// convention as the calibration probe). Design: the 300-case synthetic
+/// fixture texts (topic-disjoint, paraphrase queries) embedded with real
+/// E5-small — a clustered distribution, the complement of the
+/// uniform-random floor probe above. Exact ground truth from `vector_query`
+/// before any vector index; then IVF-PQ (Cosine, tuned partitions for the
+/// 300-row scale) with the same queries re-run. Reports Recall@10
+/// ANN-vs-exact + build time. Structural assertions only (row counts);
+/// recall numbers are reported, never gated. Scale verdict: 300 rows is
+/// far below the plan §8.3 100k target — a distribution data point, never
+/// a T-QUALITY-02 pass.
+#[tokio::test]
+#[ignore]
+async fn ann_ivf_pq_clustered_distribution_recall() {
+    use crate::search::row::SearchRow;
+    use ltmrs_domain::id::{
+        ChunkId, DocumentRevision, EntityId, ModelFingerprint, StoreGeneration,
+    };
+    use ltmrs_embeddings::artifacts::ArtifactCache;
+    use ltmrs_embeddings::recipe::Role;
+    use ltmrs_embeddings::service::EmbeddingService;
+
+    #[derive(serde::Deserialize)]
+    struct FixtureMemory {
+        title: String,
+        fragment: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct FixtureCase {
+        query: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        memories: Vec<FixtureMemory>,
+        cases: Vec<FixtureCase>,
+    }
+
+    let models = std::env::var("LTMRS_PROBE_MODELS").unwrap_or_default();
+    if models.is_empty() || !std::path::Path::new(&models).exists() {
+        eprintln!("SKIP: set LTMRS_PROBE_MODELS to a provisioned models dir");
+        return;
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../../../experiments/quality/retrieval-calibration.json"
+    ))
+    .expect("calibration fixture parses");
+    assert_eq!(fixture.memories.len(), 300);
+
+    let cache = ArtifactCache::new(&models);
+    let svc = EmbeddingService::load_e5_small_from_cache(&cache).expect("query service loads");
+
+    let lance_dir = tempfile::tempdir().unwrap();
+    let table = SearchTable::open(lance_dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    // Real E5 passage embeddings: one forward per memory (clustered by
+    // topic, unlike the uniform-random floor probe).
+    let mut rows = Vec::with_capacity(fixture.memories.len());
+    for (i, m) in fixture.memories.iter().enumerate() {
+        let text = format!("{} {}", m.title, m.fragment);
+        let vec = svc.embed(&text, Role::Passage).await.unwrap();
+        assert_eq!(vec.len(), 384);
+        assert!(vec.iter().all(|x| x.is_finite()));
+        rows.push(SearchRow {
+            store_generation: StoreGeneration::FIRST,
+            memory_id: EntityId::new(Uuid::from_u128((i + 1) as u128)),
+            document_revision: DocumentRevision::new(1),
+            model_fingerprint: ModelFingerprint::new(9001),
+            chunk_id: ChunkId::new(0),
+            chunker_version: "ann-probe-v2".to_string(),
+            lexical_text: text.clone(),
+            char_start: 0,
+            char_end: text.len() as u64,
+            project: None,
+            project_id: None,
+            fragment_type: "fact".into(),
+            created_at_millis: 1000,
+            updated_at_millis: 1000,
+            confidence: 0.5,
+            embedding: Some(vec),
+        });
+    }
+    table.publish_rows(&rows).await.unwrap();
+    assert_eq!(
+        table.count_rows(None).await.unwrap(),
+        fixture.memories.len() as u64,
+        "all clustered rows must publish"
+    );
+
+    // Queries: real E5 query embeddings of the fixture paraphrase queries.
+    let mut queries = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        let vec = svc.embed(&case.query, Role::Query).await.unwrap();
+        queries.push(vec);
+    }
+
+    async fn top_ids(table: &SearchTable, q: &[f32]) -> Vec<String> {
+        table
+            .vector_query(q, 10, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(row, _)| row.memory_id.as_uuid().to_string())
+            .collect()
+    }
+
+    // Exact ground truth: no vector index exists yet, flat scan.
+    let mut exact: Vec<Vec<String>> = Vec::with_capacity(queries.len());
+    for q in &queries {
+        exact.push(top_ids(&table, q).await);
+    }
+    assert!(exact.iter().all(|r| r.len() == 10));
+
+    // IVF-PQ tuned for the 300-row scale (Cosine MUST match vector_query).
+    use lancedb::index::{Index, vector::IvfPqIndexBuilder};
+    let build_start = std::time::Instant::now();
+    table
+        .table()
+        .create_index(
+            &["embedding"],
+            Index::IvfPq(
+                IvfPqIndexBuilder::default()
+                    .distance_type(lancedb::DistanceType::Cosine)
+                    .num_partitions(8),
+            ),
+        )
+        .execute()
+        .await
+        .unwrap();
+    let build_secs = build_start.elapsed().as_secs_f64();
+
+    fn recall_at_10(ann: &[String], truth: &[String]) -> f64 {
+        ann.iter().filter(|id| truth.contains(id)).count() as f64 / 10.0
+    }
+    let mut recalls = Vec::with_capacity(queries.len());
+    for (q, truth) in queries.iter().zip(exact.iter()) {
+        recalls.push(recall_at_10(&top_ids(&table, q).await, truth));
+    }
+    let mean: f64 = recalls.iter().sum::<f64>() / recalls.len() as f64;
+    let min: f64 = recalls.iter().cloned().fold(1.0, f64::min);
+    eprintln!(
+        "ANN clustered Recall@10: mean={mean:.3} min={min:.3} (n={})",
+        queries.len()
+    );
+    eprintln!("IVF-PQ build time (300 rows, 8 partitions, Cosine): {build_secs:.1}s");
+    eprintln!(
+        "ANN clustered verdict: distribution data point (300 real-E5 rows vs 10k uniform-random floor 0.176); scale-limited, not a T-QUALITY-02 pass"
+    );
+}
 
 /// Threshold calibration on the 300-case synthetic corpus (ignored:
 /// needs the ~500MB pinned artifacts + ~10 min). Gate:
