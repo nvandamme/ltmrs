@@ -209,7 +209,28 @@ pub fn detach_child(cmd: &mut std::process::Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0020;
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
+/// Tokio-command twin of [`detach_child`]: same signal-group detach for
+/// `tokio::process::Command` (used where the parent awaits piped child
+/// stdio instead of fire-and-forget spawning).
+#[cfg(unix)]
+pub fn detach_child_tokio(cmd: &mut tokio::process::Command) {
+    // SAFETY: same contract as `detach_child` — post-fork/pre-exec, async-signal-safe `libc::setsid` only.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 
+#[cfg(windows)]
+pub fn detach_child_tokio(cmd: &mut tokio::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0020;
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
 /// Daemon child log file: diagnostics a detached daemon would otherwise
 /// lose to /dev/null (startup failures, projection errors, idle exits).
 pub fn daemon_log_path(layout: &StdioLayout) -> PathBuf {
@@ -252,9 +273,16 @@ pub async fn ensure_daemon_process(
         hindsight,
         &daemon_log_path(layout),
     )?);
-    // Wait-ready: bounded verified attach. Refused dials poll cheaply
-    // (covers slow first boot incl. model hashing); backlog-hung dials
-    // burn a handshake timeout each, so cap consecutive silence — a
+    // Wait-ready: bounded verified attach. Each dial IS the readiness
+    // check (verified handshake, not mere bind); the 100ms between
+    // attempts is backoff, not state polling — the daemon announces
+    // nothing on stdout (detached, logs to a file), so there is no
+    // ready event to await without a file-watch dependency. Contrast
+    // the visualizer background spawn, which awaits the child's
+    // `serving at ...` line on piped stdout event-driven
+    // (`wait_ready_from_stdout`). Refused dials poll cheaply (covers
+    // slow first boot incl. model hashing); backlog-hung dials burn a
+    // handshake timeout each, so cap consecutive silence — a
     // permanently mute owner fails loudly instead of parking forever.
     const MAX_ATTEMPTS: usize = 1200;
     const MAX_SILENT: usize = 24;

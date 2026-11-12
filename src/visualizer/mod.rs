@@ -316,12 +316,14 @@ pub async fn run_foreground(
     ))
 }
 
-/// Spawn a detached child serving in the foreground, wait until it listens,
-/// and return the `serving at ... (pid ...)` message. A port that is already
-/// bound fails fast without spawning.
-/// The store is NOT passed down: the child re-derives the managed-home store
-/// from its (inherited) environment, so parent and child always agree. A
-/// store deleted between the parent check and the child start surfaces as
+/// Spawn a detached child serving in the foreground and wait for its
+/// ready line on piped stdout (`serving at ...`), which the child prints
+/// before accepting connections. A port that is already bound fails fast
+/// without spawning. Event-driven: no readiness polling — the wait ends
+/// when the child speaks (or exits, or the deadline passes). The store is
+/// NOT passed down: the child re-derives the managed-home store from its
+/// (inherited) environment, so parent and child always agree. A store
+/// deleted between the parent check and the child start surfaces as
 /// "child exited before listening".
 pub async fn run_background(port: Option<u16>) -> Result<String, CliError> {
     let port = resolve_port(port);
@@ -342,7 +344,7 @@ pub async fn run_background(port: Option<u16>) -> Result<String, CliError> {
     // printed URL matches the serving process (and the ownership probe
     // below can authenticate).
     let token = access_token();
-    let mut child = std::process::Command::new(exe);
+    let mut child = tokio::process::Command::new(exe);
     child
         .arg("-vis")
         .arg("--fg")
@@ -351,48 +353,93 @@ pub async fn run_background(port: Option<u16>) -> Result<String, CliError> {
         .arg("--vis-token")
         .arg(&token)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
     // Detach from our terminal signal group (shared with the daemon spawn):
     // new session on unix, CREATE_NEW_PROCESS_GROUP on Windows.
-    ltmrs_frontend::frontend::serve::daemon::detach_child(&mut child);
+    ltmrs_frontend::frontend::serve::daemon::detach_child_tokio(&mut child);
     let mut child = child
         .spawn()
         .map_err(|e| CliError::Runtime(format!("cannot spawn visualizer child: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CliError::Runtime("visualizer child has no stdout".into()))?;
+    let pid = child.id().unwrap_or(0);
+    match wait_ready_from_stdout(&mut child, stdout, port, &token).await {
+        Ok(()) => Ok(format!(
+            "serving at http://127.0.0.1:{port}/?token={token} (pid {pid})"
+        )),
+        Err(e) => {
+            let _ = child.kill().await;
+            Err(e)
+        }
+    }
+}
+
+/// Wait for a spawned visualizer child's ready line on piped stdout
+/// (`serving at ...`, printed before it accepts connections). Event-driven:
+/// the wait ends when the child speaks (or exits, or the deadline
+/// passes) — no readiness polling. Kills nothing on failure (the caller
+/// owns the child); reports EOF-with-live-child distinctly from a
+/// clean exit status.
+async fn wait_ready_from_stdout<R>(
+    child: &mut tokio::process::Child,
+    stdout: R,
+    port: u16,
+    token: &str,
+) -> Result<(), CliError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut lines = BufReader::new(stdout).lines();
     loop {
-        match tokio::net::TcpStream::connect((LOOPBACK, port)).await {
-            Ok(stream) => {
-                // The port may have been grabbed by another process between
-                // our probe and the child bind: only claim success when the
-                // listener answers with our own index page (authenticated
-                // with our token, so a squatter without it cannot fake us).
-                if owns_port(stream, &token).await {
-                    return Ok(format!(
-                        "serving at http://127.0.0.1:{port}/?token={token} (pid {})",
-                        child.id()
-                    ));
+        let wait = async {
+            match lines.next_line().await {
+                // Ready line: the child is listening (it prints before
+                // `serve_with_token` accepts). Verify ownership before
+                // claiming success — the port may have been grabbed by
+                // another process between our probe and the child bind.
+                Ok(Some(line)) if line.starts_with("serving at ") => {
+                    let stream = tokio::net::TcpStream::connect((LOOPBACK, port))
+                        .await
+                        .map_err(|e| {
+                            CliError::Runtime(format!(
+                                "visualizer announced ready but unreachable: {e}"
+                            ))
+                        })?;
+                    if owns_port(stream, token).await {
+                        Ok::<bool, CliError>(true)
+                    } else {
+                        Err(CliError::Runtime(format!(
+                            "port {port} answers but is not our visualizer"
+                        )))
+                    }
                 }
-                if tokio::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    return Err(CliError::Runtime(format!(
-                        "port {port} answers but is not our visualizer"
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                // The child may have died (e.g. missing store): surface it
-                // instead of waiting out the deadline.
-                if let Ok(Some(status)) = child.try_wait() {
-                    return Err(CliError::Runtime(format!(
+                // Any other line is child chatter: keep waiting for ready.
+                Ok(Some(_)) => Ok(false),
+                // EOF before ready: the child died or never spoke — surface
+                // its exit instead of waiting out the deadline.
+                Ok(None) => match child.try_wait() {
+                    Ok(Some(status)) => Err(CliError::Runtime(format!(
                         "visualizer child exited before listening: {status}"
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    ))),
+                    _ => Err(CliError::Runtime(
+                        "visualizer child closed stdout before listening".into(),
+                    )),
+                },
+                Err(e) => Err(CliError::Runtime(format!(
+                    "cannot read visualizer child stdout: {e}"
+                ))),
             }
+        };
+        match tokio::time::timeout_at(deadline, wait).await {
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => continue,
+            Ok(Err(e)) => return Err(e),
             Err(_) => {
-                let _ = child.kill();
                 return Err(CliError::Runtime(format!(
                     "visualizer did not listen on 127.0.0.1:{port} within 10s"
                 )));
@@ -824,5 +871,41 @@ mod tests {
 
         let _ = tx.send(());
         handle.await.unwrap().unwrap();
+    }
+
+    /// Background wait is event-driven: `wait_ready_from_stdout` returns
+    /// on the ready line without readiness polling. A shell stub stands
+    /// in for the child (the real `run_background` spawn is the test
+    /// binary under `cargo test`, which cannot serve).
+    #[tokio::test]
+    async fn background_returns_on_ready_line() {
+        let listener = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 30\r\n\r\n<html>ltmrs library index</html>")
+                .await;
+        });
+        // Stub child: chatter line, then the ready line, then holds stdout
+        // open (EOF would mean death — the wait must return on the line).
+        let mut stub = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo 'startup chatter'; echo 'serving at stub'; sleep 30")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = stub.stdout.take().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_ready_from_stdout(&mut stub, stdout, port, "stub-token"),
+        )
+        .await
+        .expect("ready wait must resolve")
+        .expect("ready line must satisfy ownership probe");
+        stub.kill().await.unwrap();
     }
 }
