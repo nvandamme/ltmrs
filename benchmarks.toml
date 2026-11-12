@@ -77,13 +77,15 @@ reason = "No ANN index configuration evaluated (§8.3 orders exact search first;
 name = "beir-scifact-full"
 reason = "Harness built and proven through 709 real indexed docs (ignored test beir_scifact_hybrid_quality; needs LTMRS_PROBE_MODELS + LTMRS_BEIR_DIR). Full 5,183-doc run needs ~5h CPU single-threaded bulk indexing (~4s/job measured: multi-chunk candle forwards + per-job Lance commits); run on a GPU-backed or unattended box, not interactively."
 
-[[not_run]]
+[[executed]]
 name = "contended-write-mix"
-reason = "Workload puts blind-upsert by key, so write conflicts and read-modify-write retries never occur; conflict/retry telemetry paths unexercised. Harness implemented 2026-11-11 (WorkloadOp::Rmw + hot-skew generator + execute_rmw revision-checked path + OpOutcome counters; test contended_write_mix_runs_closed_loop green, RMW_RETRY_LIMIT=20 at runner parity). Reference evidence run still open — add ignored runner or accept unit tests."
+evidence = "reports/wp12-contended-write/ (summary.json + history.jsonl + contention.json)"
+detail = "Executed 2026-11-12: ignored runner contended_write_mix_reference_run (seed 7, 500/500 put/RMW, 900/1000 hot into 4 keys, 2000 ops, 4 workers, 15.2s); 0 failures, 398 conflicts = 398 retries (every conflict exactly one retry); put p50 15.6ms (includes SyncAll barrier per write). Harness landed 2026-11-11 (RMW hot-skew + revision-checked path + OpOutcome counters; unit test contended_write_mix_runs_closed_loop green)."
 
-[[not_run]]
+[[executed]]
 name = "search-load-legs"
-reason = "Closed/open-loop runners take put/get only. Threaded FTS harness implemented 2026-11-11 (run_search_threaded: shared &SearchTable, per-thread runtimes, fts_index_ready gate; test threaded_search_matches_single_thread green). Reference load run under the threaded leg still open."
+evidence = "reports/wp12-search-load/ (summary.json + history.jsonl)"
+detail = "Executed 2026-11-12: ignored runner search_load_reference_run (seed 11 family, 200-op box-sized stream — the 1000-op stream exceeds interactive bulk-index time; 4 workers, 0.83s); 39 search ops, 0 failures, search p50 2.9ms. Harness landed 2026-11-11 (shared &SearchTable, per-thread runtimes, fts_index_ready gate; unit test threaded_search_matches_single_thread green)."
 
 [[not_run]]
 name = "lemma-unique-content-variant"

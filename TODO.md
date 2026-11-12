@@ -30,7 +30,7 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ## Open — qualification and release (S8)
 
-- [ ] WP-12 — Qualification, quality and performance (S8; matrix 234/264 executed_passed 2026-11-12 (scope+retry 33/33; remaining: 26 legacy_oracle needing provisioned live upstream — no checkout on this machine, fixtures cover read-path only — + 4 greenfield specified_not_executed); per-op CPU/fsync landed (`cpu_micros` thread-CPU + `fsync_micros` timed barrier, means in OpStats); Part III §11 open items tracked in-plan)
+- [ ] WP-12 — Qualification, quality and performance (S8; matrix 234/264 executed_passed 2026-11-12 (scope+retry 33/33; remaining: 26 legacy_oracle needing provisioned live upstream — no checkout on this machine, fixtures cover read-path only — + 4 greenfield specified_not_executed); per-op CPU/fsync landed; reference evidence: contended-write-mix (reports/wp12-contended-write/: 2000 ops, 0 failures, 398 conflicts=398 retries), search-load-legs (reports/wp12-search-load/: 39 search ops, 0 failures, p50 2.9ms); benchmarks.toml not_run 8→6; Part III §11 open items tracked in-plan)
 - [ ] WP-13 — Release, documentation and evidence closure (S8; evidence bundle exit 0 on clean checkout; publish needs owner approval)
 - [ ] DEV-008 follow-up — Upstream instructional UX (seed fragments,
   coaching blocks, technology autodetect, distill suggestion).

@@ -5,7 +5,13 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: CLI-first cutover (no LTMRS_* env switches)
+## 2026-11-12 — feat: WP-12 reference evidence (contended-write + search-load)
+
+- `contended_write_mix_reference_run` (ignored, seed 7, 2000 ops, 4 workers): 0 failures, 398 conflicts = 398 retries; evidence in reports/wp12-contended-write/.
+- `search_load_reference_run` (ignored, seed-11 family, 200-op box-sized stream, 4 workers): 39 search ops, 0 failures, p50 2.9ms; evidence in reports/wp12-search-load/.
+- Ledger: benchmarks.toml [[not_run]] 8→6; RQ-15 evidence appended; TODO WP-12 line updated. Voice-weight 0.25 invariant held (preload test green).
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - Hindsight: `--hindsight-url/bank/tags/timeout-ms/scoping/global-scope/outbox` on `daemon` + default stdio (spawn forwarding); `HindsightCliFlags` + `hindsight_config_from_flags`; env reader deleted.
 - Lifecycle: flag-only `--daemon-idle-ms`; `--project-id` on project/stdio via identity override; `--vis-token` on `-vis`; `--no-hooks` opt-out.

@@ -1067,4 +1067,76 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// Reference contended-write run (WP-12 [[not_run]] contended-write-mix):
+    /// ignored in normal runs. Execute explicitly to (re)produce the raw
+    /// evidence: `cargo test -- --ignored contended_write_mix_reference_run`.
+    /// RMW hot-skew mix (500 puts/500 RMW per 1000, 900/1000 hot into 4 keys,
+    /// 4 workers) over the same workload; history + summary + conflict/retry
+    /// totals land under reports/wp12-contended-write/ (gitignored).
+    #[test]
+    #[ignore]
+    fn contended_write_mix_reference_run() {
+        use crate::bench::experiment::{ExperimentSummary, summarize};
+        let out = crate::bench::crate_root().join("reports/wp12-contended-write");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(out.join("store")).unwrap();
+        let machine =
+            std::env::var("LTMRS_BENCH_MACHINE").unwrap_or_else(|_| "dev-box".to_string());
+        let repo = CanonicalRepository::open(out.join("store").to_str().unwrap()).unwrap();
+        let generator = GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 500,
+            rmw_per_1000: 500,
+            hot_per_1000: 900,
+            hot_key_span: 4,
+            key_space: 64,
+            value_bytes: 64,
+            top_k: 5,
+        };
+        let digest = crate::bench::config_digest_for(&generator, 2000);
+        let mut op_gen = OpGenerator::new(generator.clone());
+        let ops: Vec<WorkloadOp> = (0..2000).map(|_| op_gen.next_op()).collect();
+        let rss_before = crate::bench::experiment::current_rss_kb();
+        let wall = std::time::Instant::now();
+        let measured = run_closed_loop(&repo, &ops, 4);
+        let wall_micros = wall.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        assert_eq!(measured.len(), ops.len(), "offered == completed");
+        let history = out.join("history.jsonl");
+        let mut recorder = HistoryRecorder::create(&history).unwrap();
+        record_measured(&mut recorder, &measured).unwrap();
+        recorder.flush().unwrap();
+        let records = crate::bench::read_history(&history).unwrap();
+        let stats = summarize(&records);
+        let retries: u64 = records.iter().map(|r| r.retries).sum();
+        let conflicts: u64 = records.iter().map(|r| r.conflicts).sum();
+        assert!(conflicts > 0, "contended mix must observe conflicts");
+        assert_eq!(retries, conflicts, "every conflict costs exactly one retry");
+        let summary = ExperimentSummary {
+            provenance: crate::bench::Provenance::collect(&machine, generator.seed, digest),
+            backend_id: "fjall-canonical".to_string(),
+            op_stats: stats,
+            total_ops: records.len() as u64,
+            total_failures: records.iter().filter(|r| !r.ok).count() as u64,
+            wall_micros,
+            rss_delta_kb: crate::bench::experiment::rss_delta_kb(
+                rss_before,
+                crate::bench::experiment::current_rss_kb(),
+            ),
+        };
+        assert_eq!(summary.total_failures, 0);
+        std::fs::write(
+            out.join("summary.json"),
+            serde_json::to_vec_pretty(&summary).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("contention.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "retries": retries, "conflicts": conflicts,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }

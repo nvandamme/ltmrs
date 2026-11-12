@@ -42,7 +42,12 @@ async fn main() {
             }
             Err(e) => fail(&e),
         },
-        Ok(Command::Stdio { socket, project_id, idle_ms, hindsight }) => {
+        Ok(Command::Stdio {
+            socket,
+            project_id,
+            idle_ms,
+            hindsight,
+        }) => {
             let hindsight_flags = ltmrs_interchange::hindsight::HindsightCliFlags {
                 url: hindsight.url,
                 bank: hindsight.bank,

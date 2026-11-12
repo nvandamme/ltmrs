@@ -419,12 +419,8 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
         || hindsight_outbox.is_some();
     // --foreground stays daemon-only; idle + hindsight flags also ride
     // default stdio (the spawn it performs).
-    if selected.as_ref().is_some_and(|s| *s != Selected::Daemon)
-        && daemon_foreground
-    {
-        return Err(CliError::Usage(
-            "--foreground requires daemon".to_string(),
-        ));
+    if selected.as_ref().is_some_and(|s| *s != Selected::Daemon) && daemon_foreground {
+        return Err(CliError::Usage("--foreground requires daemon".to_string()));
     }
     if selected.is_some()
         && (daemon_idle_ms.is_some() || hindsight_given)
@@ -740,20 +736,27 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliError> {
                 ));
             }
             // Spawn-only flags are meaningless when attaching to a live daemon.
-            if socket.is_some() && (project_id.is_some() || daemon_idle_ms.is_some() || hindsight_given) {
+            if socket.is_some()
+                && (project_id.is_some() || daemon_idle_ms.is_some() || hindsight_given)
+            {
                 return Err(CliError::Usage(
                     "--project-id/--daemon-idle-ms/--hindsight-* need a spawned daemon (no --socket)".to_string(),
                 ));
             }
-            Ok(Command::Stdio { socket, project_id, idle_ms: daemon_idle_ms, hindsight: HindsightFlags {
-                url: hindsight_url,
-                bank: hindsight_bank,
-                tags: hindsight_tags,
-                timeout_ms: hindsight_timeout_ms,
-                scoping: hindsight_scoping,
-                global_scope: hindsight_global_scope,
-                outbox: hindsight_outbox,
-            } })
+            Ok(Command::Stdio {
+                socket,
+                project_id,
+                idle_ms: daemon_idle_ms,
+                hindsight: HindsightFlags {
+                    url: hindsight_url,
+                    bank: hindsight_bank,
+                    tags: hindsight_tags,
+                    timeout_ms: hindsight_timeout_ms,
+                    scoping: hindsight_scoping,
+                    global_scope: hindsight_global_scope,
+                    outbox: hindsight_outbox,
+                },
+            })
         }
     }
 }
@@ -1661,7 +1664,12 @@ mod tests {
             panic!("expected Library");
         };
         assert_eq!(store.as_deref(), Some("/tmp/s"));
-        let Command::Stdio { socket, project_id, idle_ms, hindsight } = parse(&["--socket", "/tmp/d.sock"]).unwrap()
+        let Command::Stdio {
+            socket,
+            project_id,
+            idle_ms,
+            hindsight,
+        } = parse(&["--socket", "/tmp/d.sock"]).unwrap()
         else {
             panic!("expected Stdio");
         };
@@ -1887,30 +1895,50 @@ mod tests {
     fn hindsight_flags_parse_and_gate() {
         let Command::Daemon { hindsight, .. } = parse(&[
             "daemon",
-            "--hindsight-url", "http://x",
-            "--hindsight-bank", "team",
-            "--hindsight-tags", "a,b",
-            "--hindsight-timeout-ms", "2000",
-            "--hindsight-scoping", "global",
+            "--hindsight-url",
+            "http://x",
+            "--hindsight-bank",
+            "team",
+            "--hindsight-tags",
+            "a,b",
+            "--hindsight-timeout-ms",
+            "2000",
+            "--hindsight-scoping",
+            "global",
             "--hindsight-global-scope",
-            "--hindsight-outbox", "/tmp/ob",
-        ]).unwrap() else { panic!("expected Daemon") };
+            "--hindsight-outbox",
+            "/tmp/ob",
+        ])
+        .unwrap() else {
+            panic!("expected Daemon")
+        };
         assert_eq!(hindsight.url.as_deref(), Some("http://x"));
         assert_eq!(hindsight.bank.as_deref(), Some("team"));
         assert!(hindsight.global_scope);
         // partial (url without bank) parses (CLI is shape-only); the bridge
         // constructor rejects it loudly (covered in interchange flag_tests).
-        let Command::Daemon { hindsight: partial, .. } = parse(&["daemon", "--hindsight-url", "http://x"]).unwrap() else { panic!("expected Daemon") };
+        let Command::Daemon {
+            hindsight: partial, ..
+        } = parse(&["daemon", "--hindsight-url", "http://x"]).unwrap()
+        else {
+            panic!("expected Daemon")
+        };
         assert_eq!(partial.url.as_deref(), Some("http://x"));
         assert_eq!(partial.bank, None);
         // stdio accepts them too (spawn forwarding)
-        assert!(matches!(parse(&["--hindsight-url", "http://x", "--hindsight-bank", "t"]).unwrap(), Command::Stdio { .. }));
+        assert!(matches!(
+            parse(&["--hindsight-url", "http://x", "--hindsight-bank", "t"]).unwrap(),
+            Command::Stdio { .. }
+        ));
         // elsewhere rejects
         assert!(parse(&["-lib", "--hindsight-url", "http://x"]).is_err());
         // bad scoping rejects
         assert!(parse(&["daemon", "--hindsight-scoping", "nonsense"]).is_err());
         // project-id rides stdio + project, rejects elsewhere
-        assert!(matches!(parse(&["--project-id", "prj_x_abc"]).unwrap(), Command::Stdio { .. }));
+        assert!(matches!(
+            parse(&["--project-id", "prj_x_abc"]).unwrap(),
+            Command::Stdio { .. }
+        ));
         assert!(parse(&["-lib", "--project-id", "x"]).is_err());
     }
 
@@ -1918,7 +1946,17 @@ mod tests {
     #[test]
     fn help_documents_daemon() {
         let help = help_text();
-        for flag in ["daemon", "--foreground", "--daemon-idle-ms", "--hindsight-url", "--hindsight-bank", "--project-id", "--vis-token", "--no-hooks", "--import-lib"] {
+        for flag in [
+            "daemon",
+            "--foreground",
+            "--daemon-idle-ms",
+            "--hindsight-url",
+            "--hindsight-bank",
+            "--project-id",
+            "--vis-token",
+            "--no-hooks",
+            "--import-lib",
+        ] {
             assert!(help.contains(flag), "help must document {flag}");
         }
     }

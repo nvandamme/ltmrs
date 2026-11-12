@@ -579,8 +579,7 @@ pub async fn serve_stdio(
             let exe = std::env::current_exe()
                 .map_err(|e| CliError::Runtime(format!("cannot locate ltmrs binary: {e}")))?;
             let idle = daemon_idle_ms(idle_ms);
-            ensure_daemon_process(&layout, &exe, idle, hindsight)
-            .await?;
+            ensure_daemon_process(&layout, &exe, idle, hindsight).await?;
             // The daemon is verified serving; attach (bounded, for the
             // stop-start race where it died between ensure and dial).
             let sock = daemon_socket_path(&layout);

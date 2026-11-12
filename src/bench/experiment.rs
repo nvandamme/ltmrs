@@ -1092,3 +1092,112 @@ mod tests {
         .unwrap();
     }
 }
+
+/// Reference threaded-search-load run (WP-12 [[not_run]] search-load-legs):
+/// ignored in normal runs. Execute explicitly:
+/// `cargo test -- --ignored search_load_reference_run`.
+/// Populates an FTS table from the put/get workload keys (200-op box-sized
+/// stream), then runs the threaded FTS leg (4 workers) over the search ops;
+/// history + summary land under reports/wp12-search-load/ (gitignored).
+#[tokio::test]
+#[ignore]
+async fn search_load_reference_run() {
+    use crate::bench::load::{MeasuredOp, record_measured};
+    use crate::bench::{GeneratorConfig, HistoryRecorder, OpGenerator, WorkloadOp};
+    let out = crate::bench::crate_root().join("reports/wp12-search-load");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    let generator = GeneratorConfig {
+        seed: 11,
+        puts_per_1000: 600,
+        key_space: 500,
+        value_bytes: 64,
+        top_k: 10,
+        ..Default::default()
+    };
+    let mut op_gen = OpGenerator::new(generator.clone());
+    // Box-sized stream: 200 ops keeps the FTS bulk index inside an
+    // interactive run (the 1000-op stream exceeds it; see benchmarks.toml
+    // search-load-legs). Same seed family as wp12-load-01, distinct digest.
+    let ops: Vec<WorkloadOp> = (0..200).map(|_| op_gen.next_op()).collect();
+    let queries: Vec<(u64, String, usize)> = ops
+        .iter()
+        .filter_map(|op| match op {
+            WorkloadOp::Search { probe, top_k } => {
+                Some((*probe, format!("workload {probe}"), *top_k))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!queries.is_empty(), "stream must contain search ops");
+    // Populate the FTS table from the put keys in the stream.
+    let table = SearchTable::open(out.join("search").to_str().unwrap())
+        .await
+        .unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    for op in &ops {
+        if let WorkloadOp::Put { key, .. } | WorkloadOp::Rmw { key, .. } = op
+            && seen.insert(*key)
+        {
+            let m = workload_memory(*key, 64);
+            rows.push(search_row_for(*key, &format!("{} {}", m.title, m.fragment)));
+        }
+    }
+    table.publish_rows(&rows).await.unwrap();
+    table.create_fts_index().await.unwrap();
+    let wall = std::time::Instant::now();
+    let measured = run_search_threaded(&table, &queries, 4).unwrap();
+    let wall_micros = wall.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    assert_eq!(measured.len(), queries.len(), "offered == completed");
+    let history = out.join("history.jsonl");
+    let mut recorder = HistoryRecorder::create(&history).unwrap();
+    record_measured(
+        &mut recorder,
+        &measured
+            .iter()
+            .map(|m| MeasuredOp {
+                index: m.index,
+                op: m.op.clone(),
+                elapsed_micros: m.elapsed_micros,
+                queued_micros: 0,
+                ok: m.ok,
+                detail: m.detail.clone(),
+                retries: 0,
+                conflicts: 0,
+                cpu_micros: m.cpu_micros,
+                fsync_micros: m.fsync_micros,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    recorder.flush().unwrap();
+    let records = crate::bench::read_history(&history).unwrap();
+    let stats = summarize(&records);
+    let summary = ExperimentSummary {
+        provenance: crate::bench::Provenance::collect(
+            &std::env::var("LTMRS_BENCH_MACHINE").unwrap_or_else(|_| "dev-box".to_string()),
+            generator.seed,
+            crate::bench::config_digest(
+                generator.seed,
+                generator.puts_per_1000,
+                generator.key_space,
+                generator.value_bytes,
+                generator.top_k,
+                ops.len() as u64,
+            ),
+        ),
+        backend_id: "lance-fts".to_string(),
+        op_stats: stats,
+        total_ops: records.len() as u64,
+        total_failures: records.iter().filter(|r| !r.ok).count() as u64,
+        wall_micros,
+        rss_delta_kb: None,
+    };
+    assert_eq!(summary.total_failures, 0);
+    std::fs::write(
+        out.join("summary.json"),
+        serde_json::to_vec_pretty(&summary).unwrap(),
+    )
+    .unwrap();
+}
