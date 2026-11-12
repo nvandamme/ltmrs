@@ -26,7 +26,7 @@ mod guide_render;
 mod guide_update;
 #[cfg(test)]
 mod hindsight_tests;
-mod ids;
+pub(crate) mod ids;
 mod intelligence;
 #[cfg(test)]
 mod intelligence_tests;
@@ -210,7 +210,7 @@ pub fn execute_tool(
         ..
     } = &payload
     {
-        disp.enqueue_bridge_retain(tool, text, &resolved);
+        disp.enqueue_bridge_retain(tool, text, &resolved, envelope.operation_id);
     }
     // Slice A recall (opt-in, best-effort): scoped Hindsight recall runs
     // after canonical retrieval; hits append under a labeled section, never

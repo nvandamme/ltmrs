@@ -48,3 +48,16 @@ pub(crate) fn new_legacy_id(envelope: &IpcEnvelope) -> String {
         .collect::<String>()
     )
 }
+
+/// Canonical entity id for an add: derived from the operation id so a
+/// retried envelope replays onto the same row. Shared by the add path and
+/// the bridge read-back (which must resolve the same row the add
+/// committed — one derivation, never two format strings).
+pub(crate) fn entity_id_for_add(
+    operation_id: ltmrs_domain::id::OperationId,
+) -> ltmrs_domain::id::EntityId {
+    ltmrs_domain::id::EntityId::new(uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("ltmrs:entity:{}", operation_id.as_uuid()).as_bytes(),
+    ))
+}

@@ -15,7 +15,7 @@ use ltmrs_search::similarity::{
 use ltmrs_service::repository::AdmittedScope;
 use serde_json::json;
 
-use super::ids::{legacy_id_of, new_legacy_id};
+use super::ids::{entity_id_for_add, legacy_id_of, new_legacy_id};
 use super::replay::{freeze_tool_payload, replay_tool_call, sub_command_ctx, sub_scope};
 use super::text::{generate_description, generate_title, normalize_project};
 use super::{err_result, new_relation, ok_result, similarity_service, stable_visible};
@@ -252,10 +252,7 @@ pub(crate) fn exec_memory_add(
 
     // Build the memory.
     let legacy_id = new_legacy_id(envelope);
-    let eid = EntityId::new(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_URL,
-        format!("ltmrs:entity:{}", envelope.operation_id.as_uuid()).as_bytes(),
-    ));
+    let eid = entity_id_for_add(envelope.operation_id);
     let now = disp.clock().now_millis();
     let memory = Memory {
         id: eid,

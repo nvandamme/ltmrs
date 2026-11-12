@@ -134,16 +134,46 @@ impl Dispatcher {
         tool: &ltmrs_compat::lemma::tool_args::ToolArgs,
         payload_text: &str,
         resolved: &ltmrs_service::projects::ResolvedScope,
+        operation_id: ltmrs_domain::id::OperationId,
     ) -> bool {
         let guard = self.hindsight.lock().unwrap_or_else(|e| e.into_inner());
         let Some(handle) = guard.as_ref() else {
             return false;
         };
-        let Some(mut doc) = crate::hindsight::retain_doc_for(tool, payload_text) else {
+        let Some(mut doc) = self.bridge_doc_for(tool, operation_id, payload_text) else {
             return false;
         };
+        // P0b (review): per-project retain bank from the resolved scope,
+        // not the shared handle default. Other modes derive the base bank,
+        // identical to the previous stamp.
+        doc.bank = handle.bank_for_project(resolved.name.as_deref().or(resolved.legacy.as_deref()));
         doc.tags = crate::hindsight::tags_for_retain(resolved);
         handle.enqueue_retain(doc)
+    }
+
+    /// Bridge doc with the STORED canonical text for a committed mutation
+    /// (P0: the bridge must forward what local redaction produced, never
+    /// the raw request args). Reads the committed row back by the
+    /// deterministic entity id the add path derives from the operation id;
+    /// a miss falls back to the request-args form (same as before, no
+    /// regression on paths that never redact). Used by the production
+    /// enqueue path and pinned by the redaction/bank tests.
+    pub fn bridge_doc_for(
+        &self,
+        tool: &ltmrs_compat::lemma::tool_args::ToolArgs,
+        operation_id: ltmrs_domain::id::OperationId,
+        payload_text: &str,
+    ) -> Option<ltmrs_interchange::hindsight::RetainDoc> {
+        let mut doc = crate::hindsight::retain_doc_for(tool, payload_text)?;
+        if let ltmrs_compat::lemma::tool_args::ToolArgs::MemoryAdd(_) = tool {
+            let eid = crate::tools::ids::entity_id_for_add(operation_id);
+            if let Ok(mut mems) = self.repo.get_memories(std::slice::from_ref(&eid))
+                && let Some(m) = mems.pop()
+            {
+                doc.text = m.fragment.clone();
+            }
+        }
+        Some(doc)
     }
 
     /// Bridge recall section (A4): scoped Hindsight recall + fusion.

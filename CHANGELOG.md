@@ -5,7 +5,13 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: graph expansion lift over live snapshot (ablation-graph-upstream → executed)
+## 2026-11-12 — fix: Hindsight bridge P0s (redaction bypass + project bank)
+
+- Redaction bypass (review P0, verified): bridge forwarded raw request fragments while local stored redacted. `Dispatcher::bridge_doc_for` reads the committed row back by the deterministic add eid (shared `entity_id_for_add` in tools/ids.rs — one derivation, never two); miss falls back to old behavior. RED test with live-seeming secret pre-fix, green post-fix.
+- Per-project retain bank from the resolved scope via `bank_for_project` (was shared handle default); mock-transport URL test pins team-proj. Other modes derive the base bank (unchanged wire behavior).
+- Deferred with reason: recall-path bank (server "" semantics unverifiable without live Hindsight), doc-ID stability (deliberate best-effort log design, not a bug), outbox replay (larger work).
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - `snapshot_expansion_lift` test-support loader (#[cfg(test)], no new prod deps) + `graph_snapshot_expansion_lift` (ignored, `LTMRS_GRAPH_PROBE`): 4720 real staged edges drive the production `expand` from the 20 highest-degree hubs — mean 17.8 nodes reached vs 1.0 relation-agnostic, 100% truncation (default max_nodes 24 binds on real hubs: tuning signal, not failure).
 - Machinery comparison on real edge distributions, never a recall claim (no query cases with known answers). Frozen-corpus Graph leg stays unlanded by design; UpstreamReference stays owner-blocked (TF-IDF-vs-provisioned).

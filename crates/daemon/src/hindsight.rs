@@ -383,7 +383,128 @@ mod tests {
             fragment_type: None,
             evidence: None,
         });
-        assert!(!disp.enqueue_bridge_retain(&tool, "text", &ResolvedScope::unattributed()));
+        assert!(!disp.enqueue_bridge_retain(
+            &tool,
+            "text",
+            &ResolvedScope::unattributed(),
+            ltmrs_domain::id::OperationId::new(uuid::Uuid::from_u128(1))
+        ));
+    }
+
+    /// P0 (review): a redacted add must forward the STORED (redacted)
+    /// fragment, never the raw request args. RED: fails — the bridge
+    /// forwards `ToolArgs` verbatim (`bridge_doc_for_test` does not exist).
+    #[test]
+    fn bridge_forwards_stored_redacted_fragment() {
+        use crate::dispatcher::Dispatcher;
+        use crate::registry::FrontendRegistry;
+        use ltmrs_domain::clock::FrozenClock;
+        use ltmrs_domain::command::DomainCommand;
+        use std::sync::Arc;
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(
+            ltmrs_service::repository::CanonicalRepository::open_with_clock(
+                dir.path().to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        std::mem::forget(dir);
+        // Commit the REDACTED form directly under the deterministic
+        // entity id the add path derives from the operation id.
+        let op = ltmrs_domain::id::OperationId::new(uuid::Uuid::from_u128(77));
+        let eid = ltmrs_domain::id::EntityId::new(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("ltmrs:entity:{}", op.as_uuid()).as_bytes(),
+        ));
+        let fe = ltmrs_domain::id::FrontendId::new(uuid::Uuid::from_u128(1));
+        let ch = ltmrs_domain::id::ChannelId::new(uuid::Uuid::from_u128(2));
+        repo.issue_namespace(fe, ch, 1000).unwrap();
+        // (Memory struct below carries the committed REDACTED form.)
+        let memory = ltmrs_domain::memory::Memory {
+            id: eid,
+            external_alias: None,
+            title: "t".into(),
+            fragment: "[REDACTED]".into(),
+            description: String::new(),
+            fragment_type: ltmrs_domain::memory::FragmentType::Fact,
+            project: None,
+            project_id: None,
+            source: ltmrs_domain::memory::MemorySource::Ai,
+            confidence: 1.0,
+            quality_score: None,
+            lifecycle: ltmrs_domain::memory::MemoryLifecycle::Live,
+            tags: vec![],
+            associated_with: vec![],
+            relations: vec![],
+            parent_id: None,
+            child_ids: vec![],
+            session_id: None,
+            task_type: None,
+            related_guides: vec![],
+            evidence: vec![],
+            access_count: 0,
+            last_accessed_at: None,
+            positive_feedback: 0,
+            negative_feedback: 0,
+            negative_hits: 0,
+            refinement_count: 0,
+            distill_candidate: false,
+            entity_revision: ltmrs_domain::id::EntityRevision::new(1),
+            document_revision: ltmrs_domain::id::DocumentRevision::new(1),
+            eligibility_revision: ltmrs_domain::id::EligibilityRevision::new(1),
+            created_at: ltmrs_domain::memory::Instant::new(1000),
+            updated_at: ltmrs_domain::memory::Instant::new(1000),
+            raw_created: None,
+            unknown_fields: std::collections::BTreeMap::new(),
+        };
+        let ctx = ltmrs_domain::command::CommandContext {
+            store_generation: ltmrs_domain::id::StoreGeneration::FIRST,
+            frontend_id: fe,
+            channel_id: ch,
+            retry_epoch: 1,
+            operation_id: op,
+            request_digest: "d".into(),
+            session: None,
+            deadline_millis: None,
+            scope: Default::default(),
+        };
+        repo.apply(
+            &ctx,
+            &DomainCommand::AddMemory {
+                memory,
+                session: None,
+                auto_link: None,
+            },
+        )
+        .unwrap();
+        let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock);
+        // Raw request args (pre-redaction) must NOT reach the bridge.
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "sk-live-abc123".to_string(),
+            title: None,
+            description: None,
+            project: None,
+            source: None,
+            confirm: false,
+            fragment_type: None,
+            evidence: None,
+        });
+        let doc = disp
+            .bridge_doc_for(&tool, op, "")
+            .expect("stored memory must resolve");
+        assert!(
+            !doc.text.contains("sk-live-abc123"),
+            "bridge must not forward the raw secret, got: {}",
+            doc.text
+        );
+        assert!(
+            doc.text.contains("[REDACTED]"),
+            "bridge must forward the stored text, got: {}",
+            doc.text
+        );
     }
 
     /// A3: fan-out set maps to docs; reads map to None.
@@ -473,7 +594,12 @@ mod tests {
         );
         std::mem::forget(dir);
         let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock).with_hindsight(handle);
-        assert!(disp.enqueue_bridge_retain(&tool, "", &ResolvedScope::unattributed()));
+        assert!(disp.enqueue_bridge_retain(
+            &tool,
+            "",
+            &ResolvedScope::unattributed(),
+            ltmrs_domain::id::OperationId::new(uuid::Uuid::from_u128(2))
+        ));
         // Background worker delivers: poll briefly (no sleeps in prod paths;
         // tests may poll with a deadline).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -493,6 +619,108 @@ mod tests {
                         .and_then(|d| d.as_str())
                         .unwrap();
                     assert!(doc_id.starts_with("ltmrs:memory:"), "got: {doc_id}");
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bridge worker never delivered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// P0b (review): per-project retain uses the project bank, not the
+    /// shared handle default. Mock transport captures the request URL —
+    /// the bank rides the path, so the URL pins the derivation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retain_bank_follows_resolved_project() {
+        use crate::dispatcher::Dispatcher;
+        use crate::registry::FrontendRegistry;
+        use ltmrs_domain::clock::FrozenClock;
+        use ltmrs_interchange::hindsight::client::{HindsightClient, HttpTransport};
+        use ltmrs_interchange::hindsight::{BridgeError, HindsightConfig, Scoping};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Mock {
+            pub calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        }
+        impl HttpTransport for Mock {
+            async fn post(
+                &self,
+                url: &str,
+                _bearer: Option<&str>,
+                body: serde_json::Value,
+            ) -> Result<serde_json::Value, BridgeError> {
+                self.calls.lock().unwrap().push((url.to_string(), body));
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
+        let mock = Mock::default();
+        let calls = Arc::clone(&mock.calls);
+        let cfg = HindsightConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:9999".into(),
+            bank: "team".into(),
+            default_tags: vec![],
+            timeout_ms: 1500,
+            max_queue: 8,
+            scoping: Scoping::PerProject,
+            global_scope: false,
+            outbox_dir: None,
+        };
+        let client = HindsightClient::with_transport(cfg, None, mock);
+        let (handle, _bg) = super::BridgeHandle::spawn_scoped(
+            client,
+            "team".into(),
+            vec![],
+            8,
+            Scoping::PerProject,
+        );
+        let clock: Arc<dyn ltmrs_domain::clock::Clock + Send + Sync> =
+            Arc::new(FrozenClock::new(1000));
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(
+            ltmrs_service::repository::CanonicalRepository::open_with_clock(
+                dir.path().to_str().unwrap(),
+                Arc::clone(&clock),
+            )
+            .unwrap(),
+        );
+        std::mem::forget(dir);
+        let disp = Dispatcher::new(repo, FrontendRegistry::new(), clock).with_hindsight(handle);
+        let tool = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "plain text".to_string(),
+            title: None,
+            description: None,
+            project: None,
+            source: None,
+            confirm: false,
+            fragment_type: None,
+            evidence: None,
+        });
+        let resolved = ResolvedScope {
+            name: Some("proj".into()),
+            ..ResolvedScope::unattributed()
+        };
+        assert!(disp.enqueue_bridge_retain(
+            &tool,
+            "",
+            &resolved,
+            ltmrs_domain::id::OperationId::new(uuid::Uuid::from_u128(9))
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let guard = calls.lock().unwrap();
+                if !guard.is_empty() {
+                    let (url, _) = &guard[0];
+                    assert!(
+                        url.ends_with("/v1/default/banks/team-proj/memories"),
+                        "retain must target the project bank, got: {url}"
+                    );
                     break;
                 }
             }
