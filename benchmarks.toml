@@ -62,10 +62,10 @@ verdict = "put/search not comparable (dedup-gate refusal cascade diverged the co
 name = "fault-soak-skeleton"
 evidence = "reports/wp12-soak-01/ (summary-soak.json + history-seg-{0..3}.jsonl)"
 detail = "Executed 2026-11-12: ignored runner soak_reference_run (seed 21, 400/300 put/RMW per 1000, 900/1000 hot into 8 keys, key space 64, 4 segments x 500 ops = 2000 ops, 4 workers, 13.2s with drop+reopen restart accounting between segments); 0 failures, 94 conflicts = 94 retries (every conflict exactly one retry); steady-state signal ~947 B/op first-to-last (indicative only, LSM layout noise dominates at small segment counts). Full clock-time soak, sustained racing-write consistency, fault-injection-under-load, tail-latency-under-load, and SIGKILL/power-loss runs stay not_run (machine-gated; see remaining legs below)."
-[[not_run]]
+[[superseded]]
 name = "quality-corpus-300"
-reason = "Human-reviewed corpus target (§8.1, ≥300 cases) not built; a synthetic 300-case known-answer corpus (topic-disjoint dev/heldout, paraphrase queries) is built and executed instead — experiments/quality/retrieval-calibration.json. The 10-case safety fixture pins mechanics, not retrieval quality."
-
+superseded_by = "beir-scifact-full"
+reason = "Owner decision 2026-11-12: the human-reviewed 300-case target (§8.1) is met by BEIR SciFact human test qrels (300/340 judged queries over 5,183 real docs) instead of a bespoke review effort. The synthetic 300-case corpus (experiments/quality/retrieval-calibration.json) stays as the dev/heldout calibration instrument (threshold sweeps, ANN distribution probes); BEIR is the quality gate. A derived corpus mined from live session feedback was considered and rejected — it would manufacture ground truth."
 [[not_run]]
 name = "ablation-graph-upstream"
 reason = "DenseExact/HybridRrf/Priority/Mmr legs landed 2026-11-11 (src/bench/quality/ablation.rs + ablation_tests.rs, 14/14 quality green, zero leakage on frozen corpus). Graph leg blocked: frozen corpus carries no relation edges and synthesizing them would leak answers. UpstreamReference blocked on owner decision (TF-IDF port vs provisioned upstream). Neither zero-filled."

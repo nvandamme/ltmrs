@@ -5,7 +5,14 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: clustered ANN probe (ann-vs-exact → executed)
+## 2026-11-12 — feat: live lemma importer chain + edge census (RQ-26 positive path)
+
+- `envelope_from_db_image` test-support builder + `imports_live_lemma_snapshot` (ignored, `LTMRS_LIVE_LEMMA_DB`): checkpointed rollback-journal copy of the live ~/.lemma DB (1429 memories, 4720 relations) imports end to end in 3.07s with loss accounting. First positive-path importer evidence (unit suite was refusal-paths only).
+- Real-data bug fixed: bare `YYYY-MM-DD created_at` (what upstream stores on real rows) parses as midnight UTC — was fail-loud on the first live row. WAL-mode refusal unchanged.
+- `live_snapshot_edge_census`: 1137 connected nodes, hub-component 1055 (93% giant component), degree p50=6 max=54. Distribution evidence for the graph leg, never a recall claim.
+- Methodology: `quality-corpus-300` superseded by BEIR SciFact human qrels (owner decision); full 5,183-doc BEIR run in background (release profile), lands separately. Ledger: benchmarks.toml [[not_run]] 3→2 (+1 superseded); RQ-26 evidence appended.
+- Proof: workspace fmt clean; clippy `-D warnings` clean (incl. excluded lemma-import crate); importer suite 7+10 green; gate-audit 13/13 PASS. Full workspace gate deferred to the BEIR landing commit (nothing else in this unit touches workspace code paths — importer crate is excluded, census is its test).
+
 
 - `ann_ivf_pq_clustered_distribution_recall` (ignored, 300 real E5-small embeddings of the topic-disjoint fixture, IVF-PQ Cosine 8 partitions, 218.9s): Recall@10 mean 0.875 min 0.700 (n=300), build 2.6s. The 0.176 uniform-random floor (2026-10-26) was distributional — adversarial no-structure vectors — not structural.
 - T-QUALITY-02 stays not_run-with-partial-evidence (300 rows vs 100k §8.3 target + no human labels). Ledger: benchmarks.toml [[not_run]] 8→3; RQ-24 evidence appended; TODO WP-12 line updated.

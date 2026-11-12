@@ -407,6 +407,11 @@ fn json_strings(row: &Row, column: &str, kind: &str, loss: &mut LossLog) -> Vec<
 /// (`YYYY-MM-DD HH:MM:SS`, UTC) and ISO-8601 (`T` separator, optional
 /// fractional seconds, `Z` or numeric offset).
 fn parse_instant(s: &str) -> Option<u64> {
+    // Date-only (upstream stores bare `YYYY-MM-DD` on real rows):
+    // midnight UTC.
+    if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        return parse_instant(&format!("{s}T00:00:00Z"));
+    }
     let (date_part, time_part) = s.split_once(['T', ' '])?;
     let mut date = date_part.split('-');
     let (year, month, day): (i64, i64, i64) = (
@@ -1813,6 +1818,50 @@ pub fn import_to_json(path: &Path) -> Result<String, ImportError> {
     Ok(staging.finish(&envelope))
 }
 
+/// Build a `.lemma-backup` envelope from a raw SQLite image (test support
+/// for the live-snapshot positive-path test: mirrors what the upstream
+/// writer emits — canonical base64, sha256 over the image, validated
+/// metadata — so `import_to_json` exercises its real validation chain).
+/// Refuses non-SQLite and WAL-mode images with the same errors the
+/// envelope validator would produce, so the builder cannot smuggle in a
+/// file the importer would reject.
+pub fn envelope_from_db_image(
+    db_path: &Path,
+    lemma_version: &str,
+    schema_version: u64,
+) -> Result<String, ImportError> {
+    let fail = |m: &str| ImportError(m.to_string());
+    let image = std::fs::read(db_path)
+        .map_err(|e| fail(&format!("cannot read {}: {e}", db_path.display())))?;
+    if image.len() < 100 {
+        return Err(fail("backup database image has an impossible size"));
+    }
+    if image[0..16] != *b"SQLite format 3\0" {
+        return Err(fail(
+            "backup database payload is not a readable SQLite image",
+        ));
+    }
+    if image[18] == 2 && image[19] == 2 {
+        return Err(fail(
+            "backup database image is in WAL mode: checkpoint the live database and re-export instead of enveloping the raw file",
+        ));
+    }
+    use base64::Engine;
+    use sha2::Digest;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&image);
+    let sha = hex_of(&sha2::Sha256::digest(&image));
+    Ok(serde_json::json!({
+        "format": LEMMA_FORMAT,
+        "format_version": ENVELOPE_VERSION,
+        "lemma_version": lemma_version,
+        "schema_version": schema_version,
+        "created_at": "2026-11-12T00:00:00.000Z",
+        "database_sha256": sha,
+        "database": encoded,
+    })
+    .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1929,5 +1978,111 @@ mod tests {
     fn abi_free_null_is_noop() {
         use crate::ltmrs_lemma_free_string;
         unsafe { ltmrs_lemma_free_string(std::ptr::null_mut()) };
+    }
+
+    /// Live lemma snapshot imports end to end (positive path, ignored:
+    /// needs a provisioned `LTMRS_LIVE_LEMMA_DB` rollback-journal copy of
+    /// a real lemma database — the unit suite only covers refusal paths).
+    /// RED: fails — no envelope builder from a raw DB image exists yet.
+    #[test]
+    #[ignore]
+    fn imports_live_lemma_snapshot() {
+        let db = std::env::var("LTMRS_LIVE_LEMMA_DB").unwrap_or_default();
+        if db.is_empty() || !std::path::Path::new(&db).exists() {
+            eprintln!("SKIP: set LTMRS_LIVE_LEMMA_DB to a rollback-journal lemma DB copy");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = crate::envelope_from_db_image(std::path::Path::new(&db), "0.21.0", 8)
+            .expect("envelope builder accepts the live image");
+        let path = dir.path().join("live.lemma-backup");
+        std::fs::write(&path, &envelope).unwrap();
+        let json = import_to_json(&path).expect("live snapshot must import");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["ok"], true, "import must succeed");
+        assert!(
+            v["counts"]["memories"].as_u64().unwrap_or(0) >= 1000,
+            "live snapshot must stage its memories, got counts: {}",
+            v["counts"]
+        );
+        assert!(
+            v["snapshot"]["memories"].as_array().unwrap().len() >= 1000,
+            "snapshot must carry the memories"
+        );
+    }
+
+    /// Live-snapshot edge census (ignored: same gate as the import test).
+    /// Reports degree distribution, per-type counts, and reachability
+    /// over REAL staged edges — a machinery census for the graph ablation
+    /// leg, never a recall claim (the snapshot carries no query cases
+    /// with known answers; synthesizing them would leak). Structural
+    /// asserts only (row counts, edge-shape invariants).
+    #[test]
+    #[ignore]
+    fn live_snapshot_edge_census() {
+        use std::collections::{BTreeMap, BTreeSet, VecDeque};
+        let db = std::env::var("LTMRS_LIVE_LEMMA_DB").unwrap_or_default();
+        if db.is_empty() || !std::path::Path::new(&db).exists() {
+            eprintln!("SKIP: set LTMRS_LIVE_LEMMA_DB to a rollback-journal lemma DB copy");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = crate::envelope_from_db_image(std::path::Path::new(&db), "0.21.0", 8)
+            .expect("envelope builder accepts the live image");
+        let path = dir.path().join("live.lemma-backup");
+        std::fs::write(&path, &envelope).unwrap();
+        let json = import_to_json(&path).expect("live snapshot must import");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let relations = v["snapshot"]["relations"].as_array().unwrap();
+        let memories = v["snapshot"]["memories"].as_array().unwrap();
+        assert!(memories.len() >= 1000);
+        assert!(relations.len() >= 1000);
+        // Per-type mix.
+        let mut by_type: BTreeMap<&str, usize> = BTreeMap::new();
+        for r in relations {
+            *by_type
+                .entry(r["relation_type"].as_str().unwrap())
+                .or_default() += 1;
+        }
+        // Degree distribution over staged node ids (source + target).
+        let mut degree: BTreeMap<&str, usize> = BTreeMap::new();
+        for r in relations {
+            *degree.entry(r["source"].as_str().unwrap()).or_default() += 1;
+            *degree.entry(r["target"].as_str().unwrap()).or_default() += 1;
+        }
+        let mut degs: Vec<usize> = degree.values().copied().collect();
+        degs.sort_unstable();
+        let p50 = degs[degs.len() / 2];
+        let max = *degs.last().unwrap();
+        // Undirected reachability from the highest-degree hub (BFS over
+        // staged edges — distribution shape, not the production expander).
+        let hub = degree.iter().max_by_key(|(_, d)| *d).unwrap().0;
+        let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for r in relations {
+            let (s, t) = (r["source"].as_str().unwrap(), r["target"].as_str().unwrap());
+            adj.entry(s).or_default().push(t);
+            adj.entry(t).or_default().push(s);
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut queue = VecDeque::from([*hub]);
+        seen.insert(hub);
+        while let Some(n) = queue.pop_front() {
+            for m in adj.get(n).cloned().unwrap_or_default() {
+                if seen.insert(m) {
+                    queue.push_back(m);
+                }
+            }
+        }
+        eprintln!(
+            "live edge census: {} memories, {} relations, types {:?}, degree p50={} max={}, hub-component {}/{} nodes",
+            memories.len(),
+            relations.len(),
+            by_type,
+            p50,
+            max,
+            seen.len(),
+            degree.len()
+        );
+        assert!(seen.len() >= 10, "hub component must be non-trivial");
     }
 }
