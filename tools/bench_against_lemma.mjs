@@ -103,7 +103,7 @@ if (ops.length === 0) {
   process.exit(2);
 }
 for (const op of ops) {
-  if (!["put", "get", "search"].includes(op.kind)) {
+  if (!["put", "get", "search", "rmw"].includes(op.kind)) {
     console.error(`unknown op kind: ${JSON.stringify(op.kind)}`);
     process.exit(2);
   }
@@ -215,6 +215,21 @@ async function main() {
       call = {
         name: "memory_add",
         arguments: { title: op.title || `Workload ${op.key}`, fragment: op.fragment },
+      };
+    } else if (op.kind === "rmw") {
+      // Revision-checked update of the same key: the freshest id observed
+      // for the key (tracked from put/add responses like the get mapping).
+      // Unmapped rmw (no put observed) behaves like unmapped get: read a
+      // never-written id so the miss is loud in the transcript, not silent.
+      const mapped = keyToId.get(String(op.key));
+      unmappedGet = mapped === undefined;
+      call = {
+        name: "memory_update",
+        arguments: {
+          id: mapped || `never-written-${op.key}`,
+          title: op.title || `Workload ${op.key}`,
+          fragment: op.fragment,
+        },
       };
     } else if (op.kind === "get") {
       const mapped = keyToId.get(String(op.key));

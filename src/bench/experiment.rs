@@ -976,6 +976,27 @@ mod tests {
         assert_eq!(n, 2000);
     }
 
+    /// Export the salted reference comparison stream (lemma-unique-content
+    /// variant): same config as the wp12-storage-01 ltmrs run, per-seq salt
+    /// on every put/RMW payload so the upstream dedup gate cannot collapse
+    /// same-key repeats. Ignored in normal runs; invoke explicitly.
+    #[test]
+    #[ignore]
+    fn export_salted_reference_stream() {
+        let out = crate::bench::crate_root().join("reports/wp12-lemma-salted");
+        std::fs::create_dir_all(&out).unwrap();
+        let generator = GeneratorConfig {
+            seed: 7,
+            puts_per_1000: 600,
+            key_space: 500,
+            value_bytes: 256,
+            top_k: 10,
+            ..Default::default()
+        };
+        let n = export_workload_ops_salted(&generator, 2000, &out.join("ops.jsonl"), true).unwrap();
+        assert_eq!(n, 2000);
+    }
+
     /// Reference storage experiment (WP-12 task 2): ignored in normal runs.
     /// Execute explicitly to (re)produce the raw evidence behind
     /// benchmarks.toml: `cargo test -- --ignored storage_experiment_reference_run`.

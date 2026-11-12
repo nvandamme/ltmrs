@@ -58,10 +58,10 @@ verdict = "put/search not comparable (dedup-gate refusal cascade diverged the co
 # Tail percentiles in executed summaries carry an indicative-only note below
 # TAIL_SAMPLE_FLOOR (see OpStats.note); they are not strong evidence.
 
-[[not_run]]
-name = "fault-soak-steady-state"
-reason = "Point fault-injection (injected_migration_fault_fails_atomically, injected_unknown_outcome_leaves_store_consistent — both ported, still green in crates/service), deterministic soak + fragmented-state kill + generation rotation executed 2026-10-26 (soak_mixed_ops_with_maintenance_then_kill: 5000 seeded ops, 11 optimize passes, kill/reopen at 3500, steady-state growth +1.8KiB/op over 1500 ops); old fjall_backend test names retired with src/storage (980752b), sustained racing-write consistency unported. No long-run clock-time soak harness and no fault injection under sustained load (soak skeleton implemented 2026-11-11: src/bench/soak.rs steady-state + kill/restart accounting; tests green); tail-latency-under-load, maintenance pauses and crash/power-loss behavior unmeasured (T-BENCH-03)."
-
+[[executed]]
+name = "fault-soak-skeleton"
+evidence = "reports/wp12-soak-01/ (summary-soak.json + history-seg-{0..3}.jsonl)"
+detail = "Executed 2026-11-12: ignored runner soak_reference_run (seed 21, 400/300 put/RMW per 1000, 900/1000 hot into 8 keys, key space 64, 4 segments x 500 ops = 2000 ops, 4 workers, 13.2s with drop+reopen restart accounting between segments); 0 failures, 94 conflicts = 94 retries (every conflict exactly one retry); steady-state signal ~947 B/op first-to-last (indicative only, LSM layout noise dominates at small segment counts). Full clock-time soak, sustained racing-write consistency, fault-injection-under-load, tail-latency-under-load, and SIGKILL/power-loss runs stay not_run (machine-gated; see remaining legs below)."
 [[not_run]]
 name = "quality-corpus-300"
 reason = "Human-reviewed corpus target (§8.1, ≥300 cases) not built; a synthetic 300-case known-answer corpus (topic-disjoint dev/heldout, paraphrase queries) is built and executed instead — experiments/quality/retrieval-calibration.json. The 10-case safety fixture pins mechanics, not retrieval quality."
@@ -87,6 +87,7 @@ name = "search-load-legs"
 evidence = "reports/wp12-search-load/ (summary.json + history.jsonl)"
 detail = "Executed 2026-11-12: ignored runner search_load_reference_run (seed 11 family, 200-op box-sized stream — the 1000-op stream exceeds interactive bulk-index time; 4 workers, 0.83s); 39 search ops, 0 failures, search p50 2.9ms. Harness landed 2026-11-11 (shared &SearchTable, per-thread runtimes, fts_index_ready gate; unit test threaded_search_matches_single_thread green)."
 
-[[not_run]]
+[[executed]]
 name = "lemma-unique-content-variant"
-reason = "Follow-up to wp12-lemma-01: per-seq salted put content defeating the upstream dedup gate, for a pure write-path comparison (see comparison.json follow_up_not_run). Salted export implemented 2026-11-11 (export_workload_ops_salted + salted_workload_memory; tests salted_export_defeats_dedup_collapse + salted_memory_helper_contract green). Needs bench_against_lemma.mjs rmw-kind mapping + salted reference stream run."
+evidence = "reports/wp12-lemma-salted/ (ops.jsonl + upstream-transcript.jsonl + comparison.json)"
+detail = "Executed 2026-11-12: salted stream (seed 7, 2000 ops: 1217 puts all salted, 397 gets, 386 searches) against pinned upstream lemma-mcp@0.21.0 (global install dist, scratch HOME, 13.2s). Verdict: put NOT COMPARABLE — 769/1217 puts refused ('A similar memory already exists'); salt defeats byte-identity dedup, not a similarity gate. ltmrs put is key-addressed blind upsert (no content gate). Driver rmw-kind mapping landed (memory_update on tracked id, 2-op live probe green). Follow-up CLOSED (would need upstream dedup-gate controls)."

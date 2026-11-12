@@ -5,7 +5,14 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-12 — feat: WP-12 reference evidence (contended-write + search-load)
+## 2026-11-12 — feat: WP-12 salted upstream comparison + soak-skeleton reference
+
+- `export_salted_reference_stream` ignored test (seed-7 shape, 2000 ops: 1217 salted puts / 397 gets / 386 searches) + driver `rmw`→`memory_update` mapping in tools/bench_against_lemma.mjs (tracked-id update, unmapped-loud; RED `unknown op kind` pre-fix, 2-op + 3-op live probes green incl. id stability).
+- Live run vs pinned upstream lemma-mcp@0.21.0 (13.2s): 769/1217 puts refused ('A similar memory already exists') — refusal is similarity-based, not byte-identity; salt hypothesis falsified, put NOT COMPARABLE. Evidence in reports/wp12-lemma-salted/ (comparison.json + transcript).
+- `soak_reference_run` (seed 21, 4x500 ops, drop+reopen restart accounting): 0 failures, 94 conflicts = 94 retries. Evidence in reports/wp12-soak-01/.
+- Ledger: benchmarks.toml [[not_run]] 8→4; RQ-15/RQ-23 evidence appended; TODO WP-12 line updated.
+- Proof: full `cargo test --workspace` green (0 failures); fmt clean; clippy `-D warnings` clean; gate-audit 13/13 PASS.
+
 
 - `contended_write_mix_reference_run` (ignored, seed 7, 2000 ops, 4 workers): 0 failures, 398 conflicts = 398 retries; evidence in reports/wp12-contended-write/.
 - `search_load_reference_run` (ignored, seed-11 family, 200-op box-sized stream, 4 workers): 39 search ops, 0 failures, p50 2.9ms; evidence in reports/wp12-search-load/.
