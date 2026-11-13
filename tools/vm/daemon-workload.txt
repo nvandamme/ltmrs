@@ -1,0 +1,5 @@
+echo daemon-alive
+uname -r
+cat /proc/uptime
+cat /proc/loadavg
+free -m

@@ -1,0 +1,43 @@
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>__NAME__</name>
+  <memory unit='MiB'>2048</memory>
+  <vcpu>2</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc'>hvm</type>
+    <kernel>/var/lib/libvirt/images/vmlinuz-virt</kernel>
+    <initrd>/var/lib/libvirt/images/initramfs-virt</initrd>
+    <cmdline>root=/dev/vda1 rootfstype=ext4 rw console=ttyS0,115200 console=ttyS1,115200</cmdline>
+    <boot dev='hd'/>
+  </os>
+  <devices>
+    <disk type='volume' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none'/>
+      <source pool='default' volume='__VOLUME__'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <interface type='network'>
+      <mac address='__MAC__'/>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <serial type='file'>
+      <source path='tmp/vm/__NAME__.ttyS1.log' append='on'/>
+      <target type='isa-serial' port='1'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+  </devices>
+  <qemu:commandline>
+    <qemu:arg value='-serial'/>
+    <qemu:arg value='tcp:127.0.0.1:4599,server,nowait'/>
+  </qemu:commandline>
+</domain>

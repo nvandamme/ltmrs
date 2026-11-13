@@ -1,0 +1,3 @@
+echo canary-alive
+uname -r
+cat /proc/uptime
