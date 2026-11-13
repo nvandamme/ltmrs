@@ -2,7 +2,10 @@
 name = "ltmrs-search"
 version = "0.1.0-alpha"
 edition = "2024"
-
+[features]
+# Opt-in CUDA inference (dynamic loading only): forwards to the embeddings
+# crate's `cuda` feature. Same name, same mechanism, no unilateral rename.
+cuda = ["ltmrs-embeddings/cuda"]
 [dependencies]
 ltmrs-domain = { path = "../domain" }
 ltmrs-service = { path = "../service" }

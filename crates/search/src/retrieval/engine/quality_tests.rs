@@ -558,7 +558,11 @@ async fn calibrate_dense_threshold_on_synthetic_corpus() {
 async fn beir_scifact_hybrid_quality() {
     use crate::search::backend::e5::ServiceQueryEmbedder;
     use ltmrs_embeddings::artifacts::ArtifactCache;
+    #[cfg(feature = "cuda")]
+    use ltmrs_embeddings::e5_small::DeviceMode;
     use ltmrs_embeddings::e5_small::{E5_SMALL_FINGERPRINT, E5SmallAdapter};
+    #[cfg(feature = "cuda")]
+    use ltmrs_embeddings::manifest::e5_small_artifact;
     use ltmrs_embeddings::service::EmbeddingService;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -654,6 +658,30 @@ async fn beir_scifact_hybrid_quality() {
         .await
         .unwrap();
     let cache = ArtifactCache::new(&models);
+    // Device selection: `LTMRS_BEIR_DEVICE=cuda` runs the full leg on the
+    // CubeCL CUDA backend (requires `--features cuda`); anything else (or
+    // unset) stays on CPU Flex. Reported in the verdict line so a run is
+    // never mistaken for the other backend.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    let cuda_requested = std::env::var("LTMRS_BEIR_DEVICE").unwrap_or_default() == "cuda";
+    #[cfg(feature = "cuda")]
+    let adapter = std::sync::Arc::new(
+        E5SmallAdapter::load_verified_auto(
+            &cache
+                .load_cached(&e5_small_artifact())
+                .expect("BEIR artifact cached"),
+            if cuda_requested {
+                DeviceMode::Cuda
+            } else {
+                DeviceMode::Cpu
+            },
+        )
+        .expect("projection adapter loads"),
+    );
+    #[cfg(not(feature = "cuda"))]
+    let adapter = std::sync::Arc::new(
+        E5SmallAdapter::load_from_cache(&cache).expect("projection adapter loads"),
+    );
     // Production parallel embedder (same unit the daemon wires:
     // ParallelE5Embedder over a capped rayon pool, parity-proven against
     // the sequential bridge). The projector loop stays serial by design
@@ -665,9 +693,6 @@ async fn beir_scifact_hybrid_quality() {
             .num_threads(8)
             .build()
             .expect("BEIR leg embed pool builds"),
-    );
-    let adapter = std::sync::Arc::new(
-        E5SmallAdapter::load_from_cache(&cache).expect("projection adapter loads"),
     );
     let parallel = crate::search::backend::e5::ParallelE5Embedder::new(adapter, pool);
     // Chunked projection with progress: same one-shot semantics as a
