@@ -250,11 +250,20 @@ fn t_emb_02_embeddings_match_reference() {
         "mixed_batch[1]",
     );
 
-    // Batch row 0 must equal single embed (padding correctness).
+    // Batch row 0 must match single embed within the parity envelope
+    // (not bit-identical: the adapter pads batch rows to one width and
+    // Burn SIMD softmax reduction order varies with row width ~3e-9 —
+    // same physics as the burn_batched_forward_matches_single_rows pin).
     let r0 = adapter.embed(short, Role::Passage).unwrap();
-    assert_eq!(
-        results[0].vector, r0.vector,
-        "batch row 0 must equal single embed"
+    let batch_single_max: f32 = results[0]
+        .vector
+        .iter()
+        .zip(r0.vector.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        batch_single_max <= 1e-6,
+        "batch row 0 must match single embed (max-abs {batch_single_max})"
     );
 
     // Padding correctness: batch attention masks reflect actual lengths.
@@ -828,6 +837,44 @@ fn burn_backend_matches_frozen_fixtures() {
     assert!(checked >= 4, "must cover the frozen cases, got {checked}");
 
     eprintln!("burn parity: {checked} cases, worst max-abs {worst:.2e}");
+}
+
+/// Batched [B, S, H] forward must agree with N single-row forwards within
+/// the parity envelope (bit-identity is NOT expected: Burn SIMD softmax
+/// reduction order varies with row width, so padded and unpadded forwards
+/// of identical tokens differ ~3e-9 — same physics as the T-EMB-02
+/// batch/single finding, now inside one forward call).
+#[test]
+fn burn_batched_forward_matches_single_rows() {
+    // Mixed widths in one batch: short query + passage + batch rows.
+    let cases = ["short_en", "code_snippet", "mixed_batch", "fr_query"];
+    let batched = crate::e5_burn::embed_frozen_cases_batched(&cases).expect("batched embeds");
+    let mut singles = Vec::new();
+    for case in &cases {
+        if *case == "mixed_batch" {
+            for row in 0..2 {
+                singles.push(crate::e5_burn::embed_frozen_case_row(case, row).expect("single row"));
+            }
+        } else {
+            singles.push(crate::e5_burn::embed_frozen_case(case).expect("single case"));
+        }
+    }
+    assert_eq!(batched.len(), singles.len(), "row count must match");
+    let mut worst = 0.0f32;
+    for (b, s) in batched.iter().zip(singles.iter()) {
+        assert_eq!(b.len(), s.len(), "dim must match");
+        let m: f32 = b
+            .iter()
+            .zip(s.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max);
+        worst = worst.max(m);
+    }
+    eprintln!("batched-vs-single worst max-abs {worst:.2e}");
+    assert!(
+        worst <= 1e-6,
+        "batched forward diverged from single-row path: {worst}"
+    );
 }
 
 /// Device classifier pin: `device_is_cuda` must agree with the actual

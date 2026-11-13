@@ -340,8 +340,22 @@ impl Projector {
             // Processing order is irrelevant: stale jobs are refused by the
             // revision guard and left pending, so a retryable wakeup may arrive
             // in any sequence (RV-07).
+            // Batched pass: validate + render every job under its own
+            // per-entity guard (same critical section as `process_job`,
+            // steps 2-4), then ONE `publish_rows` for all validated rows,
+            // then per-job ack. Guards and failure granularity are unchanged
+            // (per-job validate, per-job ack/retry); only the Lance write
+            // is amortized — N per-doc manifest rewrites become one.
+            // Tombstone/deletion paths stay inline below (immediate, rare).
+            struct Validated<'a> {
+                job: &'a ltmrs_domain::projection::ProjectionJob,
+                memory_revision: ltmrs_domain::id::DocumentRevision,
+                rows: Vec<crate::search::row::SearchRow>,
+                full_vectors: bool,
+            }
+            let mut validated: Vec<Validated<'_>> = Vec::new();
             let mut resolved_this_pass = 0usize;
-            for (attempted_this_pass, job) in jobs.iter().enumerate() {
+            for (attempted, job) in jobs.iter().enumerate() {
                 if limit.is_some_and(|max| total_resolved + resolved_this_pass >= max) {
                     break;
                 }
@@ -349,14 +363,90 @@ impl Projector {
                 // attempted jobs, not just resolutions — a large set of
                 // failing embeddings must not turn one pass into unbounded
                 // CPU while resolving nothing.
-                if limit.is_some_and(|max| attempted_this_pass >= max) {
+                if limit.is_some_and(|max| attempted >= max) {
                     break;
                 }
-                match self.process_job(job).await? {
-                    ProjectorOutcome::Published | ProjectorOutcome::Tombstoned => {
+                // Inline tombstone handling (unchanged semantics).
+                let mem_opt = self
+                    .repo
+                    .get_memories(std::slice::from_ref(&job.memory_id))?
+                    .pop();
+                let Some(memory) = mem_opt else {
+                    self.propagate_deletion(job.memory_id).await?;
+                    if self.repo.acknowledge_projection(job.memory_id, job.seq)? {
                         resolved_this_pass += 1;
                     }
-                    ProjectorOutcome::StaleRevision | ProjectorOutcome::SemanticPending => {}
+                    continue;
+                };
+                if !memory.lifecycle.is_recallable() || job.is_tombstone {
+                    self.propagate_deletion(job.memory_id).await?;
+                    if self.repo.acknowledge_projection(job.memory_id, job.seq)? {
+                        resolved_this_pass += 1;
+                    }
+                    continue;
+                }
+                if memory.document_revision != job.desired_document_revision {
+                    continue;
+                }
+                // Validate + render under the per-entity guard.
+                let lock = self.publication_lock(job.memory_id);
+                let _guard = lock.lock().await;
+                if self.repo.store_generation()? != self.generation
+                    && !self.generation_under_construction(self.generation)?
+                {
+                    continue;
+                }
+                let fresh = self
+                    .repo
+                    .get_memories(std::slice::from_ref(&job.memory_id))?
+                    .pop();
+                let Some(fresh) = fresh else { continue };
+                if fresh.document_revision != job.desired_document_revision
+                    || !fresh.lifecycle.is_recallable()
+                {
+                    continue;
+                }
+                let rows = self.render_chunk_rows(&fresh, job.memory_id);
+                let full_vectors = self.lexical_only || rows.iter().all(|r| r.embedding.is_some());
+                validated.push(Validated {
+                    job,
+                    memory_revision: fresh.document_revision,
+                    rows,
+                    full_vectors,
+                });
+            }
+            // Single amortized publish for the whole pass.
+            if !validated.is_empty() {
+                let all_rows: Vec<crate::search::row::SearchRow> = validated
+                    .iter()
+                    .flat_map(|v| v.rows.iter().cloned())
+                    .collect();
+                self.table.publish_rows(&all_rows).await?;
+            }
+            // Per-job ack/retry (unchanged failure granularity).
+            for v in &validated {
+                if v.full_vectors {
+                    // Re-check revision at ack time: a concurrent update
+                    // during the batch publish must not clear a job whose
+                    // canonical state moved on (compare-and-clear refuses).
+                    let cur = self
+                        .repo
+                        .get_memories(std::slice::from_ref(&v.job.memory_id))?
+                        .pop();
+                    if matches!(cur, Some(m) if m.document_revision == v.memory_revision)
+                        && self
+                            .repo
+                            .acknowledge_projection(v.job.memory_id, v.job.seq)?
+                    {
+                        resolved_this_pass += 1;
+                    }
+                } else {
+                    self.repo.enqueue_projection_job(
+                        v.job.memory_id,
+                        v.memory_revision,
+                        v.job.seq + 1,
+                        false,
+                    )?;
                 }
             }
 

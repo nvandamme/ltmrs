@@ -717,7 +717,7 @@ async fn beir_scifact_hybrid_quality() {
         // Periodic production-path compaction (`optimize`, same call the
         // daemon maintenance tick uses) collapses fragments — identical
         // rows, bounded manifest. Every 5 slices.
-        if slices % 5 == 0 {
+        if slices.is_multiple_of(5) {
             let t_opt = std::time::Instant::now();
             table.optimize().await.unwrap();
             eprintln!(

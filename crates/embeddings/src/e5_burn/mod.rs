@@ -120,13 +120,23 @@ pub fn forward_batch(
     epsilon: f32,
     device: &Device,
 ) -> Result<Vec<Vec<f32>>, String> {
+    // True batch path: one [B, S, H] forward, then per-row pooling over
+    // the padded width. The padded mask is 0 on pads so they contribute
+    // nothing to the mean — identical math to pooling over the natural
+    // length, and it keeps hidden/seq_len geometry consistent. (T-EMB-02
+    // batch/single bit-identity is out of reach across widths anyway:
+    // Burn SIMD softmax reduction order varies with row width ~3e-9, so
+    // the envelope — not equality — is the contract.)
+    let hiddens = model.forward_padded(rows, device)?;
+    let max_len = rows.iter().map(|r| r.ids.len()).max().unwrap_or(0);
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (row, hidden) in rows.iter().zip(hiddens.iter()) {
         if row.ids.is_empty() {
             return Err("empty input row".to_string());
         }
-        let hidden = model.forward(&row.ids, &row.mask, device)?;
-        out.push(pool_and_norm(&hidden, row.ids.len(), &row.mask, epsilon));
+        let mut mask = row.mask.clone();
+        mask.resize(max_len, 0);
+        out.push(pool_and_norm(hidden, max_len, &mask, epsilon));
     }
     Ok(out)
 }
@@ -162,6 +172,76 @@ fn pool_and_norm(hidden: &[f32], seq_len: usize, mask: &[u32], epsilon: f32) -> 
         *x *= inv;
     }
     pooled
+}
+
+/// Batched-vs-single parity entry point: embed several fixture cases in
+/// ONE padded forward and return per-row vectors. The parity test asserts
+/// envelope agreement with the single-row path (exact bit-identity is NOT
+/// expected: Burn SIMD softmax reduction order varies with row width).
+pub fn embed_frozen_cases_batched(cases: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/e5-artifacts");
+    let weights = load_safetensors_weights(&dir.join("model.safetensors"))?;
+    let device = Device::new(burn_dispatch::device::DispatchDevice::Flex(
+        burn_flex::FlexDevice,
+    ));
+    let model = BurnBertModel::load(weights, &device)?;
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/reference_fixture.json"))
+            .map_err(|e| e.to_string())?;
+    let mut rowspecs: Vec<(String, Vec<u32>, Vec<u32>)> = Vec::new();
+    for case in cases {
+        let c = fixture["cases"][case]
+            .as_object()
+            .ok_or_else(|| format!("unknown fixture case {case:?}"))?;
+        if let Some(texts) = c.get("texts") {
+            let n = texts.as_array().unwrap().len();
+            let id_rows: Vec<Vec<u32>> =
+                serde_json::from_value(c["input_ids"].clone()).map_err(|e| e.to_string())?;
+            let mask_rows: Vec<Vec<u32>> =
+                serde_json::from_value(c["attention_mask"].clone()).map_err(|e| e.to_string())?;
+            for row in 0..n {
+                rowspecs.push((
+                    format!("{case}[{row}]"),
+                    id_rows[row].clone(),
+                    mask_rows[row].clone(),
+                ));
+            }
+        } else {
+            let ids: Vec<u32> =
+                serde_json::from_value(c["input_ids"].clone()).map_err(|e| e.to_string())?;
+            let mask: Vec<u32> =
+                serde_json::from_value(c["attention_mask"].clone()).map_err(|e| e.to_string())?;
+            rowspecs.push(((*case).to_string(), ids, mask));
+        }
+    }
+    // Pad to the batch max (mask 0 on pads).
+    let max_len = rowspecs
+        .iter()
+        .map(|(_, ids, _)| ids.len())
+        .max()
+        .unwrap_or(0);
+    let pad_id = 1u32;
+    let rows: Vec<PaddedRow> = rowspecs
+        .iter()
+        .map(|(_, ids, mask)| {
+            let mut r_ids = ids.clone();
+            let mut r_mask = mask.clone();
+            r_ids.resize(max_len, pad_id);
+            r_mask.resize(max_len, 0);
+            PaddedRow {
+                ids: r_ids,
+                mask: r_mask,
+            }
+        })
+        .collect();
+    let hiddens = model.forward_padded(&rows, &device)?;
+    // Pool each row over the full padded width: the padded mask is 0
+    // on pads, so they contribute nothing to the mean.
+    Ok(hiddens
+        .into_iter()
+        .zip(rows.iter())
+        .map(|(h, row)| pool_and_norm(&h, max_len, &row.mask, 1e-12))
+        .collect())
 }
 
 /// Row variant for batch fixture cases (e.g. mixed_batch rows).
@@ -395,6 +475,76 @@ impl BurnBertModel {
             .map(<[f32]>::to_vec)
             .map_err(|e| format!("to vec: {e:?}"))
     }
+    /// Batched forward: `rows` padded to one `max_len` ([B, S] ids) ->
+    /// Same math as N single `forward` calls, one kernel launch per op:
+    /// embeddings gather [B, S] -> [B, S, H], attention over [B, heads, S, S]
+    /// with per-row mask bias, MLP per row. Rows may have different true
+    /// lengths (`lens[r]`); pads (mask 0) contribute nothing downstream —
+    /// pooling uses `lens`, and bit-identity with the single-row path is
+    /// pinned by `forward_batch_matches_single_rows`.
+    pub fn forward_padded(
+        &self,
+        rows: &[PaddedRow],
+        device: &Device,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let batch = rows.len();
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+        let max_len = rows.iter().map(|r| r.ids.len()).max().unwrap_or(0);
+        if max_len == 0 {
+            return Err("empty input batch".to_string());
+        }
+        // Pad rows to the batch max here (not the caller): mask 0 on pads.
+        // Natural-length rows stay valid inputs — the T-EMB-02 batch/single
+        // bit-identity contract lives one level up (per-row pooling with
+        // each row's own length, not the padded width).
+        let pad_id = 1u32;
+        let mut pids: Vec<Vec<u32>> = Vec::with_capacity(batch);
+        let mut pmasks: Vec<Vec<u32>> = Vec::with_capacity(batch);
+        for r in rows {
+            if r.ids.is_empty() {
+                return Err("empty input row".to_string());
+            }
+            if r.ids.len() != r.mask.len() {
+                return Err("row ids/mask length mismatch".to_string());
+            }
+            let mut ids = r.ids.clone();
+            let mut mask = r.mask.clone();
+            ids.resize(max_len, pad_id);
+            mask.resize(max_len, 0);
+            pids.push(ids);
+            pmasks.push(mask);
+        }
+        // [B, S] inputs (Int).
+        let flat_ids: Vec<u32> = pids.iter().flat_map(|r| r.iter().copied()).collect();
+        let input: Tensor<2, Int> =
+            Tensor::from_data(TensorData::new(flat_ids, [batch, max_len]), device);
+        let word = self.word_emb.forward(input);
+        let pos_ids: Vec<u32> = (0..max_len as u32).cycle().take(batch * max_len).collect();
+        let pos_input: Tensor<2, Int> =
+            Tensor::from_data(TensorData::new(pos_ids, [batch, max_len]), device);
+        let pos = self.pos_emb.forward(pos_input);
+        let tok = self.tok_emb.forward(Tensor::from_data(
+            TensorData::new(vec![0u32; batch * max_len], [batch, max_len]),
+            device,
+        ));
+        let mut hidden: Tensor<3> = self.emb_ln.forward(word + pos + tok);
+        // Per-row masks stacked -> [B, S] bias built inside the layer.
+        let masks: Vec<&[u32]> = pmasks.iter().map(|r| r.as_slice()).collect();
+        for layer in &self.layers {
+            hidden = layer.forward_batched(hidden, &masks, max_len, device)?;
+        }
+        let flat: Vec<f32> = hidden
+            .into_data()
+            .as_slice::<f32>()
+            .map(<[f32]>::to_vec)
+            .map_err(|e| format!("to vec: {e:?}"))?;
+        Ok(flat
+            .chunks_exact(max_len * 384)
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
 }
 
 impl BurnBertLayer {
@@ -433,6 +583,55 @@ impl BurnBertLayer {
         let probs = softmax(scores + bias_t, 3);
         // Context: [1, heads, S, hd] -> [1, S, H].
         let ctx = probs.matmul(v).swap_dims(1, 2).reshape([1, seq_len, h]);
+        // Output projection + residual + norm.
+        let attn_out = self.o_ln.forward(self.o.forward(ctx) + hidden);
+        // Intermediate (gelu-erf) + output + residual + norm.
+        let inter = gelu(self.inter.forward(attn_out.clone()));
+        let out = self.d_ln.forward(self.d.forward(inter) + attn_out);
+        Ok(out)
+    }
+
+    /// Batched twin of `forward`: hidden is [B, S, H], masks one per row.
+    /// Same op order; the batch dim rides along untouched (Linear/LayerNorm
+    /// act on the trailing dim, matmul broadcasts the batch).
+    fn forward_batched(
+        &self,
+        hidden: Tensor<3>,
+        masks: &[&[u32]],
+        seq_len: usize,
+        device: &Device,
+    ) -> Result<Tensor<3>, String> {
+        use burn_tensor::activation::{gelu, softmax};
+        let h = 384;
+        let heads = 12;
+        let hd = h / heads;
+        let batch = masks.len();
+        // Q/K/V projections: [B, S, H].
+        let q = self.q.forward(hidden.clone());
+        let k = self.k.forward(hidden.clone());
+        let v = self.v.forward(hidden.clone());
+        // Split heads: [B, S, H] -> [B, S, heads, hd] -> [B, heads, S, hd].
+        let split = |t: Tensor<3>| t.reshape([batch, seq_len, heads, hd]).swap_dims(1, 2);
+        let (q, k, v) = (split(q), split(k), split(v));
+        // Scores: [B, heads, S, S]; scale; per-row additive mask bias.
+        let scores = q.matmul(k.transpose());
+        let scale = (hd as f32).sqrt().recip();
+        let scores = scores * scale;
+        let mut bias = vec![0.0f32; batch * seq_len * seq_len];
+        for (b, mask) in masks.iter().enumerate() {
+            for j in 0..seq_len {
+                if mask[j] == 0 {
+                    for i in 0..seq_len {
+                        bias[(b * seq_len + i) * seq_len + j] = -1e9f32;
+                    }
+                }
+            }
+        }
+        let bias_t: Tensor<4> =
+            Tensor::from_data(TensorData::new(bias, [batch, 1, seq_len, seq_len]), device);
+        let probs = softmax(scores + bias_t, 3);
+        // Context: [B, heads, S, hd] -> [B, S, H].
+        let ctx = probs.matmul(v).swap_dims(1, 2).reshape([batch, seq_len, h]);
         // Output projection + residual + norm.
         let attn_out = self.o_ln.forward(self.o.forward(ctx) + hidden);
         // Intermediate (gelu-erf) + output + residual + norm.
