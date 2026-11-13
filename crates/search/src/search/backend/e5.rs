@@ -247,6 +247,7 @@ impl Embedder for Arc<Mutex<E5SmallAdapter>> {
 /// siblings, and every chunk still lands a lexical row through the
 /// projector's `r.ok()` mapping. Empty input answers empty, never dropped
 /// or padded.
+#[derive(Clone)]
 pub struct ParallelE5Embedder {
     adapter: Arc<E5SmallAdapter>,
     pool: Arc<rayon::ThreadPool>,

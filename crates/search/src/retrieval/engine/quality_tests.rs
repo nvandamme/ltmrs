@@ -561,7 +561,7 @@ async fn beir_scifact_hybrid_quality() {
     use ltmrs_embeddings::e5_small::{E5_SMALL_FINGERPRINT, E5SmallAdapter};
     use ltmrs_embeddings::service::EmbeddingService;
     use std::collections::{HashMap, HashSet};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     let models = std::env::var("LTMRS_PROBE_MODELS").unwrap_or_default();
     let beir = std::env::var("LTMRS_BEIR_DIR").unwrap_or_default();
@@ -654,13 +654,66 @@ async fn beir_scifact_hybrid_quality() {
         .await
         .unwrap();
     let cache = ArtifactCache::new(&models);
-    let adapter = Arc::new(StdMutex::new(
+    // Production parallel embedder (same unit the daemon wires:
+    // ParallelE5Embedder over a capped rayon pool, parity-proven against
+    // the sequential bridge). The projector loop stays serial by design
+    // (per-entity guards, generation checks); parallelism fans out chunk
+    // forwards inside each memory's embed_texts call — identical vectors,
+    // N-way throughput. Sequential bridge would take ~10x wall time here.
+    let pool = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .expect("BEIR leg embed pool builds"),
+    );
+    let adapter = std::sync::Arc::new(
         E5SmallAdapter::load_from_cache(&cache).expect("projection adapter loads"),
-    ));
-    let resolved =
-        Projector::project_pending(&repo, &table, Box::new(Arc::clone(&adapter)), 100000)
+    );
+    let parallel = crate::search::backend::e5::ParallelE5Embedder::new(adapter, pool);
+    // Chunked projection with progress: same one-shot semantics as a
+    // single 100000-cap drive (jobs stay pending until resolved), but each
+    // 200-doc slice reports elapsed + throughput so a 5k-doc index run is
+    // observable instead of silent. Test-side only; production path untouched.
+    let mut resolved = 0usize;
+    let t_all = std::time::Instant::now();
+    // Watchdog: the projector is serial by design, so a 5k-doc backfill is
+    // minutes of silence without this. Reports pending-queue depth every
+    // 15s from a side thread (test-side only, production path untouched);
+    // distinguishes slow drain from a stuck retry loop while it runs.
+    let repo_wd = repo.clone();
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            match repo_wd.projection_jobs() {
+                Ok(jobs) => eprintln!(
+                    "beir watchdog: {pending} jobs pending at {elapsed:.0}s",
+                    pending = jobs.len(),
+                    elapsed = t0.elapsed().as_secs_f32(),
+                ),
+                Err(e) => {
+                    eprintln!("beir watchdog: queue unreadable ({e:?}); exiting");
+                    break;
+                }
+            }
+        }
+    });
+    while resolved < corpus.len() {
+        let t_slice = std::time::Instant::now();
+        let n = Projector::project_pending(&repo, &table, Box::new(parallel.clone()), 200)
             .await
             .unwrap();
+        resolved += n;
+        eprintln!(
+            "beir index: {resolved}/{total} docs in {elapsed:.1}s ({rate:.1}/s this slice)",
+            total = corpus.len(),
+            elapsed = t_all.elapsed().as_secs_f32(),
+            rate = n as f32 / t_slice.elapsed().as_secs_f32().max(1e-6),
+        );
+        if n == 0 {
+            break;
+        }
+    }
     assert_eq!(resolved, corpus.len(), "all BEIR docs must index");
     table.create_fts_index().await.unwrap();
     let svc = EmbeddingService::load_e5_small_from_cache(&cache).expect("query service loads");
