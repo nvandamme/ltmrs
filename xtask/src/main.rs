@@ -4,6 +4,7 @@
 //! seven verbs dispatch to `verbs.rs` runners (script verbs shell out to
 //! `tools/`, suite verbs run scoped `cargo test` selectors).
 
+mod power;
 mod run;
 mod verbs;
 
@@ -50,11 +51,17 @@ enum Command {
         package: Option<String>,
         dry_run: bool,
     },
+    Power {
+        op: String,
+        mode: Option<String>,
+        name: Option<String>,
+        force: bool,
+        dry_run: bool,
+    },
     Help {
         verb: Option<String>,
     },
 }
-
 const VERBS: &[&str] = &[
     "capture-lemma",
     "capabilities",
@@ -66,6 +73,7 @@ const VERBS: &[&str] = &[
     "dist-audit",
     "gate-audit",
     "test",
+    "power",
 ];
 
 const BOOL_FLAGS: &[&str] = &["--dry-run", "--help"];
@@ -135,6 +143,7 @@ fn known_value_flags(verb: &str) -> &'static [&'static str] {
         "dist-audit" => &["--mode"],
         "gate-audit" => &[],
         "test" => &["--tier", "--package"],
+        "power" => &["--op", "--mode", "--name"],
         _ => &[],
     }
 }
@@ -236,6 +245,7 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
         }
     }
     let mut dry_run = false;
+    let mut force = false;
     let mut kept: Vec<String> = Vec::with_capacity(rest.len());
     for token in rest {
         if token.starts_with("--")
@@ -266,6 +276,14 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
                 verb: Some(verb.clone()),
             });
         } else if token.starts_with("--") {
+            if verb == "power" && flag_name(&token) == "--force" {
+                if flag_value(&token).is_some() {
+                    return Err("'--force' takes no value".to_string());
+                }
+                force = true;
+                i += 1;
+                continue;
+            }
             let resolved = resolve_flag(flag_name(&token).as_str(), &all_known)
                 .map_err(|e| format!("{e} for verb '{verb}'"))?
                 .to_string();
@@ -392,6 +410,71 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
                 dry_run,
             })
         }
+        "power" => {
+            let op = take_flag(&mut pairs, "--op", &verb)?;
+            if op != "build" && op != "trial" && op != "clean" {
+                return Err(format!(
+                    "invalid value '{op}' for '--op': expected 'build', 'trial', or 'clean'"
+                ));
+            }
+            let mode = pairs
+                .iter()
+                .position(|(k, _)| k == "--mode")
+                .map(|i| pairs.remove(i).1);
+            let name = pairs
+                .iter()
+                .position(|(k, _)| k == "--name")
+                .map(|i| pairs.remove(i).1);
+            if op == "trial" {
+                let Some(mode) = mode else {
+                    return Err("missing required flag '--mode' for verb 'power'".to_string());
+                };
+                if mode != "canary" && mode != "daemon" {
+                    return Err(format!(
+                        "invalid value '{mode}' for '--mode': expected 'canary' or 'daemon'"
+                    ));
+                }
+                let Some(name) = name else {
+                    return Err("missing required flag '--name' for verb 'power'".to_string());
+                };
+                return Ok(Command::Power {
+                    op,
+                    mode: Some(mode),
+                    name: Some(name),
+                    force,
+                    dry_run,
+                });
+            }
+            if let Some(mode) = &mode {
+                return Err(format!(
+                    "flag '--mode' is only valid with '--op trial', got '{mode}'"
+                ));
+            }
+            if op == "clean" {
+                let Some(name) = name else {
+                    return Err("missing required flag '--name' for verb 'power'".to_string());
+                };
+                return Ok(Command::Power {
+                    op,
+                    mode: None,
+                    name: Some(name),
+                    force,
+                    dry_run,
+                });
+            }
+            if let Some(name) = &name {
+                return Err(format!(
+                    "flag '--name' is only valid with '--op trial' or '--op clean', got '{name}'"
+                ));
+            }
+            Ok(Command::Power {
+                op,
+                mode: None,
+                name: None,
+                force,
+                dry_run,
+            })
+        }
         _ => unreachable!("canonical verb '{verb}' has no constructor"),
     }
 }
@@ -467,6 +550,12 @@ fn usage_verb(verb: &str) -> &'static str {
               ltmrs-service, ltmrs-compat, ltmrs-embeddings, ltmrs-search,\n\
               ltmrs-interchange, ltmrs-daemon, ltmrs-frontend, xtask).\n\
               --package and --tier full conflict (full already covers all).\n"
+        }
+        "power" => {
+            "cargo xtask power --op build|trial|clean [--mode canary|daemon] [--name <trial>] [--force] [--dry-run]\n\
+             \n\
+             Power rig as code: build the base image, run a trial, or clean a trial.\n\
+             --mode is required for trial; --name is required for trial and clean.\n"
         }
         _ => usage(),
     }
@@ -558,6 +647,19 @@ fn main() {
             }
         },
         Ok(Command::GateAudit { dry_run }) => match verbs::run_gate_audit(dry_run) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Ok(Command::Power {
+            op,
+            mode,
+            name,
+            force,
+            dry_run,
+        }) => match verbs::run_power(&op, mode.as_deref(), name.as_deref(), force, dry_run) {
             Ok(code) => std::process::exit(code),
             Err(err) => {
                 eprintln!("error: {err}");
@@ -898,5 +1000,34 @@ mod tests {
     fn test_rejects_unknown_tier() {
         let err = parse_args(args(&["xtask", "test", "--tier", "bogus"])).unwrap_err();
         assert!(err.contains("bogus"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parses_power_trial_verb() {
+        let cmd = parse_args(args(&[
+            "xtask", "power", "--op", "trial", "--mode", "canary", "--name", "t1",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::Power { op, .. } if op == "trial"
+        ));
+    }
+
+    #[test]
+    fn power_rejects_unknown_op() {
+        let err = parse_args(args(&["xtask", "power", "--op", "frobnicate"])).unwrap_err();
+        assert!(err.contains("frobnicate"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn power_trial_requires_mode_and_name() {
+        let err = parse_args(args(&["xtask", "power", "--op", "trial"])).unwrap_err();
+        assert!(err.contains("--mode"), "unexpected error: {err}");
+        let err = parse_args(args(&[
+            "xtask", "power", "--op", "trial", "--mode", "canary",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--name"), "unexpected error: {err}");
     }
 }
