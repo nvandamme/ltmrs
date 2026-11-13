@@ -132,8 +132,7 @@ fn report_dir(verb: &str) -> Result<std::path::PathBuf, String> {
     let pid = std::process::id();
     Ok(workspace_root().join(format!("reports/xtask-{verb}-{now_ms}-{pid}")))
 }
-
-fn print_dry_run(program: &str, args: &[String]) {
+pub(crate) fn print_dry_run(program: &str, args: &[String]) {
     let words = std::iter::once(program.to_string())
         .chain(args.iter().cloned())
         .map(|w| {
@@ -2625,7 +2624,11 @@ pub fn run_gate_audit(dry_run: bool) -> Result<i32, String> {
     if failed { Ok(1) } else { Ok(0) }
 }
 
-/// Thin dispatch for `cargo xtask power` (stub: Task 2 implements the body).
+/// Thin dispatch for `cargo xtask power`.
+///
+/// Missing flags fail loud here (never `unwrap_or("")` coercions): the
+/// CLI parser already requires `--mode`/`--name` for trial and `--name`
+/// for clean, so `None` here means a programming error, not user input.
 pub fn run_power(
     op: &str,
     mode: Option<&str>,
@@ -2635,9 +2638,15 @@ pub fn run_power(
 ) -> Result<i32, String> {
     match op {
         "build" => crate::power::run_build(force, dry_run),
-        "trial" => crate::power::run_trial(mode.unwrap_or(""), name.unwrap_or(""), force, dry_run),
-        "clean" => crate::power::run_clean(name.unwrap_or(""), force, dry_run),
-        other => Err(format!("unknown power op '{other}'")),
+        "trial" => {
+            let mode = mode.ok_or("trial needs --mode")?;
+            let name = name.ok_or("trial needs --name")?;
+            crate::power::run_trial(mode, name, force, dry_run)
+        }
+        "clean" => crate::power::run_clean(name.ok_or("clean needs --name")?, force, dry_run),
+        other => Err(format!(
+            "unknown power op '{other}' (expected build|trial|clean)"
+        )),
     }
 }
 
