@@ -44,8 +44,16 @@ type ImportJsonFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 type FreeStringFn = unsafe extern "C" fn(*mut c_char);
 
 /// An opened importer library: the handle plus the two resolved symbols.
-/// `unsafe` is confined to construction and the import call; the handle
-/// closes on drop.
+/// `unsafe` is confined to construction and the import call.
+///
+/// The handle is intentionally NEVER closed (`dlclose` is not called):
+/// unloading a bundled-SQLite cdylib at drop/teardown time segfaults
+/// (observed: green preview+confirm, then SIGSEGV on process teardown).
+/// Handles are cached process-wide per canonical path, so repeated
+/// imports reuse one mapping and never unload. The cdylib is stateless
+/// per call (read-only staging over a private temp-file copy), so sharing
+/// the mapping across calls and threads is sound.
+#[derive(Clone, Copy)]
 pub struct LemmaImportLib {
     handle: *mut c_void,
     import_json: ImportJsonFn,
@@ -54,17 +62,17 @@ pub struct LemmaImportLib {
 
 // The handle is an opaque dlopen cookie: safe to move across threads, never
 // dereferenced. Calls into the cdylib need no caller fence: preview and
-// confirm imports each open the library, run a read-only staging pass over
-// a private temp-file copy of the image, and close the handle on return,
-// so concurrent calls cannot share mutable state.
+// confirm imports each run a read-only staging pass over a private
+// temp-file copy of the image, so concurrent calls cannot share mutable
+// state.
 unsafe impl Send for LemmaImportLib {}
+unsafe impl Sync for LemmaImportLib {}
 
-impl Drop for LemmaImportLib {
-    fn drop(&mut self) {
-        // SAFETY: the handle came from `open_library` and is closed once.
-        unsafe { close_library(self.handle) };
-    }
-}
+/// Process-wide handle cache keyed by canonical library path: at most one
+/// mapping per cdylib, never unloaded.
+static HANDLE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, LemmaImportLib>>,
+> = std::sync::OnceLock::new();
 
 /// Last dynamic-loader error for this thread (null means no error text).
 ///
@@ -356,11 +364,21 @@ pub fn open_first(candidates: &[PathBuf]) -> Result<LemmaImportLib, LemmaImportE
                 continue;
             }
         };
-        return Ok(LemmaImportLib {
+        // Cache the mapping process-wide and never unload it (see
+        // `LemmaImportLib` docs): closing on drop segfaults at teardown
+        // with the bundled-SQLite cdylib.
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let lib = LemmaImportLib {
             handle,
             import_json,
             free_string,
-        });
+        };
+        let mut guard = HANDLE_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .expect("handle cache poisoned");
+        let cached = *guard.entry(canon).or_insert(lib);
+        return Ok(cached);
     }
     Err(LemmaImportError(format!(
         "Lemma import library not found (tried: {}). Build it with `cargo build -p {IMPORTER_PACKAGE}` or pass import_lib (backup_import_lemma tool / --import-lib flag) with the built {LIB_HINT_EXT} path.",
@@ -397,6 +415,10 @@ impl LemmaImportLib {
     /// The panic boundary is caught here as well (belt over the cdylib's
     /// own containment): a failure is an error, never unwound.
     pub fn import_json(&self, backup_path: &Path) -> Result<String, LemmaImportError> {
+        debug_assert!(
+            !self.handle.is_null(),
+            "cached library mapping must be live"
+        );
         let c_path = std::ffi::CString::new(backup_path.to_string_lossy().as_bytes())
             .map_err(|_| LemmaImportError("invalid backup path".to_string()))?;
         let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -530,9 +552,9 @@ mod tests {
     }
 
     /// The dlopen wrapper mechanics work end to end (open self, resolve two
-    /// ubiquitous symbols, close, then the same through Drop) without any
-    /// importer artifact. Both legs mirror `open_first`: the explicit close
-    /// is the failure-cleanup shape, the struct Drop is the success shape.
+    /// ubiquitous symbols, close the probe) without any importer artifact.
+    /// The explicit close here is the failure-cleanup shape only; cached
+    /// handles are never unloaded (see `LemmaImportLib` docs).
     #[cfg(not(windows))]
     #[test]
     fn dlopen_self_and_resolve_libc_symbol() {
@@ -545,14 +567,15 @@ mod tests {
         let lib = unsafe { open_library(None) }.unwrap();
         let import_json = unsafe { resolve_symbol(lib, c"printf") }.unwrap();
         let free_string = unsafe { resolve_symbol(lib, c"malloc") }.unwrap();
-        // SAFETY: pointers are stored, never called; `lib` is live and closes
-        // exactly once via Drop, like a successful `open_first`.
-        let owned = LemmaImportLib {
+        // SAFETY: pointers are stored, never called; `lib` stays live
+        // (cached handles are never unloaded by design; the probe handle
+        // is closed explicitly like the failure-cleanup path).
+        let _owned = LemmaImportLib {
             handle: lib,
             import_json: unsafe { std::mem::transmute::<*mut c_void, ImportJsonFn>(import_json) },
             free_string: unsafe { std::mem::transmute::<*mut c_void, FreeStringFn>(free_string) },
         };
-        drop(owned);
+        unsafe { close_library(lib) };
     }
 
     /// Windows twin of the dlopen self test: the already-loaded `kernel32`
@@ -575,14 +598,15 @@ mod tests {
         let lib = unsafe { open_library(Some(&probe)) }.unwrap();
         let import_json = unsafe { resolve_symbol(lib, c"GetCurrentProcess") }.unwrap();
         let free_string = unsafe { resolve_symbol(lib, c"GetModuleHandleW") }.unwrap();
-        // SAFETY: pointers are stored, never called; `lib` is live and closes
-        // exactly once via Drop, like a successful `open_first`.
-        let owned = LemmaImportLib {
+        // SAFETY: pointers are stored, never called; `lib` stays live
+        // (cached handles are never unloaded by design; the probe handle
+        // is closed explicitly like the failure-cleanup path).
+        let _owned = LemmaImportLib {
             handle: lib,
             import_json: unsafe { std::mem::transmute::<*mut c_void, ImportJsonFn>(import_json) },
             free_string: unsafe { std::mem::transmute::<*mut c_void, FreeStringFn>(free_string) },
         };
-        drop(owned);
+        unsafe { close_library(lib) };
     }
 
     /// The `None` handle is the `GetModuleHandleW(NULL)` cookie: valid for

@@ -950,3 +950,95 @@ fn restore_clears_conflict_signature_cache() {
         err.message
     );
 }
+
+/// Oracle leg for `backup_import_lemma` (fills the `legacy_oracle`
+/// specified_not_executed cell): a REAL upstream-format backup driven
+/// through the REAL daemon tool path — `exec_backup_import_lemma` with
+/// the built cdylib via `import_lib` override (dlopen, never linked),
+/// preview (loss report, no store change) then confirm (fenced replace),
+/// then verify restored content matches the upstream source.
+///
+/// Requires `LTMRS_ORACLE_BACKUP` (envelope file) and
+/// `LTMRS_ORACLE_CDYLIB` (libltmrs_lemma_import.so). Skips otherwise
+/// (artifacts live outside the repo, never committed).
+#[test]
+fn backup_import_lemma_restores_upstream_backup() {
+    let backup = std::env::var("LTMRS_ORACLE_BACKUP").unwrap_or_default();
+    let lib = std::env::var("LTMRS_ORACLE_CDYLIB").unwrap_or_default();
+    if backup.is_empty() || lib.is_empty() {
+        eprintln!("SKIP: set LTMRS_ORACLE_BACKUP + LTMRS_ORACLE_CDYLIB");
+        return;
+    }
+    let (disp, _dir) = test_dispatcher();
+    // Something must exist to be replaced (replace, never merge).
+    add_fragment(&disp, 1, "## Stale One\n\n### Context\nStale fixture.");
+    assert_eq!(disp.repo().export_full().unwrap().memories.len(), 1);
+
+    // Preview first: loss report, zero store change.
+    let preview_tool = ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
+        path: Some(backup.clone()),
+        confirm: None,
+        import_lib: Some(lib.clone()),
+    });
+    let env = tool_call(2, preview_tool.clone());
+    let preview = execute_tool(&disp, &env, &preview_tool).unwrap();
+    let text = match &preview {
+        DomainPayload::ToolResult { text, .. } => text.clone(),
+        other => panic!("unexpected payload: {other:?}"),
+    };
+    assert!(
+        text.contains("READY"),
+        "preview must report READY, got: {text}"
+    );
+    assert_eq!(
+        disp.repo().export_full().unwrap().memories.len(),
+        1,
+        "preview must not touch the store"
+    );
+
+    // Confirm: fenced replace through the real cdylib.
+    let confirm_tool = ToolArgs::BackupImportLemma(BackupImportLemmaArgs {
+        path: Some(backup.clone()),
+        confirm: Some(true),
+        import_lib: Some(lib.clone()),
+    });
+    let env = tool_call(3, confirm_tool.clone());
+    let result = execute_tool(&disp, &env, &confirm_tool).unwrap();
+    let text = match &result {
+        DomainPayload::ToolResult { text, .. } => text.clone(),
+        other => panic!("unexpected payload: {other:?}"),
+    };
+    assert!(
+        text.contains("Imported"),
+        "confirm must import, got: {text}"
+    );
+    let titles: Vec<String> = disp
+        .repo()
+        .export_full()
+        .unwrap()
+        .memories
+        .iter()
+        .map(|m| m.title.clone())
+        .collect();
+    // Replace semantics: the stale fixture is gone, upstream rows live.
+    assert!(
+        !titles.iter().any(|t| t == "Stale One"),
+        "replace must drop pre-existing rows, got: {titles:?}"
+    );
+    assert!(
+        !titles.is_empty(),
+        "upstream memories must restore, got empty store"
+    );
+    // The upstream oracle DB has 1457 memories; every restored row must
+    // carry a title (no silent drops into untitled rows).
+    assert!(
+        titles.iter().all(|t| !t.is_empty()),
+        "restored rows must keep titles"
+    );
+    // Single-use lease: the same confirm is now refused.
+    let env = tool_call(4, confirm_tool.clone());
+    assert!(
+        execute_tool(&disp, &env, &confirm_tool).is_err(),
+        "confirm lease must be single-use"
+    );
+}

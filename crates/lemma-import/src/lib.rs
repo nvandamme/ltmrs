@@ -1784,14 +1784,40 @@ impl Staging {
         counts.insert("history".to_string(), export.history.len() as u64);
         let mut export = self.export;
         export.projects = projects;
-        let digest = export.digest();
+        let digest = {
+            // Digest what we emit, not the in-memory struct: an f64 whose
+            // shortest repr a parser resolves to a neighboring double
+            // (observed: SQLite 0.9259999999999999...e vs serde_json parse
+            // resolving ...f) would otherwise trip the importer's
+            // re-digest on a perfectly good backup. Round-tripping the
+            // emitted snapshot first makes declared == derived by
+            // construction, for any parser the daemon uses.
+            // Both conversions are infallible on our own Serialize/
+            // Deserialize impls; a failure is a programming bug, so
+            // fail loud rather than declare a digest over something
+            // we did not emit.
+            // Round-trip through the STRING form, not Value: the daemon
+            // parses the emitted text, and a float whose shortest repr
+            // its parser resolves to a neighboring double must digest
+            // as-parsed, not as-held. (Value-to-struct preserves f64 bits
+            // exactly and would hide exactly this skew.)
+            let snapshot_text =
+                serde_json::to_string(&export).expect("CanonicalExport serializes to JSON");
+            let snapshot_value: serde_json::Value =
+                serde_json::from_str(&snapshot_text).expect("emitted snapshot re-parses as JSON");
+            let snapshot_back: ltmrs_domain::export::CanonicalExport =
+                serde_json::from_str(&snapshot_text)
+                    .expect("emitted snapshot parses as CanonicalExport");
+            (snapshot_back.digest(), snapshot_value)
+        };
+        let (digest, snapshot_value) = digest;
         serde_json::json!({
             "ok": true,
             "lemma_version": envelope.lemma_version,
             "schema_version": envelope.schema_version,
             "digest": digest,
             "counts": counts,
-            "snapshot": export,
+            "snapshot": snapshot_value,
             "loss": self.loss.entries,
         })
         .to_string()
