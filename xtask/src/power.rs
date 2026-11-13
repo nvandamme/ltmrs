@@ -180,12 +180,7 @@ fn step_define(
 
 /// Boot (`create`) the trial domain from its XML; `step_name` is
 /// `create` on first boot and `recreate` after the power cut.
-fn step_create(
-    guest: &str,
-    xml_path: &std::path::Path,
-    step_name: &str,
-) -> Result<StepOutcome, String> {
-    let _ = guest;
+fn step_create(xml_path: &std::path::Path, step_name: &str) -> Result<StepOutcome, String> {
     let argv = vec!["create".to_string(), xml_path.display().to_string()];
     outcome_of(step_name, &spawn_control("virsh", &argv))
 }
@@ -212,20 +207,30 @@ fn step_ssh_wait(guest: &str) -> Result<StepOutcome, String> {
                 outcome.stderr_tail
             ));
         }
+        // 2s between probes: guest boot takes tens of seconds, so a shorter
+        // interval only burns SSH handshakes without reaching ready sooner.
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 }
 
 /// Run the mode workload lines over the `ssh` CLI (one spawn per line).
 fn step_workload(mode: &str, guest: &str) -> Result<StepOutcome, String> {
+    let mut tails: Vec<String> = Vec::new();
     for line in workload_commands(mode) {
         let argv = vec![guest.to_string(), line];
         let step = outcome_of("workload", &spawn_control("ssh", &argv))?;
+        if !step.stderr_tail.is_empty() {
+            tails.push(step.stderr_tail.clone());
+        }
         if step.exit_code != 0 {
             return Ok(step);
         }
     }
-    Ok(step_ok("workload"))
+    Ok(StepOutcome {
+        name: "workload".to_string(),
+        exit_code: 0,
+        stderr_tail: tails.join("\n"),
+    })
 }
 
 /// Cut power to the trial domain.
@@ -248,14 +253,22 @@ fn verify_commands(mode: &str) -> Vec<String> {
 
 /// Verify durability after the power cut, over the `ssh` CLI.
 fn step_verify(mode: &str, guest: &str) -> Result<StepOutcome, String> {
+    let mut tails: Vec<String> = Vec::new();
     for line in verify_commands(mode) {
         let argv = vec![guest.to_string(), line];
         let step = outcome_of("verify", &spawn_control("ssh", &argv))?;
+        if !step.stderr_tail.is_empty() {
+            tails.push(step.stderr_tail.clone());
+        }
         if step.exit_code != 0 {
             return Ok(step);
         }
     }
-    Ok(step_ok("verify"))
+    Ok(StepOutcome {
+        name: "verify".to_string(),
+        exit_code: 0,
+        stderr_tail: tails.join("\n"),
+    })
 }
 
 /// Record one step; returns true when the pipeline must stop.
@@ -324,7 +337,7 @@ fn run_trial_live(mode: &str, name: &str) -> Result<i32, String> {
             &mut steps,
             &mut verdict,
             "create",
-            step_create(&guest, &xml_path, "create"),
+            step_create(&xml_path, "create"),
         );
     }
     if !stop {
@@ -346,7 +359,7 @@ fn run_trial_live(mode: &str, name: &str) -> Result<i32, String> {
             &mut steps,
             &mut verdict,
             "recreate",
-            step_create(&guest, &xml_path, "recreate"),
+            step_create(&xml_path, "recreate"),
         );
     }
     if !stop {
@@ -370,9 +383,13 @@ fn run_trial_live(mode: &str, name: &str) -> Result<i32, String> {
 }
 
 /// Would-be control-plane argv vectors (program first) for a trial.
+///
+/// Generated from the same per-step commands the live body runs
+/// (clone → define → create → ssh-wait → workload lines → destroy →
+/// recreate → verify lines) so the preview cannot drift from the pipeline.
 fn trial_plan(mode: &str, name: &str) -> Vec<Vec<String>> {
     let guest = format!("power-{name}");
-    vec![
+    let mut plan = vec![
         vec![
             "virsh".to_string(),
             "vol-clone".to_string(),
@@ -392,9 +409,24 @@ fn trial_plan(mode: &str, name: &str) -> Vec<Vec<String>> {
             format!("{guest}.xml"),
         ],
         vec!["ssh".to_string(), guest.clone(), "true".to_string()],
-        vec!["ssh".to_string(), guest.clone(), format!("trial-{mode}")],
-        vec!["virsh".to_string(), "destroy".to_string(), guest],
-    ]
+    ];
+    for line in workload_commands(mode) {
+        plan.push(vec!["ssh".to_string(), guest.clone(), line]);
+    }
+    plan.push(vec![
+        "virsh".to_string(),
+        "destroy".to_string(),
+        guest.clone(),
+    ]);
+    plan.push(vec![
+        "virsh".to_string(),
+        "create".to_string(),
+        format!("{guest}.xml"),
+    ]);
+    for line in verify_commands(mode) {
+        plan.push(vec!["ssh".to_string(), guest.clone(), line]);
+    }
+    plan
 }
 
 /// Run a trial: dry-run prints the plan without spawning; otherwise the
@@ -408,6 +440,11 @@ pub fn run_trial(mode: &str, name: &str, _force: bool, dry_run: bool) -> Result<
     if name == GOLDEN_NAME {
         return Err(format!(
             "refusing to run trial as reserved base image '{GOLDEN_NAME}' (golden guard)"
+        ));
+    }
+    if name.contains('/') || name.contains("..") {
+        return Err(format!(
+            "invalid power trial name '{name}' (must not contain '/' or '..')"
         ));
     }
     if dry_run {
@@ -451,6 +488,45 @@ mod tests {
     fn power_trial_rejects_unknown_mode() {
         let err = crate::power::run_trial("bogus", "t1", false, true).unwrap_err();
         assert!(err.contains("bogus"), "must name the mode: {err}");
+    }
+
+    #[test]
+    fn power_trial_rejects_path_escape_name() {
+        for bad in ["../evil", "a/b"] {
+            let err = crate::power::run_trial("canary", bad, false, true).unwrap_err();
+            assert!(err.contains(bad), "must name the bad name: {err}");
+        }
+    }
+
+    #[test]
+    fn power_trial_plan_matches_live_step_sequence() {
+        let plan = super::trial_plan("canary", "t1");
+        let names: Vec<&str> = plan
+            .iter()
+            .map(|argv| {
+                if argv[0] == "virsh" {
+                    argv[1].as_str()
+                } else {
+                    "ssh"
+                }
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "vol-clone",
+                "define",
+                "create",
+                "ssh",
+                "ssh",
+                "ssh",
+                "ssh",
+                "destroy",
+                "create",
+                "ssh",
+                "ssh"
+            ]
+        );
     }
 
     #[test]
