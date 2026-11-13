@@ -147,4 +147,56 @@ mod tests {
         let structured = result_structured(&out).unwrap();
         assert_eq!(structured["skill"], serde_json::json!("sql-quoting"));
     }
+
+    /// Transitive legacy oracle (alias equivalence): `learn` without a
+    /// guide stores through the SAME `exec_memory_add` the native
+    /// `memory_add` uses, so upstream-verified add behavior is inherited
+    /// iff the alias forwards identical args. Twin fixtures, alias on one
+    /// side, native lesson-typed add on the other, then compare canonical
+    /// effects. No upstream counterpart is invented.
+    #[test]
+    fn learn_without_guide_matches_native_add_effects() {
+        use ltmrs_compat::lemma::tool_args::{MemoryAddArgs, ToolArgs};
+        let (disp_a, _d1) = test_dispatcher();
+        let (disp_b, _d2) = test_dispatcher();
+        let learn = learn_tool("Prefer explicit error returns.", None, None);
+        let env_a = tool_call(1, learn.clone());
+        let out_a = run(&disp_a, &env_a, &learn);
+        assert!(
+            !result_is_error(&out_a),
+            "learn failed: {}",
+            result_text(&out_a)
+        );
+        let learn_id = result_structured(&out_a).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let native = ToolArgs::MemoryAdd(MemoryAddArgs {
+            fragment: "Prefer explicit error returns.".to_string(),
+            fragment_type: Some("lesson".to_string()),
+            ..Default::default()
+        });
+        let env_b = tool_call(1, native.clone());
+        let out_b = run(&disp_b, &env_b, &native);
+        assert!(
+            !result_is_error(&out_b),
+            "native add failed: {}",
+            result_text(&out_b)
+        );
+        let snap = |d: &crate::dispatcher::Dispatcher| {
+            let m = d.repo().export_full().unwrap().memories;
+            assert_eq!(m.len(), 1);
+            (m[0].fragment.clone(), m[0].fragment_type, m[0].confidence)
+        };
+        // Same fragment text, same lesson typing, same earned confidence.
+        let (fa, ta, ca) = snap(&disp_a);
+        let (fb, tb, cb) = snap(&disp_b);
+        assert_eq!(fa, fb, "alias must store the same fragment as native");
+        assert_eq!(ta, tb, "alias must type the lesson like native");
+        assert!(
+            (ca - cb).abs() < f64::EPSILON,
+            "confidence must match native"
+        );
+        let _ = learn_id;
+    }
 }

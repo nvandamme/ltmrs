@@ -552,7 +552,7 @@
     "enhancement_ledger": "executed_passed"
    },
    "owner_workpackage": "WP-10",
-   "notes": "Native omp-compat tri-op (P2): update maps to memory_update (fragment patch), forget to memory_forget, invalidate to memory_forget invalidate=true. Scope 2026-11-12: edit_update_excludes_foreign_stable_row + edit_forget_excludes_foreign_stable_row (daemon, inherit canonical isolation). Retry 2026-11-12: edit_update_same_envelope_replays_recorded (daemon, byte-identical replay). Stragglers 2026-11-12: edit_arms_map_to_distinct_executor_paths + edit_update_without_content_rejects (daemon). No upstream oracle (greenfield tool, no Lemma 0.21.0 counterpart): legacy_oracle stays specified_not_executed by construction."
+   "notes": "Alias omp-compat tri-op (P2): update -> exec_memory_update, forget/invalidate -> exec_memory_forget (same exec fns, same admission/scope; memory_edit.rs:36-70). No direct Lemma 0.21.0 name (29-tool inventory has no memory_edit). Transitive oracle: alias==native proven by edit_update_matches_native_update_effects + edit_forget_invalidate_match_native_forget_effects (daemon, 2026-11-13, twin-fixture export_full compare). Native targets' own legacy_oracle still not_run, so upstream equivalence inherits not_run \u2014 direct cell stays specified_not_executed (not directly executable), not a pass."
   },
   {
    "name": "learn",
@@ -568,7 +568,7 @@
     "enhancement_ledger": "executed_passed"
    },
    "owner_workpackage": "WP-10",
-   "notes": "Native omp-compat lesson capture + optional guide (Slice G3, 2026-11-12): memory (+context) persists first as lesson-typed memory_add; guide/guide_body creates the managed guide second (partial, never rollback). Empty lessons reject loudly. Tests: learn_stores_lesson + learn_empty_memory_rejects + learn_with_guide_stores_both (daemon 3/3) + learn_routes_with_memory (frontend) + mutates_store pin (compat). Route + parse + allowlist + served pin 33 + notify parity. No upstream oracle (greenfield omp tool, no Lemma 0.21.0 counterpart): legacy_oracle stays specified_not_executed by construction."
+   "notes": "Alias omp-compat lesson capture + optional guide (Slice G3): memory(+context) -> exec_memory_add (fragment_type lesson), guide/guide_body -> exec_guide_create second (learn.rs:38-57). No direct Lemma 0.21.0 name (29-tool inventory has no learn). Transitive oracle (lesson side): alias==native proven by learn_without_guide_matches_native_add_effects (daemon, 2026-11-13, fragment+type+confidence compare); guide side covered only by learn_with_guide_stores_both (stores-both, no twin compare). Native targets' own legacy_oracle still not_run, so upstream equivalence inherits not_run \u2014 direct cell stays specified_not_executed, not a pass."
   },
   {
    "name": "reflect",
@@ -584,7 +584,7 @@
     "enhancement_ledger": "executed_passed"
    },
    "owner_workpackage": "WP-10",
-   "notes": "Native omp-compat server-side synthesis (Slice G1b, 2026-11-12): query (+context) over the Hindsight bank through the bridge; scoped bank + tag filter (G1a modes); read-only (mutates_store false, notifies). Empty synthesis when disabled/down (never a failure); empty query rejects loudly. Tests: reflect_empty_query_rejects + reflect_without_bridge_degrades_honestly (daemon 2/2) + reflect_routes_with_query (frontend). Route + parse + allowlist + served pin 33 + parity. No upstream oracle (greenfield omp tool): legacy_oracle stays specified_not_executed by construction."
+   "notes": "Native omp-compat server-side synthesis (Slice G1b, 2026-11-12): query (+context) over the Hindsight bank through the bridge (reflect.rs:32; dispatcher bridge_reflect_scoped); read-only, best-effort, honest empty when disabled/down. NOT an alias: no canonical memory_*/guide_* exec target. No Lemma 0.21.0 name and no transitive path \u2014 legacy_oracle stays specified_not_executed by construction (genuinely no upstream counterpart). Tests: reflect_empty_query_rejects + reflect_without_bridge_degrades_honestly (daemon 2/2) + reflect_routes_with_query (frontend)."
   }
  ]
 }

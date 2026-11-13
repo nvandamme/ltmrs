@@ -419,4 +419,120 @@ mod scope_retry_tests {
             result_text(&out)
         );
     }
+
+    /// Transitive legacy oracle (alias equivalence): `memory_edit` routes
+    /// to the SAME exec fns the native tools use, so upstream-verified
+    /// native behavior is inherited iff the alias forwards identical args.
+    /// Twin fixtures, alias on one side, native on the other, then compare
+    /// canonical effects (fragment + lifecycle). No upstream counterpart
+    /// is invented; the oracle is the native tool's own verified path.
+    #[test]
+    fn edit_update_matches_native_update_effects() {
+        use ltmrs_compat::lemma::tool_args::MemoryUpdateArgs;
+        {
+            let content = "## New\n\n### Context\nFresh.";
+            let (disp_a, _d1) = test_dispatcher();
+            let (disp_b, _d2) = test_dispatcher();
+            let id = ident(None, None, None, false);
+            let seed = "## Old\n\n### Context\nStale.";
+            let mid_a = add_fragment(&disp_a, 11, seed);
+            let mid_b = add_fragment(&disp_b, 21, seed);
+            // Alias side.
+            let edit_tool = edit_tool("update", &mid_a, Some(content));
+            let out_a = run(
+                &disp_a,
+                &tool_call_with(12, edit_tool.clone(), id.clone()),
+                &edit_tool,
+            );
+            assert!(
+                !result_is_error(&out_a),
+                "alias update failed: {}",
+                result_text(&out_a)
+            );
+            // Native side.
+            let native = ToolArgs::MemoryUpdate(MemoryUpdateArgs {
+                id: mid_b.clone(),
+                title: None,
+                fragment: Some(content.to_string()),
+                confidence: None,
+            });
+            let out_b = run(
+                &disp_b,
+                &tool_call_with(22, native.clone(), id.clone()),
+                &native,
+            );
+            assert!(
+                !result_is_error(&out_b),
+                "native update failed: {}",
+                result_text(&out_b)
+            );
+            // Identical canonical effects.
+            let snap = |d: &crate::dispatcher::Dispatcher| {
+                let m = d.repo().export_full().unwrap().memories;
+                assert_eq!(m.len(), 1);
+                (m[0].fragment.clone(), m[0].lifecycle.clone())
+            };
+            assert_eq!(
+                snap(&disp_a),
+                snap(&disp_b),
+                "alias must equal native effects"
+            );
+        }
+    }
+
+    /// Transitive legacy oracle: `forget` and `invalidate` match native
+    /// `memory_forget` effects (live vs tombstoned lifecycle).
+    #[test]
+    fn edit_forget_invalidate_match_native_forget_effects() {
+        use ltmrs_compat::lemma::tool_args::{MemoryForgetArgs, ToolArgs};
+        for (op, expect_recallable) in [("forget", false), ("invalidate", false)] {
+            let (disp_a, _d1) = test_dispatcher();
+            let (disp_b, _d2) = test_dispatcher();
+            let id = ident(None, None, None, false);
+            let seed = "## Doomed\n\n### Context\nGone.";
+            let mid_a = add_fragment(&disp_a, 31, seed);
+            let mid_b = add_fragment(&disp_b, 41, seed);
+            let edit_tool = edit_tool(op, &mid_a, None);
+            let out_a = run(
+                &disp_a,
+                &tool_call_with(32, edit_tool.clone(), id.clone()),
+                &edit_tool,
+            );
+            assert!(
+                !result_is_error(&out_a),
+                "alias {op} failed: {}",
+                result_text(&out_a)
+            );
+            let native = ToolArgs::MemoryForget(MemoryForgetArgs {
+                id: mid_b.clone(),
+                consolidate: false,
+                invalidate: op == "invalidate",
+            });
+            let out_b = run(
+                &disp_b,
+                &tool_call_with(42, native.clone(), id.clone()),
+                &native,
+            );
+            assert!(
+                !result_is_error(&out_b),
+                "native forget failed: {}",
+                result_text(&out_b)
+            );
+            let life = |d: &crate::dispatcher::Dispatcher| {
+                let m = d.repo().export_full().unwrap().memories;
+                assert_eq!(m.len(), 1);
+                format!("{:?}", m[0].lifecycle)
+            };
+            assert_eq!(
+                life(&disp_a),
+                life(&disp_b),
+                "alias {op} must equal native lifecycle"
+            );
+            assert!(
+                life(&disp_a).contains("ecallable") == expect_recallable,
+                "unexpected recallability for {op}: {}",
+                life(&disp_a)
+            );
+        }
+    }
 }
