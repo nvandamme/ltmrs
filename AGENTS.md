@@ -123,6 +123,18 @@ expensive — see sccache below. Iterate cheaply, qualify fully:
   trees, fresh worktrees sharing `~/.cache/sccache`); warm incremental
   builds bypass it untouched and stay fast. Escape hatch:
   `LTMRS_NO_SCCACHE=1`.
+- Windows (`x86_64-pc-windows-msvc`) cannot exec the POSIX `.sh` (cargo: `os
+  error 193`), and a native `sccache` wrapper there breaks IDE cargo
+  integration — RustRover parses the `--print`/JSON probes sccache intercepts.
+  So Windows DISABLES the wrapper with an empty env override (plain rustc):
+  `setx CARGO_BUILD_RUSTC_WRAPPER ""` (set once; a per-build bypass is the same
+  empty value). cargo config cannot segment `rustc-wrapper` by platform — it is
+  a `[build]`-only key, rejected under `[target.<triple>]` — so the split is
+  per-platform via the environment; the committed `[build]` stays the POSIX
+  `.sh` for Linux/Apple. Windows gets no sccache caching (plain rustc); the
+  `.sh`'s `LTMRS_NO_SCCACHE=1` is inert there. A `.cmd` batch wrapper is not a
+  faithful alternative: cmd `%*` collapses rustc's escaped-quote
+  `--cfg`/`--check-cfg` feature-list args (`windows-sys` fails `E0554`).
 - Linker selection is automatic per member (`build.rs` + shared probe
   in `tools/detect_linker.rs`): mold if present, else wild, else the
   system default — no setup needed, and checkouts without either

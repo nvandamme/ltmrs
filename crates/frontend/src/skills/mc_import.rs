@@ -99,6 +99,12 @@ unsafe fn close_library(handle: *mut c_void) {
 }
 
 #[cfg(windows)]
+unsafe fn close_library(handle: *mut c_void) {
+    // SAFETY: live owned handle per the caller contract.
+    unsafe { windows_dl::close_library(handle) };
+}
+
+#[cfg(windows)]
 mod windows_dl {
     use super::*;
     use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError};
@@ -135,7 +141,6 @@ mod windows_dl {
             unsafe { FreeLibrary(handle as windows_sys::Win32::Foundation::HMODULE) };
         }
     }
-    pub(super) use super::LIB_FILE_NAME;
 }
 
 /// Candidate cdylib locations: env override, exe dir, well-known outputs.

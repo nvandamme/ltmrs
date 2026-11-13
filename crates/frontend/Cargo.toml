@@ -26,6 +26,11 @@ libc = "0.2"
 # Artifact fetch (model downloads). rustls-tls only — pure Rust, no native TLS.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+[target.'cfg(windows)'.dependencies]
+# cdylib dlopen for the lemma-import skill (mc_import.rs windows_dl):
+# LoadLibraryW/GetProcAddress/FreeLibrary.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
 [dev-dependencies]
 tempfile = "3.0"
 # Test-only upward edge (AGENTS rule 5): smoke tests force FTS convergence

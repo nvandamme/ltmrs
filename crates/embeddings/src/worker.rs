@@ -816,7 +816,9 @@ mod tests {
                 .lines()
                 .enumerate()
                 .filter(|(i, l)| {
-                    let off: usize = text.lines().take(*i).map(|l| l.len() + 1).sum();
+                    // split('\n') keeps '\r' so the byte offset matches
+                    // match_indices on CRLF files (lines() strips '\r').
+                    let off: usize = text.split('\n').take(*i).map(|l| l.len() + 1).sum();
                     off < in_test && (l.contains("candle::") || l.contains("candle_"))
                 })
                 .map(|(i, _)| i + 1)

@@ -35,6 +35,15 @@ pub(super) fn populate_cache(cache: &ArtifactCache, _guard: &tempfile::TempDir) 
     true
 }
 
+/// Skip guard for the Burn frozen-case tests: pinned safetensors live at the
+/// workspace root (`tmp/e5-artifacts`); absent (offline CI / fresh host) → skip.
+fn frozen_artifacts_present() -> bool {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tmp/e5-artifacts")
+        .join("model.safetensors")
+        .exists()
+}
+
 pub(super) fn test_cache() -> (ArtifactCache, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     (ArtifactCache::new(dir.path()), dir)
@@ -777,6 +786,10 @@ fn e5_adapter_is_shareable() {
 /// within the parity envelope (max-abs ≤1e-6). Fails — no Burn backend exists yet.
 #[test]
 fn burn_backend_matches_frozen_fixtures() {
+    if !frozen_artifacts_present() {
+        eprintln!("skip: pinned safetensors absent (tmp/e5-artifacts)");
+        return;
+    }
     let fixture = load_fixture();
     let cases = fixture["cases"]
         .as_object()
@@ -846,6 +859,10 @@ fn burn_backend_matches_frozen_fixtures() {
 /// batch/single finding, now inside one forward call).
 #[test]
 fn burn_batched_forward_matches_single_rows() {
+    if !frozen_artifacts_present() {
+        eprintln!("skip: pinned safetensors absent (tmp/e5-artifacts)");
+        return;
+    }
     // Mixed widths in one batch: short query + passage + batch rows.
     let cases = ["short_en", "code_snippet", "mixed_batch", "fr_query"];
     let batched = crate::e5_burn::embed_frozen_cases_batched(&cases).expect("batched embeds");

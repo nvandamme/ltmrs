@@ -36,8 +36,19 @@ pub fn event_filename(document_id: &str, nanos: u64) -> String {
     let safe: String = document_id
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 c
+            } else if c == ':' {
+                // ':' is valid on Linux ext4 but invalid on NTFS
+                // (ERROR_INVALID_NAME, os code 123), so flatten it on Windows.
+                #[cfg(windows)]
+                {
+                    '_'
+                }
+                #[cfg(not(windows))]
+                {
+                    ':'
+                }
             } else {
                 '_'
             }
@@ -170,7 +181,12 @@ mod tests {
             quarantine_dir(home),
             Path::new("/h/hindsight-outbox/quarantine")
         );
-        assert!(event_filename("ltmrs:memory:x", 7).starts_with("ltmrs:memory:x.7."));
+        // ':' is kept on Linux, flattened to '_' on Windows (NTFS).
+        #[cfg(not(windows))]
+        let prefix = "ltmrs:memory:x.7.";
+        #[cfg(windows)]
+        let prefix = "ltmrs_memory_x.7.";
+        assert!(event_filename("ltmrs:memory:x", 7).starts_with(prefix));
     }
 
     /// G1d RED: expiry cutoffs are exact day arithmetic.

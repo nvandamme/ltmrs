@@ -5,6 +5,58 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2026-11-13 — Windows rustc-wrapper split (env override disables the wrapper)
+
+- `.cargo/config.toml`: comment documents that `rustc-wrapper` is a
+  `[build]`-only key (cargo rejects it under `[target.<triple>]`, so config
+  cannot segment by platform) and that Windows DISABLES the wrapper via an
+  empty env override. The committed `[build]` stays `tools/sccache-wrap.sh`
+  (POSIX, Linux/Apple).
+- AGENTS.md: Windows bullet added — `setx CARGO_BUILD_RUSTC_WRAPPER ""` (plain
+  rustc, set once; per-build bypass is the same empty value), no sccache
+  caching on Windows, `LTMRS_NO_SCCACHE=1` inert there.
+- Why Windows disables the wrapper: cargo cannot exec the POSIX `.sh` on
+  `x86_64-pc-windows-msvc` (`os error 193`), and a native `sccache` wrapper
+  breaks IDE cargo integration — RustRover parses the `--print`/JSON probes
+  sccache intercepts. A `.cmd` batch wrapper is not a faithful alternative:
+  cmd `%*` collapses rustc's escaped-quote `--cfg`/`--check-cfg` feature-list
+  args (`windows-sys` fails `E0554`).
+- Verified: `CARGO_BUILD_RUSTC_WRAPPER="" cargo check -p ltmrs-domain` green,
+  0 sccache requests (wrapper disabled); committed `[build]` `.sh` on Windows
+  reproduces `os error 193`; `CARGO_BUILD_RUSTC_WRAPPER=sccache cargo check
+  --workspace` intercepts 807 requests, `windows-sys` 0.61/0.59 green (sccache
+  is a faithful wrapper, rejected for IDE use); cmd-wrapper corruption
+  reproduced.
+- Windows compile gap fixed in `ltmrs-frontend` (surfaced by the full gate on
+  this host): `mc_import.rs`'s `#[cfg(windows)]` dlopen module used
+  `windows_sys` with no `windows-sys` dep in `crates/frontend/Cargo.toml`
+  (added, `Win32_Foundation` + `Win32_System_LibraryLoader`, matching the
+  daemon crate pattern); `Drop` called top-level `close_library` defined only
+  `#[cfg(not(windows))]` (added the Windows delegation with a SAFETY block);
+  `daemon.rs` had an unused `CommandExt` import (`creation_flags` is an
+  inherent method, removed); `windows_dl` had a dead `LIB_FILE_NAME` re-export
+  (removed). Plain rustc (`CARGO_BUILD_RUSTC_WRAPPER=""`) now compiles
+  `ltmrs-frontend` lib+tests clippy-clean.
+- Windows NTFS filename bug fixed in `ltmrs-interchange` (surfaced by the full
+  gate): `event_filename` kept `:` in outbox event names (valid on Linux ext4,
+  invalid on NTFS — `ERROR_INVALID_NAME`, os code 123), so
+  `hindsight::tests::replay_pending_resends_and_cleans_up` failed writing
+  `ltmrs:memory:replay1.1.json`. `event_filename` now flattens `:` to `_`
+  under `#[cfg(windows)]` (Linux naming unchanged); the `layout_flattens_and_defaults`
+  assertion is platform-aware. The replayer scans by directory + `.json`
+  extension and never parses the document id from the filename, so the
+  flattening is safe.
+- Windows gaps fixed in `ltmrs-embeddings` (surfaced by the full gate, proven
+  pre-existing on clean HEAD): `burn_backend_matches_frozen_fixtures` and
+  `burn_batched_forward_matches_single_rows` read pinned safetensors from
+  workspace-root `tmp/e5-artifacts` unconditionally (`os error 3` when absent);
+  added a `frozen_artifacts_present()` skip guard matching the existing
+  `populate_cache` offline-skip pattern. `seam_files_name_no_candle` computed
+  the byte offset via `text.lines()` (strips `\r`) against a `match_indices`
+  byte offset, so on CRLF files the test's own doc-comment lines counted as
+  candle leaks; the offset now uses `split('\n')` (keeps `\r`), matching the
+  byte basis on both LF and CRLF.
+
 ## 2026-11-12 — Candle migration Tasks 4–6 + deferred legs (Burn port, wheel pins, gates)
 
 ### Task 4 — Replace Candle tensor core with Burn (dynamic loading only)
