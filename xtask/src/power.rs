@@ -56,9 +56,203 @@ pub fn workload_commands(mode: &str) -> Vec<String> {
         .collect()
 }
 
-/// Build the base image (stub: Task 5 implements).
-pub fn run_build(_force: bool, _dry_run: bool) -> Result<i32, String> {
-    Err("not implemented".to_string())
+/// Guest-side provision lines for the base image (each one `ssh` call, no
+/// heredoc scripts): mkfs vda1, copy tree, static net, autologin, dev
+/// nodes, authorized_keys, runlevel links.
+fn build_provision_commands() -> Vec<String> {
+    vec![
+        "mkfs.ext4 -L ltmrs-golden /dev/vda1".to_string(),
+        "mount /dev/vda1 /mnt && cp -a /live/tree/. /mnt/ && umount /mnt".to_string(),
+        "echo 'auto eth0\niface eth0 inet static\naddress 192.168.122.10' > /mnt/etc/network/interfaces".to_string(),
+        "echo 'tty1::respawn:/sbin/getty -n -l /bin/autologin tty1 38400' >> /mnt/etc/inittab".to_string(),
+        "mknod /mnt/dev/console c 5 1 && mknod /mnt/dev/null c 1 3".to_string(),
+        "install -m 600 /root/key.pub /mnt/root/.ssh/authorized_keys".to_string(),
+        "ln -s /etc/init.d/S99power /mnt/etc/runlevels/default/S99power".to_string(),
+    ]
+}
+
+/// Would-be control-plane argv vectors (program first) for a build.
+///
+/// Generated from the same commands the live body runs so the preview
+/// cannot drift from the pipeline.
+fn build_plan() -> Vec<Vec<String>> {
+    let guest = GOLDEN_NAME.to_string();
+    let mut plan = vec![
+        vec![
+            "qemu-img".to_string(),
+            "create".to_string(),
+            "-f".to_string(),
+            "qcow2".to_string(),
+            format!("{guest}-vol.qcow2"),
+            "8G".to_string(),
+        ],
+        vec![
+            "virsh".to_string(),
+            "define".to_string(),
+            format!("{guest}.xml"),
+        ],
+        vec![
+            "virsh".to_string(),
+            "create".to_string(),
+            format!("{guest}.xml"),
+        ],
+        vec!["ssh".to_string(), guest.clone(), "true".to_string()],
+    ];
+    for line in build_provision_commands() {
+        plan.push(vec!["ssh".to_string(), guest.clone(), line]);
+    }
+    plan.push(vec![
+        "virsh".to_string(),
+        "destroy".to_string(),
+        guest.clone(),
+    ]);
+    plan.push(vec![
+        "virsh".to_string(),
+        "undefine".to_string(),
+        guest.clone(),
+    ]);
+    plan.push(vec![
+        "virsh".to_string(),
+        "vol-info".to_string(),
+        format!("{guest}-vol"),
+        "--pool".to_string(),
+        "default".to_string(),
+    ]);
+    plan
+}
+
+/// Live build body: qcow2 create → define → create → SSH wait →
+/// provision → destroy → undefine → vol-info assert.
+fn run_build_live(force: bool) -> Result<i32, String> {
+    if cfg!(not(target_os = "linux")) {
+        return Err("unsupported platform — Hyper-V CLI backend not yet ported".to_string());
+    }
+    let guest = GOLDEN_NAME.to_string();
+    let volume = format!("{guest}-vol");
+    if !force {
+        let probe = vec![volume.clone(), "--pool".to_string(), "default".to_string()];
+        let probe = [vec!["vol-info".to_string()], probe].concat();
+        if spawn_control("virsh", &probe).exit_code == 0 {
+            return Err(format!(
+                "base image '{volume}' already exists (pass --force to overwrite)"
+            ));
+        }
+    }
+    let dir = std::path::PathBuf::from("reports/power-golden");
+    let xml_path = dir.join(format!("{guest}.xml"));
+    let img_argv = vec![
+        "create".to_string(),
+        "-f".to_string(),
+        "qcow2".to_string(),
+        format!("{volume}.qcow2"),
+        "8G".to_string(),
+    ];
+    let mut steps: Vec<StepOutcome> = Vec::new();
+    let mut verdict = "pass".to_string();
+    let mut stop = push_step(
+        &mut steps,
+        &mut verdict,
+        "img-create",
+        outcome_of("img-create", &spawn_control("qemu-img", &img_argv)),
+    );
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "define",
+            step_define(&guest, &volume, &xml_path),
+        );
+    }
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "create",
+            step_create(&xml_path, "create"),
+        );
+    }
+    if !stop {
+        stop = push_step(&mut steps, &mut verdict, "ssh-wait", step_ssh_wait(&guest));
+    }
+    if !stop {
+        let mut tails: Vec<String> = Vec::new();
+        let mut result = Ok(StepOutcome {
+            name: "provision".to_string(),
+            exit_code: 0,
+            stderr_tail: String::new(),
+        });
+        for line in build_provision_commands() {
+            let argv = vec![guest.clone(), line];
+            match outcome_of("provision", &spawn_control("ssh", &argv)) {
+                Err(fault) => {
+                    result = Err(fault);
+                    break;
+                }
+                Ok(step) => {
+                    if !step.stderr_tail.is_empty() {
+                        tails.push(step.stderr_tail.clone());
+                    }
+                    if step.exit_code != 0 {
+                        result = Ok(step);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok(step) = &mut result {
+            step.stderr_tail = tails.join("\n");
+        }
+        stop = push_step(&mut steps, &mut verdict, "provision", result);
+    }
+    if !stop {
+        stop = push_step(&mut steps, &mut verdict, "destroy", step_destroy(&guest));
+    }
+    if !stop {
+        let argv = vec!["undefine".to_string(), guest.clone()];
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "undefine",
+            outcome_of("undefine", &spawn_control("virsh", &argv)),
+        );
+    }
+    if !stop {
+        let argv = vec![
+            "vol-info".to_string(),
+            volume.clone(),
+            "--pool".to_string(),
+            "default".to_string(),
+        ];
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "vol-info",
+            outcome_of("vol-info", &spawn_control("virsh", &argv)),
+        );
+    }
+    if verdict != "pass" {
+        let tails: Vec<String> = steps
+            .iter()
+            .filter(|step| step.exit_code != 0)
+            .map(|step| format!("{}: {}", step.name, step.stderr_tail))
+            .collect();
+        return Err(format!("build failed ({}): {}", verdict, tails.join("; ")));
+    }
+    let _ = stop;
+    Ok(0)
+}
+
+/// Build the base image: dry-run prints the plan without spawning,
+/// otherwise the live qcow2 → define → provision → destroy pipeline runs.
+/// Without `--force` a live build refuses when the golden volume exists.
+pub fn run_build(force: bool, dry_run: bool) -> Result<i32, String> {
+    if dry_run {
+        for argv in build_plan() {
+            crate::verbs::print_dry_run(&argv[0], &argv[1..]);
+        }
+        return Ok(0);
+    }
+    run_build_live(force)
 }
 
 /// Outcome of one trial step: the captured exit code plus the stderr tail.
@@ -456,14 +650,88 @@ pub fn run_trial(mode: &str, name: &str, _force: bool, dry_run: bool) -> Result<
     run_trial_live(mode, name)
 }
 
-/// Clean a trial (stub: Task 5 implements; the golden guard already holds).
-pub fn run_clean(name: &str, _force: bool, _dry_run: bool) -> Result<i32, String> {
+/// Would-be control-plane argv vectors (program first) for a clean.
+fn clean_plan(name: &str) -> Vec<Vec<String>> {
+    let guest = format!("power-{name}");
+    vec![
+        vec!["virsh".to_string(), "destroy".to_string(), guest.clone()],
+        vec!["virsh".to_string(), "undefine".to_string(), guest.clone()],
+        vec![
+            "virsh".to_string(),
+            "vol-delete".to_string(),
+            format!("{guest}.img"),
+            "--pool".to_string(),
+            "default".to_string(),
+        ],
+    ]
+}
+
+/// Clean a trial: undefine the domain then delete its volume.
+/// The golden base image is always refused; path escapes are refused.
+pub fn run_clean(name: &str, _force: bool, dry_run: bool) -> Result<i32, String> {
     if name == GOLDEN_NAME {
         return Err(format!(
             "refusing to clean reserved base image '{GOLDEN_NAME}' (golden guard)"
         ));
     }
-    Err("not implemented".to_string())
+    if name.contains('/') || name.contains("..") {
+        return Err(format!(
+            "invalid power trial name '{name}' (must not contain '/' or '..')"
+        ));
+    }
+    if dry_run {
+        for argv in clean_plan(name) {
+            crate::verbs::print_dry_run(&argv[0], &argv[1..]);
+        }
+        return Ok(0);
+    }
+    if cfg!(not(target_os = "linux")) {
+        return Err("unsupported platform — Hyper-V CLI backend not yet ported".to_string());
+    }
+    let guest = format!("power-{name}");
+    let volume = format!("{guest}.img");
+    let mut steps: Vec<StepOutcome> = Vec::new();
+    let mut verdict = "pass".to_string();
+    let destroy = vec!["destroy".to_string(), guest.clone()];
+    let mut stop = push_step(
+        &mut steps,
+        &mut verdict,
+        "destroy",
+        outcome_of("destroy", &spawn_control("virsh", &destroy)),
+    );
+    if !stop {
+        let undefine = vec!["undefine".to_string(), guest.clone()];
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "undefine",
+            outcome_of("undefine", &spawn_control("virsh", &undefine)),
+        );
+    }
+    if !stop {
+        let delete = vec![
+            "vol-delete".to_string(),
+            volume.clone(),
+            "--pool".to_string(),
+            "default".to_string(),
+        ];
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "vol-delete",
+            outcome_of("vol-delete", &spawn_control("virsh", &delete)),
+        );
+    }
+    if verdict != "pass" {
+        let tails: Vec<String> = steps
+            .iter()
+            .filter(|step| step.exit_code != 0)
+            .map(|step| format!("{}: {}", step.name, step.stderr_tail))
+            .collect();
+        return Err(format!("clean failed ({}): {}", verdict, tails.join("; ")));
+    }
+    let _ = stop;
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -629,5 +897,48 @@ mod tests {
     #[should_panic(expected = "unknown power workload mode")]
     fn workload_commands_rejects_unknown_mode() {
         crate::power::workload_commands("bogus");
+    }
+    #[test]
+    fn clean_refuses_golden_volume() {
+        let err = crate::power::run_clean("ltmrs-golden", false, true).unwrap_err();
+        assert!(err.contains("ltmrs-golden"));
+    }
+
+    #[test]
+    fn clean_dry_run_prints_without_spawning() {
+        let code = crate::power::run_clean("rigtest-old", false, true).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn build_dry_run_prints_without_spawning() {
+        let code = crate::power::run_build(false, true).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn clean_rejects_path_escape_name() {
+        for bad in ["../evil", "a/b"] {
+            let err = crate::power::run_clean(bad, false, true).unwrap_err();
+            assert!(err.contains(bad), "must name the bad name: {err}");
+        }
+    }
+
+    #[test]
+    fn clean_plan_matches_live_step_sequence() {
+        let plan = super::clean_plan("rigtest-old");
+        let names: Vec<&str> = plan.iter().map(|argv| argv[1].as_str()).collect();
+        assert_eq!(names, vec!["destroy", "undefine", "vol-delete"]);
+    }
+
+    #[test]
+    fn build_plan_matches_live_step_sequence() {
+        let plan = super::build_plan();
+        assert!(plan[0][0] == "qemu-img" && plan[0][1] == "create");
+        assert!(plan[1] == vec!["virsh", "define", "ltmrs-golden.xml"]);
+        assert!(plan[2] == vec!["virsh", "create", "ltmrs-golden.xml"]);
+        assert!(plan[plan.len() - 3][1] == "destroy");
+        assert!(plan[plan.len() - 2][1] == "undefine");
+        assert!(plan[plan.len() - 1][1] == "vol-info");
     }
 }
