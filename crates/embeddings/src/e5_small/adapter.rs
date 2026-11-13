@@ -474,9 +474,22 @@ impl E5SmallAdapter {
                                 break;
                             }
                             // Largest char-boundary cut where prefix + span fits budget.
+                            // Bounded iterations: `mid_abs` can stick at `lo`
+                            // (floor_char_boundary maps a mid-char midpoint back
+                            // onto `lo`, and a fitting `[os..lo]` span then
+                            // re-selects it forever — observed as a hung index
+                            // run on multibyte SciFact units). The midpoint of
+                            // a byte range converges in <32 steps; past 64 the
+                            // search is stuck, so bail to the progress guard
+                            // below (single-char advance) instead of spinning.
                             let mut lo = os;
                             let mut hi = *e;
+                            let mut iters = 0u32;
                             while hi - lo > 1 {
+                                iters += 1;
+                                if iters > 64 {
+                                    break;
+                                }
                                 let mid_abs =
                                     os + fragment[os..*e].floor_char_boundary((lo + hi) / 2 - os);
                                 if self

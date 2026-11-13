@@ -653,6 +653,38 @@ fn t_emb_03_chunking_offsets_and_bounds() {
         prev_end = c.char_end.max(prev_end);
     }
 
+    // Bisection termination (BEIR full-corpus hang, 2026-11-13): the
+    // oversized-unit binary search stuck forever when floor_char_boundary
+    // mapped a midpoint back onto `lo` on multibyte text (single thread at
+    // 100%, queue frozen). The search is iteration-capped; these multibyte
+    // units must terminate with full verbatim coverage. Pre-fix this test
+    // hangs (caught by the harness timeout); post-fix it passes in ms.
+    // CJK + emoji + combining marks stress char-boundary arithmetic; the
+    // long-token unit stresses the single-token-exceeds-budget guard.
+    let multibyte_units = [
+        "患白血病原因 жидкость放射性骨髓移植干细胞治疗方案研究进展报告总结。".repeat(60),
+        "🧬🔬🧪🧫🧲⚗️🔭🦠🧠🫀🫁🧷".repeat(80),
+        "école café naïve résumé".repeat(120),
+        "pneumonoultramicroscopicsilicovolcanoconiosis ".repeat(120),
+    ];
+    for (i, unit) in multibyte_units.iter().enumerate() {
+        let chunks = adapter.chunk_passage(&format!("T{i}"), unit);
+        assert!(!chunks.is_empty(), "multibyte unit {i} must disclose");
+        let covered: usize = chunks.iter().map(|c| c.char_end - c.char_start).sum();
+        assert_eq!(
+            covered,
+            unit.len(),
+            "multibyte unit {i} must tile verbatim without gaps"
+        );
+        for c in &chunks {
+            assert!(
+                c.token_count <= 512,
+                "multibyte chunk exceeds window: {}",
+                c.token_count
+            );
+        }
+    }
+
     // Oversized single unit (one line > 512 tokens) is hard-split at the
     // tokenizer limit: every resulting chunk fits the window when prefixed.
     let word = "token";
