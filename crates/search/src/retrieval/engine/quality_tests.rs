@@ -698,18 +698,33 @@ async fn beir_scifact_hybrid_quality() {
             }
         }
     });
+    let mut slices = 0usize;
     while resolved < corpus.len() {
         let t_slice = std::time::Instant::now();
         let n = Projector::project_pending(&repo, &table, Box::new(parallel.clone()), 200)
             .await
             .unwrap();
         resolved += n;
+        slices += 1;
         eprintln!(
             "beir index: {resolved}/{total} docs in {elapsed:.1}s ({rate:.1}/s this slice)",
             total = corpus.len(),
             elapsed = t_all.elapsed().as_secs_f32(),
             rate = n as f32 / t_slice.elapsed().as_secs_f32().max(1e-6),
         );
+        // Fragment hygiene (test-leg only): per-doc publishes grow the
+        // manifest O(n^2) across 5k docs, decaying slice throughput.
+        // Periodic production-path compaction (`optimize`, same call the
+        // daemon maintenance tick uses) collapses fragments — identical
+        // rows, bounded manifest. Every 5 slices.
+        if slices % 5 == 0 {
+            let t_opt = std::time::Instant::now();
+            table.optimize().await.unwrap();
+            eprintln!(
+                "beir compact: {resolved} docs, optimize took {:.1}s",
+                t_opt.elapsed().as_secs_f32()
+            );
+        }
         if n == 0 {
             break;
         }
