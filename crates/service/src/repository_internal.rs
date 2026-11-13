@@ -694,7 +694,8 @@ fn apply_merge(
         }
         for source_id in source_ids {
             if let Some(mut source) = state.get_memory(*source_id)? {
-                source.confidence = ltmrs_domain::memory::CONSOLIDATED_CONFIDENCE;
+                source.confidence =
+                    ltmrs_domain::memory::consolidated_confidence(source.confidence);
                 source.entity_revision = source.entity_revision.next();
                 state.put_memory(&source)?;
                 // Confidence is a filter-relevant projection column: the

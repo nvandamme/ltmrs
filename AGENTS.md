@@ -115,26 +115,17 @@ expensive — see sccache below. Iterate cheaply, qualify fully:
   (`cargo nextest run -p <crate>`); use it for iteration and slow-test
   hunting. Gates stay on `cargo test` (evidence scripts parse it).
 - Cold-checkout builds are slow (datafusion/lance/candle/arrow from
-  source). Every rustc invocation routes through
-  `tools/sccache-wrap.sh` (tracked in `.cargo/config.toml`): sccache
-  when installed (`cargo binstall sccache`), plain rustc otherwise —
-  fresh checkouts keep building either way. sccache only engages on
-  non-incremental builds (`CARGO_INCREMENTAL=0`: cold checkouts, clean
-  trees, fresh worktrees sharing `~/.cache/sccache`); warm incremental
+  source). POSIX shells opt in to sccache explicitly:
+  `export RUSTC_WRAPPER="$PWD/tools/sccache-wrap.sh"` (direnv/.envrc or CI
+  script): sccache when installed (`cargo binstall sccache`), plain rustc
+  otherwise — fresh checkouts keep building either way. sccache only
+  engages on non-incremental builds (`CARGO_INCREMENTAL=0`: cold checkouts,
+  clean trees, fresh worktrees sharing `~/.cache/sccache`); warm incremental
   builds bypass it untouched and stay fast. Escape hatch:
-  `LTMRS_NO_SCCACHE=1`.
-- Windows (`x86_64-pc-windows-msvc`) cannot exec the POSIX `.sh` (cargo: `os
-  error 193`), and a native `sccache` wrapper there breaks IDE cargo
-  integration — RustRover parses the `--print`/JSON probes sccache intercepts.
-  So Windows DISABLES the wrapper with an empty env override (plain rustc):
-  `setx CARGO_BUILD_RUSTC_WRAPPER ""` (set once; a per-build bypass is the same
-  empty value). cargo config cannot segment `rustc-wrapper` by platform — it is
-  a `[build]`-only key, rejected under `[target.<triple>]` — so the split is
-  per-platform via the environment; the committed `[build]` stays the POSIX
-  `.sh` for Linux/Apple. Windows gets no sccache caching (plain rustc); the
-  `.sh`'s `LTMRS_NO_SCCACHE=1` is inert there. A `.cmd` batch wrapper is not a
-  faithful alternative: cmd `%*` collapses rustc's escaped-quote
-  `--cfg`/`--check-cfg` feature-list args (`windows-sys` fails `E0554`).
+  `LTMRS_NO_SCCACHE=1`. NEVER commit a `[build] rustc-wrapper` key: cargo has
+  no per-platform config, and no wrapper is Windows-safe (.sh: `os error
+  193`; .cmd shim: `E0554` on quoted `--cfg`; raw sccache: breaks IDE
+  `--print`/JSON probes). Windows builds plain rustc with zero config.
 - Linker selection is automatic per member (`build.rs` + shared probe
   in `tools/detect_linker.rs`): mold if present, else wild, else the
   system default — no setup needed, and checkouts without either

@@ -21,7 +21,7 @@ A failure in the first two cannot be offset by higher throughput. Retrieval qual
 
 Every matrix cell is one of `not_run`, `inspected`, `passed`, `failed`, `blocked`, or `waived_with_reason`. Source inspection is not execution. A waiver cannot cover acknowledged knowledge loss, partial canonical commands, unsafe restore, scope leakage, or a falsely claimed compatible tool.
 
-This package's [evidence_status.json](evidence_status.json) reports only the work actually performed while writing the specification. The conformance matrix is a planned inventory. No latency result, crash pass or Candle output has been invented. (Note 2026-10-07: that file was never created; executed evidence accumulates under `reports/release-*/INDEX.md` alongside `plans/conformance_matrix.json` and `plans/traceability.json`.)
+This package's [evidence_status.json](evidence_status.json) reports only the work actually performed while writing the specification. The conformance matrix is a planned inventory. No latency result, crash pass or model output has been invented (Candle-free since 2026-11-12; Burn tensor core). (Note 2026-10-07: that file was never created; executed evidence accumulates under `reports/release-*/INDEX.md` alongside `plans/conformance_matrix.json` and `plans/traceability.json`.)
 
 ### 1.2 Test levels
 
@@ -104,7 +104,7 @@ Run projection tests with both **same-dimensional different models** and differe
 
 | Test ID | Procedure | Required assertion |
 |---|---|---|
-| T-EMB-01 | Compare tokenizer IDs, special tokens, attention masks and prefixing to the pinned reference on FR/EN/code input. | The Candle adapter implements the selected recipe rather than a guessed architecture default. |
+| T-EMB-01 | Compare tokenizer IDs, special tokens, attention masks and prefixing to the pinned reference on FR/EN/code input. | The Burn adapter implements the selected recipe rather than a guessed architecture default. |
 | T-EMB-02 | Compare single/batched embeddings on empty, short, padded mixed-length and near-limit inputs on CPU; repeat the approved GPU profile separately. | Correct shape, finite values, masked pooling, normalized outputs and reference equivalence within frozen tolerances. |
 | T-EMB-03 | Put the only relevant fact beyond the first model window; vary Unicode/token density and paragraph boundaries. | Deterministic chunks preserve recall and parent identity; any remaining truncation is explicit. |
 | T-RANK-01 | Check RRF against hand-computed ranks, missing legs, ties, duplicate chunks and empty rankings. | One-based reference arithmetic is exact within tolerance; normalized native values remain bounded. |
@@ -229,7 +229,7 @@ Each row receives all of: schema/default validation; text/JSON/error comparison;
 | backup_preview | Readiness/leases, digest/state binding, expiry and clear replacement preview | WP-11 |
 | backup_restore | Explicit approval, single-use token, verified safety backup and usable connection after restore | WP-11 |
 
-The number 29 is an expected baseline inventory, not a substitute for the source/wire capture. The captured count and schemas are authoritative after WP-00. (29 pinned Lemma tools + the greenfield `backup_import_lemma` = 30 matrix rows; `legacy_oracle` for the greenfield row is honestly `specified_not_executed`, not deferred.)
+The number 29 is an expected baseline inventory, not a substitute for the source/wire capture. The captured count and schemas are authoritative after WP-00. (29 pinned Lemma tools + `backup_import_lemma` + 3 omp-compat natives (`memory_edit`, `learn`, `reflect`) = 33 matrix rows. `legacy_oracle` states: `executed_passed` only where an upstream comparison actually ran against pinned upstream output (memory_read render differential; backup_import_lemma live-DB oracle); `executed_partial` where a same-stream upstream comparison ran with an honest non-comparable/shape-only verdict (memory_add/memory_update legs via put+rmw and semantic_search leg of wp12-lemma-01 + wp12-lemma-salted; memory_read keeps its byte-for-byte render-differential pass with the get-leg comparison appended); `specified_not_executed` only for the three omp-compat natives with no Lemma 0.21.0 name; every other row honestly `not_run`.)
 
 ### 5.4 Conformance classes and truthful claims
 
@@ -271,7 +271,7 @@ No finite secret fixture set establishes perfect secret detection. Report suppor
 
 **Retrieval-only:** fixed corpus, index state, query vectors and context budget. Measure lexical, exact dense, optional ANN, fusion, graph hydration and formatting separately.
 
-**End-to-end:** real frontend -> IPC -> queue -> storage/search -> Candle -> context -> frontend. This is the user-perceived latency. Include batching wait, retry and durability time.
+**End-to-end:** real frontend -> IPC -> queue -> storage/search -> Burn -> context -> frontend. This is the user-perceived latency. Include batching wait, retry and durability time.
 
 Reporting only the storage kernel while excluding fsync, queuing or inference cannot establish the end-to-end target.
 
@@ -436,7 +436,7 @@ Preserve the old schemas in the compatibility adapter. Native extensions or fron
 
 Only if doing so preserves the observable contract or is an explicitly documented native behavior. A read that changes confidence/tags/stats in upstream cannot be treated as a pure read merely because its annotation says read-only.
 
-### Is Candle model support just a `model_type` match?
+### Is model support just a `model_type` match? (Candle -> Burn 2026-11-12)
 
 No. E5-small combines a BertModel configuration with an XLM-RoBERTa tokenizer and a particular pooling/prefix recipe. Qualification covers tokenizer artifacts, masks, pooling, normalization and limits, not only weight loading. [S16, S17]
 
@@ -464,15 +464,15 @@ No. It is a reviewed design, ordered implementation guide and test specification
 
 - [x] AD-01 backend selection has passing hard gates and a reviewed evidence report.
 - [x] Dependency/model/profile baselines are immutable and reproducible.
-- [ ] Every claimed tool has schema, behavior, scope, retry and restart evidence.
-- [ ] No partial canonical commands, lost acknowledged knowledge or scope leaks remain.
+- [ ] Every claimed tool has schema, behavior, scope, retry and restart evidence. (TRUE 2026-11-13: all 33 tools green on all 7 non-oracle checks; only legacy_oracle open — 10 executed, 16 honestly not_run per frozen audit, 3 specified_not_executed omp natives.)
+- [ ] No partial canonical commands, lost acknowledged knowledge or scope leaks remain. (EVIDENCED 2026-11-11..13: FuncReview scope-leak fixed + quarantined (m8888a9fca850); atomicity RQ-04 passed; no open loss defect tracked — box stays open as an invariant, not a gap.)
 - [x] No-model and stalled-index behavior is honest and useful.
-- [ ] Concurrency tests use real independent frontends and the documented session model.
-- [ ] Model reference and protected retrieval cases pass.
+- [ ] Concurrency tests use real independent frontends and the documented session model. (EVIDENCED: tests/daemon_lifecycle.rs two-frontend race + kill-isolation; lifecycle_tests greedy-bucket second-frontend reads; T-SESS-01 32-channel interleave. RQ-05/RQ-06 executed_passed.)
+- [ ] Model reference and protected retrieval cases pass. (PARTIAL 2026-11-13: RQ-09/11/14 executed_passed incl. T-SEARCH-02/T-RANK-04/protected bundles; RQ-24 executed_partial — quality scaffolding + BEIR executed, T-QUALITY-02 scale-capped.)
 - [x] Backup/import/restore tests cover coherent snapshots and interrupted publication.
 - [x] Offline runtime and native-dependency policy pass on each supported target.
 - [x] Performance and quality claims include exact measurement boundaries and raw data.
-- [ ] Skill/host compatibility is evidenced per tested host version.
+- [ ] Skill/host compatibility is evidenced per tested host version. (OPEN: host entries are documented recipes per DEV-009, not verified per-host behavior; Windows cert covers daemon+shim+visualizer, not per-host skill activation.)
 - [x] Release notes clearly distinguish complete API/workflow support from enhanced retrieval and any exclusions.
 
 | Test ID | Procedure | Required assertion |

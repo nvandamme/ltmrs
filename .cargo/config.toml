@@ -6,15 +6,11 @@ xtask = "run --quiet -p xtask --"
 # config, and a hardcoded -fuse-ld breaks checkouts without that linker.
 # Override per-build with LTMRS_LINKER=mold|wild|system.
 
-# rustc-wrapper routes every rustc invocation through tools/sccache-wrap.sh
-# (POSIX): sccache when installed, plain rustc otherwise (fresh checkouts keep
-# building). Bypass per invocation with LTMRS_NO_SCCACHE=1 (see the script
-# header). Windows (x86_64-pc-windows-msvc) cannot exec the .sh, and a native
-# sccache wrapper there blocks IDE cargo integration (RustRover parses the
-# --print/JSON probes sccache intercepts), so Windows DISABLES the wrapper via
-# an empty env override: setx CARGO_BUILD_RUSTC_WRAPPER "" (plain rustc). cargo
-# config cannot segment rustc-wrapper by platform — it is a [build]-only key,
-# rejected under [target.<triple>] — so the split is per-platform via the
-# environment; the committed [build] stays the POSIX .sh for Linux/Apple.
-[build]
-rustc-wrapper = "tools/sccache-wrap.sh"
+# NOTE: no committed [build] rustc-wrapper (2026-11-13): cargo has no
+# per-platform config — a committed wrapper is mandatory on ALL hosts,
+# and no wrapper is Windows-safe (.sh won't exec: os error 193; .cmd
+# mangles rustc's quoted --cfg args: windows-sys E0554; raw sccache
+# breaks IDE --print/JSON probes). POSIX shells opt in explicitly:
+#   export RUSTC_WRAPPER="$PWD/tools/sccache-wrap.sh"
+# (direnv/.envrc or CI script). Unset everywhere else: plain rustc,
+# zero config, zero flake surface on any host.

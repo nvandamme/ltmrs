@@ -20,7 +20,7 @@ The first work is **baseline capture and executable domain semantics**, not a po
 | S1 - Atomic memory | Create, update, relate and merge a small memory set; kill/reopen without partial state | WP-02, WP-03 | Backend gate report and canonical consistency traces |
 | S2 - Two real clients | Two separate stdio MCP frontends share one store but not implicit sessions | WP-04, early WP-08 | Host-independent wire traces, reconnect and scope tests |
 | S3 - Lexical memory | Add/update/delete then recall lexically; show explicit index readiness | WP-05, early WP-07 | Projection race tests and FTS freshness probes |
-| S4 - Real semantic memory | Use the pinned Candle model; run hybrid recall and visible no-model fallback | WP-06, WP-07 | Reference-vector and search fixtures |
+| S4 - Real semantic memory | Use the pinned E5-small model (Burn tensor core since 2026-11-12); run hybrid recall and visible no-model fallback | WP-06, WP-07 | Reference-vector and search fixtures |
 | S5 - Graph-aware recall | Retrieve a correction and an unresolved conflict without misleading context | WP-07, WP-08 | Fixed-budget graph/contradiction regression cases |
 | S6 - Whole learning workflow | Recall, act, persist, practice a guide, record attempts and end independent sessions | WP-09, WP-10 | Tool-family and supported-host conformance |
 | S7 - Safe interchange | Import a coherent Lemma store, export, preview and restore with a safety backup | WP-11 | Loss accounting, round-trip and interrupted-restore evidence |
@@ -69,7 +69,7 @@ crates/
   domain/                   # IDs, models, validated commands, invariants
   service/                  # command orchestration, scope, receipts, sessions
   compat/                   # frozen wire DTOs, responses and behavior adapters
-  embeddings/               # model manifest, Candle adapter, bounded worker
+  embeddings/               # model manifest, Burn adapter, bounded worker
   search/                   # Lance projection (search/ + retrieval/), generation metadata
   interchange/              # import/export/backup/restore
   daemon/                   # lock/lifecycle, local IPC, client registry, scheduling
@@ -126,7 +126,7 @@ Rust snippets and commands in this document are design-level examples or planned
 - [x] Capture real `initialize`, `tools/list`, `tools/call` and relevant notifications, including text plus structured results and errors.
 - [x] Inventory instructions, tool-description injection, virtual sessions, skill content/installer, CLI options, visualizer routes and backup formats.
 - [x] Record which observed behaviors are schema-documented, handler-defined, side effects, or apparent upstream defects. Do not copy a safety defect merely to make an exact-output test pass.
-- [x] Resolve a local published LanceDB/Fjall/Candle/rmcp dependency set; pin Cargo.lock and the actual toolchain. Use no `latest`, mutable Git branch or prerelease-only API in a release claim.
+- [x] Resolve a local published LanceDB/Fjall/Burn/rmcp dependency set; pin Cargo.lock and the actual toolchain. Use no `latest`, mutable Git branch or prerelease-only API in a release claim.
 - [x] Audit features, `links` crates, build scripts, C/C++/assembly dependencies and model licenses; distinguish build tools, optional import helper, CPU runtime and GPU runtime.
 - [x] Establish sandbox home, deterministic clock/IDs where possible, fixtures and documentation conventions.
 
@@ -268,7 +268,7 @@ Rust snippets and commands in this document are design-level examples or planned
 
 **Acceptance:** T-PROJ-01/02/03 and T-SEARCH-01. Replay after a crash converges to current canonical state; no highest-UUID checkpoint is used. A stalled embedder cannot prevent direct reads or lexical indexing.
 
-## 11. WP-06 - Candle embedding service and model qualification
+## 11. WP-06 - Embedding service and model qualification (Candle -> Burn 2026-11-12)
 
 **Owner:** inference/retrieval maintainer  
 **Depends on:** WP-00 model/artifact baseline; integration with WP-05  
@@ -280,7 +280,7 @@ Rust snippets and commands in this document are design-level examples or planned
 - [x] Match its BertModel configuration and XLM-RoBERTa tokenizer artifacts; do not substitute generic WordPiece assumptions.
 - [x] Implement document/query prefixing, padding/attention masks, masked pooling, normalization and finite-value checks.
 - [x] Run the reference model in development-only tooling and save approved reference vectors/tokens and tolerance rationale.
-- [x] Implement a bounded synchronous Candle worker with async service calls, request cancellation and batch accounting.
+- [x] Implement a bounded synchronous Burn worker with async service calls, request cancellation and batch accounting.
 - [x] Implement safe tokenizer-length-aware derived chunking while retaining the original memory ID and exact offsets.
 - [x] Separate native model adapters from Lance embedding registration; supply vectors explicitly.
 - [x] Add explicit artifact fetch, cache verification and offline-only load modes.
@@ -441,10 +441,10 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 - [x] Per-op CPU + fsync-cost measurement (landed: see task line 431; open item closed 2026-11-12).
 - [ ] Long-run soak + fault-under-load harness (`src/bench/soak.rs` skeleton landed 2026-11-11: steady-state accounting + kill/restart; machine-gated clock-time run still open; `benchmarks.toml [[not_run]] fault-soak-steady-state`).
-- [ ] Human-reviewed ≥300-case quality corpus (see task line 432: synthetic substituted, human review open).
-- [ ] Remaining ablation legs — Graph (blocked: no edges in corpus) + UpstreamReference (blocked: owner decision) (see task line 433; `benchmarks.toml [[not_run]] ablation-graph-upstream`).
+- [x] Human-reviewed ≥300-case quality corpus (CLOSED 2026-11-12 by owner decision: BEIR SciFact human test qrels — 300/340 judged queries over 5,183 real docs — meet the §8.1 human-reviewed target instead of a bespoke review effort; `benchmarks.toml quality-corpus-300 superseded_by beir-scifact-full`).
+- [x] Remaining ablation legs — Graph + UpstreamReference (CLOSED 2026-11-13: graph `snapshot_expansion_lift` on 4720 real staged edges + UpstreamReference live-Lemma FTS report; `benchmarks.toml ablation-graph-upstream` executed. Commits 13dd7b5 + 83e4654.
 - [ ] Ranking decisions on frozen held-out labels (see task line 436: none made yet).
-- [ ] BEIR full run (machine-gated ~5h CPU); contended-write mix + search-load legs (harnesses landed 2026-11-11: RMW hot-skew + counters, run_search_threaded; reference runs open; see `benchmarks.toml [[not_run]]`).
+- [x] BEIR full run (LANDED 2026-11-13: 5183/5183 docs + 300 queries, CPU Flex 1246s + Burn CUDA 123s, identical verdict 0.644/0.576/0.837/0.589; `benchmarks.toml beir-scifact-full`). Contended-write mix + search-load legs executed 2026-11-12 (reports/wp12-contended-write, reports/wp12-search-load). Box closed; Part II line 447 updated.
 
 ## 18. WP-13 - Release, documentation and evidence closure
 
@@ -465,7 +465,7 @@ Seven guide tools; five session/suggestion tools; `conflict_scan`, `proactive_an
 
 ### Open evidence (WP-13 stays open until these close)
 
-- [ ] Upstream-differential bench re-run on contract change (see task line 455: honest not_run).
+- [ ] Upstream-differential bench re-run on contract change (see task line 455: honest not_run — omp-compat additions since 2026-09-28 are new tools, not changes to the put/get/search/rmw paths the bench drives; bench verdicts stand until those paths change).
 - [ ] Formal v0.1-alpha publish — owner approval (see task line 462: deferred 2026-10-07).
 - [ ] Power-loss qualification on a dedicated machine (see Part III §4.1; SIGKILL/kill evidence is not power loss).
 - [ ] Multi-host matrices — Windows + Linux single-host evidence only (see `docs/RELEASE.md`).
@@ -480,7 +480,7 @@ The first implementation sequence is intentionally short:
 3. Run Lance-only's atomicity/uniqueness/local-API probes, then the same Fjall-plus-Lance probes.
 4. Select a backend only after those pass; harden the canonical repository.
 5. Demonstrate two real stdio frontends, correct session routing and recovery.
-6. Add lexical projection, then qualified Candle inference, then GraphRAG.
+6. Add lexical projection, then qualified Burn inference, then GraphRAG.
 7. Complete the tool/CLI/skill/workflow inventory and safe interchange.
 8. Qualify and publish exactly the supported release surface.
 

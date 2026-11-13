@@ -5,6 +5,29 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2026-11-13 — rig + wrapper + matrix batch
+
+### Alpine power-loss rig BUILT + PROVEN (Windows leg delegated to omp)
+- System libvirt (virsh) path after pty-driven QEMU scaffolding proved unscriptable: direct kernel boot + copy-live-system + debugfs offline edits; system libvirt with default NAT network.
+- Guest: Alpine 3.24 x86_64, 2GB RAM, virtio disk+net, static 192.168.122.50 (AF_PACKET absent in virt kernel — DHCP impossible, static required), SSH key-only root, autologin on ttyS0/ttyS1, host keys generated in-guest at first boot.
+- Golden volume `ltmrs-golden.qcow2` (pool default, 20G/47M) + domain XML `tmp/vm/ltmrs-clean.xml` + runbook `tmp/vm/POWER-RIG-README.md`; procedure: vol-clone per trial, boot, SSH write, `virsh destroy` power cut, reboot, verify.
+- Rig proof: canary written+synced survived destroy/reboot; 50MB mid-write load left journal-orphan recovery on reboot with canary intact (rigtest1, volume deleted after).
+- Debugfs lesson: batched single-session edits only — repeated rm/write cycles cross-link blocks (multiply-claimed) and corrupt readdir; live-captured volumes need e2fsck before debugfs (bitmap checksums); link-count fixups are cosmetic for boot.
+- Windows leg (rig 100.100.5.5) DELEGATED to omp on Windows host 2026-11-13; TODO Blocked section updated.
+
+### rustc-wrapper default inverted: POSIX opt-in, Windows zero-config
+- Deleted committed `[build] rustc-wrapper` from `.cargo/config.toml`: cargo has no per-platform config, so a committed wrapper is mandatory on ALL hosts — and no wrapper is Windows-safe (.sh: `os error 193`; .cmd shim: `E0554` on quoted `--cfg`; raw sccache: breaks IDE `--print`/JSON probes). Mandatory-sccache-as-cargo-dep rejected: a build-dep links the client lib, it does not wrap rustc — caching only happens via the `RUSTC_WRAPPER` binary.
+- POSIX shells opt in explicitly (`export RUSTC_WRAPPER="$PWD/tools/sccache-wrap.sh"`); script header + AGENTS.md updated; `set -u` guard preserved. Verified: default plain-rustc check green, opt-in wrapper check green (sccache hit/miss counted), `LTMRS_NO_SCCACHE=1` bypass green, `sh -n` + `cargo fmt --check` clean.
+
+### Matrix truth audit + oracle flips (2026-11-13)
+- 7 legacy_oracle not_run -> executed_partial: memory_add (salted puts 475/1217 refused), memory_update (green 2-op put+rmw probe), semantic_search (search leg, corpus-diverged NOT COMPARABLE), guide_create/guide_practice (workflow steps 4-5 exact parity), session_start (step 0), session_end (step 6). memory_read keeps executed_passed (byte-for-byte render diff + get-leg appended). guide_get flip reverted (injection_score is not discovery parity).
+- memory_feedback not_run -> executed_partial: +0.015/-0.02 constants verified against upstream memory/core.ts:312/352; RQ-17 executed_passed; 6/6 tests green.
+- Consolidate-weight fix: upstream MIN(confidence,0.1) replaces flat 0.05 (`consolidated_confidence()` in `domain::memory`; forget/merge/repository paths + tests; `MIN(confidence,0.1)` per upstream memory-store.ts:777).
+- Ranking default 0.70 (owner decision 2026-11-13): `DEFAULT_MIN_SIMILARITY` 0.0 -> 0.70 (`engine.rs:122`); search 203/203 + recall 12/12 + semantic 18/18 green; BEIR 709-slice re-run identical 0.852/0.817/0.948/0.826.
+- Skill-side DEV-008 half: portable omp/Lemma guidance in ltmrs_skill.md (learn/recall-vs-reflect-vs-retain/edit-with-care/managed-skills/distill-targets) + SKILL_VERSION 0.1.0->0.2.0 + pin test extended to 7 natives; frontend 183/183 green.
+- BEIR full-run box closed: 5183/5183 CPU 1246s + CUDA 123s, identical 0.644/0.576/0.837/0.589.
+- plans/ archive: 13 delivered dated plans moved out of plans/*.md glob; gate green.
+
 ## 2026-11-13 — Windows rustc-wrapper split (env override disables the wrapper)
 
 - `.cargo/config.toml`: comment documents that `rustc-wrapper` is a

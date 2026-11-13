@@ -1,10 +1,13 @@
 #!/bin/sh
-# Rust compiler wrapper for this workspace: route through sccache when it
-# is installed, otherwise fall back to plain rustc (fresh checkouts and
-# automation without sccache must keep building).
+# Rust compiler wrapper for POSIX shells (Linux/Apple). Opt-in ONLY:
+#   export RUSTC_WRAPPER="$PWD/tools/sccache-wrap.sh"
+# (direnv/.envrc or CI script). NEVER commit a [build] rustc-wrapper key:
+# cargo has no per-platform config, and no wrapper is Windows-safe
+# (.sh: os error 193; .cmd: E0554 on quoted --cfg; raw sccache: breaks
+# IDE --print/JSON probes). Routes through sccache when installed,
+# otherwise falls back to plain rustc (fresh checkouts keep building).
 #
-# Wired via .cargo/config.toml ([build] rustc-wrapper). Bypass with
-# LTMRS_NO_SCCACHE=1 (escape hatch if a stale cache is ever suspected).
+# Bypass with LTMRS_NO_SCCACHE=1 (escape hatch if a stale cache is suspected).
 set -u
 if [ "${LTMRS_NO_SCCACHE:-0}" = "1" ]; then
     _cc="$1"; shift; exec "$_cc" "$@"

@@ -114,12 +114,12 @@ pub struct RetrievalRequest {
     pub graph_policy: GraphPolicy,
 }
 
-/// Default dense floor: anti-correlated rows (negative cosine) are never
-/// candidates. This is a principled floor, not a calibration: genuinely
-/// similar content scores at or above zero, while uncalibrated nearest
-/// noise below it is cut. Real thresholds calibrate on held-out labels
-/// (WP-12 task 9, still open) and override this via `min_similarity`.
-pub const DEFAULT_MIN_SIMILARITY: f64 = 0.0;
+/// Default dense threshold: calibrated 0.70 (owner decision 2026-11-13).
+/// 2026-09-28 sweep on synthetic dev/heldout: 0.70 preserves full retention
+/// on both splits, 0.75 degrades (thin margin). Absolute E5 similarities
+/// saturate high so ranking does the work; the floor cuts uncalibrated
+/// nearest noise. Explicit `None` remains the opt-out for calibration runs.
+pub const DEFAULT_MIN_SIMILARITY: f64 = 0.70;
 
 impl Default for RetrievalRequest {
     fn default() -> Self {

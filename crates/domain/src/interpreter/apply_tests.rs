@@ -188,8 +188,8 @@ fn test_merge_consolidate_keeps_and_down_weights_sources() {
         );
         assert_eq!(
             source.confidence,
-            crate::memory::CONSOLIDATED_CONFIDENCE,
-            "consolidated sources down-weight"
+            crate::memory::consolidated_confidence(0.5),
+            "consolidated sources clamp to MIN(confidence, 0.1)"
         );
     }
     assert_eq!(

@@ -9,7 +9,7 @@
 
 The previous plan had a useful product direction but was not yet a reliable implementation contract. It mixed verified library capabilities with hypotheses, left crucial multi-agent behavior implicit, and allowed performance scoring to obscure correctness. It also called behavior "fully compatible" before a versioned oracle existed.
 
-This revision keeps the agreed direction: Rust-first, permissive/open dependencies, local operation, a shared daemon, the entire Lemma tool/workflow surface, Candle-owned embeddings, and LanceDB retrieval. **LanceDB-only remains the simplification candidate; Fjall plus LanceDB remains the transactional fallback. Neither has passed the required ltmrs tests.**
+This revision keeps the agreed direction: Rust-first, permissive/open dependencies, local operation, a shared daemon, the entire Lemma tool/workflow surface, Burn-owned embeddings (Candle replaced 2026-11-12, commits 2ccf544/54eb0b7/a5f2495; zero candle in tree), and LanceDB retrieval. **LanceDB-only remains the simplification candidate; Fjall plus LanceDB remains the transactional fallback. Neither has passed the required ltmrs tests.**
 
 The central correction is this: choose the smallest design that satisfies the domain contract, not the database with the longest feature list. A recoverable partial canonical merge is not equivalent to an atomic merge. A fast buffered write is not equivalent to an acknowledged durable write. A schema-compatible tool with different hidden effects is not automatically behavior-compatible.
 
@@ -126,7 +126,7 @@ CLI / visualizer client -----------+                         |
                                                             |
                                          versioned lexical/vector projection
                                                             |
-                                            LanceDB + Candle worker
+                                            LanceDB + Burn worker
 ```
 
 One daemon owns one physical store. Multiple logical stores may exist, but each has its own identity, lock, runtime endpoint and generation. Sharing a UID is not multi-user authentication.
@@ -317,7 +317,7 @@ Lance's documented scan of unindexed appended rows addresses **rows already in L
 
 ## 9. Embedding contracts
 
-Candle owns inference; Lance receives vectors. Do not enable Lance's built-in model wrapper unless its exact behavior is the selected tested recipe. The service owns model downloads, masking, pooling, prompts and model migration.
+Burn owns inference; Lance receives vectors. Do not enable Lance's built-in model wrapper unless its exact behavior is the selected tested recipe. The service owns model downloads, masking, pooling, prompts and model migration.
 
 ### 9.1 First model
 
@@ -491,9 +491,9 @@ Import into staging. Preserve all supported fields/IDs, record every unsupported
 | Decision | Current state | Evidence that closes it |
 |---|---|---|
 | AD-01 Canonical backend A or B | DECIDED: Option B (Fjall + Lance) — see plans/AD-01_canonical_backend.md | WP-02 hard gates and Part III traces |
-| AD-02 Exact crate/feature/toolchain lock | CLOSED (WP-00): toolchain 1.99.0 (`rust-toolchain.toml:4`); resolved fjall 3.1.12, lance 13.0.0, lancedb 0.40.0, candle-core 0.11.0, tokenizers 0.22.2, rmcp 3.7.0 | Reproducible local CPU build and dependency report |
+| AD-02 Exact crate/feature/toolchain lock | CLOSED (WP-00): toolchain 1.99.0 (`rust-toolchain.toml:4`); resolved fjall 3.1.12, lance 13.0.0, lancedb 0.40.0, burn 0.22 (tensor core; Candle deleted 2026-11-12), tokenizers 0.22.2, rmcp 3.7.0 | Reproducible local CPU build and dependency report |
 | AD-03 Legacy contract baseline | CLOSED (WP-00): Lemma 0.21.0 @ d30a816; 29-tool static inventory + deterministic wire snapshots in `baseline/lemma-0.21.0/` (event-driven notifications documented-not-captured, by design) | WP-00 generated snapshot and upstream transcripts |
-| AD-04 Default Candle recipe | CLOSED: E5-small qualified recipe — 384-dim, 512-token window, `query: `/`passage: ` prefixes, MaskedMean + L2 pooling, greedy-unit chunking (`crates/embeddings/src/manifest.rs:78-90`; tests `recipe_matches_manifest_identity`, `recipe_is_the_e5_small_reference`) | Reference equivalence and retrieval quality suite |
+| AD-04 Default E5-small recipe (Burn tensor core) | CLOSED: E5-small qualified recipe — 384-dim, 512-token window, `query: `/`passage: ` prefixes, MaskedMean + L2 pooling, greedy-unit chunking (`crates/embeddings/src/manifest.rs:78-90`; tests `recipe_matches_manifest_identity`, `recipe_is_the_e5_small_reference`) | Reference equivalence and retrieval quality suite |
 | AD-05 Score/abstention thresholds | CLOSED (frozen): Jaccard dedup >= 0.80 + autolink band 0.25..0.95 (`crates/search/src/similarity.rs:27-30`; test `jaccard_recipe_basics`) | Development tuning plus frozen held-out evaluation |
 | AD-06 FTS freshness/null-vector behavior | CLOSED: `SearchState` Complete/Partial/Unavailable (`crates/search/src/search/backend.rs:194-203`); nullable lexical rows + NULL probe/backfill (`backfill_null_vectors` workers.rs:385; test `backfill_requeues_lexical_null_vector_rows`; `null_vector_row_round_trips_and_filters`) | Local create/update/delete/search capability probes |
 | AD-07 Host/platform support | Linux-first; Windows 11 Pro x86_64 certified 2026-10-08 alongside Linux (MSVC toolchain 1.99.0, protoc 36.0, NTFS, no mold/wild) — see `plans/traceability.json: windows_certification_2026_10_08` | Versioned host/OS matrix |
@@ -512,7 +512,7 @@ No runtime code should depend on an unclosed decision without a failing test and
 | RQ-06: Retry-safe effects | Retried logical commands within the documented replay window have one canonical effect; ambiguous outcomes are not blindly replayed as new work. | WP-03 | T-CONC-03, T-REC-02 |
 | RQ-07: Projection convergence | Pending work is durable, versioned and acknowledged only by compare-and-clear after projection publication. | WP-05 | T-PROJ-01, T-PROJ-02 |
 | RQ-08: Freshness contracts | Direct reads observe acknowledged writes; search never silently represents stale revisions or unavailable embeddings as complete current semantic results. | WP-05 | T-PROJ-03, T-SEARCH-01 |
-| RQ-09: Model correctness | The selected Candle adapter matches a pinned reference recipe within documented numerical and retrieval tolerances. | WP-06 | T-EMB-01, T-EMB-02 |
+| RQ-09: Model correctness | The selected Burn adapter matches a pinned reference recipe within documented numerical and retrieval tolerances. | WP-06 | T-EMB-01, T-EMB-02 |
 | RQ-10: Long-memory handling | Long input produces explicit bounded chunking or a visible coverage limitation, never silent semantic loss. | WP-06 | T-EMB-03 |
 | RQ-11: Calibrated ranking | Native score components share a documented scale; legacy scoring and enhanced scoring have separate evidence. | WP-07 | T-RANK-01, T-RANK-02 |
 | RQ-12: Graph semantics | Graph mutations enforce endpoint/direction/uniqueness/cycle policy, and retrieval preserves corrections and unresolved conflicts. | WP-03 | T-GRAPH-01, T-GRAPH-02, T-RANK-03 |

@@ -4,7 +4,7 @@ use crate::dispatcher::Dispatcher;
 use crate::envelope::{DomainPayload, IpcEnvelope};
 use ltmrs_compat::lemma::tool_args::MemoryForgetArgs;
 use ltmrs_domain::command::{DomainCommand, DomainResult, ForgetMode, MemoryPatch};
-use ltmrs_domain::memory::CONSOLIDATED_CONFIDENCE;
+use ltmrs_domain::memory::consolidated_confidence;
 use ltmrs_service::repository::AdmittedScope;
 use serde_json::json;
 
@@ -31,7 +31,7 @@ pub(crate) fn exec_memory_forget(
             )
         } else if args.consolidate {
             format!(
-                "Archived fragment [{}] — down-weighted to 0.05 (kept and reversible), not deleted. Pass consolidate=false to hard-delete.",
+                "Archived fragment [{}] — clamped to MIN(confidence, 0.1) (kept and reversible), not deleted. Pass consolidate=false to hard-delete.",
                 args.id
             )
         } else {
@@ -86,9 +86,10 @@ pub(crate) fn exec_memory_forget(
             args.id
         )
     } else if args.consolidate {
-        // Non-destructive archive: down-weight, keep the row.
+        // Non-destructive archive: clamp to MIN(confidence, 0.1), keep the row.
+        let current = mems.first().map(|m| m.confidence).unwrap_or(1.0);
         let patch = MemoryPatch {
-            confidence: Some(CONSOLIDATED_CONFIDENCE),
+            confidence: Some(consolidated_confidence(current)),
             ..Default::default()
         };
         let cmd = DomainCommand::UpdateMemory {
@@ -99,7 +100,7 @@ pub(crate) fn exec_memory_forget(
         let ctx = sub_command_ctx(envelope, 0)?;
         disp.repo().apply(&ctx, &cmd)?;
         format!(
-            "Archived fragment [{}] — down-weighted to 0.05 (kept and reversible), not deleted. Pass consolidate=false to hard-delete.",
+            "Archived fragment [{}] — clamped to MIN(confidence, 0.1) (kept and reversible), not deleted. Pass consolidate=false to hard-delete.",
             args.id
         )
     } else {

@@ -20,7 +20,7 @@ pub struct SkillAsset {
 /// Installer version stamped in ownership markers. Bump on ANY asset
 /// content change: AlreadyCurrent compares version + hash, so an unbumped
 /// edit would never deploy.
-pub const SKILL_VERSION: &str = "0.1.0";
+pub const SKILL_VERSION: &str = "0.2.0";
 
 /// The managed native skill asset (multilingual recall guidance included).
 pub const LTMRS_SKILL: SkillAsset = SkillAsset {
@@ -607,22 +607,34 @@ mod tests {
         );
     }
 
-    /// Every tool referenced by the native skill workflow exists in the
-    /// frozen compatibility set (a renamed/drifted tool reference would
-    /// teach hosts a call we reject).
+    /// Every tool referenced by the native skill workflow exists either in
+    /// the frozen compatibility set or among the served native tools
+    /// (backup_*, memory_edit, learn, reflect; a renamed/drifted tool
+    /// reference would teach hosts a call we reject).
     #[test]
     fn skill_workflow_tools_match_frozen_names() {
         use std::collections::HashSet;
-        let frozen: HashSet<String> = ltmrs_compat::lemma::schemas::frozen_tools()
+        let mut known: HashSet<String> = ltmrs_compat::lemma::schemas::frozen_tools()
             .into_iter()
             .map(|t| t.name)
             .collect();
+        for native in [
+            "backup_create",
+            "backup_preview",
+            "backup_restore",
+            "backup_import_lemma",
+            "memory_edit",
+            "learn",
+            "reflect",
+        ] {
+            known.insert(native.to_string());
+        }
         let tokens = skill_tool_tokens(LTMRS_SKILL.content);
         assert!(!tokens.is_empty(), "the skill must reference tools");
         for tok in &tokens {
             assert!(
-                frozen.contains(tok),
-                "skill references unknown tool `{tok}` (not in the frozen set)"
+                known.contains(tok),
+                "skill references unknown tool `{tok}` (not served)"
             );
         }
         // The recall → act → persist workflow core is actually taught.

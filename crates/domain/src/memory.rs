@@ -108,8 +108,13 @@ impl MemoryLifecycle {
 
 /// Compatibility down-weight for consolidated (superseded but kept) sources:
 /// `memory_forget(consolidate=true)` and `memory_merge(consolidate=true)`
-/// keep the row live at this confidence, mirroring upstream Lemma.
-pub const CONSOLIDATED_CONFIDENCE: f64 = 0.05;
+/// clamp the source to `MIN(confidence, 0.1)`, mirroring upstream Lemma
+/// (`memory-store.ts:777-779`: `UPDATE memories SET confidence =
+/// MIN(confidence, 0.1)`). Low-confidence sources keep their value;
+/// nothing is ever raised by consolidation.
+pub fn consolidated_confidence(current: f64) -> f64 {
+    current.min(0.1)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Evidence {

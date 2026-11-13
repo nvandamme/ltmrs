@@ -297,7 +297,42 @@ fn memory_merge_consolidate_keeps_and_down_weights_sources() {
             mem.lifecycle.is_recallable(),
             "consolidated source stays recallable"
         );
-        assert_eq!(mem.confidence, 0.05);
+        assert_eq!(mem.confidence, 0.1);
+    }
+}
+
+/// Upstream parity (memory-store.ts:777): consolidate clamps to
+/// MIN(confidence, 0.1) — low-confidence sources keep their value,
+/// nothing is ever raised by consolidation.
+#[test]
+fn memory_merge_consolidate_keeps_low_confidence() {
+    let (disp, _dir) = test_dispatcher();
+    let id1 = add_fragment(&disp, 1, "## Low One\n\n### Context\nKept low.");
+    let id2 = add_fragment(&disp, 2, "## Low Two\n\n### Context\nKept low.");
+    set_confidence(&disp, 3, &id1, 0.03);
+    set_confidence(&disp, 4, &id2, 0.07);
+    let args = MemoryMergeArgs {
+        ids: vec![id1.clone(), id2.clone()],
+        title: "Merged Result".to_string(),
+        fragment: "## Merged Result\n\n### Context\nCombined.".to_string(),
+        project: None,
+        consolidate: true,
+    };
+    let env = tool_call(5, ToolArgs::MemoryMerge(args.clone()));
+    let result = run(&disp, &env, &ToolArgs::MemoryMerge(args));
+    assert!(
+        !result_is_error(&result),
+        "merge failed: {}",
+        result_text(&result)
+    );
+    for (id, want) in [(&id1, 0.03), (&id2, 0.07)] {
+        let eid = resolve_id(disp.repo(), id).unwrap();
+        let mem = disp.repo().get_memories(&[eid]).unwrap().pop().unwrap();
+        assert!(
+            (mem.confidence - want).abs() < 1e-9,
+            "expected {want}, got {}",
+            mem.confidence
+        );
     }
 }
 

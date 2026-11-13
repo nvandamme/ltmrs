@@ -90,8 +90,8 @@ fn merge_consolidate_creates_supersession_edges_atomically() {
             "consolidated sources stay recallable"
         );
         assert_eq!(
-            kept.confidence, 0.05,
-            "consolidated sources down-weight to 0.05"
+            kept.confidence, 0.1,
+            "consolidated sources clamp to MIN(confidence, 0.1)"
         );
     }
     let edges: Vec<_> = repo

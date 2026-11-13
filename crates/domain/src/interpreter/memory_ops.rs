@@ -282,7 +282,7 @@ impl ReferenceInterpreter {
             }
             for source_id in source_ids {
                 if let Some(source) = self.memories.get_mut(source_id) {
-                    source.confidence = crate::memory::CONSOLIDATED_CONFIDENCE;
+                    source.confidence = crate::memory::consolidated_confidence(source.confidence);
                     affected.push(*source_id);
                 }
             }
