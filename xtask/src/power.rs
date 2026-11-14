@@ -1,0 +1,1133 @@
+//! Power rig as code: build the base image, run a trial, or clean a trial.
+//!
+//! Task 2 owns the runner surface (dispatch validation, dry-run plan,
+//! golden guard). The live trial/build/clean bodies land in Tasks 4-5.
+
+/// Reserved base-image name: trials clone FROM it, never run AS it.
+const GOLDEN_NAME: &str = "ltmrs-golden";
+
+/// Domain template with `__NAME__`/`__VOLUME__`/`__MAC__` placeholders.
+/// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
+const DOMAIN_TEMPLATE: &str = include_str!("../../tools/vm/domain-template.xml");
+
+/// Derive a deterministic guest MAC: QEMU OUI `52:54:00` plus 3 bytes from a
+/// stable hash of the trial name (FNV-1a over the name bytes, no dependency).
+/// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
+pub fn derived_mac(name: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!(
+        "52:54:00:{:02x}:{:02x}:{:02x}",
+        (hash >> 16) & 0xff,
+        (hash >> 8) & 0xff,
+        hash & 0xff
+    )
+}
+
+/// Stamp the domain template for one trial (no placeholder survives).
+/// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
+pub fn stamp_domain(name: &str, volume: &str) -> String {
+    let mac = derived_mac(name);
+    DOMAIN_TEMPLATE
+        .replace("__MAC__", &mac)
+        .replace("__VOLUME__", volume)
+        .replace("__NAME__", name)
+}
+
+/// Guest-side command list for a trial mode (data from `tools/vm/`, not code).
+/// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
+pub fn workload_commands(mode: &str) -> Vec<String> {
+    let raw = match mode {
+        "canary" => include_str!("../../tools/vm/canary-workload.txt"),
+        "daemon" => include_str!("../../tools/vm/daemon-workload.txt"),
+        _ => panic!("unknown power workload mode '{mode}' (expected canary|daemon)"),
+    };
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Guest-side provision lines for the base image (each one `ssh` call, no
+/// heredoc scripts): mkfs vda1, copy tree, static net, autologin, dev
+/// nodes, authorized_keys, runlevel links.
+fn build_provision_commands() -> Vec<String> {
+    vec![
+        "mkfs.ext4 -L ltmrs-golden /dev/vda1".to_string(),
+        "mount /dev/vda1 /mnt && cp -a /live/tree/. /mnt/ && umount /mnt".to_string(),
+        "echo 'auto eth0\niface eth0 inet static\naddress 192.168.122.10' > /mnt/etc/network/interfaces".to_string(),
+        "echo 'tty1::respawn:/sbin/getty -n -l /bin/autologin tty1 38400' >> /mnt/etc/inittab".to_string(),
+        "mknod /mnt/dev/console c 5 1 && mknod /mnt/dev/null c 1 3".to_string(),
+        "install -m 600 /root/key.pub /mnt/root/.ssh/authorized_keys".to_string(),
+        "ln -s /etc/init.d/S99power /mnt/etc/runlevels/default/S99power".to_string(),
+    ]
+}
+
+/// SSH wait-probe argv (after `ssh`): shared by the live poll and every
+/// dry-run plan so the preview shows exactly what the pipeline spawns.
+fn ssh_wait_argv(guest: &str) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=2".to_string(),
+        guest.to_string(),
+        "true".to_string(),
+    ]
+}
+
+/// Would-be control-plane argv vectors (program first) for a build.
+///
+/// Generated from the same commands the live body runs so the preview
+/// cannot drift from the pipeline.
+fn build_plan() -> Vec<Vec<String>> {
+    let guest = GOLDEN_NAME.to_string();
+    let mut plan = vec![
+        vec![
+            "qemu-img".to_string(),
+            "create".to_string(),
+            "-f".to_string(),
+            "qcow2".to_string(),
+            format!("{guest}-vol.qcow2"),
+            "8G".to_string(),
+        ],
+        vec![
+            "virsh".to_string(),
+            "define".to_string(),
+            format!("{guest}.xml"),
+        ],
+        vec![
+            "virsh".to_string(),
+            "create".to_string(),
+            format!("{guest}.xml"),
+        ],
+        {
+            let mut wait = vec!["ssh".to_string()];
+            wait.extend(ssh_wait_argv(&guest));
+            wait
+        },
+    ];
+    for line in build_provision_commands() {
+        plan.push(vec!["ssh".to_string(), guest.clone(), line]);
+    }
+    plan.push(vec![
+        "virsh".to_string(),
+        "destroy".to_string(),
+        guest.clone(),
+    ]);
+    plan.push(vec![
+        "virsh".to_string(),
+        "undefine".to_string(),
+        guest.clone(),
+    ]);
+    plan.push(vec![
+        "virsh".to_string(),
+        "vol-info".to_string(),
+        format!("{guest}-vol"),
+        "--pool".to_string(),
+        "default".to_string(),
+    ]);
+    plan
+}
+
+/// Milliseconds since the Unix epoch (mirrors `run.rs` for record stamps).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Run-record directory for a build (no trial name exists; the op owns it).
+fn build_report_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("reports/power-build")
+}
+
+/// Run-record directory for a clean (sits next to the trial verdict).
+fn clean_report_dir(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("reports/power-{name}"))
+}
+
+/// Persist the op run-record (`record.json` under `dir`) via Task 2 plumbing.
+///
+/// Steps plus verdict ride in `meta`; the outcome aggregates the pipeline:
+/// 0 on `pass`, 127 on `inconclusive`, 1 on `fail`.
+fn write_op_record(
+    dir: &std::path::Path,
+    verb: &str,
+    argv: &[String],
+    steps: &[StepOutcome],
+    verdict: &str,
+    started_ms: u64,
+) -> Result<(), String> {
+    let code = if verdict == "pass" {
+        0
+    } else if verdict == "inconclusive" {
+        127
+    } else {
+        1
+    };
+    let tails: Vec<String> = steps
+        .iter()
+        .filter(|step| step.exit_code != 0)
+        .map(|step| format!("{}: {}", step.name, step.stderr_tail))
+        .collect();
+    let outcome = crate::run::RunOutcome {
+        exit_code: code,
+        stdout_tail: String::new(),
+        stderr_tail: tails.join("\n"),
+        started_ms,
+        finished_ms: now_ms(),
+    };
+    let meta = serde_json::json!({
+        "verdict": verdict,
+        "steps": steps
+            .iter()
+            .map(|step| serde_json::json!({
+                "name": step.name,
+                "exit_code": step.exit_code,
+                "stderr_tail": step.stderr_tail,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    crate::run::write_record(dir, verb, argv, &outcome, Some(&meta)).map_err(|err| {
+        format!(
+            "failed to write {verb} run-record in {}: {err}",
+            dir.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Live build body: qcow2 create → define → create → SSH wait →
+/// provision → destroy → undefine → vol-info assert.
+fn run_build_live(force: bool) -> Result<i32, String> {
+    if cfg!(not(target_os = "linux")) {
+        return Err("unsupported platform — Hyper-V CLI backend not yet ported".to_string());
+    }
+    let guest = GOLDEN_NAME.to_string();
+    let volume = format!("{guest}-vol");
+    if !force {
+        let probe = vec![volume.clone(), "--pool".to_string(), "default".to_string()];
+        let probe = [vec!["vol-info".to_string()], probe].concat();
+        if spawn_control("virsh", &probe).exit_code == 0 {
+            return Err(format!(
+                "base image '{volume}' already exists (pass --force to overwrite)"
+            ));
+        }
+    }
+    let dir = build_report_dir();
+    let xml_path = dir.join(format!("{guest}.xml"));
+    let started_ms = now_ms();
+    let record_argv = if force {
+        vec![
+            "power".to_string(),
+            "build".to_string(),
+            "--force".to_string(),
+        ]
+    } else {
+        vec!["power".to_string(), "build".to_string()]
+    };
+    let img_argv = vec![
+        "create".to_string(),
+        "-f".to_string(),
+        "qcow2".to_string(),
+        format!("{volume}.qcow2"),
+        "8G".to_string(),
+    ];
+    let mut steps: Vec<StepOutcome> = Vec::new();
+    let mut verdict = "pass".to_string();
+    let mut stop = push_step(
+        &mut steps,
+        &mut verdict,
+        "img-create",
+        outcome_of("img-create", &spawn_control("qemu-img", &img_argv)),
+    );
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "define",
+            step_define(&guest, &volume, &xml_path),
+        );
+    }
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "create",
+            step_create(&xml_path, "create"),
+        );
+    }
+    if !stop {
+        stop = push_step(&mut steps, &mut verdict, "ssh-wait", step_ssh_wait(&guest));
+    }
+    if !stop {
+        let mut tails: Vec<String> = Vec::new();
+        let mut result = Ok(StepOutcome {
+            name: "provision".to_string(),
+            exit_code: 0,
+            stderr_tail: String::new(),
+        });
+        for line in build_provision_commands() {
+            let argv = vec![guest.clone(), line];
+            match outcome_of("provision", &spawn_control("ssh", &argv)) {
+                Err(fault) => {
+                    result = Err(fault);
+                    break;
+                }
+                Ok(step) => {
+                    if !step.stderr_tail.is_empty() {
+                        tails.push(step.stderr_tail.clone());
+                    }
+                    if step.exit_code != 0 {
+                        result = Ok(step);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok(step) = &mut result {
+            step.stderr_tail = tails.join("\n");
+        }
+        stop = push_step(&mut steps, &mut verdict, "provision", result);
+    }
+    if !stop {
+        stop = push_step(&mut steps, &mut verdict, "destroy", step_destroy(&guest));
+    }
+    if !stop {
+        let argv = vec!["undefine".to_string(), guest.clone()];
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "undefine",
+            outcome_of("undefine", &spawn_control("virsh", &argv)),
+        );
+    }
+    if !stop {
+        let argv = vec![
+            "vol-info".to_string(),
+            volume.clone(),
+            "--pool".to_string(),
+            "default".to_string(),
+        ];
+        push_step(
+            &mut steps,
+            &mut verdict,
+            "vol-info",
+            outcome_of("vol-info", &spawn_control("virsh", &argv)),
+        );
+    }
+    write_op_record(
+        &dir,
+        "power-build",
+        &record_argv,
+        &steps,
+        &verdict,
+        started_ms,
+    )?;
+    if verdict != "pass" {
+        let tails: Vec<String> = steps
+            .iter()
+            .filter(|step| step.exit_code != 0)
+            .map(|step| format!("{}: {}", step.name, step.stderr_tail))
+            .collect();
+        return Err(format!("build failed ({}): {}", verdict, tails.join("; ")));
+    }
+    Ok(0)
+}
+/// Build the base image: dry-run prints the plan without spawning,
+/// otherwise the live qcow2 → define → provision → destroy pipeline runs.
+/// Without `--force` a live build refuses when the golden volume exists.
+pub fn run_build(force: bool, dry_run: bool) -> Result<i32, String> {
+    if dry_run {
+        for argv in build_plan() {
+            crate::verbs::print_dry_run(&argv[0], &argv[1..]);
+        }
+        return Ok(0);
+    }
+    run_build_live(force)
+}
+
+/// Outcome of one trial step: the captured exit code plus the stderr tail.
+pub struct StepOutcome {
+    /// Step name (e.g. `vol-clone`, `define`, `workload`).
+    pub name: String,
+    /// Process exit code for the step's control-plane spawn.
+    pub exit_code: i32,
+    /// Last 4 KiB of the step's stderr (harness fault on `Err`).
+    pub stderr_tail: String,
+}
+
+/// A passed step with no stderr (verdict-schema tests, poll success).
+pub fn step_ok(name: &str) -> StepOutcome {
+    StepOutcome {
+        name: name.to_string(),
+        exit_code: 0,
+        stderr_tail: String::new(),
+    }
+}
+
+/// Build the trial verdict value written to `verdict.json`.
+///
+/// The volume is kept for forensics exactly when the verdict is not `pass`.
+pub fn build_verdict(
+    mode: &str,
+    name: &str,
+    verdict: &str,
+    steps: Vec<StepOutcome>,
+) -> serde_json::Value {
+    let steps: Vec<serde_json::Value> = steps
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "name": step.name,
+                "exit_code": step.exit_code,
+                "stderr_tail": step.stderr_tail,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "mode": mode,
+        "name": name,
+        "verdict": verdict,
+        "steps": steps,
+        "kept_volume": verdict != "pass",
+    })
+}
+
+/// Single cfg-gated spawn site for every hypervisor control-plane call.
+///
+/// Linux spawns `virsh`/`ssh`/`qemu-img` via `run.rs` (no shell); other
+/// platforms report the missing Hyper-V CLI backend instead of spawning.
+#[cfg(target_os = "linux")]
+fn spawn_control(program: &str, args: &[String]) -> crate::run::RunOutcome {
+    crate::run::execute(program, args, std::path::Path::new("."))
+}
+
+/// Single cfg-gated spawn site for every hypervisor control-plane call.
+///
+/// Non-Linux stub: reports the missing Hyper-V CLI backend (never spawns).
+#[cfg(not(target_os = "linux"))]
+fn spawn_control(program: &str, _args: &[String]) -> crate::run::RunOutcome {
+    crate::run::RunOutcome {
+        exit_code: 127,
+        stdout_tail: String::new(),
+        stderr_tail: format!(
+            "unsupported platform — Hyper-V CLI backend not yet ported (would spawn '{program}')"
+        ),
+        started_ms: 0,
+        finished_ms: 0,
+    }
+}
+
+/// Fold one spawn into a step: harness spawn failures are `Err`
+/// (→ `inconclusive`), any other exit — zero or not — is `Ok`.
+fn outcome_of(name: &str, outcome: &crate::run::RunOutcome) -> Result<StepOutcome, String> {
+    if outcome.exit_code == 127 && outcome.stderr_tail.starts_with("failed to spawn") {
+        return Err(format!(
+            "step '{name}' harness fault: {}",
+            outcome.stderr_tail
+        ));
+    }
+    Ok(StepOutcome {
+        name: name.to_string(),
+        exit_code: outcome.exit_code,
+        stderr_tail: outcome.stderr_tail.clone(),
+    })
+}
+
+/// Clone the golden volume for one trial.
+fn step_vol_clone(volume: &str) -> Result<StepOutcome, String> {
+    let argv = vec![
+        "vol-clone".to_string(),
+        format!("{GOLDEN_NAME}-vol"),
+        volume.to_string(),
+        "--pool".to_string(),
+        "default".to_string(),
+    ];
+    outcome_of("vol-clone", &spawn_control("virsh", &argv))
+}
+
+/// Stamp the domain template and define the trial domain.
+fn step_define(
+    guest: &str,
+    volume: &str,
+    xml_path: &std::path::Path,
+) -> Result<StepOutcome, String> {
+    let xml = stamp_domain(guest, volume);
+    if let Some(parent) = xml_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("step 'define' harness fault: cannot create dir: {err}"))?;
+    }
+    std::fs::write(xml_path, xml)
+        .map_err(|err| format!("step 'define' harness fault: cannot write XML: {err}"))?;
+    let argv = vec!["define".to_string(), xml_path.display().to_string()];
+    outcome_of("define", &spawn_control("virsh", &argv))
+}
+
+/// Boot (`create`) the trial domain from its XML; `step_name` is
+/// `create` on first boot and `recreate` after the power cut.
+fn step_create(xml_path: &std::path::Path, step_name: &str) -> Result<StepOutcome, String> {
+    let argv = vec!["create".to_string(), xml_path.display().to_string()];
+    outcome_of(step_name, &spawn_control("virsh", &argv))
+}
+
+/// Poll SSH until the guest answers or the 60s deadline expires.
+fn step_ssh_wait(guest: &str) -> Result<StepOutcome, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let argv = ssh_wait_argv(guest);
+        let outcome = spawn_control("ssh", &argv);
+        if outcome.exit_code == 0 {
+            return Ok(step_ok("ssh-wait"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "step 'ssh-wait' harness fault: guest '{guest}' unreachable after 60s: {}",
+                outcome.stderr_tail
+            ));
+        }
+        // 2s between probes: guest boot takes tens of seconds, so a shorter
+        // interval only burns SSH handshakes without reaching ready sooner.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Run the mode workload lines over the `ssh` CLI (one spawn per line).
+fn step_workload(mode: &str, guest: &str) -> Result<StepOutcome, String> {
+    let mut tails: Vec<String> = Vec::new();
+    for line in workload_commands(mode) {
+        let argv = vec![guest.to_string(), line];
+        let step = outcome_of("workload", &spawn_control("ssh", &argv))?;
+        if !step.stderr_tail.is_empty() {
+            tails.push(step.stderr_tail.clone());
+        }
+        if step.exit_code != 0 {
+            return Ok(step);
+        }
+    }
+    Ok(StepOutcome {
+        name: "workload".to_string(),
+        exit_code: 0,
+        stderr_tail: tails.join("\n"),
+    })
+}
+
+/// Cut power to the trial domain.
+fn step_destroy(guest: &str) -> Result<StepOutcome, String> {
+    let argv = vec!["destroy".to_string(), guest.to_string()];
+    outcome_of("destroy", &spawn_control("virsh", &argv))
+}
+
+/// Guest-side verify commands per mode (receipt/file marker + journal).
+fn verify_commands(mode: &str) -> Vec<String> {
+    if mode == "canary" {
+        vec!["cat /var/lib/power-canary".to_string(), "dmesg".to_string()]
+    } else {
+        vec![
+            "cat /var/lib/ltmrs/receipts.json".to_string(),
+            "dmesg".to_string(),
+        ]
+    }
+}
+
+/// Verify durability after the power cut, over the `ssh` CLI.
+fn step_verify(mode: &str, guest: &str) -> Result<StepOutcome, String> {
+    let mut tails: Vec<String> = Vec::new();
+    for line in verify_commands(mode) {
+        let argv = vec![guest.to_string(), line];
+        let step = outcome_of("verify", &spawn_control("ssh", &argv))?;
+        if !step.stderr_tail.is_empty() {
+            tails.push(step.stderr_tail.clone());
+        }
+        if step.exit_code != 0 {
+            return Ok(step);
+        }
+    }
+    Ok(StepOutcome {
+        name: "verify".to_string(),
+        exit_code: 0,
+        stderr_tail: tails.join("\n"),
+    })
+}
+
+/// Record one step; returns true when the pipeline must stop.
+///
+/// Precedence is `inconclusive` > `fail` > `pass`: a later step never
+/// downgrades an earlier verdict.
+fn push_step(
+    steps: &mut Vec<StepOutcome>,
+    verdict: &mut String,
+    name: &str,
+    result: Result<StepOutcome, String>,
+) -> bool {
+    match result {
+        Ok(step) => {
+            let bad = step.exit_code != 0;
+            if bad && *verdict == "pass" {
+                *verdict = "fail".to_string();
+            }
+            steps.push(step);
+            bad
+        }
+        Err(tail) => {
+            *verdict = "inconclusive".to_string();
+            steps.push(StepOutcome {
+                name: name.to_string(),
+                exit_code: 127,
+                stderr_tail: tail,
+            });
+            true
+        }
+    }
+}
+
+/// Live trial body: clone → define → create → SSH wait → workload →
+/// destroy → recreate → verify → verdict (volume kept iff not `pass`).
+fn run_trial_live(mode: &str, name: &str) -> Result<i32, String> {
+    if cfg!(not(target_os = "linux")) {
+        return Err("unsupported platform — Hyper-V CLI backend not yet ported".to_string());
+    }
+    let guest = format!("power-{name}");
+    let volume = format!("{guest}.img");
+    let dir = std::path::PathBuf::from(format!("reports/power-{name}"));
+    let xml_path = dir.join(format!("{guest}.xml"));
+
+    let mut steps: Vec<StepOutcome> = Vec::new();
+    let mut verdict = "pass".to_string();
+
+    let mut stop = push_step(
+        &mut steps,
+        &mut verdict,
+        "vol-clone",
+        step_vol_clone(&volume),
+    );
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "define",
+            step_define(&guest, &volume, &xml_path),
+        );
+    }
+    let mut domain_may_exist = false;
+    if !stop {
+        domain_may_exist = true;
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "create",
+            step_create(&xml_path, "create"),
+        );
+    }
+    if !stop {
+        stop = push_step(&mut steps, &mut verdict, "ssh-wait", step_ssh_wait(&guest));
+    }
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "workload",
+            step_workload(mode, &guest),
+        );
+    }
+    if domain_may_exist {
+        stop = push_step(&mut steps, &mut verdict, "destroy", step_destroy(&guest)) || stop;
+    }
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "recreate",
+            step_create(&xml_path, "recreate"),
+        );
+    }
+    if !stop {
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "verify",
+            step_verify(mode, &guest),
+        );
+    }
+    let _ = stop;
+
+    let verdict_value = build_verdict(mode, name, &verdict, steps);
+    let text = serde_json::to_string_pretty(&verdict_value)
+        .map_err(|err| format!("failed to serialize verdict for trial '{name}': {err}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    std::fs::write(dir.join("verdict.json"), text)
+        .map_err(|err| format!("failed to write verdict for trial '{name}': {err}"))?;
+    Ok(if verdict == "pass" { 0 } else { 1 })
+}
+
+/// Would-be control-plane argv vectors (program first) for a trial.
+///
+/// Generated from the same per-step commands the live body runs
+/// (clone → define → create → ssh-wait → workload lines → destroy →
+/// recreate → verify lines) so the preview cannot drift from the pipeline.
+fn trial_plan(mode: &str, name: &str) -> Vec<Vec<String>> {
+    let guest = format!("power-{name}");
+    let mut plan = vec![
+        vec![
+            "virsh".to_string(),
+            "vol-clone".to_string(),
+            format!("{GOLDEN_NAME}-vol"),
+            format!("{guest}.img"),
+            "--pool".to_string(),
+            "default".to_string(),
+        ],
+        vec![
+            "virsh".to_string(),
+            "define".to_string(),
+            format!("{guest}.xml"),
+        ],
+        vec![
+            "virsh".to_string(),
+            "create".to_string(),
+            format!("{guest}.xml"),
+        ],
+        {
+            let mut wait = vec!["ssh".to_string()];
+            wait.extend(ssh_wait_argv(&guest));
+            wait
+        },
+    ];
+    for line in workload_commands(mode) {
+        plan.push(vec!["ssh".to_string(), guest.clone(), line]);
+    }
+    plan.push(vec![
+        "virsh".to_string(),
+        "destroy".to_string(),
+        guest.clone(),
+    ]);
+    plan.push(vec![
+        "virsh".to_string(),
+        "create".to_string(),
+        format!("{guest}.xml"),
+    ]);
+    for line in verify_commands(mode) {
+        plan.push(vec!["ssh".to_string(), guest.clone(), line]);
+    }
+    plan
+}
+
+/// Run a trial: dry-run prints the plan without spawning; otherwise the
+/// live clone → boot → SSH → cut → verify → verdict pipeline runs.
+pub fn run_trial(mode: &str, name: &str, _force: bool, dry_run: bool) -> Result<i32, String> {
+    if mode != "canary" && mode != "daemon" {
+        return Err(format!(
+            "unknown power trial mode '{mode}' (expected canary|daemon)"
+        ));
+    }
+    if name == GOLDEN_NAME {
+        return Err(format!(
+            "refusing to run trial as reserved base image '{GOLDEN_NAME}' (golden guard)"
+        ));
+    }
+    if name.contains('/') || name.contains("..") {
+        return Err(format!(
+            "invalid power trial name '{name}' (must not contain '/' or '..')"
+        ));
+    }
+    if dry_run {
+        for argv in trial_plan(mode, name) {
+            crate::verbs::print_dry_run(&argv[0], &argv[1..]);
+        }
+        return Ok(0);
+    }
+    run_trial_live(mode, name)
+}
+
+/// Would-be control-plane argv vectors (program first) for a clean.
+fn clean_plan(name: &str) -> Vec<Vec<String>> {
+    let guest = format!("power-{name}");
+    vec![
+        vec!["virsh".to_string(), "destroy".to_string(), guest.clone()],
+        vec!["virsh".to_string(), "undefine".to_string(), guest.clone()],
+        vec![
+            "virsh".to_string(),
+            "vol-delete".to_string(),
+            format!("{guest}.img"),
+            "--pool".to_string(),
+            "default".to_string(),
+        ],
+    ]
+}
+
+/// Clean a trial: destroy the domain, undefine it, then delete its volume.
+/// The golden base image is always refused; path escapes are refused.
+/// `force` is accepted for dispatch symmetry (`run_trial`/`run_build` take
+/// it) and ignored: cleaning an existing trial never needs a force gate.
+pub fn run_clean(name: &str, force: bool, dry_run: bool) -> Result<i32, String> {
+    let _ = force;
+    if name == GOLDEN_NAME {
+        return Err(format!(
+            "refusing to clean reserved base image '{GOLDEN_NAME}' (golden guard)"
+        ));
+    }
+    if name.contains('/') || name.contains("..") {
+        return Err(format!(
+            "invalid power trial name '{name}' (must not contain '/' or '..')"
+        ));
+    }
+    if dry_run {
+        for argv in clean_plan(name) {
+            crate::verbs::print_dry_run(&argv[0], &argv[1..]);
+        }
+        return Ok(0);
+    }
+    if cfg!(not(target_os = "linux")) {
+        return Err("unsupported platform — Hyper-V CLI backend not yet ported".to_string());
+    }
+    let guest = format!("power-{name}");
+    let volume = format!("{guest}.img");
+    let dir = clean_report_dir(name);
+    let started_ms = now_ms();
+    let record_argv = vec![
+        "power".to_string(),
+        "clean".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+    ];
+    let mut steps: Vec<StepOutcome> = Vec::new();
+    let mut verdict = "pass".to_string();
+    let destroy = vec!["destroy".to_string(), guest.clone()];
+    let mut stop = push_step(
+        &mut steps,
+        &mut verdict,
+        "destroy",
+        outcome_of("destroy", &spawn_control("virsh", &destroy)),
+    );
+    if !stop {
+        let undefine = vec!["undefine".to_string(), guest.clone()];
+        stop = push_step(
+            &mut steps,
+            &mut verdict,
+            "undefine",
+            outcome_of("undefine", &spawn_control("virsh", &undefine)),
+        );
+    }
+    if !stop {
+        let delete = vec![
+            "vol-delete".to_string(),
+            volume.clone(),
+            "--pool".to_string(),
+            "default".to_string(),
+        ];
+        push_step(
+            &mut steps,
+            &mut verdict,
+            "vol-delete",
+            outcome_of("vol-delete", &spawn_control("virsh", &delete)),
+        );
+    }
+    write_op_record(
+        &dir,
+        "power-clean",
+        &record_argv,
+        &steps,
+        &verdict,
+        started_ms,
+    )?;
+    if verdict != "pass" {
+        let tails: Vec<String> = steps
+            .iter()
+            .filter(|step| step.exit_code != 0)
+            .map(|step| format!("{}: {}", step.name, step.stderr_tail))
+            .collect();
+        return Err(format!("clean failed ({}): {}", verdict, tails.join("; ")));
+    }
+    Ok(0)
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn power_trial_dry_run_prints_without_spawning() {
+        let code = crate::power::run_trial("canary", "t1", false, true).unwrap();
+        assert_eq!(code, 0);
+        assert!(!std::path::Path::new("reports/power-t1").exists());
+    }
+
+    #[test]
+    fn power_trial_rejects_golden_name() {
+        let err = crate::power::run_trial("canary", "ltmrs-golden", false, true).unwrap_err();
+        assert!(
+            err.contains("ltmrs-golden"),
+            "must name the guard target: {err}"
+        );
+    }
+
+    #[test]
+    fn power_trial_rejects_unknown_mode() {
+        let err = crate::power::run_trial("bogus", "t1", false, true).unwrap_err();
+        assert!(err.contains("bogus"), "must name the mode: {err}");
+    }
+
+    #[test]
+    fn power_trial_rejects_path_escape_name() {
+        for bad in ["../evil", "a/b"] {
+            let err = crate::power::run_trial("canary", bad, false, true).unwrap_err();
+            assert!(err.contains(bad), "must name the bad name: {err}");
+        }
+    }
+
+    #[test]
+    fn power_trial_plan_matches_live_step_sequence() {
+        let plan = super::trial_plan("canary", "t1");
+        let names: Vec<&str> = plan
+            .iter()
+            .map(|argv| {
+                if argv[0] == "virsh" {
+                    argv[1].as_str()
+                } else {
+                    "ssh"
+                }
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "vol-clone",
+                "define",
+                "create",
+                "ssh",
+                "ssh",
+                "ssh",
+                "ssh",
+                "ssh",
+                "destroy",
+                "create",
+                "ssh",
+                "ssh"
+            ]
+        );
+    }
+
+    #[test]
+    fn power_dispatch_trial_dry_run_returns_zero() {
+        let code =
+            crate::verbs::run_power("trial", Some("canary"), Some("t1"), false, true).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn power_dispatch_rejects_trial_without_mode() {
+        let err = crate::verbs::run_power("trial", None, Some("t1"), false, true).unwrap_err();
+        assert!(err.contains("--mode"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn power_dispatch_rejects_trial_without_name() {
+        let err = crate::verbs::run_power("trial", Some("canary"), None, false, true).unwrap_err();
+        assert!(err.contains("--name"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn power_dispatch_rejects_clean_without_name() {
+        let err = crate::verbs::run_power("clean", None, None, false, true).unwrap_err();
+        assert!(err.contains("--name"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn power_dispatch_rejects_unknown_op() {
+        let err = crate::verbs::run_power("frobnicate", None, None, false, true).unwrap_err();
+        assert!(err.contains("frobnicate"), "must name the op: {err}");
+        assert!(
+            err.contains("build|trial|clean"),
+            "must list the ops: {err}"
+        );
+    }
+
+    #[test]
+    fn stamp_domain_fills_placeholders_with_derived_mac() {
+        let xml = crate::power::stamp_domain("wp12-03", "wp12-03.qcow2");
+        assert!(xml.contains("<name>wp12-03</name>"));
+        assert!(xml.contains("wp12-03.qcow2"));
+        assert!(
+            !xml.contains("__NAME__") && !xml.contains("__VOLUME__") && !xml.contains("__MAC__")
+        );
+        let mac1 = crate::power::derived_mac("wp12-03");
+        let mac2 = crate::power::derived_mac("wp12-03");
+        assert_eq!(mac1, mac2);
+        assert!(mac1.starts_with("52:54:00"));
+    }
+
+    #[test]
+    fn workload_commands_returns_per_mode_lists() {
+        let canary = crate::power::workload_commands("canary");
+        assert!(!canary.is_empty());
+        let daemon = crate::power::workload_commands("daemon");
+        assert!(!daemon.is_empty());
+        assert_ne!(canary, daemon);
+    }
+
+    #[test]
+    fn verdict_json_has_required_fields() {
+        let v = crate::power::build_verdict(
+            "canary",
+            "t1",
+            "pass",
+            vec![crate::power::step_ok("boot")],
+        );
+        let text = serde_json::to_string(&v).unwrap();
+        for field in ["mode", "name", "verdict", "steps", "kept_volume"] {
+            assert!(text.contains(field), "verdict missing {field}");
+        }
+    }
+
+    #[test]
+    fn verdict_keeps_volume_iff_not_pass() {
+        let pass = crate::power::build_verdict(
+            "canary",
+            "t1",
+            "pass",
+            vec![crate::power::step_ok("boot")],
+        );
+        assert_eq!(pass["kept_volume"], false);
+        let fail = crate::power::build_verdict(
+            "canary",
+            "t1",
+            "fail",
+            vec![crate::power::step_ok("boot")],
+        );
+        assert_eq!(fail["kept_volume"], true);
+        let inconclusive = crate::power::build_verdict(
+            "canary",
+            "t1",
+            "inconclusive",
+            vec![crate::power::step_ok("boot")],
+        );
+        assert_eq!(inconclusive["kept_volume"], true);
+    }
+    #[test]
+    #[should_panic(expected = "unknown power workload mode")]
+    fn workload_commands_rejects_unknown_mode() {
+        crate::power::workload_commands("bogus");
+    }
+    #[test]
+    fn clean_refuses_golden_volume() {
+        let err = crate::power::run_clean("ltmrs-golden", false, true).unwrap_err();
+        assert!(err.contains("ltmrs-golden"));
+    }
+
+    #[test]
+    fn clean_dry_run_prints_without_spawning() {
+        let code = crate::power::run_clean("rigtest-old", false, true).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn build_dry_run_prints_without_spawning() {
+        let code = crate::power::run_build(false, true).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn clean_rejects_path_escape_name() {
+        for bad in ["../evil", "a/b"] {
+            let err = crate::power::run_clean(bad, false, true).unwrap_err();
+            assert!(err.contains(bad), "must name the bad name: {err}");
+        }
+    }
+
+    #[test]
+    fn clean_plan_matches_live_step_sequence() {
+        let plan = super::clean_plan("rigtest-old");
+        let names: Vec<&str> = plan.iter().map(|argv| argv[1].as_str()).collect();
+        assert_eq!(names, vec!["destroy", "undefine", "vol-delete"]);
+    }
+
+    #[test]
+    fn build_plan_matches_live_step_sequence() {
+        let plan = super::build_plan();
+        assert!(plan[0][0] == "qemu-img" && plan[0][1] == "create");
+        assert!(plan[1] == vec!["virsh", "define", "ltmrs-golden.xml"]);
+        assert!(plan[2] == vec!["virsh", "create", "ltmrs-golden.xml"]);
+        assert!(plan[plan.len() - 3][1] == "destroy");
+        assert!(plan[plan.len() - 2][1] == "undefine");
+        assert!(plan[plan.len() - 1][1] == "vol-info");
+    }
+
+    #[test]
+    fn build_provision_installs_authorized_keys_and_runlevel_link() {
+        let commands = super::build_provision_commands();
+        assert_eq!(
+            commands.len(),
+            7,
+            "provision must stay 7 lines: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|line| line.contains("/mnt/root/.ssh/authorized_keys")),
+            "provision must install authorized_keys: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|line| line.contains("S99power")),
+            "provision must enable the S99power runlevel link: {commands:?}"
+        );
+        let plan = super::build_plan();
+        for needle in ["/mnt/root/.ssh/authorized_keys", "S99power"] {
+            assert!(
+                plan.iter()
+                    .any(|argv| argv.get(2).is_some_and(|line| line.contains(needle))),
+                "build plan must mirror the provision line for {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_wait_plan_entry_uses_shared_probe_argv() {
+        let mut expected = vec!["ssh".to_string()];
+        expected.extend(super::ssh_wait_argv("power-t1"));
+        let trial = super::trial_plan("canary", "t1");
+        assert_eq!(
+            trial[3], expected,
+            "trial ssh-wait preview must match the live probe"
+        );
+        let build = super::build_plan();
+        let mut golden = vec!["ssh".to_string()];
+        golden.extend(super::ssh_wait_argv(super::GOLDEN_NAME));
+        assert_eq!(
+            build[3], golden,
+            "build ssh-wait preview must match the live probe"
+        );
+    }
+
+    #[test]
+    fn build_report_dir_is_fixed_golden_path() {
+        assert_eq!(
+            super::build_report_dir(),
+            std::path::PathBuf::from("reports/power-build")
+        );
+    }
+
+    #[test]
+    fn clean_report_dir_sits_next_to_trial_verdict() {
+        assert_eq!(
+            super::clean_report_dir("rigtest-old"),
+            std::path::PathBuf::from("reports/power-rigtest-old")
+        );
+    }
+
+    #[test]
+    fn op_record_persists_verdict_steps_and_argv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argv = vec!["power".to_string(), "clean".to_string()];
+        let steps = vec![super::step_ok("destroy")];
+        super::write_op_record(dir.path(), "power-clean", &argv, &steps, "pass", 1).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("record.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["verb"], "power-clean");
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["meta"]["verdict"], "pass");
+        assert_eq!(value["meta"]["steps"][0]["name"], "destroy");
+    }
+}
