@@ -144,11 +144,7 @@ impl Projector {
     /// embedding fails keeps a lexical-only row so a stalled worker never
     /// blocks indexing. An embedder that wrongly returns zero chunks falls back
     /// to the default single unit rather than silently dropping the memory.
-    fn render_chunk_rows(
-        &mut self,
-        memory: &ltmrs_domain::memory::Memory,
-        memory_id: EntityId,
-    ) -> Vec<SearchRow> {
+    fn chunk_units(&self, memory: &ltmrs_domain::memory::Memory) -> Vec<TextChunk> {
         let mut chunks = self.embedder.chunk_text(&memory.title, &memory.fragment);
         if chunks.is_empty() {
             let text = render_text(&memory.title, &memory.fragment);
@@ -159,12 +155,16 @@ impl Projector {
                 char_end: len,
             }];
         }
-        let vectors: Vec<Option<Vec<f32>>> = self
-            .embedder
-            .embed_texts(&chunks.iter().map(|c| c.text.clone()).collect::<Vec<_>>())
-            .into_iter()
-            .map(|r| r.ok())
-            .collect();
+        chunks
+    }
+
+    fn rows_from_chunks(
+        &self,
+        memory: &ltmrs_domain::memory::Memory,
+        memory_id: EntityId,
+        chunks: Vec<TextChunk>,
+        vectors: Vec<Option<Vec<f32>>>,
+    ) -> Vec<SearchRow> {
         assert_eq!(
             vectors.len(),
             chunks.len(),
@@ -193,6 +193,21 @@ impl Projector {
                 embedding,
             })
             .collect()
+    }
+
+    fn render_chunk_rows(
+        &mut self,
+        memory: &ltmrs_domain::memory::Memory,
+        memory_id: EntityId,
+    ) -> Vec<SearchRow> {
+        let chunks = self.chunk_units(memory);
+        let vectors: Vec<Option<Vec<f32>>> = self
+            .embedder
+            .embed_texts(&chunks.iter().map(|c| c.text.clone()).collect::<Vec<_>>())
+            .into_iter()
+            .map(|r| r.ok())
+            .collect();
+        self.rows_from_chunks(memory, memory_id, chunks, vectors)
     }
 
     /// The publication guard (task 5): re-validate canonical state immediately
@@ -340,16 +355,20 @@ impl Projector {
             // Processing order is irrelevant: stale jobs are refused by the
             // revision guard and left pending, so a retryable wakeup may arrive
             // in any sequence (RV-07).
-            // Batched pass: validate + render every job under its own
-            // per-entity guard (same critical section as `process_job`,
-            // steps 2-4), then ONE `publish_rows` for all validated rows,
-            // then per-job ack. Guards and failure granularity are unchanged
-            // (per-job validate, per-job ack/retry); only the Lance write
-            // is amortized — N per-doc manifest rewrites become one.
+            // Batched pass: validate every job under its own per-entity guard
+            // (same critical section as `process_job`, steps 2-4), collect all
+            // chunks, then ONE `embed_texts` over the whole pass, ONE
+            // `publish_rows`, then per-job ack. Guards and failure granularity
+            // are unchanged (per-job validate, per-job ack/retry); the Lance
+            // write is amortized — N per-doc manifest rewrites become one —
+            // and so is the embed: single-chunk corpora leave a per-job
+            // embed pool idle, a pass-wide batch gives it N units to spread.
             // Tombstone/deletion paths stay inline below (immediate, rare).
             struct Validated<'a> {
                 job: &'a ltmrs_domain::projection::ProjectionJob,
                 memory_revision: ltmrs_domain::id::DocumentRevision,
+                memory: ltmrs_domain::memory::Memory,
+                chunks: Vec<TextChunk>,
                 rows: Vec<crate::search::row::SearchRow>,
                 full_vectors: bool,
             }
@@ -388,7 +407,7 @@ impl Projector {
                 if memory.document_revision != job.desired_document_revision {
                     continue;
                 }
-                // Validate + render under the per-entity guard.
+                // Validate under the per-entity guard.
                 let lock = self.publication_lock(job.memory_id);
                 let _guard = lock.lock().await;
                 if self.repo.store_generation()? != self.generation
@@ -406,14 +425,40 @@ impl Projector {
                 {
                     continue;
                 }
-                let rows = self.render_chunk_rows(&fresh, job.memory_id);
-                let full_vectors = self.lexical_only || rows.iter().all(|r| r.embedding.is_some());
                 validated.push(Validated {
                     job,
                     memory_revision: fresh.document_revision,
-                    rows,
-                    full_vectors,
+                    chunks: self.chunk_units(&fresh),
+                    memory: fresh,
+                    rows: Vec::new(),
+                    full_vectors: false,
                 });
+            }
+            // Pass-wide batched embed: every validated chunk in one
+            // `embed_texts` call, then split the vectors back per job.
+            // A stalled embedder answers every chunk with Err, so each job
+            // keeps lexical-only rows and re-enqueues (T-PROJ-03 unchanged).
+            if !validated.is_empty() {
+                let texts: Vec<String> = validated
+                    .iter()
+                    .flat_map(|v| v.chunks.iter().map(|c| c.text.clone()))
+                    .collect();
+                let vectors: Vec<Option<Vec<f32>>> = self
+                    .embedder
+                    .embed_texts(&texts)
+                    .into_iter()
+                    .map(|r| r.ok())
+                    .collect();
+                let mut offset = 0usize;
+                for v in &mut validated {
+                    let n = v.chunks.len();
+                    let slice = vectors[offset..offset + n].to_vec();
+                    offset += n;
+                    let chunks = std::mem::take(&mut v.chunks);
+                    v.rows = self.rows_from_chunks(&v.memory, v.job.memory_id, chunks, slice);
+                    v.full_vectors =
+                        self.lexical_only || v.rows.iter().all(|r| r.embedding.is_some());
+                }
             }
             // Single amortized publish for the whole pass.
             if !validated.is_empty() {

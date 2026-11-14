@@ -5,6 +5,23 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+
+## 2026-11-14 — projector pass-wide batched embed
+
+### Live-DB oracle for backup_import_lemma (f6d1a7f, backfilled)
+- Enveloped copy of live ~/.lemma DB (1457 memories) through real cdylib + preview/confirm; digest-of-emitted-text fix; never-dlclose handle cache. Matrix executed_passed.
+
+### Transitive alias-equivalence oracles (c2f89bb, backfilled)
+- memory_edit update/forget/invalidate + learn lesson-side alias==native proven by 3 twin-fixture tests; reflect confirmed native (no transitive path).
+
+### Burn CUDA BEIR + batched forward (3b3cbc2, 0a10fc6, backfilled)
+- LTMRS_BEIR_DEVICE=cuda: 5183 docs 123s index on RTX 5090, identical verdict to CPU. Batched [B,S,H] forward + batched projector publish: 614.7s flat index, byte-identical metrics.
+
+### Projector pass-wide batched embed
+- `run_limited` split `render_chunk_rows` into `chunk_units` (collect chunks + zero-chunk fallback, no embed) + `rows_from_chunks` (build rows from chunks+vectors, `assert_eq!` on vector/chunk count); the validated pass collects every job's chunks, runs ONE `embed_texts` over the whole pass, slices vectors back per job by chunk count. Embed is pure, so it runs outside the per-entity guard; per-job validate, single amortized `publish_rows`, per-job ack/retry, stalled-embedder re-enqueue (T-PROJ-03) unchanged. SciFact docs are single-chunk (p50 ~265 tokens, 512-token window), so a per-job `embed_texts` got a 1-element slice and the rayon pool idled.
+- Measured (release, solo): **5183/5183 docs in 557.0s** vs baseline 1246s — **2.24×** end-to-end; steady ~10 docs/s vs ~3.0 (~3.3×). Final metrics nDCG@10=0.644 MAP=0.576 Recall@100=0.837 MRR@10=0.589 — byte-identical to prior CPU evidence. Verified: ltmrs-search clippy/fmt clean, 28 projector tests green; 2 review passes (formal vs plans §8.2 step 4 + T-PROJ-01/02/03; functional bug hunt on vector-slice reassembly, lexical-only, stalled path) — no findings.
+- 3 heavy search legs re-run solo, release, 247.5s, 3 passed: calibrate recommended min_similarity 0.70 (matches CHANGELOG:376); clustered Recall@10 mean 0.875 min 0.700 n=300 (matches :157); ann_ivf_pq_vs_exact unfiltered Recall@10 0.171 (n=100), filtered 0.190 (n=20), freshness 100/100 pre+post-optimize — consistent with the 0.176 floor (:364), seed-sensitive.
+
 ## 2026-11-13 — rig + wrapper + matrix batch
 
 ### Alpine power-loss rig BUILT + PROVEN (Windows leg delegated to omp)
