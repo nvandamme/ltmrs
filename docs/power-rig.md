@@ -47,9 +47,9 @@ cargo xtask power --op clean --name <trial>
   commands the live body runs, so the preview cannot drift) and spawns
   nothing.
 - Evidence lands under `reports/power-build` (build) and
-  `reports/power-<name>` (trial): `record.json` (argv, exit code, tails,
-  verdict + steps in `meta`) and, for trials, `verdict.json` plus the
-  stamped `<guest>.xml`.
+  `reports/power-<name>` (trial): build/clean write `record.json` (argv,
+  exit code, tails, verdict + steps in `meta`); trials write `verdict.json`
+  (verdict + steps inline) plus the stamped `<guest>.xml`.
 
 ## Verdict schema (`verdict.json`)
 

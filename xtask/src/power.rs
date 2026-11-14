@@ -8,13 +8,11 @@ const GOLDEN_NAME: &str = "ltmrs-golden";
 
 /// Domain template with `__NAME__`/`__VOLUME__`/`__MAC__` placeholders.
 /// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
-#[allow(dead_code)]
 const DOMAIN_TEMPLATE: &str = include_str!("../../tools/vm/domain-template.xml");
 
 /// Derive a deterministic guest MAC: QEMU OUI `52:54:00` plus 3 bytes from a
 /// stable hash of the trial name (FNV-1a over the name bytes, no dependency).
 /// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
-#[allow(dead_code)]
 pub fn derived_mac(name: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in name.bytes() {
@@ -31,7 +29,6 @@ pub fn derived_mac(name: &str) -> String {
 
 /// Stamp the domain template for one trial (no placeholder survives).
 /// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
-#[allow(dead_code)]
 pub fn stamp_domain(name: &str, volume: &str) -> String {
     let mac = derived_mac(name);
     DOMAIN_TEMPLATE
@@ -42,7 +39,6 @@ pub fn stamp_domain(name: &str, volume: &str) -> String {
 
 /// Guest-side command list for a trial mode (data from `tools/vm/`, not code).
 /// Task 4 (live trial body) is the first runtime consumer; tests cover it meanwhile.
-#[allow(dead_code)]
 pub fn workload_commands(mode: &str) -> Vec<String> {
     let raw = match mode {
         "canary" => include_str!("../../tools/vm/canary-workload.txt"),
@@ -901,6 +897,7 @@ mod tests {
                 "vol-clone",
                 "define",
                 "create",
+                "ssh",
                 "ssh",
                 "ssh",
                 "ssh",

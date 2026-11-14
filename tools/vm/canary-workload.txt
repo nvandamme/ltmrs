@@ -1,3 +1,4 @@
 echo canary-alive
 uname -r
 cat /proc/uptime
+echo canary-alive > /var/lib/power-canary
