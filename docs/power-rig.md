@@ -70,9 +70,13 @@ cargo xtask power --op clean --name <trial>
   XML/record write failure) — the rig, not the code under test, is
   suspect. Precedence is `inconclusive` > `fail` > `pass`: a later step
   never downgrades an earlier verdict.
-- `kept_volume` is exactly `verdict != "pass"`: failing/inconclusive
-  volumes are kept for forensics; passing trials delete theirs.
-- Op exit codes: `pass` → 0, `fail` → 1, `inconclusive` → 127.
+- `kept_volume` is exactly `verdict != "pass"`: an advisory flag in
+  `verdict.json` — nothing consumes it. Trial volumes accumulate under the
+  `default` pool until `clean --name <trial>` destroys/undefines/vol-deletes
+  them, pass or not.
+- Op exit codes: 0 on `pass`, 1 otherwise. `127` never appears as a process
+  exit — it marks harness-fault steps inside `record.json`/`verdict.json`
+  step outcomes, so never branch on `$? == 127`.
 
 ## Durability rules
 
@@ -111,10 +115,12 @@ so later inspection cannot be blamed for changing what it observes.
   network/pool present? golden volume intact? guest reachable by SSH?
   Re-run; two inconclusives in a row mean the rig is broken, not the
   trial.
-- Kept-volume triage: volumes survive only when the verdict is not
-  `pass`. Inspect via the debugfs discipline above, then `clean --name
+- Kept-volume triage: trial volumes persist regardless of verdict (see
+  above). Inspect via the debugfs discipline above, then `clean --name
   <trial>` to destroy/undefine/vol-delete.
-- Stale `power-<name>` domains from an interrupted run: `clean` is
-  idempotent over destroy/undefine/vol-delete — run it and retry.
+- Stale `power-<name>` domains from an interrupted run: re-running `clean`
+  is safe while the domain still exists (destroy/undefine/vol-delete run in
+  order). Once the domain is gone but the volume lingers, re-running aborts
+  on the missing domain — vol-delete the leftover manually, then retry.
 - Windows: every `power` verb fails fast with the Hyper-V stub message;
   run the rig on Linux.

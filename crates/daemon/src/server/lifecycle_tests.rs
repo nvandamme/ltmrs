@@ -11,7 +11,7 @@ use crate::limits::{QuotaTracker, ResourceLimits};
 use crate::registry::FrontendRegistry;
 use crate::runtime::RuntimePaths;
 use ltmrs_domain::clock::{Clock, FrozenClock};
-use ltmrs_domain::command::Scope;
+use ltmrs_domain::command::{DomainCommand, Scope};
 use ltmrs_domain::id::{ChannelId, FrontendId, OperationId, StoreGeneration};
 use ltmrs_service::repository::CanonicalRepository;
 use uuid::Uuid;
@@ -1000,22 +1000,22 @@ async fn committed_receipt_survives_connection_drop() {
 // ---- Recovery after kill -9 (Task 6: power-rig runbook invariants) ----
 
 /// Open a repository with a frozen clock and issue the default namespace.
-fn recovery_repo(dir: &tempfile::TempDir) -> Arc<CanonicalRepository> {
-    use ltmrs_domain::clock::{Clock, FrozenClock};
-
+/// Returns the repo plus the issued retry epoch (threaded into every
+/// recovery context; never hardcoded).
+fn recovery_repo(dir: &tempfile::TempDir) -> (Arc<CanonicalRepository>, u64) {
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
     let repo = CanonicalRepository::open_with_clock(
         dir.path().join("store").to_str().unwrap(),
         Arc::clone(&clock),
     )
     .unwrap();
-    repo.issue_namespace(fe(1), ch(2), 1000).unwrap();
-    Arc::new(repo)
+    let ns = repo.issue_namespace(fe(1), ch(2), 1000).unwrap();
+    (Arc::new(repo), ns.retry_epoch)
 }
 
-/// Command context for recovery op `n` (frontend 1 / channel 2 / epoch 1,
-/// matching `recovery_repo`).
-fn recovery_ctx(n: u64, digest: &str) -> ltmrs_domain::command::CommandContext {
+/// Command context for recovery op `n` (frontend 1 / channel 2, matching
+/// `recovery_repo`).
+fn recovery_ctx(n: u64, digest: &str, retry_epoch: u64) -> ltmrs_domain::command::CommandContext {
     ltmrs_domain::command::CommandContext {
         store_generation: StoreGeneration::FIRST,
         frontend_id: fe(1),
@@ -1025,16 +1025,14 @@ fn recovery_ctx(n: u64, digest: &str) -> ltmrs_domain::command::CommandContext {
         request_digest: digest.to_string(),
         deadline_millis: None,
         scope: Scope::default(),
-        retry_epoch: 1,
+        retry_epoch,
     }
 }
 
 /// Commit one memory through the canonical gateway.
-fn recovery_add(repo: &CanonicalRepository, n: u64) {
-    use ltmrs_domain::command::DomainCommand;
-
+fn recovery_add(repo: &CanonicalRepository, n: u64, retry_epoch: u64) {
     repo.apply(
-        &recovery_ctx(n, &format!("recovery-{n}")),
+        &recovery_ctx(n, &format!("recovery-{n}"), retry_epoch),
         &DomainCommand::AddMemory {
             memory: test_memory(n),
             session: None,
@@ -1043,23 +1041,23 @@ fn recovery_add(repo: &CanonicalRepository, n: u64) {
     )
     .unwrap();
 }
-
 /// Reopening the store after an unclean shutdown keeps every committed
 /// receipt and memory (kill -9 drops the handle with no graceful close).
 #[test]
 fn recovery_reopen_keeps_receipts() {
     let dir = tempfile::tempdir().unwrap();
-    {
-        let repo = recovery_repo(&dir);
+    let first_epoch = {
+        let (repo, epoch) = recovery_repo(&dir);
         for n in 1..=3 {
-            recovery_add(&repo, n);
+            recovery_add(&repo, n, epoch);
         }
         // Simulate kill -9: drop the handle with no close/flush call.
-    }
-    let repo = recovery_repo(&dir);
+        epoch
+    };
+    let (repo, _) = recovery_repo(&dir);
     for n in 1..=3 {
         let receipt = repo
-            .lookup_receipt(StoreGeneration::FIRST, fe(1), 1, op(n))
+            .lookup_receipt(StoreGeneration::FIRST, fe(1), first_epoch, op(n))
             .unwrap();
         assert!(
             receipt.is_some(),
@@ -1078,16 +1076,14 @@ fn recovery_reopen_keeps_receipts() {
 /// committed merge keeps whole receipts and edges with live endpoints.
 #[test]
 fn recovery_reopen_has_no_partial_merge() {
-    use ltmrs_domain::command::DomainCommand;
-
     let dir = tempfile::tempdir().unwrap();
-    {
-        let repo = recovery_repo(&dir);
-        recovery_add(&repo, 11);
-        recovery_add(&repo, 12);
+    let first_epoch = {
+        let (repo, epoch) = recovery_repo(&dir);
+        recovery_add(&repo, 11, epoch);
+        recovery_add(&repo, 12, epoch);
         // Committed merge: result 13 consolidates sources 11 + 12.
         repo.apply(
-            &recovery_ctx(13, "recovery-merge-13"),
+            &recovery_ctx(13, "recovery-merge-13", epoch),
             &DomainCommand::Merge {
                 source_ids: vec![test_memory(11).id, test_memory(12).id],
                 result: test_memory(13),
@@ -1099,7 +1095,7 @@ fn recovery_reopen_has_no_partial_merge() {
         // dropped without commit), so the op must leave no trace.
         repo.fault_injector().set_commit_unknown_outcomes(1);
         let crashed = repo.apply(
-            &recovery_ctx(14, "recovery-merge-14"),
+            &recovery_ctx(14, "recovery-merge-14", epoch),
             &DomainCommand::Merge {
                 source_ids: vec![test_memory(11).id, test_memory(12).id],
                 result: test_memory(14),
@@ -1108,11 +1104,12 @@ fn recovery_reopen_has_no_partial_merge() {
         );
         assert!(crashed.is_err(), "injected crash-commit must error");
         // Simulate kill -9: drop the handle with no close/flush call.
-    }
-    let repo = recovery_repo(&dir);
+        epoch
+    };
+    let (repo, _) = recovery_repo(&dir);
     // The crashed op recorded nothing.
     assert!(
-        repo.lookup_receipt(StoreGeneration::FIRST, fe(1), 1, op(14))
+        repo.lookup_receipt(StoreGeneration::FIRST, fe(1), first_epoch, op(14))
             .unwrap()
             .is_none(),
         "crashed merge must leave no receipt"
@@ -1124,7 +1121,7 @@ fn recovery_reopen_has_no_partial_merge() {
     // The committed merge is whole: receipt, result, and edges whose
     // endpoints all exist.
     assert!(
-        repo.lookup_receipt(StoreGeneration::FIRST, fe(1), 1, op(13))
+        repo.lookup_receipt(StoreGeneration::FIRST, fe(1), first_epoch, op(13))
             .unwrap()
             .is_some(),
         "committed merge receipt must survive reopen"
