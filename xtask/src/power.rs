@@ -67,6 +67,7 @@ fn build_provision_commands() -> Vec<String> {
         "echo 'tty1::respawn:/sbin/getty -n -l /bin/autologin tty1 38400' >> /mnt/etc/inittab".to_string(),
         "mknod /mnt/dev/console c 5 1 && mknod /mnt/dev/null c 1 3".to_string(),
         "install -m 600 /root/key.pub /mnt/root/.ssh/authorized_keys".to_string(),
+        "ln -s /etc/init.d/S99power /mnt/etc/runlevels/default/S99power".to_string(),
     ]
 }
 
@@ -1052,25 +1053,37 @@ mod tests {
         assert!(plan[0][0] == "qemu-img" && plan[0][1] == "create");
         assert!(plan[1] == vec!["virsh", "define", "ltmrs-golden.xml"]);
         assert!(plan[2] == vec!["virsh", "create", "ltmrs-golden.xml"]);
+        assert!(plan[plan.len() - 3][1] == "destroy");
+        assert!(plan[plan.len() - 2][1] == "undefine");
         assert!(plan[plan.len() - 1][1] == "vol-info");
     }
 
     #[test]
-    fn build_provision_installs_authorized_keys() {
+    fn build_provision_installs_authorized_keys_and_runlevel_link() {
         let commands = super::build_provision_commands();
+        assert_eq!(
+            commands.len(),
+            7,
+            "provision must stay 7 lines: {commands:?}"
+        );
         assert!(
             commands
                 .iter()
                 .any(|line| line.contains("/mnt/root/.ssh/authorized_keys")),
             "provision must install authorized_keys: {commands:?}"
         );
-        let plan = super::build_plan();
         assert!(
-            plan.iter().any(|argv| argv
-                .get(2)
-                .is_some_and(|line| line.contains("/mnt/root/.ssh/authorized_keys"))),
-            "build plan must mirror the authorized_keys provision line"
+            commands.iter().any(|line| line.contains("S99power")),
+            "provision must enable the S99power runlevel link: {commands:?}"
         );
+        let plan = super::build_plan();
+        for needle in ["/mnt/root/.ssh/authorized_keys", "S99power"] {
+            assert!(
+                plan.iter()
+                    .any(|argv| argv.get(2).is_some_and(|line| line.contains(needle))),
+                "build plan must mirror the provision line for {needle}"
+            );
+        }
     }
 
     #[test]
