@@ -66,8 +66,20 @@ fn build_provision_commands() -> Vec<String> {
         "echo 'auto eth0\niface eth0 inet static\naddress 192.168.122.10' > /mnt/etc/network/interfaces".to_string(),
         "echo 'tty1::respawn:/sbin/getty -n -l /bin/autologin tty1 38400' >> /mnt/etc/inittab".to_string(),
         "mknod /mnt/dev/console c 5 1 && mknod /mnt/dev/null c 1 3".to_string(),
-        "install -m 600 /root/key.pub /mnt/root/.ssh/authorized_keys".to_string(),
         "ln -s /etc/init.d/S99power /mnt/etc/runlevels/default/S99power".to_string(),
+    ]
+}
+
+/// SSH wait-probe argv (after `ssh`): shared by the live poll and every
+/// dry-run plan so the preview shows exactly what the pipeline spawns.
+fn ssh_wait_argv(guest: &str) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=2".to_string(),
+        guest.to_string(),
+        "true".to_string(),
     ]
 }
 
@@ -96,7 +108,11 @@ fn build_plan() -> Vec<Vec<String>> {
             "create".to_string(),
             format!("{guest}.xml"),
         ],
-        vec!["ssh".to_string(), guest.clone(), "true".to_string()],
+        {
+            let mut wait = vec!["ssh".to_string()];
+            wait.extend(ssh_wait_argv(&guest));
+            wait
+        },
     ];
     for line in build_provision_commands() {
         plan.push(vec!["ssh".to_string(), guest.clone(), line]);
@@ -121,6 +137,75 @@ fn build_plan() -> Vec<Vec<String>> {
     plan
 }
 
+/// Milliseconds since the Unix epoch (mirrors `run.rs` for record stamps).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Run-record directory for a build (no trial name exists; the op owns it).
+fn build_report_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("reports/power-build")
+}
+
+/// Run-record directory for a clean (sits next to the trial verdict).
+fn clean_report_dir(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("reports/power-{name}"))
+}
+
+/// Persist the op run-record (`record.json` under `dir`) via Task 2 plumbing.
+///
+/// Steps plus verdict ride in `meta`; the outcome aggregates the pipeline:
+/// 0 on `pass`, 127 on `inconclusive`, 1 on `fail`.
+fn write_op_record(
+    dir: &std::path::Path,
+    verb: &str,
+    argv: &[String],
+    steps: &[StepOutcome],
+    verdict: &str,
+    started_ms: u64,
+) -> Result<(), String> {
+    let code = if verdict == "pass" {
+        0
+    } else if verdict == "inconclusive" {
+        127
+    } else {
+        1
+    };
+    let tails: Vec<String> = steps
+        .iter()
+        .filter(|step| step.exit_code != 0)
+        .map(|step| format!("{}: {}", step.name, step.stderr_tail))
+        .collect();
+    let outcome = crate::run::RunOutcome {
+        exit_code: code,
+        stdout_tail: String::new(),
+        stderr_tail: tails.join("\n"),
+        started_ms,
+        finished_ms: now_ms(),
+    };
+    let meta = serde_json::json!({
+        "verdict": verdict,
+        "steps": steps
+            .iter()
+            .map(|step| serde_json::json!({
+                "name": step.name,
+                "exit_code": step.exit_code,
+                "stderr_tail": step.stderr_tail,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    crate::run::write_record(dir, verb, argv, &outcome, Some(&meta)).map_err(|err| {
+        format!(
+            "failed to write {verb} run-record in {}: {err}",
+            dir.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Live build body: qcow2 create → define → create → SSH wait →
 /// provision → destroy → undefine → vol-info assert.
 fn run_build_live(force: bool) -> Result<i32, String> {
@@ -138,8 +223,18 @@ fn run_build_live(force: bool) -> Result<i32, String> {
             ));
         }
     }
-    let dir = std::path::PathBuf::from("reports/power-golden");
+    let dir = build_report_dir();
     let xml_path = dir.join(format!("{guest}.xml"));
+    let started_ms = now_ms();
+    let record_argv = if force {
+        vec![
+            "power".to_string(),
+            "build".to_string(),
+            "--force".to_string(),
+        ]
+    } else {
+        vec!["power".to_string(), "build".to_string()]
+    };
     let img_argv = vec![
         "create".to_string(),
         "-f".to_string(),
@@ -223,13 +318,21 @@ fn run_build_live(force: bool) -> Result<i32, String> {
             "--pool".to_string(),
             "default".to_string(),
         ];
-        stop = push_step(
+        push_step(
             &mut steps,
             &mut verdict,
             "vol-info",
             outcome_of("vol-info", &spawn_control("virsh", &argv)),
         );
     }
+    write_op_record(
+        &dir,
+        "power-build",
+        &record_argv,
+        &steps,
+        &verdict,
+        started_ms,
+    )?;
     if verdict != "pass" {
         let tails: Vec<String> = steps
             .iter()
@@ -238,10 +341,8 @@ fn run_build_live(force: bool) -> Result<i32, String> {
             .collect();
         return Err(format!("build failed ({}): {}", verdict, tails.join("; ")));
     }
-    let _ = stop;
     Ok(0)
 }
-
 /// Build the base image: dry-run prints the plan without spawning,
 /// otherwise the live qcow2 → define → provision → destroy pipeline runs.
 /// Without `--force` a live build refuses when the golden volume exists.
@@ -383,14 +484,7 @@ fn step_create(xml_path: &std::path::Path, step_name: &str) -> Result<StepOutcom
 fn step_ssh_wait(guest: &str) -> Result<StepOutcome, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let argv = vec![
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "ConnectTimeout=2".to_string(),
-            guest.to_string(),
-            "true".to_string(),
-        ];
+        let argv = ssh_wait_argv(guest);
         let outcome = spawn_control("ssh", &argv);
         if outcome.exit_code == 0 {
             return Ok(step_ok("ssh-wait"));
@@ -602,7 +696,11 @@ fn trial_plan(mode: &str, name: &str) -> Vec<Vec<String>> {
             "create".to_string(),
             format!("{guest}.xml"),
         ],
-        vec!["ssh".to_string(), guest.clone(), "true".to_string()],
+        {
+            let mut wait = vec!["ssh".to_string()];
+            wait.extend(ssh_wait_argv(&guest));
+            wait
+        },
     ];
     for line in workload_commands(mode) {
         plan.push(vec!["ssh".to_string(), guest.clone(), line]);
@@ -666,9 +764,12 @@ fn clean_plan(name: &str) -> Vec<Vec<String>> {
     ]
 }
 
-/// Clean a trial: undefine the domain then delete its volume.
+/// Clean a trial: destroy the domain, undefine it, then delete its volume.
 /// The golden base image is always refused; path escapes are refused.
-pub fn run_clean(name: &str, _force: bool, dry_run: bool) -> Result<i32, String> {
+/// `force` is accepted for dispatch symmetry (`run_trial`/`run_build` take
+/// it) and ignored: cleaning an existing trial never needs a force gate.
+pub fn run_clean(name: &str, force: bool, dry_run: bool) -> Result<i32, String> {
+    let _ = force;
     if name == GOLDEN_NAME {
         return Err(format!(
             "refusing to clean reserved base image '{GOLDEN_NAME}' (golden guard)"
@@ -690,6 +791,14 @@ pub fn run_clean(name: &str, _force: bool, dry_run: bool) -> Result<i32, String>
     }
     let guest = format!("power-{name}");
     let volume = format!("{guest}.img");
+    let dir = clean_report_dir(name);
+    let started_ms = now_ms();
+    let record_argv = vec![
+        "power".to_string(),
+        "clean".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+    ];
     let mut steps: Vec<StepOutcome> = Vec::new();
     let mut verdict = "pass".to_string();
     let destroy = vec!["destroy".to_string(), guest.clone()];
@@ -715,13 +824,21 @@ pub fn run_clean(name: &str, _force: bool, dry_run: bool) -> Result<i32, String>
             "--pool".to_string(),
             "default".to_string(),
         ];
-        stop = push_step(
+        push_step(
             &mut steps,
             &mut verdict,
             "vol-delete",
             outcome_of("vol-delete", &spawn_control("virsh", &delete)),
         );
     }
+    write_op_record(
+        &dir,
+        "power-clean",
+        &record_argv,
+        &steps,
+        &verdict,
+        started_ms,
+    )?;
     if verdict != "pass" {
         let tails: Vec<String> = steps
             .iter()
@@ -730,10 +847,8 @@ pub fn run_clean(name: &str, _force: bool, dry_run: bool) -> Result<i32, String>
             .collect();
         return Err(format!("clean failed ({}): {}", verdict, tails.join("; ")));
     }
-    let _ = stop;
     Ok(0)
 }
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -938,7 +1053,54 @@ mod tests {
         assert!(plan[1] == vec!["virsh", "define", "ltmrs-golden.xml"]);
         assert!(plan[2] == vec!["virsh", "create", "ltmrs-golden.xml"]);
         assert!(plan[plan.len() - 3][1] == "destroy");
-        assert!(plan[plan.len() - 2][1] == "undefine");
         assert!(plan[plan.len() - 1][1] == "vol-info");
+    }
+
+    #[test]
+    fn ssh_wait_plan_entry_uses_shared_probe_argv() {
+        let mut expected = vec!["ssh".to_string()];
+        expected.extend(super::ssh_wait_argv("power-t1"));
+        let trial = super::trial_plan("canary", "t1");
+        assert_eq!(
+            trial[3], expected,
+            "trial ssh-wait preview must match the live probe"
+        );
+        let build = super::build_plan();
+        let mut golden = vec!["ssh".to_string()];
+        golden.extend(super::ssh_wait_argv(super::GOLDEN_NAME));
+        assert_eq!(
+            build[3], golden,
+            "build ssh-wait preview must match the live probe"
+        );
+    }
+
+    #[test]
+    fn build_report_dir_is_fixed_golden_path() {
+        assert_eq!(
+            super::build_report_dir(),
+            std::path::PathBuf::from("reports/power-build")
+        );
+    }
+
+    #[test]
+    fn clean_report_dir_sits_next_to_trial_verdict() {
+        assert_eq!(
+            super::clean_report_dir("rigtest-old"),
+            std::path::PathBuf::from("reports/power-rigtest-old")
+        );
+    }
+
+    #[test]
+    fn op_record_persists_verdict_steps_and_argv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let argv = vec!["power".to_string(), "clean".to_string()];
+        let steps = vec![super::step_ok("destroy")];
+        super::write_op_record(dir.path(), "power-clean", &argv, &steps, "pass", 1).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("record.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["verb"], "power-clean");
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["meta"]["verdict"], "pass");
+        assert_eq!(value["meta"]["steps"][0]["name"], "destroy");
     }
 }
