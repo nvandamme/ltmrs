@@ -5,7 +5,14 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-13 — rig + wrapper + matrix batch
+## 2026-11-14 — power verbs live-trial hardening (canary `pass` end to end)
+
+### Live trial proof: `power --op trial --mode canary` verdict `pass`
+- `reports/power-wp12-smoke11/verdict.json`: 12 steps green (clone/define/start/ssh-wait/workload/destroy/recreate/ssh-wait/verify + teardown destroy/undefine/vol-delete), volume deleted, no domain left.
+- Live-found fixes (all in-tree, all gated): `-c qemu:///system` pinned in the single spawn site (session URI has no `default` pool); `create <xml>` → `start <name>` (transient-vs-defined collision); absolute serial-log path (libvirt CWD ≠ xtask CWD); per-trial TCP serial port derived like the MAC (4599 collision on leftovers); `GUEST_IP` .50 const + shared ssh identity helper (`root@`, key from `LTMRS_POWER_SSH_KEY`, BatchMode, no host-key prompt); `sync` appended to both workloads (page cache never flushed before destroy); second ssh-wait after recreate (verify raced the reboot); post-verify teardown (destroy+undefine always, vol-delete iff pass).
+- Gate: `cargo test -p xtask` 130/130, fmt clean, clippy `-D warnings` clean; full `cargo test --workspace` 23 ok / 0 failed.
+
+## f023c0c (2026-11-13) — rig + wrapper + matrix batch
 
 ### Alpine power-loss rig BUILT + PROVEN (Windows leg delegated to omp)
 - System libvirt (virsh) path after pty-driven QEMU scaffolding proved unscriptable: direct kernel boot + copy-live-system + debugfs offline edits; system libvirt with default NAT network.

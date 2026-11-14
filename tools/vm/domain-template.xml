@@ -38,6 +38,6 @@
   </devices>
   <qemu:commandline>
     <qemu:arg value='-serial'/>
-    <qemu:arg value='tcp:127.0.0.1:4599,server,nowait'/>
+    <qemu:arg value='tcp:127.0.0.1:__SERIAL_PORT__,server,nowait'/>
   </qemu:commandline>
 </domain>

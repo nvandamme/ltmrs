@@ -4,3 +4,4 @@ cat /proc/uptime
 cat /proc/loadavg
 free -m
 echo daemon-alive > /var/lib/ltmrs/receipts.json
+sync
