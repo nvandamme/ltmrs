@@ -152,6 +152,37 @@ fn argv(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
+/// Child env for cargo spawns: the `RUSTC_WRAPPER` opt-in.
+///
+/// Cargo resolves `RUSTC_WRAPPER` in the parent process before any rustc
+/// spawns, so the wrapper must be set on the child env, never via a
+/// `cargo:rustc-env` build-script directive (that reaches only the
+/// dependent crate's own compilation — verified 2026-11-14). xtask is the
+/// repo's spawn seam, and the IDE runs cargo directly, never xtask, so the
+/// committed-wrapper ban does not apply here.
+fn wrapper_choice(no_scache: &str, wrapper: &str, opt_in: &str) -> Option<String> {
+    if no_scache == "1" {
+        return None;
+    }
+    if !wrapper.is_empty() {
+        return Some(wrapper.to_string());
+    }
+    if opt_in == "1" {
+        Some("sccache".to_string())
+    } else {
+        None
+    }
+}
+
+fn cargo_child_env(env: &mut Vec<(String, String)>) {
+    let no_scache = std::env::var("LTMRS_NO_SCCACHE").unwrap_or_default();
+    let wrapper = std::env::var("RUSTC_WRAPPER").unwrap_or_default();
+    let opt_in = std::env::var("LTMRS_SCCACHE").unwrap_or_default();
+    if let Some(w) = wrapper_choice(&no_scache, &wrapper, &opt_in) {
+        env.push(("RUSTC_WRAPPER".to_string(), w));
+    }
+}
+
 fn finish(
     verb: &str,
     argv: &[String],
@@ -445,7 +476,13 @@ fn run_children(
     let dir = report_dir(verb)?;
     for (argv, name) in commands.iter().zip(names.iter()) {
         let (program, args) = argv.split_first().ok_or(format!("{verb} argv is empty"))?;
-        let outcome = execute(program, args, &workdir);
+        let mut env: Vec<(String, String)> = Vec::new();
+        if program == "cargo" {
+            cargo_child_env(&mut env);
+        }
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let outcome = execute_with_env(program, args, &workdir, &env_refs);
         let code = finish(verb, argv, &outcome, &dir.join(name), None)?;
         if code != 0 {
             return Ok(code);
@@ -1356,10 +1393,14 @@ pub fn run_dist_audit(full: bool, dry_run: bool) -> Result<i32, String> {
     }
 
     if full {
+        let mut env: Vec<(String, String)> = Vec::new();
+        cargo_child_env(&mut env);
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let release_argv = dist_audit_release_argv();
         let (prog, args) = release_argv.split_first().ok_or("release argv is empty")?;
         let t0 = std::time::Instant::now();
-        let release = execute(prog, args, &workdir);
+        let release = execute_with_env(prog, args, &workdir, &env_refs);
         let wall = t0.elapsed().as_secs();
         if release.exit_code == 0 {
             report.push(format!("locked-release-build: PASS (wall {wall}s)"));
@@ -1373,7 +1414,7 @@ pub fn run_dist_audit(full: bool, dry_run: bool) -> Result<i32, String> {
         let offline_argv = dist_audit_offline_argv();
         let (prog, args) = offline_argv.split_first().ok_or("offline argv is empty")?;
         let t0 = std::time::Instant::now();
-        let offline = execute(prog, args, &workdir);
+        let offline = execute_with_env(prog, args, &workdir, &env_refs);
         let wall = t0.elapsed().as_secs();
         if offline.exit_code == 0 {
             report.push(format!(
@@ -3484,5 +3525,23 @@ mod tests {
             warnings[0].contains("RQ-01"),
             "must name the row: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn wrapper_opt_in_engages_only_when_requested() {
+        assert_eq!(
+            super::wrapper_choice("0", "", "1"),
+            Some("sccache".to_string())
+        );
+        assert_eq!(super::wrapper_choice("0", "", "0"), None);
+    }
+
+    #[test]
+    fn wrapper_respects_user_export_and_bypass() {
+        assert_eq!(
+            super::wrapper_choice("0", "sccache-wrap.sh", "0"),
+            Some("sccache-wrap.sh".to_string())
+        );
+        assert_eq!(super::wrapper_choice("1", "sccache", "1"), None);
     }
 }
