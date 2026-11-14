@@ -996,3 +996,148 @@ async fn committed_receipt_survives_connection_drop() {
     let memories = repo.get_memories(&[test_memory(1).id]).unwrap();
     assert_eq!(memories.len(), 1, "committed memory must survive");
 }
+
+// ---- Recovery after kill -9 (Task 6: power-rig runbook invariants) ----
+
+/// Open a repository with a frozen clock and issue the default namespace.
+fn recovery_repo(dir: &tempfile::TempDir) -> Arc<CanonicalRepository> {
+    use ltmrs_domain::clock::{Clock, FrozenClock};
+
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FrozenClock::new(1000));
+    let repo = CanonicalRepository::open_with_clock(
+        dir.path().join("store").to_str().unwrap(),
+        Arc::clone(&clock),
+    )
+    .unwrap();
+    repo.issue_namespace(fe(1), ch(2), 1000).unwrap();
+    Arc::new(repo)
+}
+
+/// Command context for recovery op `n` (frontend 1 / channel 2 / epoch 1,
+/// matching `recovery_repo`).
+fn recovery_ctx(n: u64, digest: &str) -> ltmrs_domain::command::CommandContext {
+    ltmrs_domain::command::CommandContext {
+        store_generation: StoreGeneration::FIRST,
+        frontend_id: fe(1),
+        channel_id: ch(2),
+        session: None,
+        operation_id: op(n),
+        request_digest: digest.to_string(),
+        deadline_millis: None,
+        scope: Scope::default(),
+        retry_epoch: 1,
+    }
+}
+
+/// Commit one memory through the canonical gateway.
+fn recovery_add(repo: &CanonicalRepository, n: u64) {
+    use ltmrs_domain::command::DomainCommand;
+
+    repo.apply(
+        &recovery_ctx(n, &format!("recovery-{n}")),
+        &DomainCommand::AddMemory {
+            memory: test_memory(n),
+            session: None,
+            auto_link: None,
+        },
+    )
+    .unwrap();
+}
+
+/// Reopening the store after an unclean shutdown keeps every committed
+/// receipt and memory (kill -9 drops the handle with no graceful close).
+#[test]
+fn recovery_reopen_keeps_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let repo = recovery_repo(&dir);
+        for n in 1..=3 {
+            recovery_add(&repo, n);
+        }
+        // Simulate kill -9: drop the handle with no close/flush call.
+    }
+    let repo = recovery_repo(&dir);
+    for n in 1..=3 {
+        let receipt = repo
+            .lookup_receipt(StoreGeneration::FIRST, fe(1), 1, op(n))
+            .unwrap();
+        assert!(
+            receipt.is_some(),
+            "committed receipt {n} must survive reopen"
+        );
+    }
+    let memories = repo
+        .get_memories(&[test_memory(1).id, test_memory(2).id, test_memory(3).id])
+        .unwrap();
+    assert_eq!(memories.len(), 3, "committed memories must survive reopen");
+}
+
+/// Reopening after an injected crash-commit (transaction dropped without
+/// commit, the kill -9 mid-write case) leaves no half-merged graph:
+/// the crashed op records no receipt and no memory, while the earlier
+/// committed merge keeps whole receipts and edges with live endpoints.
+#[test]
+fn recovery_reopen_has_no_partial_merge() {
+    use ltmrs_domain::command::DomainCommand;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let repo = recovery_repo(&dir);
+        recovery_add(&repo, 11);
+        recovery_add(&repo, 12);
+        // Committed merge: result 13 consolidates sources 11 + 12.
+        repo.apply(
+            &recovery_ctx(13, "recovery-merge-13"),
+            &DomainCommand::Merge {
+                source_ids: vec![test_memory(11).id, test_memory(12).id],
+                result: test_memory(13),
+                consolidate: true,
+            },
+        )
+        .unwrap();
+        // Crashed merge: the commit outcome is unknown (transaction
+        // dropped without commit), so the op must leave no trace.
+        repo.fault_injector().set_commit_unknown_outcomes(1);
+        let crashed = repo.apply(
+            &recovery_ctx(14, "recovery-merge-14"),
+            &DomainCommand::Merge {
+                source_ids: vec![test_memory(11).id, test_memory(12).id],
+                result: test_memory(14),
+                consolidate: true,
+            },
+        );
+        assert!(crashed.is_err(), "injected crash-commit must error");
+        // Simulate kill -9: drop the handle with no close/flush call.
+    }
+    let repo = recovery_repo(&dir);
+    // The crashed op recorded nothing.
+    assert!(
+        repo.lookup_receipt(StoreGeneration::FIRST, fe(1), 1, op(14))
+            .unwrap()
+            .is_none(),
+        "crashed merge must leave no receipt"
+    );
+    assert!(
+        repo.get_memories(&[test_memory(14).id]).unwrap().is_empty(),
+        "crashed merge must leave no result memory"
+    );
+    // The committed merge is whole: receipt, result, and edges whose
+    // endpoints all exist.
+    assert!(
+        repo.lookup_receipt(StoreGeneration::FIRST, fe(1), 1, op(13))
+            .unwrap()
+            .is_some(),
+        "committed merge receipt must survive reopen"
+    );
+    let live = repo
+        .get_memories(&[test_memory(11).id, test_memory(12).id, test_memory(13).id])
+        .unwrap();
+    assert_eq!(live.len(), 3, "committed merge rows must survive reopen");
+    let have: std::collections::HashSet<_> = live.iter().map(|memory| memory.id).collect();
+    for relation in repo.all_relations().unwrap() {
+        assert!(
+            have.contains(&relation.source) && have.contains(&relation.target),
+            "no half-merged edge may name a missing endpoint"
+        );
+    }
+}
