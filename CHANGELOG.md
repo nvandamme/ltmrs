@@ -5,6 +5,15 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
+## 2026-11-14 — power `clean --stale` sweep + trial teardown hardening
+
+### Power `clean --stale` sweep + teardown hardening
+- `clean --stale` sweeps every leftover `power-*` domain/volume: destroy best-effort (benign-if-absent normalization for missing domains), undefine, vol-delete, record at `reports/power-clean-stale/record.json`. Enumerates domains AND pool volumes (volume-only orphans included); dry-run prints per-guest plans without spawning.
+- Trial teardown after verify: destroy+undefine always (no domain left behind), vol-delete iff verdict `pass`. Canary `pass` end to end re-verified after teardown (smoke11: 12 steps green, volume deleted, no domain left).
+- Live-found fixes folded in: `-c qemu:///system` pinned in the single spawn site; `create <xml>` → `start <name>`; absolute serial-log path; per-trial TCP serial port; `GUEST_IP` .50 const + shared ssh identity (`root@`, `LTMRS_POWER_SSH_KEY`); `sync` appended to workloads; post-recreate ssh-wait.
+- Host discipline: repo-owned `tmp/vm/mnt-*` only for future host-side mounts (never `/` or `/mnt`); loop/ISO debris from manual sessions cleaned.
+- Gate: xtask 133/133, fmt clean, clippy `-D warnings` clean, full workspace green.
+
 
 ## b2a1e27 (2026-11-14) — projector pass-wide batched embed
 

@@ -27,7 +27,8 @@ on non-Linux it compiles to a stub reporting
 ```
 cargo xtask power --op build [--force] [--dry-run]
 cargo xtask power --op trial --mode canary|daemon --name <trial> [--dry-run]
-cargo xtask power --op clean --name <trial>
+cargo xtask power --op clean --name <trial> [--dry-run]
+cargo xtask power --op clean --stale [--dry-run]
 ```
 
 - `build` creates the 8G qcow2 golden volume, defines/boots
@@ -41,8 +42,8 @@ cargo xtask power --op clean --name <trial>
   `ConnectTimeout=2`, 2s between probes), runs the mode workload
   (`tools/vm/<mode>-workload.txt`, one `ssh` spawn per line), cuts power
   (`virsh destroy` — never graceful shutdown), recreates the domain from
-  the same XML, and verifies (`cat` the mode marker plus `dmesg`).
 - `clean` destroys, undefines, and vol-deletes `power-<name>`.
+- `clean --stale` sweeps every leftover `power-*` domain/volume (failed trials keep theirs for forensics) — destroy (best-effort, absent domains treated as already clean), undefine, vol-delete — and writes `reports/power-clean-stale/record.json`. Only names starting with `power-` are touched, so the golden and host domains are never matched.
 - `--dry-run` prints every would-be argv (generated from the same step
   commands the live body runs, so the preview cannot drift) and spawns
   nothing.
@@ -118,9 +119,16 @@ so later inspection cannot be blamed for changing what it observes.
 - Kept-volume triage: trial volumes persist regardless of verdict (see
   above). Inspect via the debugfs discipline above, then `clean --name
   <trial>` to destroy/undefine/vol-delete.
-- Stale `power-<name>` domains from an interrupted run: re-running `clean`
-  is safe while the domain still exists (destroy/undefine/vol-delete run in
-  order). Once the domain is gone but the volume lingers, re-running aborts
-  on the missing domain — vol-delete the leftover manually, then retry.
+- Stale `power-<name>` leftovers from an interrupted run: `clean --stale` sweeps them all (destroy best-effort, then undefine + vol-delete per guest, record at `reports/power-clean-stale/record.json`). Single-trial cleanup stays `clean --name <trial>`.
+
+## Host-mount discipline
+
+Host-side mounts (loop devices, ISO images, qcow2 assembly in the future
+build op) live ONLY under repo-owned `tmp/vm/mnt-*`, created per use and
+removed after unmount in the same op. NEVER `/`, `/mnt`, or any bare
+system path — the manual sessions leaked an ISO mount on `/mnt` and loop
+devices on deleted images, requiring superuser cleanup. `virsh`/`qemu-img`
+never mount anything; only a future build step that explicitly loops a
+host file must follow this rule.
 - Windows: every `power` verb fails fast with the Hyper-V stub message;
   run the rig on Linux.

@@ -56,6 +56,7 @@ enum Command {
         mode: Option<String>,
         name: Option<String>,
         force: bool,
+        stale: bool,
         dry_run: bool,
     },
     Help {
@@ -143,7 +144,7 @@ fn known_value_flags(verb: &str) -> &'static [&'static str] {
         "dist-audit" => &["--mode"],
         "gate-audit" => &[],
         "test" => &["--tier", "--package"],
-        "power" => &["--op", "--mode", "--name"],
+        "power" => &["--op", "--mode", "--name", "--stale"],
         _ => &[],
     }
 }
@@ -246,6 +247,7 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
     }
     let mut dry_run = false;
     let mut force = false;
+    let mut stale = false;
     let mut kept: Vec<String> = Vec::with_capacity(rest.len());
     for token in rest {
         if token.starts_with("--")
@@ -276,11 +278,16 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
                 verb: Some(verb.clone()),
             });
         } else if token.starts_with("--") {
-            if verb == "power" && flag_name(&token) == "--force" {
+            if verb == "power" && (flag_name(&token) == "--force" || flag_name(&token) == "--stale")
+            {
                 if flag_value(&token).is_some() {
-                    return Err("'--force' takes no value".to_string());
+                    return Err(format!("'{}' takes no value", flag_name(&token)));
                 }
-                force = true;
+                if flag_name(&token) == "--force" {
+                    force = true;
+                } else {
+                    stale = true;
+                }
                 i += 1;
                 continue;
             }
@@ -425,6 +432,9 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
                 .iter()
                 .position(|(k, _)| k == "--name")
                 .map(|i| pairs.remove(i).1);
+            if stale && op != "clean" {
+                return Err("flag '--stale' is only valid with '--op clean'".to_string());
+            }
             if op == "trial" {
                 let Some(mode) = mode else {
                     return Err("missing required flag '--mode' for verb 'power'".to_string());
@@ -442,6 +452,7 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
                     mode: Some(mode),
                     name: Some(name),
                     force,
+                    stale: false,
                     dry_run,
                 });
             }
@@ -451,14 +462,28 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
                 ));
             }
             if op == "clean" {
+                if stale && name.is_some() {
+                    return Err("flag '--stale' sweeps all trials; drop '--name'".to_string());
+                }
+                if stale {
+                    return Ok(Command::Power {
+                        op,
+                        mode: None,
+                        name: None,
+                        force,
+                        stale: true,
+                        dry_run,
+                    });
+                }
                 let Some(name) = name else {
-                    return Err("missing required flag '--name' for verb 'power'".to_string());
+                    return Err("missing required flag '--name' for verb 'power' (or pass --stale to sweep)".to_string());
                 };
                 return Ok(Command::Power {
                     op,
                     mode: None,
                     name: Some(name),
                     force,
+                    stale: false,
                     dry_run,
                 });
             }
@@ -472,6 +497,7 @@ fn parse_args(argv: Vec<String>) -> Result<Command, String> {
                 mode: None,
                 name: None,
                 force,
+                stale: false,
                 dry_run,
             })
         }
@@ -552,10 +578,10 @@ fn usage_verb(verb: &str) -> &'static str {
               --package and --tier full conflict (full already covers all).\n"
         }
         "power" => {
-            "cargo xtask power --op build|trial|clean [--mode canary|daemon] [--name <trial>] [--force] [--dry-run]\n\
+            "cargo xtask power --op build|trial|clean [--mode canary|daemon] [--name <trial>] [--force] [--stale] [--dry-run]\n\
              \n\
-             Power rig as code: build the base image, run a trial, or clean a trial.\n\
-             --mode is required for trial; --name is required for trial and clean.\n"
+             Power rig as code: build the base image, run a trial, clean a trial, or sweep leftovers.\n\
+             --mode is required for trial; --name is required for trial and clean (omit with --stale to sweep all power-* domains/volumes).\n"
         }
         _ => usage(),
     }
@@ -658,14 +684,17 @@ fn main() {
             mode,
             name,
             force,
+            stale,
             dry_run,
-        }) => match verbs::run_power(&op, mode.as_deref(), name.as_deref(), force, dry_run) {
-            Ok(code) => std::process::exit(code),
-            Err(err) => {
-                eprintln!("error: {err}");
-                std::process::exit(1);
+        }) => {
+            match verbs::run_power(&op, mode.as_deref(), name.as_deref(), force, stale, dry_run) {
+                Ok(code) => std::process::exit(code),
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("{}", usage());
@@ -1029,5 +1058,28 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("--name"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn power_clean_stale_needs_no_name() {
+        let cmd = parse_args(args(&["xtask", "power", "--op", "clean", "--stale"])).unwrap();
+        assert!(
+            matches!(cmd, Command::Power { ref op, name: None, stale: true, .. } if op == "clean"),
+            "stale sweep must parse without --name: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn power_stale_rejected_outside_clean() {
+        let err = parse_args(args(&[
+            "xtask", "power", "--op", "trial", "--mode", "canary", "--name", "t1", "--stale",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--stale"), "unexpected error: {err}");
+        let err = parse_args(args(&[
+            "xtask", "power", "--op", "clean", "--name", "t1", "--stale",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--stale"), "unexpected error: {err}");
     }
 }

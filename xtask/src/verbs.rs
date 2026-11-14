@@ -2675,6 +2675,7 @@ pub fn run_power(
     mode: Option<&str>,
     name: Option<&str>,
     force: bool,
+    stale: bool,
     dry_run: bool,
 ) -> Result<i32, String> {
     match op {
@@ -2684,7 +2685,16 @@ pub fn run_power(
             let name = name.ok_or("trial needs --name")?;
             crate::power::run_trial(mode, name, force, dry_run)
         }
-        "clean" => crate::power::run_clean(name.ok_or("clean needs --name")?, force, dry_run),
+        "clean" => {
+            if stale {
+                return crate::power::run_clean_stale(dry_run);
+            }
+            crate::power::run_clean(
+                name.ok_or("clean needs --name (or --stale to sweep)")?,
+                force,
+                dry_run,
+            )
+        }
         other => Err(format!(
             "unknown power op '{other}' (expected build|trial|clean)"
         )),
