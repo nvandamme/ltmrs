@@ -60,7 +60,7 @@ the production cache; any mismatch is a hard error.
   mixed-length batch, prefix asymmetry (query vs passage on identical text),
   near-limit 512-token input, long-document chunking with the fact beyond the
   first window.
-- **Tolerance rationale:** CPU F32 Candle vs PyTorch F32 reference — elementwise
+- **Tolerance rationale:** CPU F32 Burn Flex vs PyTorch F32 reference (Candle replaced 2026-11-12, commits 2ccf544/54eb0b7/a5f2495) — elementwise
   cosine similarity ≥ 0.999 and max abs diff ≤ 1e-3 per vector (frozen in tests).
   These are qualification tolerances, not performance claims; any change to the
   recipe or artifacts invalidates them and requires re-running this section.

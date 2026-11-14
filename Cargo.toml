@@ -51,7 +51,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 # Release-grade optimization on both profiles (v0.1-alpha decision):
 # Dev profile is tuned for iteration speed, not runtime: no LTO
-# (thin-LTO costs minutes per test link on the candle/lance tree),
+# (thin-LTO costs minutes per test link on the burn/lance tree),
 # line-tables-only debuginfo (fast links, usable backtraces), and
 # extra codegen units for many-core machines. Release keeps thin LTO.
 [profile.dev]
