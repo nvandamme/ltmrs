@@ -5,14 +5,38 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 
 ---
 
-## 2026-11-14 — power verbs live-trial hardening (canary `pass` end to end)
 
-### Live trial proof: `power --op trial --mode canary` verdict `pass`
-- `reports/power-wp12-smoke11/verdict.json`: 12 steps green (clone/define/start/ssh-wait/workload/destroy/recreate/ssh-wait/verify + teardown destroy/undefine/vol-delete), volume deleted, no domain left.
-- Live-found fixes (all in-tree, all gated): `-c qemu:///system` pinned in the single spawn site (session URI has no `default` pool); `create <xml>` → `start <name>` (transient-vs-defined collision); absolute serial-log path (libvirt CWD ≠ xtask CWD); per-trial TCP serial port derived like the MAC (4599 collision on leftovers); `GUEST_IP` .50 const + shared ssh identity helper (`root@`, key from `LTMRS_POWER_SSH_KEY`, BatchMode, no host-key prompt); `sync` appended to both workloads (page cache never flushed before destroy); second ssh-wait after recreate (verify raced the reboot); post-verify teardown (destroy+undefine always, vol-delete iff pass).
-- Gate: `cargo test -p xtask` 130/130, fmt clean, clippy `-D warnings` clean; full `cargo test --workspace` 23 ok / 0 failed.
+## b2a1e27 (2026-11-14) — projector pass-wide batched embed
 
-## f023c0c (2026-11-13) — rig + wrapper + matrix batch
+### Live-DB oracle for backup_import_lemma (f6d1a7f, backfilled)
+- Enveloped copy of live ~/.lemma DB (1457 memories) through real cdylib + preview/confirm; digest-of-emitted-text fix; never-dlclose handle cache. Matrix executed_passed.
+
+### Transitive alias-equivalence oracles (c2f89bb, backfilled)
+- memory_edit update/forget/invalidate + learn lesson-side alias==native proven by 3 twin-fixture tests; reflect confirmed native (no transitive path).
+
+### Burn CUDA BEIR + batched forward (3b3cbc2, 0a10fc6, backfilled)
+- LTMRS_BEIR_DEVICE=cuda: 5183 docs 123s index on RTX 5090, identical verdict to CPU. Batched [B,S,H] forward + batched projector publish: 614.7s flat index, byte-identical metrics.
+
+### Projector pass-wide batched embed
+- `run_limited` split `render_chunk_rows` into `chunk_units` (collect chunks + zero-chunk fallback, no embed) + `rows_from_chunks` (build rows from chunks+vectors, `assert_eq!` on vector/chunk count); the validated pass collects every job's chunks, runs ONE `embed_texts` over the whole pass, slices vectors back per job by chunk count. Embed is pure, so it runs outside the per-entity guard; per-job validate, single amortized `publish_rows`, per-job ack/retry, stalled-embedder re-enqueue (T-PROJ-03) unchanged. SciFact docs are single-chunk (p50 ~265 tokens, 512-token window), so a per-job `embed_texts` got a 1-element slice and the rayon pool idled.
+- Measured (release, solo): **5183/5183 docs in 557.0s** vs baseline 1246s — **2.24×** end-to-end; steady ~10 docs/s vs ~3.0 (~3.3×). Final metrics nDCG@10=0.644 MAP=0.576 Recall@100=0.837 MRR@10=0.589 — byte-identical to prior CPU evidence. Verified: ltmrs-search clippy/fmt clean, 28 projector tests green; 2 review passes (formal vs plans §8.2 step 4 + T-PROJ-01/02/03; functional bug hunt on vector-slice reassembly, lexical-only, stalled path) — no findings.
+- 3 heavy search legs re-run solo, release, 247.5s, 3 passed: calibrate recommended min_similarity 0.70 (matches CHANGELOG:376); clustered Recall@10 mean 0.875 min 0.700 n=300 (matches :157); ann_ivf_pq_vs_exact unfiltered Recall@10 0.171 (n=100), filtered 0.190 (n=20), freshness 100/100 pre+post-optimize — consistent with the 0.176 floor (:364), seed-sensitive.
+
+## bd680e3 (2026-11-14) — Windows sccache per-build opt-in + xtask wrapper hook
+
+### Windows sccache: per-build opt-in verified + documented
+- Empirical verification of the "no wrapper is Windows-safe" claims (sccache 0.19): `RUSTC_WRAPPER=sccache` (plain env, argv invocation) engages (41 requests, 25 compiles, 16 probes; ltmrs-domain + ltmrs-daemon incl. windows-sys built clean through it). The probe-breaking claim is stale — `sccache rustc --version/-vV/--print cfg/--print target-list` pass through verbatim. The windows-sys E0554 claim is stale for raw sccache; it is true only for a `.cmd` shim (`cmd /c echo %*` collapses rustc's escaped quotes — reproduced). `.sh` wrapper cannot exec on Windows (os error 193). Conclusion: committed-wrapper ban stays (cargo has no per-platform config; committed key inherited by the IDE); a per-build `RUSTC_WRAPPER=sccache` is Windows-safe. Release profile is non-incremental (incremental=false, lto=thin) so sccache engages exactly on the cold builds that hurt. Docs: AGENTS.md sccache section, `.cargo/config.toml`, `tools/sccache-wrap.sh` comments.
+
+### xtask carries the sccache opt-in to its cargo children
+- `build.rs` cannot set the wrapper (`cargo:rustc-env=RUSTC_WRAPPER` reaches only the dependent crate's compilation, not cargo's parent-side resolution — verified). The in-repo seam is xtask: `xtask/src/verbs.rs` `wrapper_choice` (pure) + `cargo_child_env` — opt-in `LTMRS_SCCACHE=1` sets `RUSTC_WRAPPER=sccache` on cargo children, a user-exported wrapper passes through, `LTMRS_NO_SCCACHE=1` forces plain rustc. Wired into `run_children` (all cargo-spawning verbs) and `dist-audit --mode full` release + offline builds. 2 policy tests; xtask clippy/fmt green, 100 tests.
+- Engagement proof (solo, `LTMRS_SCCACHE=1 cargo xtask dist-audit --mode full`): **`locked-release-build: PASS (wall 1919s)`** — the release workspace build flowed through sccache via the xtask child env (152 compile requests, 148 executed, 148 cache misses: cold build populating the cache). The offline leg then showed **16 C/C++ cache hits** — the cache-hit proof. 6/9 dist-audit checks PASS. The 3 FAILs are in legs untouched by this change set (scan code byte-identical to HEAD): `reqwest-sites` is a scan-rule staleness (the `interchange/hindsight` bridge legitimately uses reqwest, absent from `PROVISION_ONLY`); `offline-build` is the running `cargo xtask` verb self-locking its own `target/debug/xtask.exe` (os error 5); `deny-graph` is cargo-lock contention in the build window (the exact scan command exits 0 standalone).
+
+## 2026-11-14 — resolve Candle→Burn plan staleness (owner call)
+
+### Candle→Burn plan staleness RESOLVED
+- Tree is Candle-free (2ccf544; Cargo.lock 0 candle refs, Burn 0.22 live). Stale refs updated in one review: `plans/01_design_and_concepts.md:111` (Candle withdrawn from WP-00 candidates, AD-02 pointer); `plans/models/e5-small-manifest.md:63` (Burn Flex vs PyTorch, CPU tolerances cos ≥ 0.999 / abs ≤ 1e-3 unchanged); `plans/traceability.json:368` (RQ-09 contract "Candle adapter" → "Burn adapter"); `:375` (Candle GPU envelope 1.31e-7/1e-6/0.999999 as history, envelope re-baselined 2026-11-13 to MAX_ABS_DIFF=1e-4 / COSINE_FLOOR=0.999998, candle-ug dual-cudarc HOLD resolved). Archive plans left as dated history. `Cargo.toml` dev-profile comment fixed (candle→burn tree). `traceability.json` validates as JSON.
+
+## 2026-11-13 — rig + wrapper + matrix batch
 
 ### Alpine power-loss rig BUILT + PROVEN (Windows leg delegated to omp)
 - System libvirt (virsh) path after pty-driven QEMU scaffolding proved unscriptable: direct kernel boot + copy-live-system + debugfs offline edits; system libvirt with default NAT network.

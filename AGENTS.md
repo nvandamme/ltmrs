@@ -38,7 +38,7 @@ Project instructions for coding agents working in this repository.
 2. **No behemoth monolithic files (1500 LOC hard ceiling, 800 LOC preferably)** — Every file over 1500 lines of code MUST be split into sub-files/modules per intent/domain, no exceptions for "cohesive" giants. LOC counts non-blank, non-comment lines (blank lines and doc comments do not add structural complexity; code lines are the budget). When a domain has multiple related modules, make it a subpackage. Splits are mechanical moves (no behavior change in the same commit as logic edits); shared items go through the owning module, never via glob re-exports (see rule 6).
 3. **No code duplication; shared-first** — Never duplicate logic across modules. Maintain shared functions/features in a single owning module and import them. If a helper is used by ≥2 modules, it belongs in a shared/common module for that domain (or a cross-module utility if truly generic). Before writing ANY helper, search the whole workspace for an existing one (CCC semantic search first, then grep); reuse it or promote it — never clone it.
 4. **These rules are permanent** — They apply to the whole repository and all future work. Do not violate them for convenience; restructure existing code to comply when you touch it.
-5. **Workspace crates own their domains; the crate DAG stays acyclic** — The workspace is `crates/domain`, `crates/service`, `crates/compat`, `crates/embeddings`, `crates/search` (search+retrieval, one crate: the prod `search`↔`retrieval` cycle cannot be cut without a trait-extraction refactor), `crates/interchange`, `crates/daemon`, `crates/frontend`, plus the binary-only root `ltmrs` — and the excluded helper `crates/lemma-import` (own workspace; runtime-loaded cdylib, never a build-time dependency). New code lives in the owning crate, never duplicated or scattered at the workspace root. Cross-crate production dependencies must keep the DAG acyclic, bottom-up: `domain` → `service`/`compat` → `embeddings` → `search` → `interchange` → `daemon` → `frontend` → binary. Heavy-dependency ownership is fixed: `fjall` lives in `ltmrs-service`; candle/tokenizers live in `ltmrs-embeddings`; `lancedb`/`lance-index` live in `ltmrs-search`; `rmcp` lives in `ltmrs-frontend`; `rusqlite` (bundled) lives in `ltmrs-lemma-import` (excluded from the workspace; loaded at runtime via `dlopen`, never linked into the daemon). `lancedb::arrow` stays inside `ltmrs-search` — no other crate may name Arrow types. `skills/` lives in `ltmrs-frontend` alongside `cli.rs` (which names `crate::skills`; co-location is the only sane resolution — adjudicated Task 10 deviation from the superseded "skills stays in the binary" plan text). Test-only upward edges via dev-dependencies are allowed but must be called out in the owning manifest (precedent: the embeddings→search bridge-test dev-dependency). Dropping a dependency pin requires per-pin grep proof of zero users, each way (`^use` lines plus full-path uses).
+5. **Workspace crates own their domains; the crate DAG stays acyclic** — The workspace is `crates/domain`, `crates/service`, `crates/compat`, `crates/embeddings`, `crates/search` (search+retrieval, one crate: the prod `search`↔`retrieval` cycle cannot be cut without a trait-extraction refactor), `crates/interchange`, `crates/daemon`, `crates/frontend`, plus the binary-only root `ltmrs` — and the excluded helper `crates/lemma-import` (own workspace; runtime-loaded cdylib, never a build-time dependency). New code lives in the owning crate, never duplicated or scattered at the workspace root. Cross-crate production dependencies must keep the DAG acyclic, bottom-up: `domain` → `service`/`compat` → `embeddings` → `search` → `interchange` → `daemon` → `frontend` → binary. Heavy-dependency ownership is fixed: `fjall` lives in `ltmrs-service`; burn/tokenizers live in `ltmrs-embeddings`; `lancedb`/`lance-index` live in `ltmrs-search`; `rmcp` lives in `ltmrs-frontend`; `rusqlite` (bundled) lives in `ltmrs-lemma-import` (excluded from the workspace; loaded at runtime via `dlopen`, never linked into the daemon). `lancedb::arrow` stays inside `ltmrs-search` — no other crate may name Arrow types. `skills/` lives in `ltmrs-frontend` alongside `cli.rs` (which names `crate::skills`; co-location is the only sane resolution — adjudicated Task 10 deviation from the superseded "skills stays in the binary" plan text). Test-only upward edges via dev-dependencies are allowed but must be called out in the owning manifest (precedent: the embeddings→search bridge-test dev-dependency). Dropping a dependency pin requires per-pin grep proof of zero users, each way (`^use` lines plus full-path uses).
 6. **No shims, no re-exports, no back-compat** — No compatibility shims, no `pub use` re-export facades, no deprecated-alias wrappers. Every name lives exactly where it is defined and is imported by path. The sole exception is a stable public API surface that is explicitly documented as such (doc comment stating the stability promise); anything else gets deleted, not shimmed.
 
 ## Rust Rules
@@ -82,17 +82,17 @@ mandatory before any commit or qualification claim.
 
 ### Fast iteration (STRICT — build time is expensive here)
 
-The daemon test binary links candle/lance/arrow. Measured iteration
+The daemon test binary links burn/lance/arrow. Measured iteration
 costs (32-core, mold, incremental codegen): single-crate touch
 rebuild ~4s, full-workspace rebuild after a bottom-crate edit ~15s.
 The full suite (`cargo test --workspace`, ~2m) is dominated by test
 execution (daemon ~50s, search ~20s, integration suites), not compile.
-Cold builds (fresh checkout: datafusion/lance/candle/arrow) remain
+Cold builds (fresh checkout: datafusion/lance/burn/arrow) remain
 expensive — see sccache below. Iterate cheaply, qualify fully:
 
 - Quick tier (seconds): `cargo xtask test` runs the light-crate lib
   suites only (domain, service, compat, interchange — no
-  candle/lance/arrow/rmcp in their closures).
+  burn/lance/arrow/rmcp in their closures).
 - Full gate: `cargo xtask test --tier full` (== `cargo test --workspace`).
   Never run bare `cargo test` (builds the root binary incl.
   `src/bench/quality.rs`) or `--workspace` for iteration.
@@ -105,7 +105,7 @@ expensive — see sccache below. Iterate cheaply, qualify fully:
   goes through `cargo sweep` (see below), never ad-hoc deletion.
 - `target/` hygiene: if `target/debug` exceeds ~50GB, run
   `cargo sweep --time 30` to prune artifacts unused for 30+ days
-  (never plain `cargo clean`, which forces a full candle/lance
+  (never plain `cargo clean`, which forces a full burn/lance
   rebuild).
 - Dev-tool installs (sweep, nextest, linkers, …) go through
   `cargo binstall`, never `cargo install` — prebuilt binaries,
@@ -114,18 +114,32 @@ expensive — see sccache below. Iterate cheaply, qualify fully:
 - `cargo-nextest` runs the same suites faster with per-test timing
   (`cargo nextest run -p <crate>`); use it for iteration and slow-test
   hunting. Gates stay on `cargo test` (evidence scripts parse it).
-- Cold-checkout builds are slow (datafusion/lance/candle/arrow from
-  source). POSIX shells opt in to sccache explicitly:
-  `export RUSTC_WRAPPER="$PWD/tools/sccache-wrap.sh"` (direnv/.envrc or CI
-  script): sccache when installed (`cargo binstall sccache`), plain rustc
-  otherwise — fresh checkouts keep building either way. sccache only
-  engages on non-incremental builds (`CARGO_INCREMENTAL=0`: cold checkouts,
-  clean trees, fresh worktrees sharing `~/.cache/sccache`); warm incremental
-  builds bypass it untouched and stay fast. Escape hatch:
-  `LTMRS_NO_SCCACHE=1`. NEVER commit a `[build] rustc-wrapper` key: cargo has
-  no per-platform config, and no wrapper is Windows-safe (.sh: `os error
-  193`; .cmd shim: `E0554` on quoted `--cfg`; raw sccache: breaks IDE
-  `--print`/JSON probes). Windows builds plain rustc with zero config.
+- Cold-checkout builds are slow (datafusion/lance/burn/arrow from
+  source). Opt in to sccache **per build** by exporting `RUSTC_WRAPPER`
+  (POSIX: `RUSTC_WRAPPER="$PWD/tools/sccache-wrap.sh"` — the wrapper falls
+  back to plain rustc when sccache is absent; Windows: `RUSTC_WRAPPER=sccache`
+  directly, sccache 0.19 passes rustc probes through verbatim). sccache
+  engages only on non-incremental builds (`CARGO_INCREMENTAL=0`, which the
+  release profile already sets): cold checkouts, clean trees, fresh worktrees.
+  Warm incremental builds bypass it untouched and stay fast. Cache: POSIX
+  `~/.cache/sccache`, Windows `%LOCALAPPDATA%\Mozilla\sccache\cache`
+  (10 GiB cap; `sccache --show-stats` to inspect, `sccache --stop-server`
+  to flush). Escape hatch: `LTMRS_NO_SCCACHE=1`.
+- **`cargo xtask` carries the opt-in to its cargo children**: `LTMRS_SCCACHE=1`
+  sets `RUSTC_WRAPPER=sccache` on the spawn (xtask is the repo's spawn seam;
+  the IDE runs cargo directly, never xtask, so the committed-wrapper ban does
+  not apply). A wrapper the user already exported passes through unchanged;
+  `LTMRS_NO_SCCACHE=1` forces plain rustc. A `cargo:rustc-env=RUSTC_WRAPPER`
+  build-script directive does NOT work — cargo resolves the wrapper in the
+  parent before any rustc spawns (verified 2026-11-14).
+- **NEVER commit a `[build] rustc-wrapper` key** — cargo has no per-platform
+  config, so a committed wrapper is mandatory on ALL hosts. Windows-safe
+  per-build invocation (plain `RUSTC_WRAPPER=sccache`) is fine; a committed
+  `.sh` wrapper fails on Windows (`os error 193`), and a `.cmd` shim
+  corrupts rustc's quoted `--cfg`/`--check-cfg` args (cmd `%*` collapses
+  escaped quotes — `windows-sys` fails `E0554`). Windows builds plain rustc
+  with zero config by default; add `RUSTC_WRAPPER=sccache` per-build when
+  the cold-build cost bites.
 - Linker selection is automatic per member (`build.rs` + shared probe
   in `tools/detect_linker.rs`): mold if present, else wild, else the
   system default — no setup needed, and checkouts without either

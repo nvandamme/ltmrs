@@ -2,10 +2,12 @@
 # Rust compiler wrapper for POSIX shells (Linux/Apple). Opt-in ONLY:
 #   export RUSTC_WRAPPER="$PWD/tools/sccache-wrap.sh"
 # (direnv/.envrc or CI script). NEVER commit a [build] rustc-wrapper key:
-# cargo has no per-platform config, and no wrapper is Windows-safe
-# (.sh: os error 193; .cmd: E0554 on quoted --cfg; raw sccache: breaks
-# IDE --print/JSON probes). Routes through sccache when installed,
-# otherwise falls back to plain rustc (fresh checkouts keep building).
+# cargo has no per-platform config, so a committed wrapper is mandatory on
+# ALL hosts, and a committed wrapper cannot be Windows-safe (.sh: os error
+# 193; .cmd: E0554 on quoted --cfg). Windows uses plain RUSTC_WRAPPER=sccache
+# per-build (probes pass through verbatim). Routes through sccache when
+# installed, otherwise falls back to plain rustc (fresh checkouts keep
+# building).
 #
 # Bypass with LTMRS_NO_SCCACHE=1 (escape hatch if a stale cache is suspected).
 set -u
