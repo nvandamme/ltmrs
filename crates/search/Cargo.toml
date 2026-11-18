@@ -1,6 +1,6 @@
 [package]
 name = "ltmrs-search"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 edition = "2024"
 [features]
 # Opt-in CUDA inference (dynamic loading only): forwards to the embeddings

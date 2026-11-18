@@ -6093,7 +6093,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "libc",
  "ltmrs-compat",
@@ -6115,7 +6115,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-compat"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "ltmrs-domain",
  "regex",
@@ -6126,7 +6126,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-daemon"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "libc",
  "ltmrs-compat",
@@ -6149,7 +6149,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-domain"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "serde",
  "serde_json",
@@ -6160,7 +6160,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-embeddings"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "burn-core",
  "burn-cubecl",
@@ -6185,7 +6185,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-frontend"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "libc",
  "ltmrs-compat",
@@ -6209,7 +6209,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-interchange"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "ltmrs-domain",
  "ltmrs-service",
@@ -6225,7 +6225,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-search"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "futures-util",
  "lance-index",
@@ -6243,7 +6243,7 @@ dependencies = [
 
 [[package]]
 name = "ltmrs-service"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "fjall",
  "ltmrs-domain",
@@ -10692,7 +10692,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 dependencies = [
  "serde_json",
  "tempfile",

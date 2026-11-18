@@ -1,6 +1,6 @@
 [package]
 name = "ltmrs-mc-import"
-version = "0.1.0-alpha"
+version = "0.2.0-beta"
 edition = "2024"
 description = "Isolated Magic Context SQLite importer (cdylib; owns its rusqlite edge)."
 license = "MIT OR Apache-2.0"

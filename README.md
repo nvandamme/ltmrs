@@ -11,10 +11,10 @@ never calls a remote model.
 
 ## Status
 
-**Release candidate v0.1-alpha** (`ltmrs 0.1.0-alpha`). Implementation
-covers WP-12 plus post-WP-12 enhancements, with WP-13 evidence largely
-executed. Release tracking (per-ticker status, evidence pointers,
-open items) lives in [`docs/RELEASE.md`](docs/RELEASE.md); history in
+**v0.2-beta** (`ltmrs 0.2.0-beta`, tag `v0.2-beta`). Implementation covers
+WP-00…WP-11 plus post-alpha enhancements (Burn tensor core, Hindsight
+bridge, hooks, Magic Context import, Windows port, CUDA); WP-12
+qualification is in progress — executed legs (BEIR SciFact full run, CUDA parity, Windows certification, Alpine power-rig trials, load/soak/contended records) and the open tickers are listed per-ticker in [`docs/RELEASE.md`](docs/RELEASE.md); history in
 [`CHANGELOG.md`](CHANGELOG.md). This repository contains:
 
 - the reviewed implementation specification and test plan in [`plans/`](plans/),
@@ -41,14 +41,15 @@ Dense semantic search and graph-aware context are **intentional enhancements**.
 The release claim under qualification is therefore: *complete supported Lemma
 API/workflow surface with documented retrieval enhancements*, not byte-identical
 behavioral equivalence — pending the WP-13 gates (approvals + checklist). Known deviations are tracked in an explicit ledger
-(`baseline/lemma-0.21.0/deviations.json`; all 12 owner-approved).
+(`baseline/lemma-0.21.0/deviations.json`; 17 entries — 14 owner-approved,
+DEV-007 re-approval pending, DEV-016/017 proposed).
 
 Beyond Lemma, ltmrs speaks the [oh-my-pi](https://github.com/can1357/oh-my-pi)
 memory dialect: `memory_edit` tri-op, `learn` lesson capture, `reflect`
 server-side synthesis, Hindsight bridge scoping, mental-model seeds,
 `memory`/`mm` CLI groups, curated decision files and polyphonic recall
-voices. The [gap table](#omp-gap-table) below maps every omp surface to its
-ltmrs counterpart; deliberate divergences are ledgered, not hidden.
+voices. The [gap table](#gap-table-multi-target) below maps every Lemma, omp and
+bridge surface to its ltmrs counterpart; deliberate divergences are ledgered, not hidden.
 
 ## Quick Start
 
@@ -85,13 +86,13 @@ CLI / visualizer client -----------+                         |
                                                              |
                                           versioned lexical/vector projection
                                                              |
-                                             LanceDB + Candle worker
+                                             LanceDB + Burn worker
 ```
 
 - One binary: MCP stdio frontends, `ltmrs daemon`, CLI and optional visualizer.
 - One daemon owns one physical store; multiple frontends share it.
 - Canonical knowledge and derived search state are logically separated.
-- Embeddings are computed locally with Candle; retrieval with LanceDB.
+- Embeddings are computed locally with Burn (Candle→Burn 2026-11-12, tree Candle-free); retrieval with LanceDB.
 - Canonical backend is **B** Fjall + LanceDB (decided, AD-01
   `plans/AD-01_canonical_backend.md`, gated on hard correctness/atomicity
   tests — not on feature lists or throughput scores).
@@ -117,7 +118,7 @@ rollback). Explanations (`explain: true` on `memory_read` /
 flags behind each answer.
 
 Recall blends lexical + dense + fact + temporal voices through
-reciprocal-rank fusion (advisory fact/temporal legs at half weight;
+reciprocal-rank fusion (advisory fact/temporal legs at quarter weight each;
 text-similarity legs stay primary), with a generation-keyed result
 cache (5-minute TTL; writes bump the generation, so hits are never
 stale). `reflect` synthesizes over the Hindsight bank when the bridge
@@ -229,7 +230,7 @@ spawned daemons explicitly (never inherited env).
   recall fusion appended after canonical results, never into ranking.
 - Bank derivation per mode (shared base for global/tagged, base-label
   for per-project); recall tag filters for tagged mode; global
-  (untagged) writes need `GLOBAL_SCOPE=1` + a non-isolated mode.
+  (untagged) writes need `--hindsight-global-scope` + a mode other than per-project.
 - `reflect` synthesizes over the bank (30s timeout, "" when down).
 - Durable outbox (when `OUTBOX` set): each retain persists to disk
   before send; failures retry 5s→30s→5m then stay on disk; 7-day
@@ -275,23 +276,23 @@ The specification is the source of truth for implementation:
 | [Part III — Quality, tests, benchmarks, conformance](plans/03_quality_tests_benchmarks_conformance.md) | Hard gates, test catalog, recovery/security suites, benchmark strategy, release checklist |
 | [traceability.json](plans/traceability.json) | Machine-readable requirements → work packages → tests mapping |
 | [conformance_matrix.json](plans/conformance_matrix.json) | Per-tool conformance inventory (all `not_run` until executed) |
-| [omp gap closure](.kilo/specs/2026-11-12-omp-memory-gap-closure.md) | omp ↔ ltmrs gap analysis + closure plan (local-only, not committed) |
+| omp gap closure (local-only spec, not committed) | omp ↔ ltmrs gap analysis + closure plan — delivered per TODO (Slices 1–5, G1–G7) |
 
-Implementation starts with **WP-00** (freeze upstream baseline, resolve the CPU
-dependency lock) and **WP-01** (domain model + reference interpreter). Do not
-implement the full tool surface against an unproven storage transaction
-assumption.
+Implementation status (per TODO): WP-00…WP-11 delivered (slices S0–S7, 33 tools
+served); open work is WP-12 qualification and WP-13 release closure. The
+canonical backend gate stays on hard correctness/atomicity tests — not on
+feature lists or throughput scores.
 
 ## Install
 
 Prerequisites: a Rust stable toolchain. `rust-toolchain.toml` pins it
 (currently 1.99.0 with rustfmt + clippy); rustup picks it up
 automatically. No Node, Python, or system database engine is needed —
-inference is CPU Candle, storage is Fjall + LanceDB.
+inference is CPU Burn, storage is Fjall + LanceDB.
 
 ```bash
 cargo build                # debug binary at target/debug/ltmrs
-cargo build --release      # release binary at target/release/ltmrs (~286MB)
+cargo build --release      # release binary at target/release/ltmrs
 ```
 
 Optional, for dense retrieval (the only step that uses the network):
@@ -333,8 +334,7 @@ ltmrs mm list                                  # mental-model seed catalog
 
 Backups run through the MCP tools (`backup_create` to a
 directory, `backup_preview`, `backup_restore` with token + confirm);
-see Operations above. Verification gates: `cargo test` (664 lib +
-2 smoke suites), `cargo fmt -- --check`, `cargo clippy
+see Operations above. Verification gates: `cargo test`, `cargo fmt -- --check`, `cargo clippy
 --all-targets -- -D warnings`.
 
 ## Tools (33)
@@ -368,27 +368,72 @@ The assistant stores a lesson-typed memory first, then (if asked with
 a guide name) creates the managed guide second — skill failure is
 partial, never a rollback. Empty lessons reject loudly.
 
-## omp gap table
+## Gap table (multi-target)
 
-| omp surface | ltmrs counterpart | Notes |
-|---|---|---|
-| `recall` / `retain` / `reflect` tools | `memory_read`+`semantic_search` / `memory_add` / `reflect` | `reflect` needs the bridge; otherwise honest empty synthesis |
-| `memory_edit` tri-op + importance clamp | `memory_edit` native tool | importance-only rejects (confidence is earned); fact rows editable by design |
-| `learn` + optional skill | `learn` native tool (lesson + `guide_create` second) | 2000/400 caps + 100-cap + dedup + redaction live in the add path |
-| `manage_skill` CRUD | `learn --guide` + installer guards | No MCP tool: the daemon never writes host files; host uses CLI/lib |
-| `/memory view\|stats\|diagnose\|queue` | P3 renderers + `memory` CLI | Bridge-disabled labels, never fabricated data |
-| `/memory sync\|enqueue\|rebuild` | `memory sync` (real consolidation) | Drains queues + consolidates; bridge flush runs in the daemon |
-| `/memory clear\|reset` | Refuses loudly | Canonical store is never wiped from a CLI verb |
-| `/memory mm …` | `mm` CLI (frozen 3-seed catalog) | Synthesis runs server-side via the bridge |
-| `memory://` URLs | `memory_library` + `-lib` snapshot | Host-side scheme; server exposes the snapshot, not the protocol |
-| `local` backend pipeline | Curated files (`memories/`, `sharpshooter/`) | Daemon never calls a model; hosts enqueue deltas, daemon consolidates |
-| `sharpshooter` decision files | `sharpshooter/<bank>/*.md` + pending queues | Same mechanism; extraction stays host-side |
-| `hindsight` backend | Opt-in bridge (dual-write + scoped recall + reflect) | 7 CLI flags; scoping/globalScope/outbox/mental models landed |
-| `mnemopi` backend | Canonical Fjall store (no separate SQLite mode) | One store, not two; no `noEmbeddings` toggle needed (lexical fallback is automatic) |
-| auto-recall / auto-retain | `session_start` preload + `hook-extract` | No silent background writes from the server; host opts in |
-| polyphonic / enhanced recall / proactive linking | RRF fact+temporal voices + generation-keyed cache | Graph voice blocked (no relation edges); cache drops on generation bump |
-| hook event bus | Slice B CLI hooks (`hook-inject`/`extract`) | Different layer (CLI entry points, not in-process events) |
-| bank scoping global/per-project/tagged | G1a `Scoping` + bank derivation + tag filters | Project label = lowercase basename (omp parity) |
+Every compatibility surface ltmrs claims, by target: Lemma 0.21.0 (the pinned
+legacy contract, AD-03), the omp `memory` dialect and its backends, Magic
+Context, and the legacy `lemma` CLI. Deviation ids point into
+`baseline/lemma-0.21.0/deviations.json`.
+
+| Target | Surface | ltmrs counterpart | Status / notes |
+|---|---|---|---|
+| Lemma 0.21.0 | 33 MCP tools + frozen schemas | served verbatim from the wire capture | matrix: 33 cells executed_passed |
+| Lemma 0.21.0 | `semantic_search` ranking | hybrid RRF + native scorer | `hybrid:false` serves the upstream TF-IDF reference profile (DEV-011); `explain:true` adds the upstream-shaped recall explanation (DEV-012); DEV-001/005 enhancements |
+| Lemma 0.21.0 | secret redaction on `memory_add` | `confirm:true` overrides non-critical secrets only | critical credentials (PEM, GitHub PAT, AWS AKIA) always redacted (DEV-002) |
+| Lemma 0.21.0 | session model | sessions bound to authenticated frontend channels | no daemon-global current session (DEV-003) |
+| Lemma 0.21.0 | `source` provenance | strict enum user\|ai\|web\|paper\|book\|code | truly-unknown values coerce to ai (DEV-004) |
+| Lemma 0.21.0 | project attribution | stable `prj_<name>_<ulid>` + `project bind\|status\|adopt` | cwd is a fallback clue, never an identity (DEV-006) |
+| Lemma 0.21.0 | add dedup + conflict handling | Jaccard 0.80 similarity contract; conflicting adds refused pre-commit with advice | DEV-007 re-approval pending; DEV-015 has no override flag |
+| Lemma 0.21.0 | pagination | typed validation errors for out-of-range limit/top_k/offset | no silent clamps (DEV-013) |
+| Lemma 0.21.0 | tools/list | static frozen schemas, verbatim | memory context in responses, never injected descriptions (DEV-014) |
+| Lemma 0.21.0 | consolidate weights | MIN(confidence, 0.1) on all write paths | parity restored 2026-11-13; flat-0.05 bug fixed (DEV-017) |
+| Lemma 0.21.0 | instructional UX | no seed fragments, no coaching blocks, no auto-detect | host concern (DEV-008); skill-side guidance landed in SKILL.md 0.2.0 |
+| Lemma 0.21.0 | host skill install | recipes at `~/.agents/skills/ltmrs/SKILL.md`, installer-guarded | per-host verification pending (DEV-009) |
+| Lemma 0.21.0 | `.lemma-backup` archives | `backup_import_lemma` (preview + confirm, loss-accounted) | isolated runtime cdylib; SQLite never in the build graph (DEV-010) |
+| Lemma 0.21.0 | CLI aliases | `-lib`, `-vis`, `--install-skill`, `-h`, `-V` | verbatim (WP-10) |
+| Lemma 0.21.0 | deviation ledger | `baseline/lemma-0.21.0/deviations.json` | 17 entries: 14 approved, DEV-007 re-approval pending, DEV-016/017 proposed |
+| omp `memory` | `recall` / `retain` / `reflect` tools | `memory_read`+`semantic_search` / `memory_add` / `reflect` | `reflect` needs the bridge; otherwise honest empty synthesis |
+| omp `memory` | `memory_edit` tri-op + importance clamp | `memory_edit` native tool | importance-only rejects (confidence is earned); fact rows editable by design |
+| omp `memory` | `learn` + optional skill | `learn` native tool (lesson + `guide_create` second) | 100-cap learned queue + dedup + redaction live in the add path |
+| omp `memory` | `manage_skill` CRUD | `learn --guide` + installer guards | No MCP tool: the daemon never writes host files; host uses CLI/lib |
+| omp `memory` | `/memory view\|stats\|diagnose\|queue` | P3 renderers + `memory` CLI | Bridge-disabled labels, never fabricated data |
+| omp `memory` | `/memory sync\|enqueue\|rebuild` | `memory sync` (real consolidation) | Drains queues + consolidates; bridge flush runs in the daemon |
+| omp `memory` | `/memory clear\|reset` | Refuses loudly | Canonical store is never wiped from a CLI verb |
+| omp `memory` | `/memory mm …` | `mm` CLI (frozen 3-seed catalog) | Synthesis runs server-side via the bridge |
+| omp `memory` | `memory://` URLs | `memory_library` + `-lib` snapshot | Host-side scheme; server exposes the snapshot, not the protocol |
+| omp `memory` | `local` backend pipeline | Curated files (`memories/`, `sharpshooter/`) | Daemon never calls a model; hosts enqueue deltas, daemon consolidates |
+| omp `memory` (sharpshooter) | decision files | `sharpshooter/<bank>/*.md` + pending queues | Same mechanism; extraction stays host-side |
+| omp `memory` (hindsight) | `hindsight` backend | Opt-in bridge (dual-write + scoped recall + reflect) | 7 CLI flags; scoping/globalScope/outbox/mental models landed |
+| omp `memory` (mnemopi) | `mnemopi` backend | Canonical Fjall store (no separate SQLite mode) | One store, not two; no `noEmbeddings` toggle needed (lexical fallback is automatic) |
+| omp `memory` | auto-recall / auto-retain | `session_start` preload + `hook-extract` | No silent background writes from the server; host opts in |
+| omp `memory` | polyphonic / enhanced recall / proactive linking | RRF fact+temporal voices (quarter weight) + generation-keyed cache | Graph voice landed: bounded relation-graph expansion (supersession/contradiction/relatedness, engine stage 8); cache drops on generation bump |
+| omp `memory` | hook event bus | Slice B CLI hooks (`hook-inject`/`hook-extract`) | Different layer (CLI entry points, not in-process events) |
+| omp `memory` | bank scoping global/per-project/tagged | G1a `Scoping` + bank derivation + tag filters | Project label = lowercase basename (omp parity) |
+| Magic Context | `.mc` bundle import | `mc-import preview\|confirm <path> [--digest D]` | read-only preview, version fence, loss accounting; isolated cdylib, CLI-first (Slice C) |
+| legacy lemma CLI | `lemma` executable | `--install-shim` → `~/.local/bin/lemma` (Windows `lemma.cmd`) | refuses non-managed paths, warns on PATH collisions |
+
+## Known limits
+
+Status per ticker lives in `docs/RELEASE.md`; the honest open list:
+
+- Long-run stability: 4-segment soak executed (2000 ops / 0 failures, RSS stable,
+  `reports/wp12-soak-01/`); the 24h clock soak is open.
+- Power-loss durability: the libvirt rig **models** power loss (guest dirty pages
+  discarded on `virsh destroy`; host caches intact — plans/03 §4.1 doctrine).
+  Built and proven 2026-11-13: canary written+synced survived destroy/reboot;
+  50MB mid-write load rebooted into journal-orphan recovery with the canary
+  intact (rigtest1); trials `smoke10`, `smoke11` (12 steps green) and `stale1`
+  pass (`reports/power-wp12-*/verdict.json`); `power clean --stale` sweep
+  (`reports/power-clean-stale/`). Hardware qualification on a dedicated machine
+  remains open.
+- Multi-host matrices: Linux R0 primary, Windows certified on-host (daemon +
+  T-SEC-01 security suite + full gate, 2026-10-08/2026-11-13), Alpine rig guest
+  for power legs; the broader host matrix is not_run, and Windows per-host skill
+  activation is not covered.
+- Quality waves: upstream-manual full-corpus waves open; BEIR beyond SciFact
+  open (SciFact full run closed 2026-11-13: 5183/5183, CPU 1246s + CUDA 123s).
+- Deviation review: 17-entry ledger — 14 owner-approved; DEV-007 re-approval
+  pending, DEV-016/017 proposed (`baseline/lemma-0.21.0/deviations.json`).
 
 ## Security
 

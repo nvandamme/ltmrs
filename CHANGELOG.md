@@ -6,6 +6,15 @@ Content before `---` is instructions — do not modify. Add entries after the `-
 ---
 
 ## 2026-11-14 — power `clean --stale` sweep + trial teardown hardening
+## v0.2.0-beta (2026-11-18) — release claim: bump + executed-legs tracker + publish
+
+### v0.2-beta milestone claim (ONE commit, per the release-claim rule)
+- Version 0.1.0-alpha → 0.2.0-beta across the root + 10 crate manifests + xtask (path deps carry no version; no test pins the literal — `-V` and MCP server-info derive from `CARGO_PKG_VERSION`).
+- README Status: v0.2-beta, delivered scope (WP-00…WP-11 + Burn, Hindsight bridge, hooks, Magic Context import, Windows, CUDA), naming the executed legs; gap table made multi-target (Lemma 0.21.0 / omp `memory` / Hindsight / Magic Context / legacy lemma CLI); Known-limits section added (soak scope, modeled power-loss rig, multi-host, quality waves, deviation ledger).
+- docs/RELEASE.md rewritten to the executed truth (was frozen at the 2026-10-20 baseline): legs flipped to `done` with evidence — host_live/cold/daemon/kill9/contended-write (2026-10-21, `reports/wp12-*`), load 811 ops + search-load 39 ops + soak 4 segments 2000 ops — all 0 failures, upstream re-run 2026-10-28 + salted comparison 2026-11-12, BEIR SciFact full run closed (5183/5183, CPU 1246s + CUDA 123s, identical 0.644/0.576/0.837/0.589), CUDA qualification on RTX 3080 (2000-put + 400-search parity, driverless legs, release-profile 4/4), Windows certification (2026-10-08 daemon + T-SEC-01, on-host gate 2026-11-13), Alpine power-rig trials `smoke10`/`smoke11`/`stale1` pass + `clean --stale` sweep. Power-loss row names the rig as **modeled** power loss (plans/03 §4.1; host caches intact), hardware qualification on a dedicated machine stays open. Deviation row fixed to the 17-entry ledger (14 approved, DEV-007 pending, DEV-016/017 proposed).
+- Gates: fmt clean, clippy `-D warnings` clean, full workspace suite green (1312 passed / 0 failed / 44 ignored; re-run on this commit), `ltmrs -V` = 0.2.0-beta.
+- Publish executed 2026-11-18 (owner-approved): the claim is squashed to ONE commit (owner decision — amends the three-commit post-alpha sequence 61e49b5/1f02457/bd9b177); annotated tag `v0.2-beta` at this commit, main + tag force-pushed to origin.
+
 
 ### Power `clean --stale` sweep + teardown hardening
 - `clean --stale` sweeps every leftover `power-*` domain/volume: destroy best-effort (benign-if-absent normalization for missing domains), undefine, vol-delete, record at `reports/power-clean-stale/record.json`. Enumerates domains AND pool volumes (volume-only orphans included); dry-run prints per-guest plans without spawning.
